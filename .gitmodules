@@ -7,3 +7,7 @@
 [submodule "components/esp-sr"]
 	path = components/esp-sr
 	url = https://github.com/espressif/esp-sr.git
+[submodule "components/oneye-dev-sdk"]
+	path = components/oneye-dev-sdk
+	url = git@github.com:eleball-oneye/oneye-dev-sdk.git
+	branch = main

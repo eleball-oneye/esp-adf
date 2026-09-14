@@ -212,7 +212,7 @@ copy_dep_pkgconfig() { # $1=out $2=name $3=pkgname $4=required $5=desc
             mkdir -p "$out/include"
             cp -a "$incd/$name" "$out/include/" 2>/dev/null && hdrs+=("include/$name")
         elif [ "$incd" = "/usr/include" ] || [ "$incd" = "/usr/local/include" ]; then
-            warn "  $name：头文件位于系统根 $incd 且无同名子目录（未整体复制）"
+            warn "  $name：头文件位于系统根 $incd 且无同名子目录（未整体复制）" >&2
         else
             mkdir -p "$out/include/$name"
             cp -a "$incd/." "$out/include/$name/" 2>/dev/null && hdrs+=("include/$name")
@@ -241,7 +241,8 @@ copy_dep_pkgconfig() { # $1=out $2=name $3=pkgname $4=required $5=desc
             done
         done
     done
-    ok "依赖 $name v$ver：头文件 → include/$name/（${#hdrs[@]} 项）、库 → lib/（${#libs_copied[@]} 个文件）"
+    # 注意：本函数的 stdout 只允许输出 JSON（进度信息走 stderr），否则会被 JSON 捕获破坏 deps.json
+    ok "依赖 $name v$ver：头文件 → include/$name/（${#hdrs[@]} 项）、库 → lib/（${#libs_copied[@]} 个文件）" >&2
     printf '{"name":"%s","kind":"pkgconfig","pkgconfig":"%s","version":"%s","required":"%s","status":"bundled","desc":"%s"}' \
         "$name" "$ident" "$ver" "$req" "$desc"
 }
@@ -397,7 +398,7 @@ build_esp() { # $1=idf 版本, $2=target
         || ar rcs "$out/lib/liboneye_dev_sdk.a" "$scratch/oneye_dev_sdk.o" || return 1
     ok "lib/liboneye_dev_sdk.a  ($(stat -c%s "$out/lib/liboneye_dev_sdk.a") bytes)"
 
-    bundle_deps_esp "$out" "$idf" "v$idfv"
+    bundle_deps_esp "$out" "$idf" "$idfv"
     write_manifest "$out" "$tcid" "$cc" "$("$cc" -dumpfullversion 2>/dev/null || "$cc" -dumpversion)" "$target" "v$idfv" "$cflags"
     [ "$PUBLISH_REPO_LIB" = "1" ] && publish_to_repo_lib "$out" "$tcid"
     ESP_OUTS+=("$tcid|$target|$idfv")

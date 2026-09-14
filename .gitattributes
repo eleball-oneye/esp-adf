@@ -1,0 +1,3 @@
+# oneye 集成新增：统一编译脚本为 shell 脚本，必须保持 LF
+# （Windows 检出若转成 CRLF，在 WSL/Linux 下会报 "/bin/bash^M: bad interpreter"）
+build-all.sh text eol=lf

@@ -280,6 +280,7 @@ build_demo_esp() { # $1=idf 版本, $2=target
     demo="$OUT_ROOT/demo/$tcid"; mkdir -p "$demo"
     ex="$SDK_DIR/examples/esp-idf/hello_oneye"
     info "构建板级例程 hello_oneye（$target @ IDF v$idfv）→ output/demo/$tcid/esp-hello_oneye/"
+    local build_dir="$OUT_ROOT/.build/esp-hello_oneye-$tcid"   # 构建目录放在 output/.build 下，避免污染仓库（子仓 git status 保持干净）
     (
         set +u
         # shellcheck disable=SC1090
@@ -287,13 +288,13 @@ build_demo_esp() { # $1=idf 版本, $2=target
         # 让例程工程找到 SDK 组件（组件在 SDK 仓根，独立检出时用该环境变量）
         export ONEYE_DEV_SDK_PATH="$SDK_DIR"
         cd "$ex"
-        rm -rf "build-$tcid"
-        idf.py -B "build-$tcid" set-target "$target" > "$demo/esp-build.log" 2>&1 \
-            && idf.py -B "build-$tcid" build >> "$demo/esp-build.log" 2>&1
+        rm -rf "$build_dir"
+        idf.py -B "$build_dir" set-target "$target" > "$demo/esp-build.log" 2>&1 \
+            && idf.py -B "$build_dir" build >> "$demo/esp-build.log" 2>&1
     ) || { warn "hello_oneye 构建失败（见 esp-build.log）"; return 2; }
     mkdir -p "$demo/esp-hello_oneye"
-    cp -f "$ex/build-$tcid"/hello_oneye.bin "$ex/build-$tcid"/hello_oneye.elf "$ex/build-$tcid"/bootloader/bootloader.bin \
-          "$ex/build-$tcid"/partition_table/partition-table.bin "$demo/esp-hello_oneye/" 2>/dev/null || true
+    cp -f "$build_dir"/hello_oneye.bin "$build_dir"/hello_oneye.elf "$build_dir"/bootloader/bootloader.bin \
+          "$build_dir"/partition_table/partition-table.bin "$demo/esp-hello_oneye/" 2>/dev/null || true
     cp -f "$demo/esp-build.log" "$demo/esp-hello_oneye/" 2>/dev/null || true
     if grep -q "链接预编译库" "$demo/esp-build.log" 2>/dev/null; then
         ok "hello_oneye 构建通过；组件自动链接预编译库"

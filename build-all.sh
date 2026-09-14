@@ -9,15 +9,21 @@
 #   ├── <toolchain-id>/                 # 例：x86_64-linux-gnu-gcc-13.3.0
 #   │   ├── include/oneye_dev_sdk.h         头文件（随库交付）
 #   │   ├── include/oneye_dev_sdk_test.h
+#   │   ├── include/<依赖名>/…              **依赖的第三方头文件**（宿主轨随包复制）
 #   │   ├── lib/liboneye_dev_sdk.a          静态库
 #   │   ├── lib/liboneye_dev_sdk.so*        动态库（仅宿主）
-#   │   ├── toolchain.json                  构建口径（编译器/版本/IDF 版本/编译选项）
-#   │   └── SHA256SUMS                      校验值
+#   │   ├── lib/lib<依赖>.a|.so*            **依赖的库**（宿主轨随包复制）
+#   │   ├── toolchain.json                  构建口径（编译器/版本/IDF 版本/编译选项/依赖摘要）
+#   │   ├── deps.json                       依赖清单（名字/方式/版本/状态：bundled|provided-by-idf|missing）
+#   │   └── SHA256SUMS                      校验值（含随包复制的依赖头文件与库）
 #   ├── demo/
 #   │   └── <toolchain-id>/             # demo 产物与运行日志（与库分离）
 #   │       ├── demo_static / demo_shared / demo_dlopen(.log)
 #   │       └── esp-hello_oneye/hello_oneye.bin（含 build.log）
-#   └── BUILD-REPORT.md                 本次构建汇总（工具链 × 产物 × 校验值）
+#   └── BUILD-REPORT.md                 本次构建汇总（工具链 × 产物 × 校验值 × 依赖）
+#
+# 依赖打包：声明见 components/oneye-dev-sdk/deps/（linux.conf 用 pkg-config 解析并**复制头文件+库**；
+# idf.conf 为 IDF 组件，**登记**组件名/版本、库由 IDF 提供，可用 --vendor-idf-headers 复制其头文件）。
 #
 # 工具链标识规则：<compiler-triple>-gcc-<compiler-version>
 #   host                -> x86_64-linux-gnu-gcc-13.3.0
@@ -31,6 +37,10 @@
 #   ./build-all.sh --toolchains esp32s3@5.5.5,esp32c3@5.5.5 --no-demo
 #   ./build-all.sh --toolchains all                    # host + 每套已装 IDF 的 esp32s3/esp32c3
 #   OUT=/tmp/out ./build-all.sh --toolchains host       # 或 --out <dir> 覆盖输出目录
+#   ./build-all.sh --deps-list                          # 查看依赖声明
+#   ./build-all.sh --deps-strict --toolchains host      # required 依赖缺失即判定失败
+#   ./build-all.sh --vendor-idf-headers --toolchains esp32s3@5.5.5   # 连 IDF 组件头文件一并复制
+#   ./build-all.sh --no-deps --toolchains host          # 不做依赖打包
 # =============================================================================
 
 set -uo pipefail
@@ -45,6 +55,10 @@ WITH_DEMO=1
 DO_CLEAN=0
 DO_LIST=0
 PUBLISH_REPO_LIB=1
+DEPS_MODE="auto"        # auto | none
+DEPS_STRICT=0           # 1 = required 依赖缺失即失败
+VENDOR_IDF_HEADERS=0    # 1 = 复制 IDF 组件头文件到产物 include/idf-deps/
+DEPS_LIST_ONLY=0
 
 C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_RED=$'\033[31m'
 info()  { printf '%s==> %s%s\n' "$C_BOLD" "$*" "$C_RESET"; }
@@ -65,6 +79,11 @@ while [ $# -gt 0 ]; do
         --idf-root)      IDF_ROOT="${2:-}"; shift 2 ;;
         --no-demo)       WITH_DEMO=0; shift ;;
         --no-publish)    PUBLISH_REPO_LIB=0; shift ;;
+        --deps)          DEPS_MODE="${2:-auto}"; shift 2 ;;
+        --deps-strict)   DEPS_STRICT=1; shift ;;
+        --deps-list)     DEPS_LIST_ONLY=1; shift ;;
+        --vendor-idf-headers) VENDOR_IDF_HEADERS=1; shift ;;
+        --no-deps)       DEPS_MODE="none"; shift ;;
         --clean)         DO_CLEAN=1; shift ;;
         --list)          DO_LIST=1; shift ;;
         -h|--help)       usage; exit 0 ;;
@@ -115,6 +134,12 @@ list_idf_versions() {
     done
 }
 
+if [ "$DEPS_LIST_ONLY" = "1" ]; then
+    echo "SDK: $SDK_DIR (version $SDK_VERSION)"
+    print_deps_list
+    exit 0
+fi
+
 if [ "$DO_LIST" = "1" ]; then
     echo "SDK: $SDK_DIR (version $SDK_VERSION)"
     echo "输出根: $OUT_ROOT"
@@ -149,6 +174,136 @@ host_cc() { local c="${CC:-cc}"; command -v "$c" >/dev/null 2>&1 || c=gcc; echo 
 
 # gcc>=7 的 -dumpversion 只给主版本号（"13"），库目录名需要完整版本（"13.3.0"）
 cc_full_version() { local c="$1" v; v="$("$c" -dumpfullversion 2>/dev/null || true)"; [ -n "$v" ] || v="$("$c" -dumpversion)"; echo "$v"; }
+
+# ======================================================= 依赖解析与打包
+# 目标：把 liboneye_dev_sdk 的第三方依赖（头文件 + 库）一并打进产物目录，
+#       使 output/<工具链>/ 成为自包含交付单元。声明见 components/oneye-dev-sdk/deps/。
+DEPS_FAIL=0
+
+deps_conf_for() { # $1=host|esp
+    case "$1" in
+        host) echo "$SDK_DIR/deps/linux.conf" ;;
+        esp)  echo "$SDK_DIR/deps/idf.conf" ;;
+    esac
+}
+
+print_deps_list() {
+    local kind conf
+    for kind in host esp; do
+        conf="$(deps_conf_for "$kind")"
+        echo "── $kind 轨依赖声明（$conf）"
+        if [ -f "$conf" ]; then
+            grep -v '^[[:space:]]*#' "$conf" | grep -v '^[[:space:]]*$' | \
+                awk -F'|' '{printf "   %-14s %-14s %-9s %s\n", $1, $2, $4, $5}'
+        else
+            echo "   （未找到声明文件）"
+        fi
+    done
+}
+
+# pkg-config 依赖：复制头文件到 include/<name>/、库到 lib/，返回 JSON 条目
+copy_dep_pkgconfig() { # $1=out $2=name $3=pkgname $4=required $5=desc
+    local out="$1" name="$2" ident="$3" req="$4" desc="$5"
+    local ver cflags l flag incd libdir libname f
+    local -a hdrs=() libs_copied=()
+    ver="$(pkg-config --modversion "$ident")"
+    cflags="$(pkg-config --cflags-only-I "$ident")"
+    for incd in $cflags; do
+        incd="${incd#-I}"
+        [ -d "$incd" ] || continue
+        if [ -d "$incd/$name" ]; then
+            mkdir -p "$out/include"
+            cp -a "$incd/$name" "$out/include/" 2>/dev/null && hdrs+=("include/$name")
+        elif [ "$incd" = "/usr/include" ] || [ "$incd" = "/usr/local/include" ]; then
+            warn "  $name：头文件位于系统根 $incd（未整体复制）——请确认 <$name/...> 随包提供"
+        else
+            mkdir -p "$out/include/$name"
+            cp -a "$incd/." "$out/include/$name/" 2>/dev/null && hdrs+=("include/$name")
+        fi
+    done
+    libdir=""
+    for flag in $(pkg-config --libs-only-L --libs-only-l "$ident"); do
+        case "$flag" in
+            -L*) libdir="${flag#-L}" ;;
+            -l*)
+                libname="${flag#-l}"
+                [ -n "$libdir" ] || continue
+                for f in "$libdir"/lib"$libname".a "$libdir"/lib"$libname".so "$libdir"/lib"$libname".so.*; do
+                    [ -e "$f" ] || continue
+                    cp -a "$f" "$out/lib/" 2>/dev/null && libs_copied+=("lib/$(basename "$f")")
+                done
+                ;;
+        esac
+    done
+    ok "依赖 $name v$ver：头文件 → include/${name}/（${#hdrs[@]} 项）、库 → lib/（${#libs_copied[@]} 个文件）"
+    printf '{"name":"%s","kind":"pkgconfig","pkgconfig":"%s","version":"%s","required":"%s","status":"bundled","desc":"%s"}' \
+        "$name" "$ident" "$ver" "$req" "$desc"
+}
+
+# 宿主轨依赖打包
+bundle_deps_host() { # $1=out dir
+    local out="$1" conf; conf="$(deps_conf_for host)"
+    mkdir -p "$out/include" "$out/lib"
+    if [ "$DEPS_MODE" = "none" ]; then printf '[]\n' > "$out/deps.json"; return 0; fi
+    if [ ! -f "$conf" ]; then warn "未找到依赖声明 $conf（跳过依赖打包）"; printf '[]\n' > "$out/deps.json"; return 0; fi
+    if ! command -v pkg-config >/dev/null 2>&1; then
+        warn "缺少 pkg-config，无法解析依赖（安装：sudo apt-get install -y pkg-config）；deps.json 标记为 missing"
+    fi
+    local json="[" first=1 name kind ident req desc entry
+    while IFS='|' read -r name kind ident req desc; do
+        name="$(echo "${name:-}" | xargs)"; kind="$(echo "${kind:-}" | xargs)"
+        ident="$(echo "${ident:-}" | xargs)"; req="$(echo "${req:-}" | xargs)"; desc="$(echo "${desc:-}" | xargs)"
+        [ -z "$name" ] && continue
+        if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists "$ident" 2>/dev/null; then
+            entry="$(copy_dep_pkgconfig "$out" "$name" "$ident" "$req" "$desc")"
+        else
+            entry="{\"name\":\"$name\",\"kind\":\"$kind\",\"pkgconfig\":\"$ident\",\"required\":\"$req\",\"status\":\"missing\",\"desc\":\"$desc\"}"
+            if [ "$req" = "required" ]; then
+                err "必需依赖缺失：$name（$ident）"
+                [ "$DEPS_STRICT" = "1" ] && DEPS_FAIL=1
+            else
+                warn "依赖缺失（可选）：$name（$ident）——安装后重跑即可随包复制"
+            fi
+        fi
+        if [ "$first" = "1" ]; then json="$json$entry"; first=0; else json="$json,$entry"; fi
+    done < "$conf"
+    printf '%s]\n' "$json" > "$out/deps.json"
+}
+
+# ESP-IDF 轨依赖登记（库由 IDF 提供，不复制；可选复制头文件）
+bundle_deps_esp() { # $1=out dir, $2=idf path
+    local out="$1" idf="$2" conf; conf="$(deps_conf_for esp)"
+    if [ "$DEPS_MODE" = "none" ] || [ ! -f "$conf" ]; then printf '[]\n' > "$out/deps.json"; return 0; fi
+    local json="[" first=1 name kind req desc cdir ver status entry
+    while IFS='|' read -r name kind req desc; do
+        name="$(echo "${name:-}" | xargs)"; kind="$(echo "${kind:-}" | xargs)"
+        req="$(echo "${req:-}" | xargs)"; desc="$(echo "${desc:-}" | xargs)"
+        [ -z "$name" ] && continue
+        cdir="$idf/components/$name"; ver=""; status="provided-by-idf"
+        [ -d "$cdir" ] || cdir="$(find "$idf/components" -maxdepth 3 -type d -name "$name" 2>/dev/null | head -1)"
+        if [ -n "$cdir" ] && [ -f "$cdir/idf_component.yml" ]; then
+            ver="$(sed -n 's/^version:[[:space:]]*"\?\([^"]*\)"\?.*/\1/p' "$cdir/idf_component.yml" | head -1)"
+        fi
+        if [ -z "$cdir" ] || [ ! -d "$cdir" ]; then
+            status="missing"
+            if [ "$req" = "required" ]; then
+                err "IDF 组件缺失：$name"
+                [ "$DEPS_STRICT" = "1" ] && DEPS_FAIL=1
+            else
+                warn "IDF 组件缺失（可选）：$name"
+            fi
+        else
+            if [ "$VENDOR_IDF_HEADERS" = "1" ] && [ -d "$cdir/include" ]; then
+                mkdir -p "$out/include/idf-deps/$name"
+                cp -a "$cdir/include/." "$out/include/idf-deps/$name/" 2>/dev/null && status="headers-bundled"
+            fi
+            ok "IDF 依赖 $name${ver:+ v$ver}（$status；库由 IDF 构建系统按 target 提供）"
+        fi
+        entry="{\"name\":\"$name\",\"kind\":\"idf-component\",\"required\":\"$req\",\"status\":\"$status\",\"version\":\"$ver\",\"desc\":\"$desc\"}"
+        if [ "$first" = "1" ]; then json="$json$entry"; first=0; else json="$json,$entry"; fi
+    done < "$conf"
+    printf '%s]\n' "$json" > "$out/deps.json"
+}
 
 write_manifest() { # $1=out dir, $2=tc id, $3=compiler, $4=cc ver, $5=target, $6=idf ver, $7=cflags
     local out="$1" tcid="$2" cc="$3" ccver="$4" target="$5" idfver="$6" cflags="$7"
@@ -192,6 +347,7 @@ build_host() {
     ln -sf "liboneye_dev_sdk.so.$sover" "$out/lib/liboneye_dev_sdk.so"
     ok "lib/liboneye_dev_sdk.so.$SDK_VERSION_NUM  ($(stat -c%s "$out/lib/liboneye_dev_sdk.so.$SDK_VERSION_NUM") bytes)"
 
+    bundle_deps_host "$out"
     write_manifest "$out" "$(basename "$out")" "$c" "$(cc_full_version "$c")" "x86_64/host" "" "$cflags"
     [ "$PUBLISH_REPO_LIB" = "1" ] && publish_to_repo_lib "$out" "$(basename "$out")"
     LAST_HOST_OUT="$out"
@@ -231,6 +387,7 @@ build_esp() { # $1=idf 版本, $2=target
         || ar rcs "$out/lib/liboneye_dev_sdk.a" "$scratch/oneye_dev_sdk.o" || return 1
     ok "lib/liboneye_dev_sdk.a  ($(stat -c%s "$out/lib/liboneye_dev_sdk.a") bytes)"
 
+    bundle_deps_esp "$out" "$idf"
     write_manifest "$out" "$tcid" "$cc" "$("$cc" -dumpfullversion 2>/dev/null || "$cc" -dumpversion)" "$target" "v$idfv" "$cflags"
     [ "$PUBLISH_REPO_LIB" = "1" ] && publish_to_repo_lib "$out" "$tcid"
     ESP_OUTS+=("$tcid|$target|$idfv")
@@ -373,6 +530,28 @@ REPORT="$OUT_ROOT/BUILD-REPORT.md"
         echo "| \`$tcid\` | $ccv | $tgt ${idfv:-（host）} | $libs | $sums |"
     done
     echo
+    echo "## 依赖打包（随产物复制/登记；声明见 components/oneye-dev-sdk/deps/）"
+    echo
+    echo "| 工具链目录 | 依赖（名字:状态:版本） |"
+    echo "| --- | --- |"
+    for d in "$OUT_ROOT"/*/; do
+        [ -f "$d/deps.json" ] || continue
+        tcid="$(basename "$d")"
+        deps_txt="$(python3 - "$d/deps.json" <<'PY' 2>/dev/null || true
+import json,sys
+try:
+    data=json.load(open(sys.argv[1]))
+except Exception:
+    print("（deps.json 解析失败）"); raise SystemExit
+if not data:
+    print("（无声明依赖）"); raise SystemExit
+print("; ".join(f"{x.get('name')}:{x.get('status')}:{x.get('version') or '-'}" for x in data))
+PY
+)"
+        [ -n "$deps_txt" ] || deps_txt="（解析需 python3）"
+        echo "| \`$tcid\` | $deps_txt |"
+    done
+    echo
     echo "## demo 产物"
     echo
     echo "| 工具链目录 | 产物 |"
@@ -387,4 +566,5 @@ REPORT="$OUT_ROOT/BUILD-REPORT.md"
 info "完成。产物树："
 ( cd "$OUT_ROOT" && find . -maxdepth 2 -mindepth 1 \( -name '.build' -prune -o -print \) | sort | sed 's/^/    /' )
 info "汇总报告：$REPORT"
+[ "$DEPS_FAIL" = "1" ] && { err "存在 required 依赖缺失（--deps-strict 生效），构建判定失败"; LASTRC=1; }
 exit $LASTRC

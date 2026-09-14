@@ -58,3 +58,6 @@ coverage_report/
 .vscode
 
 docs/venv/
+
+# oneye 集成：统一编译脚本的产物目录（build-all.sh 生成，不入库）
+output/

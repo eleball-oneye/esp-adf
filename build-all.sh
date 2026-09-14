@@ -1,0 +1,389 @@
+#!/usr/bin/env bash
+# =============================================================================
+# oneye-dev-sdk 统一编译脚本（位于 esp-adf 仓库根目录）
+#
+# 一次命令、可选工具链，产出「头文件 + 库（.a/.so）+ 接入 demo」，全部落到
+# **esp-adf 仓库内的 output/**（已在 .gitignore 中忽略，不入库），按工具链名称分目录：
+#
+#   output/
+#   ├── <toolchain-id>/                 # 例：x86_64-linux-gnu-gcc-13.3.0
+#   │   ├── include/oneye_dev_sdk.h         头文件（随库交付）
+#   │   ├── include/oneye_dev_sdk_test.h
+#   │   ├── lib/liboneye_dev_sdk.a          静态库
+#   │   ├── lib/liboneye_dev_sdk.so*        动态库（仅宿主）
+#   │   ├── toolchain.json                  构建口径（编译器/版本/IDF 版本/编译选项）
+#   │   └── SHA256SUMS                      校验值
+#   ├── demo/
+#   │   └── <toolchain-id>/             # demo 产物与运行日志（与库分离）
+#   │       ├── demo_static / demo_shared / demo_dlopen(.log)
+#   │       └── esp-hello_oneye/hello_oneye.bin（含 build.log）
+#   └── BUILD-REPORT.md                 本次构建汇总（工具链 × 产物 × 校验值）
+#
+# 工具链标识规则：<compiler-triple>-gcc-<compiler-version>
+#   host                -> x86_64-linux-gnu-gcc-13.3.0
+#   esp32s3@5.5.5       -> xtensa-esp32s3-elf-gcc-14.2.0
+#   esp32s3@6.0.3       -> xtensa-esp32s3-elf-gcc-15.2.0
+#   esp32c3@5.5.5       -> riscv32-esp-elf-gcc-14.2.0
+#
+# 用法示例（在 esp-adf 根目录执行）：
+#   ./build-all.sh --list
+#   ./build-all.sh --toolchains host
+#   ./build-all.sh --toolchains esp32s3@5.5.5,esp32c3@5.5.5 --no-demo
+#   ./build-all.sh --toolchains all                    # host + 每套已装 IDF 的 esp32s3/esp32c3
+#   OUT=/tmp/out ./build-all.sh --toolchains host       # 或 --out <dir> 覆盖输出目录
+# =============================================================================
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+OUT_ROOT=""
+SDK_DIR=""
+IDF_ROOT="${IDF_ROOT:-$HOME/esp}"
+TOOLCHAINS=""
+WITH_DEMO=1
+DO_CLEAN=0
+DO_LIST=0
+PUBLISH_REPO_LIB=1
+
+C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_RED=$'\033[31m'
+info()  { printf '%s==> %s%s\n' "$C_BOLD" "$*" "$C_RESET"; }
+ok()    { printf '    %s%s%s\n' "$C_GREEN" "$*" "$C_RESET"; }
+warn()  { printf '    %s%s%s\n' "$C_YELLOW" "$*" "$C_RESET"; }
+err()   { printf '%sERROR: %s%s\n' "$C_RED" "$*" "$C_RESET" >&2; }
+
+usage() {
+    sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+# ---------------------------------------------------------------- 参数解析
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -t|--toolchains) TOOLCHAINS="${2:-}"; shift 2 ;;
+        --sdk)           SDK_DIR="${2:-}"; shift 2 ;;
+        -o|--out)        OUT_ROOT="${2:-}"; shift 2 ;;
+        --idf-root)      IDF_ROOT="${2:-}"; shift 2 ;;
+        --no-demo)       WITH_DEMO=0; shift ;;
+        --no-publish)    PUBLISH_REPO_LIB=0; shift ;;
+        --clean)         DO_CLEAN=1; shift ;;
+        --list)          DO_LIST=1; shift ;;
+        -h|--help)       usage; exit 0 ;;
+        *) err "未知参数：$1"; usage; exit 2 ;;
+    esac
+done
+
+# ------------------------------------------------- SDK 与输出目录自动探测
+# 本脚本规范位置：esp-adf 仓库根目录（集成仓）。SDK 组件位于 components/oneye-dev-sdk。
+if [ -z "$SDK_DIR" ]; then
+    if [ -f "$SCRIPT_DIR/include/oneye_dev_sdk.h" ]; then
+        SDK_DIR="$SCRIPT_DIR"                                          # 脚本位于 SDK 仓根
+    elif [ -f "$SCRIPT_DIR/components/oneye-dev-sdk/include/oneye_dev_sdk.h" ]; then
+        SDK_DIR="$SCRIPT_DIR/components/oneye-dev-sdk"                 # 脚本位于 esp-adf 根（推荐）
+    elif [ -f "$SCRIPT_DIR/../include/oneye_dev_sdk.h" ]; then
+        SDK_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"                        # 脚本位于 <sdk>/tools/
+    elif [ -f "$PWD/esp-adf/components/oneye-dev-sdk/include/oneye_dev_sdk.h" ]; then
+        SDK_DIR="$PWD/esp-adf/components/oneye-dev-sdk"
+    else
+        err "未找到 oneye-dev-sdk，请用 --sdk <path> 指定"; exit 2
+    fi
+fi
+[ -f "$SDK_DIR/include/oneye_dev_sdk.h" ] || { err "SDK 目录无效：$SDK_DIR"; exit 2; }
+[ -d "$SDK_DIR/src" ] || { err "SDK 缺少 src/（参考实现）"; exit 2; }
+
+# 输出根：默认放在 esp-adf 根目录下的 output/（已 gitignore）；脚本在别处运行时用当前目录
+if [ -z "$OUT_ROOT" ]; then
+    if [ -f "$SCRIPT_DIR/components/oneye-dev-sdk/include/oneye_dev_sdk.h" ]; then
+        OUT_ROOT="$SCRIPT_DIR/output"
+    else
+        OUT_ROOT="$PWD/output"
+    fi
+fi
+SDK_VERSION="$(sed -n 's/^#define ONEYE_DEV_SDK_VERSION_STR[[:space:]]*"\(.*\)"/\1/p' "$SDK_DIR/include/oneye_dev_sdk.h" | head -1)"
+SDK_VERSION="${SDK_VERSION:-unknown}"
+# 数值版本（用于库文件名/SONAME，不含 -ref 之类的后缀）
+V_MAJOR="$(sed -n 's/^#define ONEYE_DEV_SDK_VERSION_MAJOR[[:space:]]*\([0-9]*\).*/\1/p' "$SDK_DIR/include/oneye_dev_sdk.h" | head -1)"
+V_MINOR="$(sed -n 's/^#define ONEYE_DEV_SDK_VERSION_MINOR[[:space:]]*\([0-9]*\).*/\1/p' "$SDK_DIR/include/oneye_dev_sdk.h" | head -1)"
+V_PATCH="$(sed -n 's/^#define ONEYE_DEV_SDK_VERSION_PATCH[[:space:]]*\([0-9]*\).*/\1/p' "$SDK_DIR/include/oneye_dev_sdk.h" | head -1)"
+SDK_VERSION_NUM="${V_MAJOR:-0}.${V_MINOR:-0}.${V_PATCH:-0}"
+
+# ------------------------------------------------------------ 工具链发现
+list_idf_versions() {
+    local d
+    for d in "$IDF_ROOT"/esp-idf-*; do
+        [ -d "$d" ] || continue
+        basename "$d" | sed 's/^esp-idf-//'
+    done
+}
+
+if [ "$DO_LIST" = "1" ]; then
+    echo "SDK: $SDK_DIR (version $SDK_VERSION)"
+    echo "输出根: $OUT_ROOT"
+    echo "可用工具链规格："
+    printf '  %-18s %s\n' host "宿主编译器（$(cc -dumpmachine 2>/dev/null || echo 'cc 不可用')）"
+    for v in $(list_idf_versions); do
+        for t in esp32s3 esp32c3 esp32 esp32c6; do
+            printf '  %-18s %s\n' "$t@$v" "ESP-IDF v$v（$IDF_ROOT/esp-idf-$v）"
+        done
+    done
+    exit 0
+fi
+
+# 交叉编译器：从该 IDF 版本自己的工具索引解析（避免 PATH 混入其它 IDF 版本）
+esp_cc_for() {
+    local idf="$1" target="$2" ccname kv toolpath p cand
+    case "$target" in
+        esp32|esp32s2|esp32s3) ccname="xtensa-${target}-elf-gcc" ;;
+        *)                     ccname="riscv32-esp-elf-gcc" ;;
+    esac
+    kv="$(python3 "$idf/tools/idf_tools.py" --idf-path "$idf" export --format key-value 2>/dev/null || true)"
+    toolpath="$(printf '%s\n' "$kv" | sed -n 's/^PATH=//p' | head -1)"
+    local IFS=':'
+    for p in $toolpath; do
+        cand="$p/$ccname"
+        [ -x "$cand" ] && { echo "$cand"; return 0; }
+    done
+    command -v "$ccname" 2>/dev/null
+}
+
+host_cc() { local c="${CC:-cc}"; command -v "$c" >/dev/null 2>&1 || c=gcc; echo "$c"; }
+
+# gcc>=7 的 -dumpversion 只给主版本号（"13"），库目录名需要完整版本（"13.3.0"）
+cc_full_version() { local c="$1" v; v="$("$c" -dumpfullversion 2>/dev/null || true)"; [ -n "$v" ] || v="$("$c" -dumpversion)"; echo "$v"; }
+
+write_manifest() { # $1=out dir, $2=tc id, $3=compiler, $4=cc ver, $5=target, $6=idf ver, $7=cflags
+    local out="$1" tcid="$2" cc="$3" ccver="$4" target="$5" idfver="$6" cflags="$7"
+    cat > "$out/toolchain.json" <<EOF
+{
+  "sdk": "oneye-dev-sdk",
+  "sdk_version": "$(sed -n 's/^#define ONEYE_DEV_SDK_VERSION_MAJOR \([0-9]*\)$/\1/p' "$SDK_DIR/include/oneye_dev_sdk.h" | head -1).$(sed -n 's/^#define ONEYE_DEV_SDK_VERSION_MINOR \([0-9]*\)$/\1/p' "$SDK_DIR/include/oneye_dev_sdk.h" | head -1).$(sed -n 's/^#define ONEYE_DEV_SDK_VERSION_PATCH \([0-9]*\)$/\1/p' "$SDK_DIR/include/oneye_dev_sdk.h" | head -1)",
+  "sdk_version_str": "$SDK_VERSION",
+  "toolchain_id": "$tcid",
+  "compiler": "$cc",
+  "compiler_version": "$ccver",
+  "target": "$target",
+  "idf_version": "$idfver",
+  "cflags": "$cflags",
+  "built_at_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
+    ( cd "$out" && find lib include -type f 2>/dev/null | sort | xargs -r sha256sum > SHA256SUMS )
+}
+
+# --------------------------------------------------------------- 构建：宿主
+build_host() {
+    local out="$OUT_ROOT/$(host_cc >/dev/null; local c; c="$(host_cc)"; echo "$("$c" -dumpmachine)-gcc-$(cc_full_version "$c")")"
+    local scratch="$OUT_ROOT/.build/host"
+    local c cflags
+    c="$(host_cc)"
+    cflags="-O2 -Wall -Wextra -fPIC -ffunction-sections -fdata-sections -std=c99"
+    info "构建宿主工具链：$("$c" --version | head -1)"
+    mkdir -p "$out/lib" "$out/include" "$scratch"
+    cp -f "$SDK_DIR"/include/*.h "$out/include/"
+
+    "$c" $cflags -I"$SDK_DIR/include" -c "$SDK_DIR/src/oneye_dev_sdk.c" -o "$scratch/oneye_dev_sdk.o" \
+        || { err "编译失败（host）"; return 1; }
+    ar rcs "$out/lib/liboneye_dev_sdk.a" "$scratch/oneye_dev_sdk.o" || return 1
+    ok "lib/liboneye_dev_sdk.a  ($(stat -c%s "$out/lib/liboneye_dev_sdk.a") bytes)"
+
+    local sover="0" 
+    "$c" -shared "$scratch/oneye_dev_sdk.o" -Wl,-soname,"liboneye_dev_sdk.so.$sover" \
+        -o "$out/lib/liboneye_dev_sdk.so.$SDK_VERSION_NUM" || { err "链接 .so 失败"; return 1; }
+    ln -sf "liboneye_dev_sdk.so.$SDK_VERSION_NUM" "$out/lib/liboneye_dev_sdk.so.$sover"
+    ln -sf "liboneye_dev_sdk.so.$sover" "$out/lib/liboneye_dev_sdk.so"
+    ok "lib/liboneye_dev_sdk.so.$SDK_VERSION_NUM  ($(stat -c%s "$out/lib/liboneye_dev_sdk.so.$SDK_VERSION_NUM") bytes)"
+
+    write_manifest "$out" "$(basename "$out")" "$c" "$(cc_full_version "$c")" "x86_64/host" "" "$cflags"
+    [ "$PUBLISH_REPO_LIB" = "1" ] && publish_to_repo_lib "$out" "$(basename "$out")"
+    LAST_HOST_OUT="$out"
+    LAST_HOST_ID="$(basename "$out")"
+    return 0
+}
+
+# ------------------------------------------------------- 构建：ESP 目标
+build_esp() { # $1=idf 版本, $2=target
+    local idfv="$1" target="$2" idf cc
+    idf="$IDF_ROOT/esp-idf-$idfv"
+    if [ ! -d "$idf" ]; then
+        warn "跳过 $target@$idfv：未找到 $idf（先安装或改 --idf-root）"
+        return 2
+    fi
+    cc="$(esp_cc_for "$idf" "$target")"
+    if [ -z "$cc" ] || [ ! -x "$cc" ]; then
+        warn "跳过 $target@$idfv：未找到交叉编译器（先在该 IDF 下执行 install.ps1/install.sh）"
+        return 2
+    fi
+    local tcid; tcid="$(basename "$cc" | sed 's/-gcc$//')-gcc-$("$cc" -dumpfullversion 2>/dev/null || "$cc" -dumpversion)"
+    local out="$OUT_ROOT/$tcid" scratch="$OUT_ROOT/.build/$tcid"
+    # xtensa 目标必须加 -mlongcalls，否则应用工程链接期会报
+    # "dangerous relocation: call8: call target out of range"（libc/ROM 调用超出 call8 范围）
+    local arch_flags=""
+    case "$target" in
+        esp32|esp32s2|esp32s3) arch_flags="-mlongcalls" ;;
+    esac
+    local cflags="-O2 -Wall -Wextra -ffreestanding -fno-common $arch_flags -ffunction-sections -fdata-sections -std=c99"
+    info "构建 $target @ ESP-IDF v$idfv → $tcid"
+    mkdir -p "$out/lib" "$out/include" "$scratch"
+    cp -f "$SDK_DIR"/include/*.h "$out/include/"
+
+    "$cc" $cflags -I"$SDK_DIR/include" -c "$SDK_DIR/src/oneye_dev_sdk.c" -o "$scratch/oneye_dev_sdk.o" \
+        || { err "编译失败（$tcid）"; return 1; }
+    "$(dirname "$cc")/$(basename "$cc" | sed 's/gcc$/ar/')" rcs "$out/lib/liboneye_dev_sdk.a" "$scratch/oneye_dev_sdk.o" \
+        || ar rcs "$out/lib/liboneye_dev_sdk.a" "$scratch/oneye_dev_sdk.o" || return 1
+    ok "lib/liboneye_dev_sdk.a  ($(stat -c%s "$out/lib/liboneye_dev_sdk.a") bytes)"
+
+    write_manifest "$out" "$tcid" "$cc" "$("$cc" -dumpfullversion 2>/dev/null || "$cc" -dumpversion)" "$target" "v$idfv" "$cflags"
+    [ "$PUBLISH_REPO_LIB" = "1" ] && publish_to_repo_lib "$out" "$tcid"
+    ESP_OUTS+=("$tcid|$target|$idfv")
+    return 0
+}
+
+# 把库同步到 SDK 仓内的 lib/<tcid>/（ESP-IDF 组件按此路径优先链接预编译库）
+publish_to_repo_lib() {
+    local out="$1" tcid="$2"
+    mkdir -p "$SDK_DIR/lib/$tcid"
+    cp -f "$out/lib/"*.a "$SDK_DIR/lib/$tcid/" 2>/dev/null || true
+    cp -f "$out/lib/"*.so* "$SDK_DIR/lib/$tcid/" 2>/dev/null || true
+    cp -f "$out/toolchain.json" "$SDK_DIR/lib/$tcid/" 2>/dev/null || true
+    cp -f "$out/SHA256SUMS" "$SDK_DIR/lib/$tcid/" 2>/dev/null || true
+}
+
+# ------------------------------------------------------------ 构建：demo
+build_demo_host() { # $1=out dir（宿主工具链目录）
+    local out="$1"
+    local tcid; tcid="$(basename "$out")"
+    local demo="$OUT_ROOT/demo/$tcid"
+    local c cflags
+    [ "$WITH_DEMO" = "1" ] || return 0
+    c="$(host_cc)"
+    cflags="-O2 -Wall -Wextra -std=c99"
+    mkdir -p "$demo"
+    info "构建并运行宿主 demo → output/demo/$tcid/"
+    "$c" $cflags -I"$out/include" "$SDK_DIR/examples/linux/demo.c" "$out/lib/liboneye_dev_sdk.a" -o "$demo/demo_static" || return 1
+    ok "demo_static（链接 .a）"
+    "$c" $cflags -I"$out/include" "$SDK_DIR/examples/linux/demo.c" -L"$out/lib" -loneye_dev_sdk \
+        -Wl,-rpath,"$out/lib" -o "$demo/demo_shared" || return 1
+    ok "demo_shared（链接 .so，rpath 指向 output/<tc>/lib）"
+    "$c" $cflags -I"$out/include" "$SDK_DIR/examples/linux/demo_dlopen.c" -ldl -o "$demo/demo_dlopen" || return 1
+    ok "demo_dlopen（运行期加载）"
+
+    "$demo/demo_static" > "$demo/demo_static.log" 2>&1 && ok "demo_static 运行通过（日志 demo_static.log）" || warn "demo_static 运行失败（见 demo_static.log）"
+    "$demo/demo_shared" > "$demo/demo_shared.log" 2>&1 && ok "demo_shared 运行通过（日志 demo_shared.log）" || warn "demo_shared 运行失败（见 demo_shared.log）"
+    "$demo/demo_dlopen" "$out/lib/liboneye_dev_sdk.so" > "$demo/demo_dlopen.log" 2>&1 && ok "demo_dlopen 运行通过（ABI 自检）" || warn "demo_dlopen 运行失败（见 demo_dlopen.log）"
+}
+
+build_demo_esp() { # $1=idf 版本, $2=target
+    local idfv="$1" target="$2" idf cc tcid demo ex
+    [ "$WITH_DEMO" = "1" ] || return 0
+    idf="$IDF_ROOT/esp-idf-$idfv"; [ -d "$idf" ] || return 0
+    cc="$(esp_cc_for "$idf" "$target")"; [ -n "$cc" ] || return 0
+    tcid="$(basename "$cc" | sed 's/-gcc$//')-gcc-$("$cc" -dumpversion)"
+    demo="$OUT_ROOT/demo/$tcid"; mkdir -p "$demo"
+    ex="$SDK_DIR/examples/esp-idf/hello_oneye"
+    info "构建板级例程 hello_oneye（$target @ IDF v$idfv）→ output/demo/$tcid/esp-hello_oneye/"
+    (
+        set +u
+        # shellcheck disable=SC1090
+        . "$idf/export.sh" >/dev/null 2>&1
+        # 让例程工程找到 SDK 组件（组件在 SDK 仓根，独立检出时用该环境变量）
+        export ONEYE_DEV_SDK_PATH="$SDK_DIR"
+        cd "$ex"
+        rm -rf "build-$tcid"
+        idf.py -B "build-$tcid" set-target "$target" > "$demo/esp-build.log" 2>&1 \
+            && idf.py -B "build-$tcid" build >> "$demo/esp-build.log" 2>&1
+    ) || { warn "hello_oneye 构建失败（见 esp-build.log）"; return 2; }
+    mkdir -p "$demo/esp-hello_oneye"
+    cp -f "$ex/build-$tcid"/hello_oneye.bin "$ex/build-$tcid"/hello_oneye.elf "$ex/build-$tcid"/bootloader/bootloader.bin \
+          "$ex/build-$tcid"/partition_table/partition-table.bin "$demo/esp-hello_oneye/" 2>/dev/null || true
+    cp -f "$demo/esp-build.log" "$demo/esp-hello_oneye/" 2>/dev/null || true
+    if grep -q "链接预编译库" "$demo/esp-build.log" 2>/dev/null; then
+        ok "hello_oneye 构建通过；组件自动链接预编译库"
+    else
+        warn "hello_oneye 构建完成，但日志未见 '链接预编译库'（可能回落到源码构建）"
+    fi
+}
+
+# ---------------------------------------------------------------- 主流程
+info "oneye-dev-sdk 统一编译：SDK=$SDK_DIR (v$SDK_VERSION)"
+info "输出根：$OUT_ROOT"
+mkdir -p "$OUT_ROOT/demo" "$OUT_ROOT/.build"
+[ "$DO_CLEAN" = "1" ] && { info "清理输出"; rm -rf "$OUT_ROOT"/*; mkdir -p "$OUT_ROOT/demo" "$OUT_ROOT/.build"; }
+
+# 解析工具链列表
+if [ -z "$TOOLCHAINS" ]; then
+    TOOLCHAINS="host"
+    if [ -n "$(list_idf_versions)" ]; then
+        v="$(list_idf_versions | head -1)"
+        TOOLCHAINS="host,esp32s3@$v"
+    fi
+fi
+if [ "$TOOLCHAINS" = "all" ]; then
+    TOOLCHAINS="host"
+    for v in $(list_idf_versions); do
+        TOOLCHAINS="$TOOLCHAINS,esp32s3@$v,esp32c3@$v"
+    done
+fi
+
+LASTRC=0
+LAST_HOST_OUT=""; LAST_HOST_ID=""; ESP_OUTS=()
+IFS=',' read -ra SPECS <<< "$TOOLCHAINS"
+for spec in "${SPECS[@]}"; do
+    spec="$(echo "$spec" | xargs)"
+    [ -n "$spec" ] || continue
+    case "$spec" in
+        host)
+            build_host; rc=$?; [ $rc -ne 0 ] && LASTRC=$rc
+            ;;
+        *@*)
+            build_esp "${spec#*@}" "${spec%@*}"; rc=$?; [ $rc -eq 1 ] && LASTRC=1
+            ;;
+        *) warn "无法识别的工具链规格：$spec（用 host 或 <target>@<idf-version>）" ;;
+    esac
+done
+
+# demo（库构建完成后再跑，确保组件能取到 output 里的库）
+[ "$WITH_DEMO" = "1" ] && [ -n "$LAST_HOST_OUT" ] && build_demo_host "$LAST_HOST_OUT"
+for entry in "${ESP_OUTS[@]:-}"; do
+    [ -n "$entry" ] || continue
+    IFS='|' read -r _tcid _t _v <<< "$entry"
+    build_demo_esp "$_v" "$_t"
+done
+
+# ------------------------------------------------------------ 汇总报告
+REPORT="$OUT_ROOT/BUILD-REPORT.md"
+{
+    echo "# oneye-dev-sdk 构建报告"
+    echo
+    echo "- SDK 版本：\`$SDK_VERSION\`（源码：\`$SDK_DIR\`）"
+    echo "- 时间：$(date -u +%Y-%m-%dT%H:%M:%SZ)（UTC）"
+    echo "- 输出根：\`$OUT_ROOT\`"
+    echo
+    echo "## 工具链 × 产物"
+    echo
+    echo "| 工具链目录 | 编译器 | 目标/IDF | 库产物 | 校验值 |"
+    echo "| --- | --- | --- | --- | --- |"
+    for d in "$OUT_ROOT"/*/; do
+        [ -f "$d/toolchain.json" ] || continue
+        tcid="$(basename "$d")"
+        ccv="$(sed -n 's/.*"compiler_version": "\(.*\)".*/\1/p' "$d/toolchain.json")"
+        tgt="$(sed -n 's/.*"target": "\(.*\)".*/\1/p' "$d/toolchain.json")"
+        idfv="$(sed -n 's/.*"idf_version": "\(.*\)".*/\1/p' "$d/toolchain.json")"
+        libs="$(cd "$d/lib" && ls -1 2>/dev/null | tr '\n' ' ')"
+        sums="$(cd "$d" && sha256sum lib/*.a 2>/dev/null | awk '{print substr($1,1,16)}' | tr '\n' ' ')"
+        echo "| \`$tcid\` | $ccv | $tgt ${idfv:-（host）} | $libs | $sums |"
+    done
+    echo
+    echo "## demo 产物"
+    echo
+    echo "| 工具链目录 | 产物 |"
+    echo "| --- | --- |"
+    for d in "$OUT_ROOT"/demo/*/; do
+        [ -d "$d" ] || continue
+        files="$(cd "$d" && ls -1 | tr '\n' ' ')"
+        echo "| \`$(basename "$d")\` | $files |"
+    done
+} > "$REPORT"
+
+info "完成。产物树："
+( cd "$OUT_ROOT" && find . -maxdepth 2 -mindepth 1 \( -name '.build' -prune -o -print \) | sort | sed 's/^/    /' )
+info "汇总报告：$REPORT"
+exit $LASTRC

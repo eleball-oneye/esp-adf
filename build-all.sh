@@ -134,12 +134,6 @@ list_idf_versions() {
     done
 }
 
-if [ "$DEPS_LIST_ONLY" = "1" ]; then
-    echo "SDK: $SDK_DIR (version $SDK_VERSION)"
-    print_deps_list
-    exit 0
-fi
-
 if [ "$DO_LIST" = "1" ]; then
     echo "SDK: $SDK_DIR (version $SDK_VERSION)"
     echo "输出根: $OUT_ROOT"
@@ -204,38 +198,50 @@ print_deps_list() {
 # pkg-config 依赖：复制头文件到 include/<name>/、库到 lib/，返回 JSON 条目
 copy_dep_pkgconfig() { # $1=out $2=name $3=pkgname $4=required $5=desc
     local out="$1" name="$2" ident="$3" req="$4" desc="$5"
-    local ver cflags l flag incd libdir libname f
-    local -a hdrs=() libs_copied=()
+    local ver incd libd libname f
+    local -a inc_dirs=() lib_dirs=() lib_names=() hdrs=() libs_copied=()
     ver="$(pkg-config --modversion "$ident")"
-    cflags="$(pkg-config --cflags-only-I "$ident")"
-    for incd in $cflags; do
-        incd="${incd#-I}"
+
+    # 头文件候选目录：-I 参数 + pkg-config 的 includedir 变量
+    # （很多系统包的头文件在默认搜索路径 /usr/include 下，不带 -I，必须靠 includedir 兜底）
+    for incd in $(pkg-config --cflags-only-I "$ident"); do inc_dirs+=("${incd#-I}"); done
+    incd="$(pkg-config --variable=includedir "$ident" 2>/dev/null || true)"; [ -n "$incd" ] && inc_dirs+=("$incd")
+    for incd in $(printf '%s\n' "${inc_dirs[@]:-}" | awk 'NF && !seen[$0]++'); do
         [ -d "$incd" ] || continue
-        if [ -d "$incd/$name" ]; then
+        if [ -d "$incd/$name" ]; then                        # 例：/usr/include/cjson、/usr/include/mbedtls
             mkdir -p "$out/include"
             cp -a "$incd/$name" "$out/include/" 2>/dev/null && hdrs+=("include/$name")
         elif [ "$incd" = "/usr/include" ] || [ "$incd" = "/usr/local/include" ]; then
-            warn "  $name：头文件位于系统根 $incd（未整体复制）——请确认 <$name/...> 随包提供"
+            warn "  $name：头文件位于系统根 $incd 且无同名子目录（未整体复制）"
         else
             mkdir -p "$out/include/$name"
             cp -a "$incd/." "$out/include/$name/" 2>/dev/null && hdrs+=("include/$name")
         fi
     done
-    libdir=""
+
+    # 库候选目录：-L 参数 + pkg-config 的 libdir 变量 + 编译器默认库目录
+    libd="$(pkg-config --variable=libdir "$ident" 2>/dev/null || true)"; [ -n "$libd" ] && lib_dirs+=("$libd")
+    local flag
     for flag in $(pkg-config --libs-only-L --libs-only-l "$ident"); do
         case "$flag" in
-            -L*) libdir="${flag#-L}" ;;
-            -l*)
-                libname="${flag#-l}"
-                [ -n "$libdir" ] || continue
-                for f in "$libdir"/lib"$libname".a "$libdir"/lib"$libname".so "$libdir"/lib"$libname".so.*; do
-                    [ -e "$f" ] || continue
-                    cp -a "$f" "$out/lib/" 2>/dev/null && libs_copied+=("lib/$(basename "$f")")
-                done
-                ;;
+            -L*) lib_dirs+=("${flag#-L}") ;;
+            -l*) lib_names+=("${flag#-l}") ;;
         esac
     done
-    ok "依赖 $name v$ver：头文件 → include/${name}/（${#hdrs[@]} 项）、库 → lib/（${#libs_copied[@]} 个文件）"
+    if [ "${#lib_dirs[@]}" -eq 0 ]; then
+        lib_dirs=("/usr/lib/$(uname -m)-linux-gnu" "/usr/lib" "/usr/local/lib")
+    fi
+    mkdir -p "$out/lib"
+    for libname in "${lib_names[@]:-}"; do
+        [ -n "$libname" ] || continue
+        for libd in $(printf '%s\n' "${lib_dirs[@]:-}" | awk 'NF && !seen[$0]++'); do
+            for f in "$libd"/lib"$libname".a "$libd"/lib"$libname".so "$libd"/lib"$libname".so.*; do
+                [ -e "$f" ] || continue
+                cp -a "$f" "$out/lib/" 2>/dev/null && libs_copied+=("lib/$(basename "$f")")
+            done
+        done
+    done
+    ok "依赖 $name v$ver：头文件 → include/$name/（${#hdrs[@]} 项）、库 → lib/（${#libs_copied[@]} 个文件）"
     printf '{"name":"%s","kind":"pkgconfig","pkgconfig":"%s","version":"%s","required":"%s","status":"bundled","desc":"%s"}' \
         "$name" "$ident" "$ver" "$req" "$desc"
 }
@@ -266,7 +272,7 @@ bundle_deps_host() { # $1=out dir
             fi
         fi
         if [ "$first" = "1" ]; then json="$json$entry"; first=0; else json="$json,$entry"; fi
-    done < "$conf"
+    done < <(grep -v '^[[:space:]]*#' "$conf" | grep -v '^[[:space:]]*$')
     printf '%s]\n' "$json" > "$out/deps.json"
 }
 
@@ -301,7 +307,7 @@ bundle_deps_esp() { # $1=out dir, $2=idf path
         fi
         entry="{\"name\":\"$name\",\"kind\":\"idf-component\",\"required\":\"$req\",\"status\":\"$status\",\"version\":\"$ver\",\"desc\":\"$desc\"}"
         if [ "$first" = "1" ]; then json="$json$entry"; first=0; else json="$json,$entry"; fi
-    done < "$conf"
+    done < <(grep -v '^[[:space:]]*#' "$conf" | grep -v '^[[:space:]]*$')
     printf '%s]\n' "$json" > "$out/deps.json"
 }
 
@@ -465,6 +471,13 @@ info "oneye-dev-sdk 统一编译：SDK=$SDK_DIR (v$SDK_VERSION)"
 info "输出根：$OUT_ROOT"
 mkdir -p "$OUT_ROOT/demo" "$OUT_ROOT/.build"
 [ "$DO_CLEAN" = "1" ] && { info "清理输出"; rm -rf "$OUT_ROOT"/*; mkdir -p "$OUT_ROOT/demo" "$OUT_ROOT/.build"; }
+
+# --deps-list：只打印依赖声明（函数已定义完毕，放在此处避免 "command not found"）
+if [ "$DEPS_LIST_ONLY" = "1" ]; then
+    echo "SDK: $SDK_DIR (version $SDK_VERSION)"
+    print_deps_list
+    exit 0
+fi
 
 # 解析工具链列表
 if [ -z "$TOOLCHAINS" ]; then

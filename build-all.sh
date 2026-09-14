@@ -277,19 +277,23 @@ bundle_deps_host() { # $1=out dir
 }
 
 # ESP-IDF 轨依赖登记（库由 IDF 提供，不复制；可选复制头文件）
-bundle_deps_esp() { # $1=out dir, $2=idf path
-    local out="$1" idf="$2" conf; conf="$(deps_conf_for esp)"
+bundle_deps_esp() { # $1=out dir, $2=idf path, $3=idf version
+    local out="$1" idf="$2" idfv="${3:-}" conf; conf="$(deps_conf_for esp)"
     if [ "$DEPS_MODE" = "none" ] || [ ! -f "$conf" ]; then printf '[]\n' > "$out/deps.json"; return 0; fi
-    local json="[" first=1 name kind req desc cdir ver status entry
+    local json="[" first=1 name kind req desc cdir ver status entry alt
     while IFS='|' read -r name kind req desc; do
         name="$(echo "${name:-}" | xargs)"; kind="$(echo "${kind:-}" | xargs)"
         req="$(echo "${req:-}" | xargs)"; desc="$(echo "${desc:-}" | xargs)"
         [ -z "$name" ] && continue
         cdir="$idf/components/$name"; ver=""; status="provided-by-idf"
-        [ -d "$cdir" ] || cdir="$(find "$idf/components" -maxdepth 3 -type d -name "$name" 2>/dev/null | head -1)"
+        # IDF 组件目录名可能用连字符（如 esp_tls → components/esp-tls）
+        alt="${name//_/-}"
+        [ -d "$cdir" ] || cdir="$idf/components/$alt"
+        [ -d "$cdir" ] || cdir="$(find "$idf/components" -maxdepth 3 -type d \( -name "$name" -o -name "$alt" \) 2>/dev/null | head -1)"
         if [ -n "$cdir" ] && [ -f "$cdir/idf_component.yml" ]; then
             ver="$(sed -n 's/^version:[[:space:]]*"\?\([^"]*\)"\?.*/\1/p' "$cdir/idf_component.yml" | head -1)"
         fi
+        [ -n "$ver" ] || ver="$idfv"   # IDF 内置组件无独立版本号：回落到 IDF 版本
         if [ -z "$cdir" ] || [ ! -d "$cdir" ]; then
             status="missing"
             if [ "$req" = "required" ]; then
@@ -393,7 +397,7 @@ build_esp() { # $1=idf 版本, $2=target
         || ar rcs "$out/lib/liboneye_dev_sdk.a" "$scratch/oneye_dev_sdk.o" || return 1
     ok "lib/liboneye_dev_sdk.a  ($(stat -c%s "$out/lib/liboneye_dev_sdk.a") bytes)"
 
-    bundle_deps_esp "$out" "$idf"
+    bundle_deps_esp "$out" "$idf" "v$idfv"
     write_manifest "$out" "$tcid" "$cc" "$("$cc" -dumpfullversion 2>/dev/null || "$cc" -dumpversion)" "$target" "v$idfv" "$cflags"
     [ "$PUBLISH_REPO_LIB" = "1" ] && publish_to_repo_lib "$out" "$tcid"
     ESP_OUTS+=("$tcid|$target|$idfv")

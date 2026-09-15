@@ -594,6 +594,12 @@ esp_err_t panel_api_start(uint16_t port)
     cfg.stack_size = 6144;
     cfg.recv_wait_timeout = 5;
     cfg.send_wait_timeout = 10;
+    /* ⚠️ 必须显式指定通配匹配函数：IDF 的 HTTPD_DEFAULT_CONFIG() 里 uri_match_fn = NULL，
+     * 而 httpd_find_uri_handler() 在 NULL 时退化为 httpd_uri_match_simple（**精确串比较**），
+     * 于是以星号结尾的通配路由（如媒体下载路由）**永不命中**——真机实测：/media/list 正常，
+     * 而 /media/<alias>/<path> 返回 "Nothing matches the given URI"。
+     * 主机 mock 用 Python 自写前缀匹配，故该缺陷只能在真机暴露。 */
+    cfg.uri_match_fn = httpd_uri_match_wildcard;
 
     esp_err_t rc = httpd_start(&s_httpd, &cfg);
     if (rc != ESP_OK) {

@@ -79,12 +79,18 @@ static void teardown_no_task(void)
         if (s_evt) {
             audio_pipeline_remove_listener(s_pipeline);
         }
+        /* ⚠️ ADF 所有权口径：audio_pipeline_deinit() 会**逐个 deinit 已注册元素**
+         * （components/audio_pipeline/audio_pipeline.c:263-271：audio_element_deinit + unregister）。
+         * 因此这里**不得**再对元素调用 audio_element_deinit —— 真机实测重复销毁会导致
+         * audio_element_deinit → audio_element_stop → xEventGroupSetBits 在已释放的事件组加锁，
+         * 触发 `assert failed: spinlock_acquire (lock->count == 0)` → 设备重启（停止播放必崩）。
+         * 元素句柄随管线销毁一并失效，这里只置空。 */
         (void)audio_pipeline_deinit(s_pipeline);
         s_pipeline = NULL;
+        s_writer = NULL;
+        s_decoder = NULL;
+        s_reader = NULL;
     }
-    if (s_writer)  { audio_element_deinit(s_writer);  s_writer = NULL; }
-    if (s_decoder) { audio_element_deinit(s_decoder); s_decoder = NULL; }
-    if (s_reader)  { audio_element_deinit(s_reader);  s_reader = NULL; }
     if (s_evt)     { audio_event_iface_destroy(s_evt); s_evt = NULL; }
     if (s_codec) {
         (void)audio_hal_ctrl_codec(s_codec, AUDIO_HAL_CODEC_MODE_BOTH, AUDIO_HAL_CTRL_STOP);

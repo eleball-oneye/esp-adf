@@ -1,0 +1,22 @@
+#
+# korvo2_oneye —— ESP32-S3 目标板级缺省
+#
+# 目标与板卡选择（Audio HAL）：ESP32-S3-Korvo-2 v3
+#   板卡标识来源：components/audio_board/Kconfig.projbuild:24
+#   板级参数来源：components/audio_board/esp32_s3_korvo2_v3/board_def.h
+#
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_IDF_TARGET_ESP32S3=y
+CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240=y
+CONFIG_ESP32S3_DEFAULT_CPU_FREQ_MHZ=240
+
+# 模组 ESP32-S3-WROOM-1：8 MB flash（rst「组件介绍」）
+# 注：flash 模式/频率沿用 IDF 缺省（DIO/80M），按实际模组改；PSRAM 本固件不启用。
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="8MB"
+
+# Audio HAL：本板
+CONFIG_ESP32_S3_KORVO2_V3_BOARD=y
+
+# ADF 音频通路对系统事件任务栈的要求（与 ADF 例程口径一致）
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=3072

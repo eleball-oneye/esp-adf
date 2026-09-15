@@ -1,0 +1,99 @@
+menu "korvo2_oneye 板级固件配置"
+
+    config ONEYE_FW_DEVICE_ID
+        string "设备 node_id（同时作为 MQTT username / client_id）"
+        default "korvo2-0001"
+        help
+            对应契约 topic 中的 {node} 段（rmng/dev/{node}/...）。
+            EMQX ACL 变量 %u 依赖 username，故默认三者同值。
+
+    menu "接入（EMQX / 云端）"
+
+        config ONEYE_FW_CLOUD_HOST
+            string "云端主机（host 或 IP）"
+            default "192.168.1.100"
+
+        config ONEYE_FW_CLOUD_PORT
+            int "端口（0 = 按承载取契约缺省：1883/8883/8083/8084）"
+            range 0 65535
+            default 0
+
+        config ONEYE_FW_CLOUD_WS_PATH
+            string "WebSocket 路径（空 = /mqtt，契约 §9）"
+            default ""
+
+        config ONEYE_FW_CLOUD_TOKEN
+            string "设备令牌 token（空 = 匿名/dev 形态）"
+            default ""
+
+        choice ONEYE_FW_TRANSPORT
+            prompt "承载（契约：tcp 1883 / tls 8883 / ws 8083 / wss 8084）"
+            default ONEYE_FW_TRANSPORT_TCP
+
+            config ONEYE_FW_TRANSPORT_TCP
+                bool "MQTT over TCP（开发/联调）"
+            config ONEYE_FW_TRANSPORT_WS
+                bool "MQTT over WebSocket（/mqtt）"
+            config ONEYE_FW_TRANSPORT_TLS
+                bool "MQTT over TLS（生产主承载，一机一密）"
+            config ONEYE_FW_TRANSPORT_WSS
+                bool "MQTT over WSS（/mqtt）"
+        endchoice
+
+        config ONEYE_FW_TLS_INSECURE
+            bool "TLS 跳过证书校验（仅 dev/产测；生产必须 n）"
+            default n
+            help
+                置 y 时 SDK 会打 WARN。生产形态为一机一密 + 自研 CA，
+                须通过 oneye_dev_base_config_t.tls_ca_pem 投放 CA，不得跳过校验。
+    endmenu
+
+    menu "Wi-Fi"
+
+        config ONEYE_FW_WIFI_SSID
+            string "Wi-Fi SSID（空 = 不联网，仅跑板级自检）"
+            default ""
+
+        config ONEYE_FW_WIFI_PASSWORD
+            string "Wi-Fi 密码"
+            default ""
+    endmenu
+
+    menu "板级外设（默认关闭：未确认项不据推测启用）"
+
+        config ONEYE_FW_ENABLE_SDCARD
+            bool "启用 microSD（1-line；无卡检测引脚）"
+            default n
+            help
+                本板仅支持 SD_MODE_1_LINE（board.c:173-201），
+                SDCARD_INTR_GPIO = -1（board_def.h:61）⇒ 无插拔事件，只上报挂载成败。
+
+        config ONEYE_FW_ENABLE_LCD
+            bool "启用 LCD（ILI9341 320x240，SPI2 + TCA9554）"
+            default n
+
+        config ONEYE_FW_ENABLE_KEYS
+            bool "启用 6 键 ADC 按键（REC/MUTE/PLAY/SET/VOL-/VOL+）"
+            default y
+
+        config ONEYE_FW_ENABLE_MPP
+            bool "启用 mpp 域（媒体会话；本轮默认关）"
+            default n
+            help
+                媒体数据面（webrtc/http_upload/mqtt_frame）尚未在真机验证，
+                默认关闭；打开仅初始化 mpp 域，不发起会话。
+
+        config ONEYE_FW_DECLARE_VIDEO_LIVE
+            bool "在 caps/up 声明 video.live（须真机取帧取证通过后才可开）"
+            default n
+            help
+                契约红线：未实现/未验证的能力不得声明。开启前须完成
+                backend/contracts/api/mqtt/Korvo-2设备能力与协议映射.md §6-1 真机取证。
+                audio.intercom 在 WebRTC 数据面落地前一律不得声明（本固件不提供开关）。
+    endmenu
+
+    config ONEYE_FW_SELFTEST_STRICT
+        bool "板级自检失败即中止上云（推荐）"
+        default y
+
+endmenu

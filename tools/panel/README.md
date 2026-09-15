@@ -52,9 +52,12 @@ python3 panel.py --device korvo2-0001=http://192.168.1.50 --serial /dev/ttyUSB0@
    按 `data.ref == 事件 id` 关联）；"云端确认"列来自面板自身 MQTT 订阅（**独立于设备自报**，两者对照即端到端证据）；
 3. **板级参数核对** —— 设备运行期自检逐行 `项 / 期望 / 实测 / PASS-FAIL`（与串口 `[board-check]` 同源）；
    编译期断言（`board_expect.h`）失败时**固件根本不构建**，因此这里只列运行期项；
-4. **音频：AEC 采集与 SD 卡媒体** —— 「录 5/10/30 s」「停止录音」按钮触发设备侧 AEC 采集（AFE：AEC + 降噪 → WAV 落 SD/SPIFFS），
-   文件列表显示名称/类型/大小/时间；点「播放」用 `<audio controls>` **直接向设备拉流播放**（设备实现 `Range` ⇒ 可拖动进度），
-   另可「下载」留证；图片/视频文件提供「预览」（SD 卡上的录像后续接同一入口）；
+4. **音频：AEC 采集与 SD 卡媒体** —— 「录 5/10/30 s」「停止录音」按钮触发设备侧 AEC 采集（AFE：AEC + 降噪 → WAV 落 SD/SPIFFS）；
+   文件列表显示名称/类型/大小/时间，并区分**两个播放方向**：
+   - **网页播放**（任何文件）：`<audio controls>` 直接向设备拉流（设备实现 `Range` ⇒ 可拖动进度）+「下载」留证；
+   - **板上播放**（仅 SD 卡上的 wav/mp3）：多一个「板上播放」按钮 ⇒ 设备扬声器出声，另有「停止播放」与音量滑块，
+     状态行显示正在播放的文件、编码、采样率与已播时长（数据来自 `/api/status.player{}`）；
+   图片/视频文件提供**网页预览**（板上视频解码本轮不做）；
 5. **设备与链路** —— 固件版本、板卡、运行时长、Wi-Fi IP、云端链路与收发帧、最近错误；
 6. **串口兜底** —— 最近日志尾部（无网时仍能核对按键与自检输出）。
 
@@ -68,7 +71,7 @@ python3 panel.py --device korvo2-0001=http://192.168.1.50 --serial /dev/ttyUSB0@
 | `GET /api/keys?limit=N` | `keys[]`（6 键标签）、`current{seq,id,key,action,ts_ms,uplink,ack_ms}`、`counters{}`、`history[]`（**新→旧**，含 `uplink`/`ack_ms`） |
 | `GET /media/list` | `{count,rec_root,aec_enabled,aec_recording,files:[{alias,name,size,mtime,kind,item{url}}]}`（SD 与 SPIFFS；按扩展名判 `audio`/`image`/`video`） |
 | `GET /media/<alias>/<path>` | 文件下载/流式播放，**支持 `Range`**（`206` + `Content-Range` + `Accept-Ranges`）⇒ 浏览器 `<audio>` 可拖动；`alias`=`sdcard`\|`spiffs`；含目录穿越防护 |
-| `POST /api/action` | `{"op":"aec_start","duration_s":N}` / `{"op":"aec_stop"}` ⇒ `{ok,msg,file,recording,last_bytes}`（**写操作，仅台面验证**） |
+| `POST /api/action` | `{"op":"aec_start","duration_s":N}` / `{"op":"aec_stop"}` / `{"op":"play","path":"/sdcard/..."}` / `{"op":"stop"}` / `{"op":"set_volume","volume":0-100}` ⇒ `{ok,msg,file,recording,playing,volume,last_bytes}`（**写操作，仅台面验证**；`play` 仅接受 SD 卡上的 wav/mp3） |
 
 事件 id 由固件生成（`key-00001`…）并作为 `event/up` 的幂等 `id`；云端 ack 的 `data.ref` 与之对齐 ⇒ **设备侧**能自报三态，
 **面板侧**再用 MQTT 独立验证一次。
@@ -94,9 +97,9 @@ python3 panel.py --device korvo2-0001=http://192.168.1.50 --serial /dev/ttyUSB0@
 
 | 项 | 命令 | 结果 |
 | --- | --- | --- |
-| 面板自检（无硬件） | `python3 panel.py --self-test`（内置 mock 设备 + mock broker + 模拟 AEC 录音 WAV） | **19 项全部通过，rc=0**：设备 HTTP 可达、自检明细 15 行、固件标识、MQTT 连接、按键历史 ≥3 条且新→旧排序、**云端确认关联 3/3**、端到端时延可算、动作类型覆盖、`/api/health`、首页渲染、**首页含音频/AEC 卡片**、**媒体列表非空**、**播放地址为设备绝对地址**、**Range 请求返回 206 + Content-Range + RIFF 头（拖动播放前提）**、**触发 AEC 采集（POST /api/action）**、**采集后列表增长 1→2**、**停止采集**、设备离线降级可用 |
-| 设备侧 API + AEC 采集编译 | `idf.py build`（IDF v5.5.5 / esp32s3 / KORVO2_V3；自定义分区表 + esp-sr AFE） | 见本页 §7.1 构建记录 |
-| 真机联调 | —— | **未做**（本轮只出构建产物；烧录后：配 Wi-Fi → 面板 `--device name=http://<IP>` → 按键三态 + 录 5 s 并在网页播放） |
+| 面板自检（无硬件） | `python3 panel.py --self-test`（内置 mock 设备 + mock broker + 模拟 AEC 录音 WAV + SD 卡媒体） | **25 项全部通过，rc=0**：设备 HTTP、自检明细 15 行、固件标识、MQTT 连接、按键历史（新→旧、**云端确认 3/3**、端到端时延、动作覆盖）、`/api/health`、首页渲染、**首页含音频/AEC 卡片**、**媒体列表非空**、**绝对播放地址**、**Range 206 + Content-Range + RIFF 头**、**触发 AEC 采集**、**采集后列表增长**、**停止采集**、**SD 卡媒体可板上回放标记**、**触发板上播放**、**播放状态回显**、**音量设置**、**停止播放**、**非 SD 路径被拒绝**、设备离线降级 |
+| 设备侧 API + AEC 采集 + 板上回放编译 | `idf.py build`（IDF v5.5.5 / esp32s3 / KORVO2_V3；自定义分区表 + esp-sr AFE） | 见本页 §7.1 构建记录 |
+| 真机联调 | —— | **未做**（本轮只出构建产物；烧录后：配 Wi-Fi → 面板 `--device name=http://<IP>` → 按键三态 + 录 5 s 网页播放 + 插 SD 卡后「板上播放」） |
 
 ### 7.1 构建记录（AEC 采集 + 媒体 API）
 
@@ -104,7 +107,7 @@ python3 panel.py --device korvo2-0001=http://192.168.1.50 --serial /dev/ttyUSB0@
 | --- | --- |
 | 命令 | `idf.py build`（IDF v5.5.5 / esp32s3 / `CONFIG_ESP32_S3_KORVO2_V3_BOARD=y`） |
 | 分区 | 自定义 `partitions.csv`：`factory 2M` + **`model 2M`** + `storage(spiffs) 1M` |
-| 产物 | `korvo2_oneye.bin` **390,128 B**（分区余量 81%）；**`srmodels/srmodels.bin` 337,952 B**（esp-sr 模型，烧写偏移 `0x210000`，`flash_args` 已包含） |
+| 产物 | `korvo2_oneye.bin` **390,656 B**（分区余量 81%）；**`srmodels/srmodels.bin` 337,952 B**（esp-sr 模型，烧写偏移 `0x210000`，`flash_args` 已包含） |
 | 坑位（已修） | esp-sr 只在分区表存在 `model` 分区时才投放模型（上游 AEC/algorithm 例程缺该分区 ⇒ 模型从未投放）；另有 4 类编译期错误（注释内嵌 `/*`、`HTTPD_416_*` 缺失、`I2S_CHANNEL_FMT_*` 需 `driver/i2s.h`、`snprintf` 截断告警） |
 
 复跑：`python3 panel.py --self-test`（日志落 `output/.build/panel-selftest.log`）。

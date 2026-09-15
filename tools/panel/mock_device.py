@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import socket
 import struct
 import threading
@@ -238,13 +239,17 @@ class MockDevice:
         self.broker = MiniBroker(broker_port, log=log)
         self._mqtt_sock: socket.socket | None = None
         self._stop = threading.Event()
-        # 媒体（模拟 AEC 采集产物）：alias/相对路径 → 字节内容
+        # 媒体（模拟 AEC 采集产物 + SD 卡媒体）：alias/相对路径 → 字节内容
         self._base_wav = make_wav(2.0)
         self.files: dict[str, bytes] = {}
         self._file_seq = 0
         self._aec_recording = False
         self._rec_timer: threading.Timer | None = None
-        self._make_recording()      # 预置一条录音，便于面板首次打开即有可播放内容
+        self._make_recording()      # 预置一条录音（SPIFFS 兜底路径，网页可播、不上板）
+        self.files["sdcard/music/demo.wav"] = make_wav(3.0, freq=440.0)   # SD 卡媒体（可板上回放）
+        # 板上回放状态（mock：不真的出声，只维护状态机）
+        self.player = {"playing": False, "path": "", "codec": "-", "rate_hz": 0,
+                       "channels": 0, "elapsed_ms": 0, "volume": 80, "msg": "就绪"}
 
     # ------------------------------------------------------------ 媒体（模拟 AEC 产物）
     def _make_recording(self, seconds: float = 2.0) -> str:
@@ -256,14 +261,20 @@ class MockDevice:
 
     def media_list(self) -> dict:
         with self._lock:
-            files = [{
-                "alias": rel.split("/", 1)[0],
-                "name": rel.split("/", 1)[1],
-                "size": len(data),
-                "mtime": int(time.time()),
-                "kind": "audio",
-                "item": {"url": f"media/{rel}"},
-            } for rel, data in sorted(self.files.items())]
+            files = []
+            for rel, data in sorted(self.files.items()):
+                alias, name = rel.split("/", 1)
+                dot = os.path.splitext(name)[1].lower()
+                files.append({
+                    "alias": alias,
+                    "name": name,
+                    "size": len(data),
+                    "mtime": int(time.time()),
+                    "kind": "audio",
+                    "item": {"url": f"media/{rel}"},
+                    "device_path": f"/{alias}/{name}",
+                    "playable_on_board": alias == "sdcard" and dot in (".wav", ".mp3"),
+                })
             return {
                 "count": len(files),
                 "rec_root": "/spiffs/rec",
@@ -271,6 +282,34 @@ class MockDevice:
                 "aec_recording": self._aec_recording,
                 "files": files,
             }
+
+    def play(self, path: str) -> dict:
+        """模拟板上回放：仅接受 /sdcard/ 下的 wav/mp3（与固件口径一致）"""
+        dot = os.path.splitext(path or "")[1].lower()
+        if not path or not path.startswith("/sdcard/"):
+            return {"ok": False, "msg": "invalid path (must be /sdcard/...)", "playing": False}
+        if dot not in (".wav", ".mp3"):
+            return {"ok": False, "msg": "unsupported codec (wav/mp3 only)", "playing": False}
+        rel = path.lstrip("/")
+        if rel not in self.files:
+            return {"ok": False, "msg": "file not found", "playing": False}
+        with self._lock:
+            self.player.update({"playing": True, "path": path, "codec": dot.lstrip("."),
+                                "rate_hz": 16000, "channels": 1, "elapsed_ms": 0, "msg": "播放中"})
+        self.log(f"[mock] 板上播放：{path}")
+        return {"ok": True, "msg": "playing", "file": path, "playing": True,
+                "volume": self.player["volume"]}
+
+    def player_stop(self) -> dict:
+        with self._lock:
+            self.player.update({"playing": False, "msg": "已停止"})
+        return {"ok": True, "msg": "stopped", "playing": False, "volume": self.player["volume"]}
+
+    def set_volume(self, volume: int) -> dict:
+        with self._lock:
+            self.player["volume"] = max(0, min(100, int(volume)))
+        return {"ok": True, "msg": "volume set", "playing": self.player["playing"],
+                "volume": self.player["volume"]}
 
     def aec_start(self, seconds: int = 5) -> dict:
         path = self._make_recording(max(1, min(seconds, 30)))
@@ -469,7 +508,8 @@ class MockDevice:
                         "last_bytes": len(self.files[last]) if last else 0,
                         "total_files": self._file_seq,
                         "root": "/spiffs/rec"},
-                "media": {"sd_mounted": False, "rec_root": "/spiffs/rec", "poll_hint_ms": 1000},
+                "media": {"sd_mounted": True, "rec_root": "/spiffs/rec", "poll_hint_ms": 1000},
+                "player": dict(self.player),
                 "panel": {"api_version": "1", "scope": "local-verification-only"},
             }
 
@@ -579,6 +619,12 @@ class MockDevice:
                     self._json(mock.aec_start(int(doc.get("duration_s") or 5)))
                 elif op == "aec_stop":
                     self._json(mock.aec_stop())
+                elif op == "play":
+                    self._json(mock.play(doc.get("path") or ""))
+                elif op in ("stop", "play_stop"):
+                    self._json(mock.player_stop())
+                elif op == "set_volume":
+                    self._json(mock.set_volume(int(doc.get("volume") or 0)))
                 else:
                     self._json({"ok": False, "msg": "unknown op"}, 200)
 

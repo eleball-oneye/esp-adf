@@ -649,19 +649,27 @@ async function tick(){
   const media = dev.media || {};
   const aec = (dev.status && dev.status.aec) || {};
   const sd = (dev.status && dev.status.media && dev.status.media.sd_mounted);
+  const pl = (dev.status && dev.status.player) || {};
   $('aecmeta').innerHTML = `
     <div>AEC 采集</div><div>${media.aec_enabled===false? '<span class="pill bad">未启用</span>' :
         (media.aec_recording? '<span class="pill pend">录音中</span>' : '<span class="pill ok">就绪</span>')}
       <span class="mut">落盘：${media.rec_root || '—'}（${sd? 'SD 卡' : 'SPIFFS 兜底'}）</span></div>
+    <div>板上回放</div><div>${pl.playing? `<span class="pill ok">播放中</span> ${pl.path||''} <span class="mut">${pl.codec||''} ${pl.rate_hz?pl.rate_hz+' Hz':''} ${pl.channels?pl.channels+'ch':''} ${(pl.elapsed_ms? (pl.elapsed_ms/1000).toFixed(1)+' s':'')}</span>`
+        : `<span class="mut">空闲（${pl.msg||'—'}）</span>`}
+      音量 <input type="range" min="0" max="100" value="${pl.volume!==undefined?pl.volume:80}"
+        onchange="act('set_volume', null, null, this.value)" style="vertical-align:middle;width:110px">
+      <button onclick="act('stop')">停止播放</button></div>
     <div>最近录音</div><div>${aec.last_file? `${aec.last_file} <span class="mut">${(aec.last_bytes||0)} 字节</span>` : '<span class="mut">尚无</span>'}</div>
     <div>文件数</div><div>${media.count||0} 个可播放文件${media.error? ` <span class="pill bad">${media.error}</span>`:''}</div>`;
   const rows2 = (media.files||[]).map(f=>{
     const sz = f.size>=1024? (f.size/1024).toFixed(1)+' KB' : (f.size||0)+' B';
     const mt = f.mtime? new Date(f.mtime*1000).toLocaleString() : '—';
-    const act = f.kind==='audio' ? `<button onclick="play('${f.play_url}')">播放</button>`
-              : (f.kind==='image'||f.kind==='video' ? `<button onclick="preview('${f.play_url}','${f.kind}')">预览</button>` : '');
+    const act = f.kind==='audio' ? `<button onclick="play('${f.play_url}')">网页播放</button>`
+              : (f.kind==='image'||f.kind==='video' ? `<button onclick="preview('${f.play_url}','${f.kind}')">网页预览</button>` : '');
+    const board = f.playable_on_board
+      ? `<button onclick="act('play', null, '${f.device_path}')" title="在开发板扬声器上播放">板上播放</button>` : '';
     return `<tr><td>${f.name}</td><td class="mut">${f.kind}</td><td class="mut">${sz}</td><td class="mut">${mt}</td>
-      <td>${act} <a href="${f.play_url}" download target="_blank"><button>下载</button></a></td></tr>`;
+      <td>${act} ${board} <a href="${f.play_url}" download target="_blank"><button>下载</button></a></td></tr>`;
   });
   $('media').innerHTML = rows2.join('') ||
     '<tr><td colspan="5" class="mut">尚无媒体文件（点“录 5 s”触发 AEC 采集；SD 卡文件需插入卡并启用 CONFIG_ONEYE_FW_ENABLE_SDCARD）</td></tr>';
@@ -680,10 +688,13 @@ function preview(url, kind){
     ? `<video controls autoplay style="max-width:100%" src="${url}"></video>`
     : `<img src="${url}" style="max-width:100%;border-radius:8px">`;
 }
-async function act(op, duration_s){
+async function act(op, duration_s, path, volume){
   if(!currentDev) return;
   $('actmsg').textContent = '执行中…';
-  const body = duration_s ? {op, duration_s} : {op};
+  const body = {op};
+  if (duration_s) body.duration_s = duration_s;
+  if (path) body.path = path;
+  if (volume !== undefined && volume !== null) body.volume = Number(volume);
   try{
     const r = await fetch(`/api/action?device=${encodeURIComponent(currentDev)}`, {
       method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
@@ -988,6 +999,29 @@ def self_test(verbose: bool = True) -> int:
         check("采集后媒体列表增长", after > before, f"{before} → {after}")
         stop = dv.post_action({"op": "aec_stop"})
         check("停止采集（aec_stop）", bool(stop and stop.get("ok")), (stop or {}).get("msg", ""))
+
+        # 4c) 板上回放（SD 卡选择 → 板上播放 → 停止）
+        playable = [f for f in files if f.get("playable_on_board")]
+        check("SD 卡媒体标记为可板上回放", len(playable) >= 1,
+              f"{len(playable)} 个（device_path={playable[0].get('device_path') if playable else '-'}）")
+        if playable:
+            p = dv.post_action({"op": "play", "path": playable[0]["device_path"]})
+            check("触发板上播放（POST /api/action play）", bool(p and p.get("ok")),
+                  (p or {}).get("msg", ""))
+            time.sleep(0.5)
+            dv.poll()
+            pl = (dv.status or {}).get("player", {})
+            check("播放状态回显（playing=true + 文件名）",
+                  bool(pl.get("playing")) and playable[0]["device_path"] in (pl.get("path") or ""),
+                  f"{pl.get('playing')} / {pl.get('path')}")
+            v = dv.post_action({"op": "set_volume", "volume": 42})
+            check("音量设置（set_volume）", bool(v and v.get("ok") and v.get("volume") == 42),
+                  str((v or {}).get("volume")))
+            s2 = dv.post_action({"op": "stop"})
+            check("停止播放（stop）", bool(s2 and s2.get("ok")), (s2 or {}).get("msg", ""))
+            bad = dv.post_action({"op": "play", "path": "/spiffs/rec/aec-00001.wav"})
+            check("非 SD 路径被拒绝（/spiffs 不上板播放）",
+                  bool(bad) and not bad.get("ok"), (bad or {}).get("msg", ""))
 
         # 5) 设备离线时的降级（不崩、状态可见）
         mock.stop()

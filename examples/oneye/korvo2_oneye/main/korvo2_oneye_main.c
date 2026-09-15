@@ -24,6 +24,7 @@
 
 #include "esp_log.h"
 #include "esp_err.h"
+#include "esp_timer.h"
 #include "esp_netif.h"
 #include "esp_event.h"
 #include "esp_wifi.h"
@@ -40,6 +41,7 @@
 #include "oneye_dev_sdk.h"
 
 #include "board_expect.h"
+#include "panel_api.h"
 
 static const char *TAG = "korvo2_oneye";
 
@@ -60,23 +62,30 @@ static int s_check_failed;
 static void chk_int(const char *item, int expect, int actual)
 {
     s_check_total++;
+    char se[16], sa[16];
+    snprintf(se, sizeof(se), "%d", expect);
+    snprintf(sa, sizeof(sa), "%d", actual);
     if (expect == actual) {
         ESP_LOGI(TAG, "[board-check] %-34s expect=%-6d actual=%-6d PASS", item, expect, actual);
+        panel_api_record_check(item, se, sa, true);
     } else {
         s_check_failed++;
         ESP_LOGE(TAG, "[board-check] %-34s expect=%-6d actual=%-6d FAIL", item, expect, actual);
+        panel_api_record_check(item, se, sa, false);
     }
 }
 
 static void chk_str(const char *item, const char *expect, const char *actual)
 {
     s_check_total++;
+    const char *act = actual ? actual : "(null)";
     if (actual != NULL && strcmp(expect, actual) == 0) {
-        ESP_LOGI(TAG, "[board-check] %-34s expect=%-6s actual=%-6s PASS", item, expect, actual);
+        ESP_LOGI(TAG, "[board-check] %-34s expect=%-6s actual=%-6s PASS", item, expect, act);
+        panel_api_record_check(item, expect, act, true);
     } else {
         s_check_failed++;
-        ESP_LOGE(TAG, "[board-check] %-34s expect=%-6s actual=%-6s FAIL", item, expect,
-                 actual ? actual : "(null)");
+        ESP_LOGE(TAG, "[board-check] %-34s expect=%-6s actual=%-6s FAIL", item, expect, act);
+        panel_api_record_check(item, expect, act, false);
     }
 }
 
@@ -85,9 +94,11 @@ static void chk_ok(const char *item, bool ok, const char *note)
     s_check_total++;
     if (ok) {
         ESP_LOGI(TAG, "[board-check] %-34s %s PASS", item, note ? note : "ok");
+        panel_api_record_check(item, "ok", note ? note : "ok", true);
     } else {
         s_check_failed++;
         ESP_LOGE(TAG, "[board-check] %-34s %s FAIL", item, note ? note : "fail");
+        panel_api_record_check(item, "ok", note ? note : "fail", false);
     }
 }
 
@@ -204,6 +215,11 @@ static void sdk_event_cb(oneye_dev_event_t evt, const void *payload, size_t len,
 {
     (void)ctx;
     ESP_LOGI(TAG, "[sdk-event] %s len=%u", evt_name(evt), (unsigned)len);
+    if (evt == ONEYE_DEV_EVENT_EVT_ACK) {
+        /* 云端 ack：契约信封 data.ref == 上行事件 id ⇒ 关联到本地按键历史（"历史响应"第三态）
+         * 注意：a.c. 的 "ack" 指云端对 event/up 的确认帧；SDK 以原始负载投递。 */
+        panel_api_key_ack((const char *)payload, len);
+    }
     if (evt == ONEYE_DEV_SDK_EVT_COMMAND_RECEIVED && payload != NULL && len > 0) {
         /* 真机产品：解析命令 → 执行 → oneye_dev_base_ack_command(id, err)
          * 本固件仅打印（命令面/PTZ 属 S16，未落地，不做假实现）。 */
@@ -253,13 +269,22 @@ static esp_err_t input_key_service_cb(periph_service_handle_t handle, periph_ser
     snprintf(data, sizeof(data), "{\"key\":\"%s\",\"action\":\"%s\"}", key, act);
     ESP_LOGI(TAG, "[key] %s/%s", key, act);
 
+    /* 本地验证面：先登记本地检测（pending），再上报；随后按 SDK 回执/云端 ack 推进状态 */
+    static uint32_t s_key_id;
+    char id[24];
+    snprintf(id, sizeof(id), "key-%05u", (unsigned)++s_key_id);
+    panel_api_key_event(key, act, id, (uint64_t)(esp_timer_get_time() / 1000));
+
     oneye_dev_event_item_t item;
     memset(&item, 0, sizeof(item));   /* 事件条目无 struct_size/api_version（非配置结构体） */
+    item.id = id;                     /* 幂等 id：用于与云端 ack 的 data.ref 关联 */
     item.type = ONEYE_FW_EVENT_TYPE_DEVICE_EVENT;
     item.severity = ONEYE_DEV_SEVERITY_INFO;
     item.title = "key";
     item.data_json = data;
-    (void)oneye_dev_event_report(&item, 1);
+
+    oneye_dev_sdk_err_t rc = oneye_dev_event_report(&item, 1);
+    panel_api_key_uplink(id, rc == ONEYE_DEV_SDK_OK ? "sent" : "failed");
     return ESP_OK;
 }
 
@@ -292,13 +317,24 @@ static EventGroupHandle_t s_wifi_eg;
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     (void)arg;
-    (void)data;
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         (void)esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         ESP_LOGW(TAG, "Wi-Fi 断开，重连");
+        panel_api_set_wifi(false, NULL);
         (void)esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *evt = (ip_event_got_ip_t *)data;
+        char ip[20] = "";
+        esp_ip4addr_ntoa(&evt->ip_info.ip, ip, sizeof(ip));
+        ESP_LOGI(TAG, "Wi-Fi 已获取 IP：%s", ip);
+        panel_api_set_wifi(true, ip);
+#if CONFIG_ONEYE_FW_ENABLE_PANEL_API
+        /* 本地验证面（面板）需要 IP；此处启动，与云端链路是否可用无关 */
+        if (panel_api_start(0) == ESP_OK) {
+            ESP_LOGI(TAG, "验证面板：浏览器打开宿主面板服务，或直接访问 http://%s/api/status", ip);
+        }
+#endif
         if (s_wifi_eg != NULL) {
             xEventGroupSetBits(s_wifi_eg, WIFI_CONNECTED_BIT);
         }
@@ -444,6 +480,26 @@ static void oneye_start(void)
 #endif
 }
 
+/* 面板用的链路快照同步（2 s 周期；面板只读，不改变设备行为） */
+static void panel_sync_task(void *arg)
+{
+    (void)arg;
+    while (1) {
+        oneye_dev_link_status_t link;
+        oneye_dev_base_stats_t stats;
+        memset(&link, 0, sizeof(link));
+        ONEYE_DEV_STRUCT_INIT(link);
+        memset(&stats, 0, sizeof(stats));
+        ONEYE_DEV_STRUCT_INIT(stats);
+        if (oneye_dev_base_get_link_status(&link) == ONEYE_DEV_SDK_OK &&
+            oneye_dev_base_get_stats(&stats) == ONEYE_DEV_SDK_OK) {
+            panel_api_set_link(link.cloud_link_up, oneye_dev_transport_str(link.transport),
+                               stats.tx_frames, stats.rx_frames);
+        }
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
+
 /* ---------------------------------------------------------------- 入口 */
 
 void app_main(void)
@@ -452,6 +508,8 @@ void app_main(void)
 
     ESP_LOGI(TAG, "korvo2_oneye 启动：ESP32-S3-Korvo-2 v3 板级固件（ESP-ADF v2.8 / IDF 5.5）");
     ESP_LOGI(TAG, "编译期板级断言：board_expect.h 已通过（rst V3.1 ↔ board_def.h）");
+
+    panel_api_set_identity(ONEYE_FW_VERSION, "ESP32-S3-Korvo-2 v3");
 
     nvs = nvs_flash_init();
     if (nvs == ESP_ERR_NVS_NO_FREE_PAGES || nvs == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -486,6 +544,8 @@ void app_main(void)
     } else {
         ESP_LOGI(TAG, "Wi-Fi 已连接");
         oneye_start();
+        /* 面板链路快照同步（本地验证面；与云端链路状态解耦） */
+        (void)xTaskCreate(panel_sync_task, "panel_sync", 3072, NULL, 3, NULL);
     }
 
     while (1) {

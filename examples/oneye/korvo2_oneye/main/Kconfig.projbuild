@@ -92,6 +92,31 @@ menu "korvo2_oneye 板级固件配置"
                 audio.intercom 在 WebRTC 数据面落地前一律不得声明（本固件不提供开关）。
     endmenu
 
+    menu "验证面板（本地验证面，非云端契约）"
+
+        config ONEYE_FW_ENABLE_PANEL_API
+            bool "启用设备侧本地验证 HTTP API（/api/status、/api/selftest、/api/keys）"
+            default y
+            help
+                供宿主验证面板（embedded/esp-adf/tools/panel/）与其他联调工具读取：
+                板级自检明细、按键实时状态与历史响应（本地检测 → event/up → 云端 ack）。
+                该 API **不是**云端设备面契约（不进 backend/contracts、不新增 topic/影子键），
+                仅为台面联调；**量产固件应置 n**。
+
+        config ONEYE_FW_PANEL_PORT
+            depends on ONEYE_FW_ENABLE_PANEL_API
+            int "本地验证 API 端口"
+            range 1 65535
+            default 80
+
+        config ONEYE_FW_KEY_HISTORY_MAX
+            depends on ONEYE_FW_ENABLE_PANEL_API
+            int "按键历史保留条数"
+            range 8 256
+            default 64
+
+    endmenu
+
     config ONEYE_FW_SELFTEST_STRICT
         bool "板级自检失败即中止上云（推荐）"
         default y

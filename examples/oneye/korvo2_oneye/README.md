@@ -100,6 +100,37 @@ I (xxx) korvo2_oneye: [board-check] 结果：15 项，失败 0 项
 
 `CONFIG_ONEYE_FW_SELFTEST_STRICT=y`（缺省）时，任一项 FAIL 即**中止上云**并保持自检结论可见——不静默继续。
 
+## 5.1 本地验证面（HTTP JSON API）与验证面板
+
+固件内置一个**本地验证面**（`main/panel_api.c`），供宿主**验证面板**（[`tools/panel/`](../../../tools/panel/README.md)）
+与其他联调工具读取设备状态。**它不是云端设备面契约**（不进 `backend/contracts`、不新增 topic/影子键），
+量产应置 `CONFIG_ONEYE_FW_ENABLE_PANEL_API=n`。
+
+| 路由 | 内容 |
+| --- | --- |
+| `GET /api/ping` | 存活探针 |
+| `GET /api/status` | 固件/板卡、运行时长、Wi-Fi IP、云端链路与收发帧、自检汇总、按键计数 |
+| `GET /api/selftest` | 板级核对**逐行** `item/expect/actual/pass`（与串口 `[board-check]` 同源） |
+| `GET /api/keys?limit=N` | 6 键标签、`current`（最近一次）、`counters`、`history[]`（新→旧，含上行状态与 ack 时间） |
+| 预留（下一轮） | `GET /media/list`、`GET /media/<path>`（带 `Range`）、`POST /api/action`（录音/回放触发） |
+
+**按键"历史响应"三态**：本地检测（`pending`）→ 交 SDK 上报（`sent`，失败 `failed`）→ 收到云端 `event/down` ack
+（`acked`，按 `data.ref == 事件 id` 关联，固件生成的 id 形如 `key-00001`）。
+
+宿主面板（`tools/panel/`，Python 标准库零依赖）把三条通道聚合到一页：设备 HTTP（主）、MQTT `rmng/dev/+/event/up`（云端独立验证）、
+串口（无网兜底）：
+
+```bash
+# 设备侧（先烧录并配好 Wi-Fi；IP 见串口日志）
+idf.py -p <COMx> flash monitor
+
+# 宿主侧（本仓根目录）
+python3 tools/panel/panel.py --device korvo2-0001=http://<设备IP>
+#   → 浏览器打开 http://127.0.0.1:8787/ ：按键实时状态 + 历史响应（含云端确认与端到端时延）+ 板级核对表 + 链路 + 串口
+# 无硬件时验证面板自身链路：
+python3 tools/panel/panel.py --self-test
+```
+
 ## 6. 配置（`idf.py menuconfig` → `korvo2_oneye 板级固件配置`）
 
 | 配置 | 缺省 | 说明 |
@@ -113,6 +144,7 @@ I (xxx) korvo2_oneye: [board-check] 结果：15 项，失败 0 项
 | `ONEYE_FW_ENABLE_KEYS` | y | 6 键 → `event/up` |
 | `ONEYE_FW_ENABLE_SDCARD` / `_LCD` | n | 板级外设（未确认项不默认启用） |
 | `ONEYE_FW_ENABLE_MPP` | n | 只初始化 mpp 域，不发起会话 |
+| `ONEYE_FW_ENABLE_PANEL_API` | y | 设备侧本地验证 HTTP API（**量产置 n**）；`_PANEL_PORT` 缺省 80、`_KEY_HISTORY_MAX` 缺省 64 |
 | `ONEYE_FW_DECLARE_VIDEO_LIVE` | **n** | 真机取帧取证通过后才可开；`audio.intercom` 无开关（WebRTC 数据面未落地前一律不得声明） |
 | `ONEYE_FW_SELFTEST_STRICT` | y | 自检失败中止上云 |
 
@@ -136,10 +168,13 @@ I (xxx) korvo2_oneye: [board-check] 结果：15 项，失败 0 项
 | --- | --- |
 | 固件轨（推荐入口） | `./build-all.sh --toolchains esp32s3@5.5.5 --firmware` → **rc=0**；产物 `output/firmware/xtensa-esp32s3-elf-gcc-14.2.0/korvo2_oneye/` |
 | 固件产物 | `korvo2_oneye.bin` **301,152 B**（SHA256 `516738fb65fd8cd11409574940ba05ca1cd5baa7371c95b88697688e653dc38a`）；`korvo2_oneye.elf` 5,312,804 B；`bootloader.bin` 20,832 B；`partition-table.bin` 3,072 B |
+| 固件产物（**含本地验证 API 后**，2026-09-15 第二轮） | `korvo2_oneye.bin` **302,496 B**（`0x49da0`；分区余量 71%）；新增 `main/panel_api.c`（`esp_http_server`）+ 按键历史/ack 关联 ⇒ 相对上一版 +1,344 B |
 | 板卡选择核对 | `board-config.txt` = `CONFIG_IDF_TARGET_ESP32S3=y` + `CONFIG_ESP32_S3_KORVO2_V3_BOARD=y`（由 `--firmware` 轨自动核对） |
 | SDK 链接形态 | 构建日志：`链接预编译库（4 分域库，toolchain=xtensa-esp32s3-elf-gcc-14.2.0）` |
 | 编译期断言 | `board_expect.h` 40+ 条 `_Static_assert` 全部通过（**失败即构建失败**，本轮已用它拦住 4 处真实问题，见总控集成说明 §10.3） |
 | 运行期自检 | **未跑真机**（本轮只出构建产物）——烧录后应看到 `[board-check] … PASS` 逐行输出与 `结果：N 项，失败 0 项` |
+| 本地验证面（设备 API） | 编译通过（IDF 5.5.5 / esp32s3）：`CONFIG_ONEYE_FW_ENABLE_PANEL_API=y`、端口 80、历史 64 条 |
+| 宿主验证面板 | `python3 tools/panel/panel.py --self-test`（内置 mock 设备 + mock broker）**12 项全通过、rc=0**：设备/自检/按键历史/云端确认关联/端到端时延等；详见 [tools/panel/README.md](../../../tools/panel/README.md) §7 |
 | 门禁 | 宿主轨（4×`.a`+4×`.so`+demo+单测 17 组/215 用例/2890 断言）与 backend `contract_check` / `md_link_check`、总控 `md_link_check` 全绿（契约面零改动） |
 
 **后续（真机）**：`idf.py -p <COM> flash monitor` → 核对自检逐行 PASS → 配 Wi-Fi/云端端点（menuconfig）→ 观察 `caps/up` / `status/up`（retained + LWT）/ `shadow/up` / `log/up` 与按键 `event/up`；摄像头取帧另行取证（决定 `video.live` 是否可声明）。

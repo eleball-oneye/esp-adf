@@ -43,6 +43,7 @@
 #include "board_expect.h"
 #include "panel_api.h"
 #include "aec_capture.h"
+#include "player.h"
 
 static const char *TAG = "korvo2_oneye";
 
@@ -151,6 +152,7 @@ static void board_selftest(void)
 /* ---------------------------------------------------------------- 板级初始化 */
 
 static esp_periph_set_handle_t s_periph_set;
+static audio_board_handle_t    s_board;
 
 static void board_init_peripherals(void)
 {
@@ -162,6 +164,7 @@ static void board_init_peripherals(void)
     }
 
     audio_board_handle_t board = audio_board_init();
+    s_board = board;
     chk_ok("audio_board_init(ES8311+ES7210)",
            board != NULL && board->audio_hal != NULL && board->adc_hal != NULL,
            board == NULL ? "board=NULL" : (board->audio_hal == NULL ? "codec=NULL" :
@@ -535,6 +538,12 @@ void app_main(void)
         ESP_LOGI(TAG, "AEC 采集就绪（面板可触发录音：POST /api/action {\"op\":\"aec_start\"}）");
     } else {
         ESP_LOGW(TAG, "AEC 采集初始化失败（面板将显示 aec.enabled=false 或不可用）");
+    }
+
+    /* ③c 板上回放（SD 卡 wav/mp3 → 扬声器；面板可触发：POST /api/action {\"op\":\"play\",\"path\":...}） */
+    if (player_init(s_board != NULL ? s_board->audio_hal : NULL) == ESP_OK) {
+        (void)player_set_volume(80);
+        ESP_LOGI(TAG, "板上回放就绪（仅 SD 卡 /sdcard 下的 wav、mp3）");
     }
 
     ESP_LOGI(TAG, "[board-check] 自检汇总：%d 项，失败 %d 项", s_check_total, s_check_failed);

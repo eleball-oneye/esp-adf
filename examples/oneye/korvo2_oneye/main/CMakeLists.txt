@@ -2,6 +2,7 @@ idf_component_register(SRCS "korvo2_oneye_main.c"
                             "panel_api.c"
                             "media_api.c"
                             "aec_capture.c"
+                            "player.c"
                        INCLUDE_DIRS "."
                        REQUIRES oneye-dev-sdk
                                 audio_board

@@ -22,6 +22,7 @@
 #include "panel_api.h"
 #include "media_api.h"
 #include "aec_capture.h"
+#include "player.h"
 
 static const char *TAG = "panel_api";
 
@@ -406,6 +407,20 @@ static esp_err_t h_status(httpd_req_t *req)
     sb_fmt(&s, "\"sd_mounted\":%s,", aec.sd_mounted ? "true" : "false");
     sb_kv_str(&s, "rec_root", aec_capture_root()); sb_raw(&s, ",");
     sb_kv_i(&s, "poll_hint_ms", 1000);
+    sb_raw(&s, "},");
+
+    /* 板上回放状态（面板据此显示"播放中/文件名/音量"并切换按钮） */
+    player_status_t ps;
+    player_get_status(&ps);
+    sb_raw(&s, "\"player\":{");
+    sb_fmt(&s, "\"playing\":%s,", ps.playing ? "true" : "false");
+    sb_kv_str(&s, "path", ps.path); sb_raw(&s, ",");
+    sb_kv_str(&s, "codec", ps.codec); sb_raw(&s, ",");
+    sb_kv_i(&s, "rate_hz", (long long)ps.rate_hz); sb_raw(&s, ",");
+    sb_kv_i(&s, "channels", (long long)ps.channels); sb_raw(&s, ",");
+    sb_kv_i(&s, "elapsed_ms", (long long)ps.elapsed_ms); sb_raw(&s, ",");
+    sb_kv_i(&s, "volume", (long long)ps.volume); sb_raw(&s, ",");
+    sb_kv_str(&s, "msg", ps.last_msg);
     sb_raw(&s, "},");
 
     sb_raw(&s, "\"panel\":{");

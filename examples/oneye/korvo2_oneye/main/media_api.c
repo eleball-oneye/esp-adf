@@ -14,6 +14,7 @@
 
 #include "media_api.h"
 #include "aec_capture.h"
+#include "player.h"
 
 static const char *TAG = "media_api";
 
@@ -142,6 +143,14 @@ static void add_file(cJSON *arr, const char *alias, const char *root, const char
     char url[MEDIA_URI_MAX];
     snprintf(url, sizeof(url), "media/%s/%s", alias, name);
     cJSON_AddStringToObject(item, "url", url);
+    /* 板上回放（本轮）：仅 SD 卡（FATFS）上的 wav/mp3 —— SPIFFS 录不上板播，只能网页播放/下载 */
+    const char *dot = strrchr(name, '.');
+    bool audio = (dot != NULL) &&
+                 (strcasecmp(dot, ".wav") == 0 || strcasecmp(dot, ".mp3") == 0);
+    cJSON_AddBoolToObject(o, "playable_on_board", audio && strcmp(alias, "sdcard") == 0);
+    char dev_path[PLAYER_PATH_MAX];
+    snprintf(dev_path, sizeof(dev_path), "/%s/%s", alias, name);
+    cJSON_AddStringToObject(o, "device_path", dev_path);
     cJSON_AddItemToArray(arr, o);
 }
 
@@ -346,7 +355,7 @@ static esp_err_t h_media_get(httpd_req_t *req)
 
 static esp_err_t h_action(httpd_req_t *req)
 {
-    char body[256];
+    char body[320];
     int got = httpd_req_recv(req, body, sizeof(body) - 1);
     if (got <= 0) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
@@ -359,11 +368,14 @@ static esp_err_t h_action(httpd_req_t *req)
     }
     const cJSON *op = cJSON_GetObjectItem(doc, "op");
     const cJSON *dur = cJSON_GetObjectItem(doc, "duration_s");
+    const cJSON *path = cJSON_GetObjectItem(doc, "path");
+    const cJSON *vol = cJSON_GetObjectItem(doc, "volume");
     esp_err_t rc = ESP_OK;
     const char *msg = "ok";
     char file[64] = "";
+    const char *op_str = cJSON_IsString(op) ? op->valuestring : "";
 
-    if (cJSON_IsString(op) && strcmp(op->valuestring, "aec_start") == 0) {
+    if (strcmp(op_str, "aec_start") == 0) {
         uint32_t seconds = (cJSON_IsNumber(dur) && dur->valuedouble > 0)
                                ? (uint32_t)dur->valuedouble : 0;
         rc = aec_capture_start(seconds, file, sizeof(file));
@@ -371,9 +383,35 @@ static esp_err_t h_action(httpd_req_t *req)
             msg = (rc == ESP_ERR_INVALID_STATE) ? "already recording"
                                                 : (rc == ESP_ERR_NOT_SUPPORTED ? "aec disabled" : "start failed");
         }
-    } else if (cJSON_IsString(op) && strcmp(op->valuestring, "aec_stop") == 0) {
+    } else if (strcmp(op_str, "aec_stop") == 0) {
         rc = aec_capture_stop();
         msg = (rc == ESP_OK) ? "stopped" : "stop failed";
+    } else if (strcmp(op_str, "play") == 0) {
+        if (!cJSON_IsString(path)) {
+            rc = ESP_ERR_INVALID_ARG;
+            msg = "missing path";
+        } else {
+            rc = player_play(path->valuestring);
+            if (rc != ESP_OK) {
+                msg = (rc == ESP_ERR_NOT_SUPPORTED) ? "unsupported codec (wav/mp3 only)"
+                      : (rc == ESP_ERR_INVALID_ARG ? "invalid path (must be /sdcard/...)"
+                                                   : "play failed");
+            } else {
+                msg = "playing";
+                snprintf(file, sizeof(file), "%s", path->valuestring);
+            }
+        }
+    } else if (strcmp(op_str, "stop") == 0 || strcmp(op_str, "play_stop") == 0) {
+        rc = player_stop();
+        msg = (rc == ESP_OK) ? "stopped" : "stop failed";
+    } else if (strcmp(op_str, "set_volume") == 0) {
+        if (!cJSON_IsNumber(vol)) {
+            rc = ESP_ERR_INVALID_ARG;
+            msg = "missing volume";
+        } else {
+            rc = player_set_volume((int)vol->valuedouble);
+            msg = (rc == ESP_OK) ? "volume set" : "volume failed";
+        }
     } else {
         msg = "unknown op";
         rc = ESP_ERR_INVALID_ARG;
@@ -382,15 +420,19 @@ static esp_err_t h_action(httpd_req_t *req)
 
     aec_capture_status_t st;
     aec_capture_get_status(&st);
+    player_status_t ps;
+    player_get_status(&ps);
     cJSON *resp = cJSON_CreateObject();
     if (resp == NULL) {
         return httpd_resp_send_500(req);
     }
     cJSON_AddBoolToObject(resp, "ok", rc == ESP_OK);
     cJSON_AddStringToObject(resp, "msg", msg);
-    cJSON_AddStringToObject(resp, "file", file[0] ? file : st.last_file);
+    cJSON_AddStringToObject(resp, "file", file[0] ? file : (ps.path[0] ? ps.path : st.last_file));
     cJSON_AddBoolToObject(resp, "recording", st.recording);
     cJSON_AddNumberToObject(resp, "last_bytes", (double)st.last_bytes);
+    cJSON_AddBoolToObject(resp, "playing", ps.playing);
+    cJSON_AddNumberToObject(resp, "volume", ps.volume);
     char *txt = cJSON_PrintUnformatted(resp);
     cJSON_Delete(resp);
     if (txt == NULL) {

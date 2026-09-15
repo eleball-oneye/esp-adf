@@ -1,0 +1,7 @@
+{
+  "_comment": "验证面板设备清单（可选）。复制为 devices.json 后按实际改；node = 设备的 node_id（= 固件 CONFIG_ONEYE_FW_DEVICE_ID，用于 MQTT 关联）",
+  "devices": [
+    { "name": "korvo2-0001", "http": "http://192.168.1.50", "node": "korvo2-0001" },
+    { "name": "korvo2-0002", "http": "http://192.168.1.51", "node": "korvo2-0002" }
+  ]
+}

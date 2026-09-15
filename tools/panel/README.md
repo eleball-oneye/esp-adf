@@ -1,0 +1,105 @@
+# oneye 例程验证面板（宿主侧小型服务）
+
+> **一句话**：把例程跑出来的功能成果在浏览器里**看得见、可回放、可留证** —— 按键实时状态与历史响应、
+> 板级参数核对逐行 PASS/FAIL、链路与设备概况；（随后接入）AEC 采集音频与 SD 卡录音在 web 播放。
+
+## 0. 定位与边界（先读）
+
+| 项 | 口径 |
+| --- | --- |
+| 服务位置 | **宿主侧**（PC / WSL），Python 3 **标准库零第三方依赖**；浏览器打开 `http://127.0.0.1:8787/` |
+| 设备侧配合 | 固件内**本地验证 API**（`examples/oneye/korvo2_oneye/main/panel_api.c`）：`/api/status`、`/api/selftest`、`/api/keys` |
+| **不是契约** | 设备侧 `/api/*` 是**台面/联调验证面**，**不是云端设备面契约**：不进 `backend/contracts`、不新增 topic、不写影子新键、不参与 `caps/up` 声明；**量产固件应置 `CONFIG_ONEYE_FW_ENABLE_PANEL_API=n`** |
+| 只读性 | 面板只读设备数据；**不改变设备行为**（触发录音/回放等写操作属下一轮的 `POST /api/action`，须先冻结口径） |
+
+## 1. 快速开始
+
+```bash
+# ① 真机（设备已联网；IP 见串口日志 / 路由器）
+python3 panel.py --device korvo2-0001=http://192.168.1.50
+#   → 浏览器打开 http://127.0.0.1:8787/
+
+# ② 多板聚合 + MQTT（dev-stack EMQX；云端视角与设备视角对照）
+python3 panel.py --device a=http://192.168.1.50 --device b=http://192.168.1.51 \
+                 --mqtt 127.0.0.1:1883
+
+# ③ 无硬件：内置 mock 设备 + mock broker 自检（面板自身链路）
+python3 panel.py --self-test
+
+# ④ 串口兜底（无网也能核对；POSIX 用 termios，Windows 需 pip install pyserial）
+python3 panel.py --device korvo2-0001=http://192.168.1.50 --serial /dev/ttyUSB0@115200
+```
+
+设备清单也可落 `devices.json`（见 `devices.example.json`）；`--device name#node=URL` 可显式指定 MQTT 关联用的 `node_id`。
+
+## 2. 三条取数通道（自动降级，互为兜底）
+
+| 通道 | 取什么 | 不可用时 |
+| --- | --- | --- |
+| **设备 HTTP**（主） | `/api/status`（固件/板卡/uptime/Wi-Fi/云端链路与收发）、`/api/selftest`（逐行核对）、`/api/keys`（实时 + 历史） | 设备显示离线并给出错误；面板其余部分照常 |
+| **MQTT**（云端视角） | 订阅 `rmng/dev/+/event/up`、`rmng/dev/+/status/up`；按事件 `id` 与设备本地历史**关联** ⇒ 判断"云端是否真的收到"并可算端到端时延 | 面板标 `MQTT 未连接`；按键仍走设备 HTTP 显示 |
+| **串口**（兜底） | 解析 `[key]`、`[board-check]`、`[sdk-event]` 行 | POSIX 直接可用；Windows 缺 pyserial 时自动禁用并提示 |
+
+> 极简 MQTT 客户端（`panel.py` 内 `MiniMqtt`）只实现面板所需子集（CONNECT/SUBSCRIBE/PUBLISH/PINGREQ），
+> 与 SDK 侧"协议自持"的口径一致：**验证工具不引入 pip 依赖**。
+
+## 3. 页面能力（本轮）
+
+1. **按键：实时状态** —— 6 键（REC/MUTE/PLAY/SET/VOL−/VOL+）高亮最近触发键、显示动作（短按/长按/释放）、
+   计数（短按/长按/释放）与"云端事件条数"；
+2. **按键：历史响应** —— 每行一条事件：`#seq / 本地时间 / 按键 / 动作 / 上行状态 / 云端确认 / 端到端时延`；
+   **上行状态三态**来自设备侧：`pending`（本地已检测）→ `sent`（已交 SDK 上报，失败为 `failed`）→ `acked`（收到云端 `event/down` ack，
+   按 `data.ref == 事件 id` 关联）；"云端确认"列来自面板自身 MQTT 订阅（**独立于设备自报**，两者对照即端到端证据）；
+3. **板级参数核对** —— 设备运行期自检逐行 `项 / 期望 / 实测 / PASS-FAIL`（与串口 `[board-check]` 同源）；
+   编译期断言（`board_expect.h`）失败时**固件根本不构建**，因此这里只列运行期项；
+4. **设备与链路** —— 固件版本、板卡、运行时长、Wi-Fi IP、云端链路与收发帧、最近错误；
+5. **串口兜底** —— 最近日志尾部（无网时仍能核对按键与自检输出）。
+
+## 4. 设备侧 API（本地验证面）
+
+| 路由 | 返回（要点） |
+| --- | --- |
+| `GET /api/ping` | `{"ok":true,"api_version":"1","role":"local-verification-only"}` |
+| `GET /api/status` | `fw`、`board`、`uptime_ms`、`wifi{connected,ip}`、`cloud{link_up,transport,tx_frames,rx_frames}`、`selftest{total,failed}`、`keys{count,events,history_max}` |
+| `GET /api/selftest` | `{total,failed,note,items:[{item,expect,actual,pass}]}`（运行期核对明细） |
+| `GET /api/keys?limit=N` | `keys[]`（6 键标签）、`current{seq,id,key,action,ts_ms,uplink,ack_ms}`、`counters{}`、`history[]`（**新→旧**，含 `uplink`/`ack_ms`） |
+| **预留（下一轮）** | `GET /media/list`、`GET /media/<path>`（含 `Range`，便于浏览器拖动回放）、`POST /api/action`（开始/停止录音、播放指定文件） |
+
+事件 id 由固件生成（`key-00001`…）并作为 `event/up` 的幂等 `id`；云端 ack 的 `data.ref` 与之对齐 ⇒ **设备侧**能自报三态，
+**面板侧**再用 MQTT 独立验证一次。
+
+## 5. 面板自身 API（供脚本/CI 复用）
+
+| 路由 | 说明 |
+| --- | --- |
+| `GET /` | 单页 UI（内嵌，无 CDN；轮询 `/api/state`，缺省 600 ms，可用 `--poll-ms`） |
+| `GET /api/state` | 聚合快照：`mqtt{}`、`serial{}`、`devices[]`（`status`/`selftest`/`keys`/`history`（含云端关联字段）/`serial_tail`） |
+| `GET /api/health` | `{"ok":true,"version":"0.1.0"}` |
+
+## 6. 文件
+
+| 文件 | 作用 |
+| --- | --- |
+| `panel.py` | 面板服务（HTTP + 设备轮询 + 极简 MQTT 客户端 + 串口兜底 + 内嵌页面 + `--self-test`） |
+| `mock_device.py` | 模拟 Korvo-2 设备（与固件同形的 `/api/*`）+ 极简 MQTT broker + `GET /mock/press?key=&action=` 触发按键；并自扮云端回 `event/down` ack |
+| `devices.example.json` | 设备清单示例 |
+| `README.md` | 本文件 |
+
+## 7. 本轮实测记录（2026-09-15）
+
+| 项 | 命令 | 结果 |
+| --- | --- | --- |
+| 面板自检（无硬件） | `python3 panel.py --self-test`（内置 mock 设备 + mock broker） | **12 项全部通过，rc=0**：设备 HTTP 可达、自检明细 15 行、固件标识、MQTT 连接、按键历史 ≥3 条且新→旧排序、**云端确认关联 3/3**、端到端时延可算、动作类型覆盖 click/press、`/api/health`、首页渲染、设备离线降级可用 |
+| 设备侧 API 编译 | `idf.py build`（IDF v5.5.5 / esp32s3 / KORVO2_V3） | 通过（新增 `main/panel_api.c`，`esp_http_server` 组件） |
+| 真机联调 | —— | **未做**（本轮只出构建产物；烧录后：配 Wi-Fi → 面板 `--device name=http://<IP>` → 按键验证三态） |
+
+复跑：`python3 panel.py --self-test`（日志落 `output/.build/panel-selftest.log`）。
+
+## 8. 后续（同一面板继续接）
+
+1. **AEC 采集音频在 web 播放**：设备把录音 WAV 落 SD/SPIFFS → `GET /media/list` + `GET /media/<path>`（实现 `Range`）→
+   面板"音频"卡片列出文件并 `<audio>` 播放/下载留证；
+2. **SD 卡录音/录像选择与回放**：`GET /media/list` 列出 `/sdcard` 媒体（WAV/MP3/AVI/MJPEG）→ 面板选择 →
+   `POST /api/action {op:"play",path:"..."}` 触发板上播放，同时网页可直接试听/预览该文件（设备 HTTP 直供）；
+3. **回归留证**：面板把每次会话的历史（按键三态 + 自检表 + 云端时延）落 JSONL，供验收与回归对照；
+4. **多板批量**：`devices.json` 已支持多台；后续加"一键全部刷新/批量按键注入"以便产测台复用。

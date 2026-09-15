@@ -250,9 +250,12 @@ class DeviceView:
         self.selftest: dict = {}
         self.keys: dict = {}
         self.history: list[dict] = []
+        self.media: dict = {}
+        self.media_error: str | None = None
         self.cloud: dict[str, dict] = {}      # event id -> {ts_ms, recv_at_ms}
         self.serial_tail: list[str] = []
         self.last_poll_ms = 0
+        self._media_ts = 0.0
 
     def _get(self, path: str, timeout: float = 2.0) -> dict | None:
         url = f"{self.base_url}{path}"
@@ -264,7 +267,24 @@ class DeviceView:
             self.last_error = f"{path}: {exc}"
             return None
 
-    def poll(self) -> None:
+    def post_action(self, payload: dict, timeout: float = 5.0) -> dict | None:
+        """触发设备侧本地动作（如 AEC 录音启停）。面板只做代理，便于浏览器同源调用。"""
+        url = f"{self.base_url}/api/action"
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(url, data=data, method="POST",
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8", "replace"))
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            self.media_error = f"/api/action: {exc}"
+            return None
+
+    def media_url(self, rel_url: str) -> str:
+        """把设备返回的相对 url（media/<alias>/<path>）拼成可直接播放的绝对地址。"""
+        return f"{self.base_url}/{rel_url.lstrip('/')}"
+
+    def poll(self, media_interval_s: float = 3.0) -> None:
         st = self._get("/api/status")
         if st is None:
             self.online = False
@@ -290,6 +310,16 @@ class DeviceView:
                 else:
                     e["cloud_seen"] = False
             self.history = hist
+        # 媒体列表（含 AEC 录音与 SD 卡媒体）——降频轮询
+        now = time.time()
+        if now - self._media_ts >= media_interval_s:
+            self._media_ts = now
+            ml = self._get("/media/list")
+            if ml is not None:
+                for f in ml.get("files", []):
+                    f["play_url"] = self.media_url((f.get("item") or {}).get("url", ""))
+                self.media = ml
+                self.media_error = None
         self.last_poll_ms = _now_ms()
 
     def note_cloud_event(self, payload: bytes) -> dict | None:
@@ -346,6 +376,14 @@ class PanelState:
                 "last_poll_ms": d.last_poll_ms,
                 "status": d.status, "selftest": d.selftest,
                 "keys": d.keys, "history": d.history[:history_limit],
+                "media": {
+                    "count": (d.media or {}).get("count", 0),
+                    "rec_root": (d.media or {}).get("rec_root"),
+                    "aec_enabled": (d.media or {}).get("aec_enabled"),
+                    "aec_recording": (d.media or {}).get("aec_recording"),
+                    "error": d.media_error,
+                    "files": list((d.media or {}).get("files", [])),
+                },
                 "cloud_event_count": len(d.cloud),
                 "serial_tail": d.serial_tail[-30:],
             } for d in self.devices.values()],
@@ -519,12 +557,19 @@ PAGE = r"""<!doctype html>
   </div>
 
   <div class="card">
-    <h2>媒体（随后接入）<small>AEC 采集音频 / SD 卡录音回放</small></h2>
-    <div class="mut" style="font-size:13px">
-      预留接口（设备侧）：<code>GET /media/list</code>、<code>GET /media/&lt;path&gt;</code>（含 Range，便于浏览器拖动）；
-      <code>POST /api/action</code>（开始/停止录音、播放指定文件）。
-      AEC 采集的 WAV 与 SD 卡上的录音/录像将由本面板“选择 + 播放”，并保留本地留证文件。
+    <h2>音频：AEC 采集与 SD 卡媒体 <small>设备 HTTP 直供（支持 Range，可拖动播放）</small></h2>
+    <div class="kv" id="aecmeta"></div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin:10px 0">
+      <button onclick="rec(5)">录 5 s</button>
+      <button onclick="rec(10)">录 10 s</button>
+      <button onclick="rec(30)">录 30 s</button>
+      <button onclick="act('aec_stop')">停止录音</button>
+      <button onclick="tick()">刷新列表</button>
+      <span class="mut" id="actmsg"></span>
     </div>
+    <table><thead><tr><th>文件</th><th>类型</th><th>大小</th><th>修改时间</th><th>操作</th></tr></thead>
+    <tbody id="media"></tbody></table>
+    <div id="player" style="margin-top:10px"></div>
   </div>
 </main>
 <script>
@@ -538,6 +583,7 @@ async function tick(){
   try{ st = await (await fetch('/api/state')).json(); }
   catch(e){ $('c-upd').textContent = '面板服务不可达'; return; }
   const dev = (st.devices||[]).find(d=>d.online) || (st.devices||[])[0] || {};
+  currentDev = dev.name || null;
   const keys = dev.keys||{}, ks = keys.history||[];
 
   // 顶部状态
@@ -599,9 +645,54 @@ async function tick(){
     <div>收发帧</div><div>tx ${cloud.tx_frames||0} / rx ${cloud.rx_frames||0}</div>
     <div>错误</div><div class="mut">${dev.last_error||'—'}</div>`;
 
+  // 音频 / 媒体卡片
+  const media = dev.media || {};
+  const aec = (dev.status && dev.status.aec) || {};
+  const sd = (dev.status && dev.status.media && dev.status.media.sd_mounted);
+  $('aecmeta').innerHTML = `
+    <div>AEC 采集</div><div>${media.aec_enabled===false? '<span class="pill bad">未启用</span>' :
+        (media.aec_recording? '<span class="pill pend">录音中</span>' : '<span class="pill ok">就绪</span>')}
+      <span class="mut">落盘：${media.rec_root || '—'}（${sd? 'SD 卡' : 'SPIFFS 兜底'}）</span></div>
+    <div>最近录音</div><div>${aec.last_file? `${aec.last_file} <span class="mut">${(aec.last_bytes||0)} 字节</span>` : '<span class="mut">尚无</span>'}</div>
+    <div>文件数</div><div>${media.count||0} 个可播放文件${media.error? ` <span class="pill bad">${media.error}</span>`:''}</div>`;
+  const rows2 = (media.files||[]).map(f=>{
+    const sz = f.size>=1024? (f.size/1024).toFixed(1)+' KB' : (f.size||0)+' B';
+    const mt = f.mtime? new Date(f.mtime*1000).toLocaleString() : '—';
+    const act = f.kind==='audio' ? `<button onclick="play('${f.play_url}')">播放</button>`
+              : (f.kind==='image'||f.kind==='video' ? `<button onclick="preview('${f.play_url}','${f.kind}')">预览</button>` : '');
+    return `<tr><td>${f.name}</td><td class="mut">${f.kind}</td><td class="mut">${sz}</td><td class="mut">${mt}</td>
+      <td>${act} <a href="${f.play_url}" download target="_blank"><button>下载</button></a></td></tr>`;
+  });
+  $('media').innerHTML = rows2.join('') ||
+    '<tr><td colspan="5" class="mut">尚无媒体文件（点“录 5 s”触发 AEC 采集；SD 卡文件需插入卡并启用 CONFIG_ONEYE_FW_ENABLE_SDCARD）</td></tr>';
+
   // 串口
   if((st.serial_tail||[]).length) $('serial').textContent = st.serial_tail.join('\n');
 }
+
+let currentDev = null;
+function play(url){
+  $('player').innerHTML = `<audio controls autoplay style="width:100%" src="${url}"></audio>
+    <div class="mut" style="font-size:12px;margin-top:4px">${url}</div>`;
+}
+function preview(url, kind){
+  $('player').innerHTML = kind==='video'
+    ? `<video controls autoplay style="max-width:100%" src="${url}"></video>`
+    : `<img src="${url}" style="max-width:100%;border-radius:8px">`;
+}
+async function act(op, duration_s){
+  if(!currentDev) return;
+  $('actmsg').textContent = '执行中…';
+  const body = duration_s ? {op, duration_s} : {op};
+  try{
+    const r = await fetch(`/api/action?device=${encodeURIComponent(currentDev)}`, {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    const j = await r.json();
+    $('actmsg').textContent = (j.ok? '✔ ' : '✗ ') + (j.msg||'') + (j.file? ` → ${j.file}`:'');
+  }catch(e){ $('actmsg').textContent = '✗ ' + e; }
+  setTimeout(tick, 400);
+}
+function rec(seconds){ act('aec_start', seconds); }
 
 $('btn-refresh').onclick = tick;
 tick(); setInterval(tick, __POLL_MS__);
@@ -633,19 +724,48 @@ def make_handler(state: PanelState, poll_ms: int):
                 pass
 
         def do_GET(self):  # noqa: N802
-            path = urllib.parse.urlparse(self.path).path
+            parsed = urllib.parse.urlparse(self.path)
+            path = parsed.path
             if path in ("/", "/index.html"):
                 html = PAGE.replace("__POLL_MS__", str(poll_ms)).encode("utf-8")
                 self._send(200, html, "text/html; charset=utf-8")
             elif path == "/api/state":
                 self._send(200, json.dumps(state.snapshot(), ensure_ascii=False).encode("utf-8"))
+            elif path == "/api/media":
+                doc = {d.name: {"http": d.base_url,
+                                "files": list((d.media or {}).get("files", [])),
+                                "aec": d.status.get("aec", {}),
+                                "rec_root": (d.media or {}).get("rec_root"),
+                                "error": d.media_error}
+                       for d in state.devices.values()}
+                self._send(200, json.dumps(doc, ensure_ascii=False).encode("utf-8"))
             elif path == "/api/health":
                 self._send(200, json.dumps({"ok": True, "version": PANEL_VERSION}).encode("utf-8"))
             else:
                 self._send(404, b'{"error":"not_found"}')
 
         def do_POST(self):  # noqa: N802
-            self._send(404, b'{"error":"not_found"}')
+            parsed = urllib.parse.urlparse(self.path)
+            q = urllib.parse.parse_qs(parsed.query)
+            if parsed.path != "/api/action":
+                self._send(404, b'{"error":"not_found"}')
+                return
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length > 0 else b"{}"
+            try:
+                payload = json.loads(raw.decode("utf-8", "replace") or "{}")
+            except ValueError:
+                self._send(400, b'{"error":"invalid_json"}')
+                return
+            name = (q.get("device") or [None])[0]
+            dv = state.devices.get(name) if name else next(iter(state.devices.values()), None)
+            if dv is None:
+                self._send(404, b'{"error":"no_device"}')
+                return
+            resp = dv.post_action(payload)
+            if resp is None:
+                resp = {"ok": False, "msg": dv.media_error or "action failed"}
+            self._send(200, json.dumps(resp, ensure_ascii=False).encode("utf-8"))
 
     return Handler
 
@@ -833,8 +953,42 @@ def self_test(verbose: bool = True) -> int:
             with urllib.request.urlopen("http://127.0.0.1:18787/", timeout=3) as r:
                 page = r.read().decode("utf-8", "replace")
             check("首页渲染可用", "按键：实时状态" in page and "__POLL_MS__" not in page)
+            check("首页含音频/AEC 卡片", "音频：AEC 采集" in page and "/api/action" in page)
         except Exception as exc:  # noqa: BLE001
             check("首页渲染可用", False, str(exc))
+
+        # 4b) 媒体面：列表 / 播放（Range） / 动作触发
+        deadline = time.time() + 6
+        while time.time() < deadline and not (dv.media or {}).get("files"):
+            time.sleep(0.2)
+        files = (dv.media or {}).get("files") or []
+        check("媒体列表非空（/media/list）", len(files) >= 1, f"{len(files)} 个文件")
+        play_url = files[0].get("play_url") if files else None
+        check("播放地址为设备绝对地址", bool(play_url and play_url.startswith("http")))
+        head_ok = False
+        if play_url:
+            try:
+                req = urllib.request.Request(play_url, headers={"Range": "bytes=0-43"})
+                with urllib.request.urlopen(req, timeout=4) as r:
+                    body = r.read()
+                    head_ok = (r.status == 206 and r.headers.get("Content-Range") is not None
+                               and body[:4] == b"RIFF")
+            except Exception as exc:  # noqa: BLE001
+                check("Range 请求（拖动播放前提）", False, str(exc))
+            else:
+                check("Range 请求（拖动播放前提）", head_ok,
+                      "206 + Content-Range + RIFF 头" if head_ok else "响应不符合预期")
+        before = len(files)
+        act = dv.post_action({"op": "aec_start", "duration_s": 1})
+        check("触发 AEC 采集（POST /api/action）", bool(act and act.get("ok")),
+              (act or {}).get("file") or (act or {}).get("msg", ""))
+        time.sleep(1.6)
+        dv.poll(media_interval_s=0)
+        after = len((dv.media or {}).get("files") or [])
+        check("采集后媒体列表增长", after > before, f"{before} → {after}")
+        stop = dv.post_action({"op": "aec_stop"})
+        check("停止采集（aec_stop）", bool(stop and stop.get("ok")), (stop or {}).get("msg", ""))
+
         # 5) 设备离线时的降级（不崩、状态可见）
         mock.stop()
         time.sleep(1.2)

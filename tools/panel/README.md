@@ -52,18 +52,23 @@ python3 panel.py --device korvo2-0001=http://192.168.1.50 --serial /dev/ttyUSB0@
    按 `data.ref == 事件 id` 关联）；"云端确认"列来自面板自身 MQTT 订阅（**独立于设备自报**，两者对照即端到端证据）；
 3. **板级参数核对** —— 设备运行期自检逐行 `项 / 期望 / 实测 / PASS-FAIL`（与串口 `[board-check]` 同源）；
    编译期断言（`board_expect.h`）失败时**固件根本不构建**，因此这里只列运行期项；
-4. **设备与链路** —— 固件版本、板卡、运行时长、Wi-Fi IP、云端链路与收发帧、最近错误；
-5. **串口兜底** —— 最近日志尾部（无网时仍能核对按键与自检输出）。
+4. **音频：AEC 采集与 SD 卡媒体** —— 「录 5/10/30 s」「停止录音」按钮触发设备侧 AEC 采集（AFE：AEC + 降噪 → WAV 落 SD/SPIFFS），
+   文件列表显示名称/类型/大小/时间；点「播放」用 `<audio controls>` **直接向设备拉流播放**（设备实现 `Range` ⇒ 可拖动进度），
+   另可「下载」留证；图片/视频文件提供「预览」（SD 卡上的录像后续接同一入口）；
+5. **设备与链路** —— 固件版本、板卡、运行时长、Wi-Fi IP、云端链路与收发帧、最近错误；
+6. **串口兜底** —— 最近日志尾部（无网时仍能核对按键与自检输出）。
 
 ## 4. 设备侧 API（本地验证面）
 
 | 路由 | 返回（要点） |
 | --- | --- |
 | `GET /api/ping` | `{"ok":true,"api_version":"1","role":"local-verification-only"}` |
-| `GET /api/status` | `fw`、`board`、`uptime_ms`、`wifi{connected,ip}`、`cloud{link_up,transport,tx_frames,rx_frames}`、`selftest{total,failed}`、`keys{count,events,history_max}` |
+| `GET /api/status` | `fw`、`board`、`uptime_ms`、`wifi{connected,ip}`、`cloud{link_up,transport,tx_frames,rx_frames}`、`selftest{total,failed}`、`keys{count,events,history_max}`、**`aec{enabled,recording,last_file,last_bytes,total_files,root}`**、**`media{sd_mounted,rec_root}`** |
 | `GET /api/selftest` | `{total,failed,note,items:[{item,expect,actual,pass}]}`（运行期核对明细） |
 | `GET /api/keys?limit=N` | `keys[]`（6 键标签）、`current{seq,id,key,action,ts_ms,uplink,ack_ms}`、`counters{}`、`history[]`（**新→旧**，含 `uplink`/`ack_ms`） |
-| **预留（下一轮）** | `GET /media/list`、`GET /media/<path>`（含 `Range`，便于浏览器拖动回放）、`POST /api/action`（开始/停止录音、播放指定文件） |
+| `GET /media/list` | `{count,rec_root,aec_enabled,aec_recording,files:[{alias,name,size,mtime,kind,item{url}}]}`（SD 与 SPIFFS；按扩展名判 `audio`/`image`/`video`） |
+| `GET /media/<alias>/<path>` | 文件下载/流式播放，**支持 `Range`**（`206` + `Content-Range` + `Accept-Ranges`）⇒ 浏览器 `<audio>` 可拖动；`alias`=`sdcard`\|`spiffs`；含目录穿越防护 |
+| `POST /api/action` | `{"op":"aec_start","duration_s":N}` / `{"op":"aec_stop"}` ⇒ `{ok,msg,file,recording,last_bytes}`（**写操作，仅台面验证**） |
 
 事件 id 由固件生成（`key-00001`…）并作为 `event/up` 的幂等 `id`；云端 ack 的 `data.ref` 与之对齐 ⇒ **设备侧**能自报三态，
 **面板侧**再用 MQTT 独立验证一次。
@@ -89,17 +94,27 @@ python3 panel.py --device korvo2-0001=http://192.168.1.50 --serial /dev/ttyUSB0@
 
 | 项 | 命令 | 结果 |
 | --- | --- | --- |
-| 面板自检（无硬件） | `python3 panel.py --self-test`（内置 mock 设备 + mock broker） | **12 项全部通过，rc=0**：设备 HTTP 可达、自检明细 15 行、固件标识、MQTT 连接、按键历史 ≥3 条且新→旧排序、**云端确认关联 3/3**、端到端时延可算、动作类型覆盖 click/press、`/api/health`、首页渲染、设备离线降级可用 |
-| 设备侧 API 编译 | `idf.py build`（IDF v5.5.5 / esp32s3 / KORVO2_V3） | 通过（新增 `main/panel_api.c`，`esp_http_server` 组件） |
-| 真机联调 | —— | **未做**（本轮只出构建产物；烧录后：配 Wi-Fi → 面板 `--device name=http://<IP>` → 按键验证三态） |
+| 面板自检（无硬件） | `python3 panel.py --self-test`（内置 mock 设备 + mock broker + 模拟 AEC 录音 WAV） | **19 项全部通过，rc=0**：设备 HTTP 可达、自检明细 15 行、固件标识、MQTT 连接、按键历史 ≥3 条且新→旧排序、**云端确认关联 3/3**、端到端时延可算、动作类型覆盖、`/api/health`、首页渲染、**首页含音频/AEC 卡片**、**媒体列表非空**、**播放地址为设备绝对地址**、**Range 请求返回 206 + Content-Range + RIFF 头（拖动播放前提）**、**触发 AEC 采集（POST /api/action）**、**采集后列表增长 1→2**、**停止采集**、设备离线降级可用 |
+| 设备侧 API + AEC 采集编译 | `idf.py build`（IDF v5.5.5 / esp32s3 / KORVO2_V3；自定义分区表 + esp-sr AFE） | 见本页 §7.1 构建记录 |
+| 真机联调 | —— | **未做**（本轮只出构建产物；烧录后：配 Wi-Fi → 面板 `--device name=http://<IP>` → 按键三态 + 录 5 s 并在网页播放） |
+
+### 7.1 构建记录（AEC 采集 + 媒体 API）
+
+| 项 | 结果 |
+| --- | --- |
+| 命令 | `idf.py build`（IDF v5.5.5 / esp32s3 / `CONFIG_ESP32_S3_KORVO2_V3_BOARD=y`） |
+| 分区 | 自定义 `partitions.csv`：`factory 2M` + **`model 2M`** + `storage(spiffs) 1M` |
+| 产物 | `korvo2_oneye.bin` **390,128 B**（分区余量 81%）；**`srmodels/srmodels.bin` 337,952 B**（esp-sr 模型，烧写偏移 `0x210000`，`flash_args` 已包含） |
+| 坑位（已修） | esp-sr 只在分区表存在 `model` 分区时才投放模型（上游 AEC/algorithm 例程缺该分区 ⇒ 模型从未投放）；另有 4 类编译期错误（注释内嵌 `/*`、`HTTPD_416_*` 缺失、`I2S_CHANNEL_FMT_*` 需 `driver/i2s.h`、`snprintf` 截断告警） |
 
 复跑：`python3 panel.py --self-test`（日志落 `output/.build/panel-selftest.log`）。
 
 ## 8. 后续（同一面板继续接）
 
-1. **AEC 采集音频在 web 播放**：设备把录音 WAV 落 SD/SPIFFS → `GET /media/list` + `GET /media/<path>`（实现 `Range`）→
-   面板"音频"卡片列出文件并 `<audio>` 播放/下载留证；
-2. **SD 卡录音/录像选择与回放**：`GET /media/list` 列出 `/sdcard` 媒体（WAV/MP3/AVI/MJPEG）→ 面板选择 →
-   `POST /api/action {op:"play",path:"..."}` 触发板上播放，同时网页可直接试听/预览该文件（设备 HTTP 直供）；
-3. **回归留证**：面板把每次会话的历史（按键三态 + 自检表 + 云端时延）落 JSONL，供验收与回归对照；
-4. **多板批量**：`devices.json` 已支持多台；后续加"一键全部刷新/批量按键注入"以便产测台复用。
+1. ~~**AEC 采集音频在 web 播放**~~ **已完成**（2026-09-15）：设备侧 AEC 采集（esp-sr AFE → WAV 落 SD/SPIFFS）
+   + `GET /media/list` + `GET /media/<alias>/<path>`（Range）× 面板「音频」卡片（录音/播放/下载）；
+   真机录音与出声效果待烧录后验证；
+2. **SD 卡录音/录像选择与回放**（下一步）：`GET /media/list` 已能列出 `/sdcard` 媒体（WAV/MP3/JPG/AVI/MJPEG），
+   面板已支持音频播放与图片/视频预览；待补：`POST /api/action {op:"play",path}` 触发**板上**播放并回显播放状态；
+3. **回归留证**：面板把每次会话的历史（按键三态 + 自检表 + 云端时延 + 录音文件清单）落 JSONL，供验收与回归对照；
+4. **多板批量**：`devices.json` 已支持多台；后续加"一键全部刷新/批量按键注入/批量录音"以便产测台复用。

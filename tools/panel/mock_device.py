@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import socket
 import struct
 import threading
@@ -37,6 +38,20 @@ ACTIONS = ("click", "click_release", "press", "press_release")
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def make_wav(seconds: float = 2.0, rate: int = 16000, freq: float = 1000.0) -> bytes:
+    """生成 16 kHz / 16 bit / 单声道正弦 WAV（模拟 AEC 采集产物，用于面板播放/拖动验证）。"""
+    n = int(rate * seconds)
+    frames = bytearray()
+    for i in range(n):
+        v = int(0.35 * 32767 * math.sin(2 * math.pi * freq * i / rate))
+        frames += struct.pack("<h", v)
+    data = bytes(frames)
+    hdr = b"RIFF" + struct.pack("<I", 36 + len(data)) + b"WAVEfmt " + \
+        struct.pack("<IHHIIHH", 16, 1, 1, rate, rate * 2, 2, 16) + \
+        b"data" + struct.pack("<I", len(data))
+    return hdr + data
 
 
 # ----------------------------------------------------------------------------
@@ -223,6 +238,76 @@ class MockDevice:
         self.broker = MiniBroker(broker_port, log=log)
         self._mqtt_sock: socket.socket | None = None
         self._stop = threading.Event()
+        # 媒体（模拟 AEC 采集产物）：alias/相对路径 → 字节内容
+        self._base_wav = make_wav(2.0)
+        self.files: dict[str, bytes] = {}
+        self._file_seq = 0
+        self._aec_recording = False
+        self._rec_timer: threading.Timer | None = None
+        self._make_recording()      # 预置一条录音，便于面板首次打开即有可播放内容
+
+    # ------------------------------------------------------------ 媒体（模拟 AEC 产物）
+    def _make_recording(self, seconds: float = 2.0) -> str:
+        with self._lock:
+            self._file_seq += 1
+            rel = f"spiffs/rec/aec-{self._file_seq:05d}.wav"
+            self.files[rel] = make_wav(seconds)
+            return "/spiffs/rec/aec-%05d.wav" % self._file_seq
+
+    def media_list(self) -> dict:
+        with self._lock:
+            files = [{
+                "alias": rel.split("/", 1)[0],
+                "name": rel.split("/", 1)[1],
+                "size": len(data),
+                "mtime": int(time.time()),
+                "kind": "audio",
+                "item": {"url": f"media/{rel}"},
+            } for rel, data in sorted(self.files.items())]
+            return {
+                "count": len(files),
+                "rec_root": "/spiffs/rec",
+                "aec_enabled": True,
+                "aec_recording": self._aec_recording,
+                "files": files,
+            }
+
+    def aec_start(self, seconds: int = 5) -> dict:
+        path = self._make_recording(max(1, min(seconds, 30)))
+        with self._lock:
+            self._aec_recording = True
+        if self._rec_timer:
+            self._rec_timer.cancel()
+        self._rec_timer = threading.Timer(max(1, seconds), self._aec_finish)
+        self._rec_timer.daemon = True
+        self._rec_timer.start()
+        self.log(f"[mock] AEC 采集开始（{seconds}s）→ {path}")
+        return {"ok": True, "msg": "ok", "file": path, "recording": True,
+                "last_bytes": len(self.files[sorted(self.files)[-1]])}
+
+    def _aec_finish(self):
+        with self._lock:
+            self._aec_recording = False
+        self.log("[mock] AEC 采集结束")
+
+    def aec_stop(self) -> dict:
+        if self._rec_timer:
+            self._rec_timer.cancel()
+        with self._lock:
+            self._aec_recording = False
+        return {"ok": True, "msg": "stopped", "file": "", "recording": False,
+                "last_bytes": len(self.files[sorted(self.files)[-1]])}
+
+    def media_bytes(self, uri: str):
+        """uri 形如 /media/spiffs/rec/aec-00001.wav → 字节内容（None = 不存在/非法）"""
+        prefix = "/media/"
+        if not uri.startswith(prefix):
+            return None
+        rel = uri[len(prefix):]
+        if ".." in rel:
+            return None
+        with self._lock:
+            return self.files.get(rel)
 
     @staticmethod
     def _default_checks() -> list[dict]:
@@ -369,6 +454,7 @@ class MockDevice:
     # ------------------------------------------------------------ HTTP
     def _status(self) -> dict:
         with self._lock:
+            last = sorted(self.files)[-1] if self.files else ""
             return {
                 "fw": self.fw, "board": "ESP32-S3-Korvo-2 v3 (mock)",
                 "uptime_ms": _now_ms() % 10_000_000,
@@ -378,6 +464,12 @@ class MockDevice:
                 "selftest": {"total": len(self.checks), "failed": 0},
                 "keys": {"count": len(KEYS), "events": self.counters["total"],
                          "history_max": 200},
+                "aec": {"enabled": True, "recording": self._aec_recording,
+                        "last_file": ("/" + last) if last else "",
+                        "last_bytes": len(self.files[last]) if last else 0,
+                        "total_files": self._file_seq,
+                        "root": "/spiffs/rec"},
+                "media": {"sd_mounted": False, "rec_root": "/spiffs/rec", "poll_hint_ms": 1000},
                 "panel": {"api_version": "1", "scope": "local-verification-only"},
             }
 
@@ -422,12 +514,73 @@ class MockDevice:
                                 "note": "运行期核对项（mock 数据）", "items": mock.checks})
                 elif parsed.path == "/api/keys":
                     self._json(mock._keys(int(q.get("limit", ["50"])[0])))
+                elif parsed.path == "/media/list":
+                    self._json(mock.media_list())
+                elif parsed.path.startswith("/media/"):
+                    self._send_file(parsed.path)
                 elif parsed.path == "/mock/press":
                     key = q.get("key", ["play"])[0]
                     action = q.get("action", ["click"])[0]
                     self._json(mock.press(key, action))
                 else:
                     self._json({"error": "not_found"}, 404)
+
+            def _send_file(self, uri: str):
+                blob = mock.media_bytes(uri)
+                if blob is None:
+                    self._json({"error": "file_not_found"}, 404)
+                    return
+                total = len(blob)
+                start, end = 0, total - 1
+                rng = self.headers.get("Range")
+                if rng and rng.startswith("bytes="):
+                    spec = rng[6:]
+                    a, _, b = spec.partition("-")
+                    try:
+                        if a == "":                      # 末尾 N 字节
+                            start = max(0, total - int(b))
+                            end = total - 1
+                        else:
+                            start = int(a)
+                            end = int(b) if b else total - 1
+                            end = min(end, total - 1)
+                    except ValueError:
+                        start, end = 0, total - 1
+                    if start >= total or start > end:
+                        self.send_response(416)
+                        self.send_header("Content-Range", f"bytes */{total}")
+                        self.end_headers()
+                        return
+                body = blob[start:end + 1]
+                self.send_response(206 if (rng and (start > 0 or end < total - 1)) else 200)
+                self.send_header("Content-Type", "audio/wav")
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Content-Length", str(len(body)))
+                if rng and (start > 0 or end < total - 1):
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):  # noqa: N802
+                parsed = urllib.parse.urlparse(self.path)
+                if parsed.path != "/api/action":
+                    self._json({"error": "not_found"}, 404)
+                    return
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b"{}"
+                try:
+                    doc = json.loads(raw.decode("utf-8", "replace") or "{}")
+                except ValueError:
+                    self._json({"error": "invalid_json"}, 400)
+                    return
+                op = doc.get("op")
+                if op == "aec_start":
+                    self._json(mock.aec_start(int(doc.get("duration_s") or 5)))
+                elif op == "aec_stop":
+                    self._json(mock.aec_stop())
+                else:
+                    self._json({"ok": False, "msg": "unknown op"}, 200)
 
         return Handler
 

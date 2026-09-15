@@ -13,6 +13,17 @@
 
 ## 1. 构建
 
+> **前置：给 IDF v5.5.5 打 ADF 的 FreeRTOS 补丁**（真机实测必需，否则按键不可用）。
+> ADF 的 `audio_thread` 用 `xTaskCreateRestrictedPinnedToCore()` 给按键等任务分配**静态栈**；
+> IDF v5.5.5 未含该函数 ⇒ ADC 按键任务创建失败（串口：`Not found right xTaskCreateRestrictedPinnedToCore`
+> → `ADC_BTN: Create button_task failed!`）。上游 `idf_patches/idf_v5.5_freertos.patch` 面向 v5.5.0，
+> 在 v5.5.5 上**上下文已变（`git apply --check` 失败）**，故本 fork 增补适配版：
+>
+> ```bash
+> cd ~/esp/esp-idf-5.5.5
+> git apply <repo>/embedded/esp-adf/idf_patches/idf_v5.5.5_freertos.patch   # 已在 WSL IDF 上实打并实测通过
+> ```
+
 ```bash
 # 一次 shell 只导出**一个** IDF 版本（多版本 export 会互相污染 PATH）
 source ~/esp/esp-idf-5.5.5/export.sh
@@ -28,7 +39,7 @@ idf.py build
 构建后请核对 `sdkconfig`：`CONFIG_IDF_TARGET="esp32s3"`、`CONFIG_ESP32_S3_KORVO2_V3_BOARD=y`
 （两者缺一即视为"没按本板构建"）。
 
-## 2. 烧录（本轮**未执行**：真机烧录与取证按计划拆为后续卡）
+## 2. 烧录（2026-09-15 **已实测**：Windows 侧 esptool → COM12，见 §8）
 
 ```bash
 idf.py -p <COMx> flash monitor        # Windows；Linux/macOS 为 /dev/ttyUSB0 或 /dev/ttyACM0
@@ -252,6 +263,14 @@ python3 tools/panel/panel.py --self-test
 | 本地验证面（设备 API） | 编译通过（IDF 5.5.5 / esp32s3）：`CONFIG_ONEYE_FW_ENABLE_PANEL_API=y`、端口 80、历史 64 条；`/api/status.wifi{}` 增 `ssid`/`source`，`/api/action` 增 `wifi_set` |
 | 宿主验证面板 | `python3 tools/panel/panel.py --self-test`（内置 mock 设备 + mock broker + 凭据文件配网模拟）**33 项全通过、rc=0**：设备/自检/按键历史/云端确认关联/端到端时延/AEC 采集/板上回放/**Wi-Fi 配网四态与来源核对**等；详见 [tools/panel/README.md](../../../tools/panel/README.md) §7 |
 | 门禁 | 宿主轨（4×`.a`+4×`.so`+demo+单测 17 组/215 用例/2890 断言）与 backend `contract_check` / `md_link_check`、总控 `md_link_check` 全绿（契约面零改动） |
+| **真机识别（2026-09-15 第十二轮）** | `esptool flasher_id`：`ESP32-S3 (QFN56) rev v0.2`，**Embedded PSRAM 8MB**、**flash 实测 16 MB** ⇒ 模组实为 **ESP32-S3-WROOM-1-N16R8**（`CONFIG_SPIRAM_MODE_OCT=y` 假设**成立**：启动日志 `octal_psram: vendor id 0x0d (AP) … Found 8MB PSRAM device / Speed 80MHz`）；MAC `b8:1f:3f:c4:07:24` |
+| **真机烧录（COM12）** | 全片擦除 + 按偏移写 4 区域（`0x0/0x8000/0x10000/0x210000`）→ 全部 `Hash of data verified`；启动日志分区表 = `nvs / phy_init / factory 2M / model 2M / storage 1M`（与 `partitions.csv` 一致） |
+| **板级自检（真机，STRICT 口径）** | **19 项，失败 0 项**：I²C 17/18、I2S0 五脚 16/9/45/8/10、PA 48、耳机/卡检测 -1、SD 参数、绿/蓝灯、ES8311 MCLK=0、`RMNM`、codec 初始化、6 键初始化、SD 挂载 —— 首轮曾 16 项失败 1（蓝灯见下），修正后全绿 |
+| **蓝灯断言口径修正** | 首轮真机 `blue_led_gpio expect=128 actual=-128 FAIL`：ADF `get_blue_led_gpio()` 返回 **`int8_t`**，而 TCA9554 P7 = `BIT(7)` = 0x80 ⇒ 经 int8 回传为 **-128**（板子无问题，是取值类型口径）⇒ 期望值按同口径折算（`(int)(int8_t)(1<<7)`） |
+| **6 键任务（真机）** | 打 `idf_v5.5.5_freertos.patch` 后：`AUDIO_THREAD: The button_task task allocate stack on external memory` → `ADC_BTN: Calibration scheme version is Curve Fitting / Calibration Success` → `按键服务已启动（6 键 → event/up）`（**补丁前**为 `Not found right xTaskCreateRestrictedPinnedToCore` → `Create button_task failed!`） |
+| **SD 卡（真机）** | `sdcard mount (1-line) mounted PASS`（`CID name SD!`）；SPIFFS 兜底 `total=934 KB` |
+| **AEC / 回放（真机启动）** | `AEC 采集已就绪（16000 Hz / 32 bit / RMNM → AFE → WAV 16000 Hz 16 bit 单声道）`、`板上回放就绪`、ES7210 `Enable ES7210_INPUT_MIC1/2/3` + `Enable TDM mode`、ES8311 `in Slave mode` |
+| **凭据文件配网（真机首启）** | SD 已挂载但根目录无凭据文件 ⇒ `wifi_prov: 未找到 Wi-Fi 凭据文件（试过 /sdcard/oneye-wifi.txt 与 /spiffs/oneye-wifi.txt）` → 按设计**降级不中止**（自检/按键/录音/回放继续），并在串口给出投放指引 |
 
 **后续（真机）**：`idf.py -p <COM> flash monitor` → 核对自检逐行 PASS → **SD 卡放 `oneye-wifi.txt` 复位自动配网** → 观察
 `caps/up` / `status/up`（retained + LWT）/ `shadow/up` / `log/up` 与按键 `event/up`；其间可用面板「Wi-Fi 配网」卡片核对**凭据来源**；

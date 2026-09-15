@@ -137,7 +137,9 @@ static void board_selftest(void)
     chk_int("sdcard_pwr_ctrl_gpio", -1, get_sdcard_power_ctrl_gpio());
     chk_int("sdcard_open_file_num_max", 5, get_sdcard_open_file_num_max());
     chk_int("green_led_gpio (无)", -1, get_green_led_gpio());
-    chk_int("blue_led_gpio (TCA9554 P7)", (1 << 7), get_blue_led_gpio());
+    /* ADF 的 getter 返回 **int8_t**，而 TCA9554 P7 位 = BIT(7) = 0x80 ⇒ 经 int8_t 回传为 -128。
+     * 真机实测即 -128（不是板子的问题，是取值类型口径）：期望值按同口径折算再比对。 */
+    chk_int("blue_led_gpio (TCA9554 P7)", (int)(int8_t)(1 << 7), get_blue_led_gpio());
     chk_int("es8311_mclk_src (ESP MCLK)", 0, get_es8311_mclk_src());
 
     /* ADC 输入通道格式：rst「AEC 电路」——4 通道，R = 硬件 AEC 回采；board_def.h:126 */

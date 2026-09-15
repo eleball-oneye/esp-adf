@@ -148,7 +148,7 @@ _Static_assert(CAM_PIN_PWDN == -1 && CAM_PIN_RESET == -1,
  *   get_sdcard_intr_gpio()    → -1                （board_pins_config.c:93-96）
  *   get_sdcard_power_ctrl_gpio() → -1             （board_pins_config.c:103-106）
  *   get_green_led_gpio()      → -1                （board_pins_config.c:154-157）
- *   get_blue_led_gpio()       → BIT(7)            （board_pins_config.c:159-162）
+ *   get_blue_led_gpio()       → BIT(7)（以 int8_t 回传 ⇒ 运行期读数为 -128）（board_pins_config.c:159-162）
  *   get_es8311_mclk_src()     → 0                 （board_pins_config.c:164-167）
  *   AUDIO_ADC_INPUT_CH_FORMAT → "RMNM"            （rst「AEC 电路」；board_def.h:126）
  */

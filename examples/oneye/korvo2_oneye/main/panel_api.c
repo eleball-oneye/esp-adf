@@ -70,6 +70,8 @@ static char     s_transport[16] = "none";
 static uint32_t s_tx_frames, s_rx_frames;
 static bool     s_wifi_up;
 static char     s_ip[20] = "";
+static char     s_wifi_ssid[36] = "";
+static char     s_wifi_source[64] = "";   /* "file:/sdcard/oneye-wifi.txt" | "kconfig" | "api" */
 
 /* ------------------------------------------------------------------ 字符串构造器（JSON） */
 
@@ -307,11 +309,17 @@ void panel_api_set_link(bool cloud_link_up, const char *transport, uint32_t tx_f
     s_rx_frames = rx_frames;
 }
 
-void panel_api_set_wifi(bool connected, const char *ip)
+void panel_api_set_wifi(bool connected, const char *ip, const char *ssid, const char *source)
 {
     s_wifi_up = connected;
     if (ip) {
         snprintf(s_ip, sizeof(s_ip), "%s", ip);
+    }
+    if (ssid) {
+        snprintf(s_wifi_ssid, sizeof(s_wifi_ssid), "%s", ssid);
+    }
+    if (source) {
+        snprintf(s_wifi_source, sizeof(s_wifi_source), "%s", source);
     }
 }
 
@@ -372,7 +380,9 @@ static esp_err_t h_status(httpd_req_t *req)
 
     sb_raw(&s, "\"wifi\":{");
     sb_fmt(&s, "\"connected\":%s,", s_wifi_up ? "true" : "false");
-    sb_kv_str(&s, "ip", s_ip);
+    sb_kv_str(&s, "ip", s_ip); sb_raw(&s, ",");
+    sb_kv_str(&s, "ssid", s_wifi_ssid); sb_raw(&s, ",");
+    sb_kv_str(&s, "source", s_wifi_source);
     sb_raw(&s, "},");
 
     sb_raw(&s, "\"cloud\":{");

@@ -36,6 +36,12 @@ idf.py -p <COMx> flash monitor        # Windows；Linux/macOS 为 /dev/ttyUSB0 �
 
 - Boot 键 + Reset 键进入下载模式；或由串口 DTR/RTS 自动下载（rst「自动下载」）。
 - 扬声器接 **扬声器输出端口**；USB 供电建议 ≥5 V/2 A（rst「供电说明」）。
+- **首次上电前**（本仓库为 Windows 侧烧录准备，见 `output/.build/flash-korvo2.ps1`）：
+  1. 把 [`sd-root/oneye-wifi.txt`](sd-root/oneye-wifi.txt) 拷到 microSD 卡**根目录**并填好 `ssid=` / `password=`，插卡；
+  2. 烧写四个镜像（**必须先 `-Erase`**：分区表已改为 `factory 2M + model 2M + storage 1M`）：
+     `0x0 bootloader.bin` / `0x8000 partition-table.bin` / `0x10000 korvo2_oneye.bin` / `0x210000 srmodels/srmodels.bin`;
+  3. 复位后看串口：`从凭据文件读取 Wi-Fi` → `Wi-Fi 已获取 IP：…` → `已联网 → 启动上云` → `本地验证面板：http://<IP>/api/status`。
+     若没看到，按 §5.4 的排查口径逐条核对（卡未挂载 / 文件不在根目录 / 键名拼写 / 密码错误）。
 
 ## 3. 板级参数核对表（rst ↔ ADF ↔ 固件自证）
 
@@ -143,7 +149,26 @@ I2S0(CODEC_ADC_I2S_PORT) 16 kHz / 32 bit / RIGHT_LEFT     ← ES7210 四通道�
 验证面板的「音频」卡片里，SD 卡音频文件会多出一个 **「板上播放」** 按钮（`/media/list` 已带 `playable_on_board` 与 `device_path`），
 另有「停止播放」与音量滑块；状态行显示正在播放的文件、编码、采样率与已播时长。
 
-## 5.4 本地验证面（HTTP JSON API）与验证面板
+## 5.4 Wi-Fi 配网（SD 卡凭据文件 → 开机自动配网）
+
+**用户操作三步**：把凭据文件放 SD 卡 → 插卡 → 复位。固件启动时按 `SD 凭据文件 → Kconfig` 顺序取凭据，
+命中即连接；连接成功才启动上云与本地验证面板（面板需设备 IP 才可达）。
+
+| 项 | 说明 |
+| --- | --- |
+| 文件路径 | `/sdcard/oneye-wifi.txt`（SD 卡**根目录**；模板见 [`sd-root/oneye-wifi.txt`](sd-root/oneye-wifi.txt)）；SD 未挂载时自动试 `/spiffs/oneye-wifi.txt` |
+| 文件格式 | `key=value` 逐行（也接受 `key: value`）；键 `ssid`（或 `wifi_ssid`）、`password`（或 `pass`/`psk`/`wifi_password`）；`#`/`;` 开头为注释；两侧空白与行尾 CR 自动去除 |
+| 查找顺序 | `/sdcard/oneye-wifi.txt` → `/spiffs/oneye-wifi.txt` → `CONFIG_ONEYE_FW_WIFI_SSID/_PASSWORD` → 都没有则**不联网**（板级自检/按键/录音/板上回放照常） |
+| 串口取证 | `[wifi_prov] 从凭据文件读取 Wi-Fi：/sdcard/oneye-wifi.txt（ssid=…，密码已提供）` → `Wi-Fi 已获取 IP：192.168.x.x（ssid=…，来源=file:/sdcard/oneye-wifi.txt）` → `已联网 → 启动上云（oneye-dev-sdk）` |
+| 面板可见 | `GET /api/status` → `wifi{connected,ip,ssid,source}`；面板「Wi-Fi 配网」卡片显示**凭据来源** |
+| 运行期改配 | `POST /api/action {"op":"wifi_set","ssid":"…","password":"…"}`（面板表单同款）：只改**本次运行**、**不写文件**，用于换网/排障；持久化仍以 SD 文件（或 Kconfig）为准 |
+| 开关 | `CONFIG_ONEYE_FW_ENABLE_WIFI_FILE`（缺省 y）同时控制凭据文件读取与 `wifi_set`；量产**必须置 n** |
+| 安全口径 | 凭据文件在 SD 卡上是**明文** Wi-Fi 密码 ⇒ **仅台面/研发配网**。量产不得依赖该路径：走 claim + 一机一密凭据（ADR-0007） |
+
+连接超时为 20 s（`wifi_prov_connect(…, 0)` 取缺省）；失败只降级、不重启、不阻塞板级自检，
+串口给出 `Wi-Fi 连接失败（来源 …，ssid=…）→ 跳过上云` 与改配建议。
+
+## 5.5 本地验证面（HTTP JSON API）与验证面板
 
 固件内置一个**本地验证面**（`main/panel_api.c`），供宿主**验证面板**（[`tools/panel/`](../../../tools/panel/README.md)）
 与其他联调工具读取设备状态。**它不是云端设备面契约**（不进 `backend/contracts`、不新增 topic/影子键），
@@ -185,9 +210,10 @@ python3 tools/panel/panel.py --self-test
 | `ONEYE_FW_TRANSPORT` | TCP | 承载选择（契约四承载） |
 | `ONEYE_FW_CLOUD_TOKEN` | 空 | 设备令牌（空 = 匿名 dev 形态） |
 | `ONEYE_FW_TLS_INSECURE` | **n** | 仅 dev/产测可开；生产须投放自研 CA（`tls_ca_pem`） |
-| `ONEYE_FW_WIFI_SSID` / `_PASSWORD` | 空 | 空 = 只跑板级自检与按键，不上云 |
+| `ONEYE_FW_ENABLE_WIFI_FILE` | **y** | 凭据文件配网（SD/SPIFFS `oneye-wifi.txt`）+ `/api/action wifi_set`；**量产置 n** |
+| `ONEYE_FW_WIFI_SSID` / `_PASSWORD` | 空 | 兜底凭据；空且无凭据文件 = 只跑板级自检与按键，不上云 |
 | `ONEYE_FW_ENABLE_KEYS` | y | 6 键 → `event/up` |
-| `ONEYE_FW_ENABLE_SDCARD` / `_LCD` | n | 板级外设（未确认项不默认启用） |
+| `ONEYE_FW_ENABLE_SDCARD` / `_LCD` | **y** / n | SD 缺省开（凭据文件、录音、板上回放都依赖它；未插卡只告警不阻塞）；LCD 仍未确认，保持 n |
 | `ONEYE_FW_ENABLE_MPP` | n | 只初始化 mpp 域，不发起会话 |
 | `ONEYE_FW_ENABLE_PANEL_API` | y | 设备侧本地验证 HTTP API（**量产置 n**）；`_PANEL_PORT` 缺省 80、`_KEY_HISTORY_MAX` 缺省 64 |
 | `ONEYE_FW_DECLARE_VIDEO_LIVE` | **n** | 真机取帧取证通过后才可开；`audio.intercom` 无开关（WebRTC 数据面未落地前一律不得声明） |
@@ -216,16 +242,20 @@ python3 tools/panel/panel.py --self-test
 | 固件产物（**含本地验证 API 后**，2026-09-15 第二轮） | `korvo2_oneye.bin` **302,496 B**（`0x49da0`；分区余量 71%）；新增 `main/panel_api.c`（`esp_http_server`）+ 按键历史/ack 关联 ⇒ 相对上一版 +1,344 B |
 | 固件产物（**含 AEC 采集 + 媒体 API 后**，2026-09-15 第三轮） | 自定义分区表：`factory 2M` + `model 2M` + `storage(spiffs) 1M`；`korvo2_oneye.bin` **390,128 B**（`0x5f3f0`，分区余量 81%）；`srmodels/srmodels.bin` **337,952 B**（烧写偏移 `0x210000`）；`flash_args` 已含 `0x210000 srmodels/srmodels.bin` |
 | 固件产物（**含板上回放后**，2026-09-15 第四轮） | `korvo2_oneye.bin` **390,656 B**（`0x5f600`，分区余量 81%）；新增 `main/player.c`（fatfs → wav/mp3 解码 → i2s，动态重设时钟）+ `/api/action` 的 play/stop/set_volume + `/api/status.player{}` |
+| ⚠️ **上表体积口径更正（第十一轮）** | 上面四行（301,152 / 302,496 / 390,128 / 390,656 B）**都不含 Wi-Fi**：用 `xtensa-esp32s3-elf-nm` 核对当时产物，`esp_wifi_init`/`esp_netif_init`/`esp_event_loop_create_default` **均为 0 个已定义符号**（那几轮 `app_main` 未引用 Wi-Fi 代码路径，链接器没拉 `libesp_wifi`/`libwpa_supplicant`/`libnet80211`/`libesp_netif`）。**镜像体积一律以本行以下的完整固件为准**，旧数字仅作历史记录 |
+| 固件产物（**含 SD 卡凭据文件配网后**，2026-09-15 第十一轮） | 删除工程内 `sdkconfig` 后经 `./build-all.sh --toolchains esp32s3@5.5.5 --firmware` 重建（证明 `sdkconfig.defaults*` 可独立决定构建结果）：`korvo2_oneye.bin` **1,930,864 B**（`0x1d7670`；`factory 2M` 余量 **8%**）、`.elf` 16,185,716 B、`bootloader.bin` 20,832 B、`partition-table.bin` 3,072 B；新增 `main/wifi_prov.{c,h}` + `sd-root/oneye-wifi.txt` 模板；**Wi-Fi 首次真正进镜像**（+`libwpa_supplicant`/`libnet80211`/`libesp_netif` 等，约 +1.5 MB @ `-Og`）；`flash_args` 仍含 `0x210000 srmodels/srmodels.bin`；余量偏紧 ⇒ 后续增长时首选打开 `CONFIG_COMPILER_OPTIMIZATION_SIZE=y`（-Os） |
 | AEC 编译期硬伤拦截 | 本轮构建先后拦下 4 类问题并修复：`/api/*` 注释内嵌 `/*`（`-Werror=comment`）、`HTTPD_416_*` 在本 IDF 版本不存在（改手工置状态码）、`I2S_CHANNEL_FMT_*` 需显式 `#include "driver/i2s.h"`、`snprintf` 路径拼接可能截断（`-Werror=format-truncation`，改用 512 B 缓冲 + 显式长度校验）；**并查出 esp-sr 缺 `model` 分区导致模型从不投放的上游坑位**（见 §5.2） |
 | 板卡选择核对 | `board-config.txt` = `CONFIG_IDF_TARGET_ESP32S3=y` + `CONFIG_ESP32_S3_KORVO2_V3_BOARD=y`（由 `--firmware` 轨自动核对） |
 | SDK 链接形态 | 构建日志：`链接预编译库（4 分域库，toolchain=xtensa-esp32s3-elf-gcc-14.2.0）` |
 | 编译期断言 | `board_expect.h` 40+ 条 `_Static_assert` 全部通过（**失败即构建失败**，本轮已用它拦住 4 处真实问题，见总控集成说明 §10.3） |
 | 运行期自检 | **未跑真机**（本轮只出构建产物）——烧录后应看到 `[board-check] … PASS` 逐行输出与 `结果：N 项，失败 0 项` |
-| 本地验证面（设备 API） | 编译通过（IDF 5.5.5 / esp32s3）：`CONFIG_ONEYE_FW_ENABLE_PANEL_API=y`、端口 80、历史 64 条 |
-| 宿主验证面板 | `python3 tools/panel/panel.py --self-test`（内置 mock 设备 + mock broker）**12 项全通过、rc=0**：设备/自检/按键历史/云端确认关联/端到端时延等；详见 [tools/panel/README.md](../../../tools/panel/README.md) §7 |
+| 本地验证面（设备 API） | 编译通过（IDF 5.5.5 / esp32s3）：`CONFIG_ONEYE_FW_ENABLE_PANEL_API=y`、端口 80、历史 64 条；`/api/status.wifi{}` 增 `ssid`/`source`，`/api/action` 增 `wifi_set` |
+| 宿主验证面板 | `python3 tools/panel/panel.py --self-test`（内置 mock 设备 + mock broker + 凭据文件配网模拟）**33 项全通过、rc=0**：设备/自检/按键历史/云端确认关联/端到端时延/AEC 采集/板上回放/**Wi-Fi 配网四态与来源核对**等；详见 [tools/panel/README.md](../../../tools/panel/README.md) §7 |
 | 门禁 | 宿主轨（4×`.a`+4×`.so`+demo+单测 17 组/215 用例/2890 断言）与 backend `contract_check` / `md_link_check`、总控 `md_link_check` 全绿（契约面零改动） |
 
-**后续（真机）**：`idf.py -p <COM> flash monitor` → 核对自检逐行 PASS → 配 Wi-Fi/云端端点（menuconfig）→ 观察 `caps/up` / `status/up`（retained + LWT）/ `shadow/up` / `log/up` 与按键 `event/up`；摄像头取帧另行取证（决定 `video.live` 是否可声明）。
+**后续（真机）**：`idf.py -p <COM> flash monitor` → 核对自检逐行 PASS → **SD 卡放 `oneye-wifi.txt` 复位自动配网** → 观察
+`caps/up` / `status/up`（retained + LWT）/ `shadow/up` / `log/up` 与按键 `event/up`；其间可用面板「Wi-Fi 配网」卡片核对**凭据来源**；
+摄像头取帧另行取证（决定 `video.live` 是否可声明）。
 
 ## 9. 边界
 

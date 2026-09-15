@@ -557,6 +557,21 @@ PAGE = r"""<!doctype html>
   </div>
 
   <div class="card">
+    <h2>Wi-Fi 配网 <small>启动读 SD 卡凭据文件；此处可运行期改配</small></h2>
+    <div class="kv" id="wifimeta"></div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px">
+      <input id="w-ssid" placeholder="SSID" style="min-width:170px">
+      <input id="w-pass" placeholder="密码（开放网络留空）" type="password" style="min-width:170px">
+      <button onclick="wifiSet()">改配并连接</button>
+      <span class="mut" id="wifimsg"></span>
+    </div>
+    <div class="mut" style="font-size:12px;margin-top:6px">
+      持久化：把 <code>oneye-wifi.txt</code>（内容 <code>ssid=…</code> / <code>password=…</code>）放 SD 卡<b>根目录</b>后复位设备，
+      串口出现 <code>[wifi_prov] 从凭据文件读取 Wi-Fi</code> 即生效；本表单只改本次运行、不写文件（明文，仅台面/联调）。
+    </div>
+  </div>
+
+  <div class="card">
     <h2>音频：AEC 采集与 SD 卡媒体 <small>设备 HTTP 直供（支持 Range，可拖动播放）</small></h2>
     <div class="kv" id="aecmeta"></div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin:10px 0">
@@ -645,6 +660,14 @@ async function tick(){
     <div>收发帧</div><div>tx ${cloud.tx_frames||0} / rx ${cloud.rx_frames||0}</div>
     <div>错误</div><div class="mut">${dev.last_error||'—'}</div>`;
 
+  // Wi-Fi 配网卡片
+  const wf = s.wifi||{};
+  $('wifimeta').innerHTML = `
+    <div>状态</div><div>${wf.connected? '<span class="pill ok">已连接</span> '+ (wf.ip||'') : '<span class="pill pend">未连接</span>'}</div>
+    <div>SSID</div><div>${wf.ssid||'<span class="mut">—</span>'}</div>
+    <div>凭据来源</div><div>${wf.source? `<span class="mut">${wf.source}</span>`
+        : '<span class="mut">未配网：把 oneye-wifi.txt 放 SD 卡根目录后复位；或在下方改配</span>'}</div>`;
+
   // 音频 / 媒体卡片
   const media = dev.media || {};
   const aec = (dev.status && dev.status.aec) || {};
@@ -704,6 +727,20 @@ async function act(op, duration_s, path, volume){
   setTimeout(tick, 400);
 }
 function rec(seconds){ act('aec_start', seconds); }
+async function wifiSet(){
+  const ssid = ($('w-ssid').value||'').trim();
+  const pass = $('w-pass').value||'';
+  if(!ssid){ $('wifimsg').textContent = '✗ 请先填 SSID'; return; }
+  $('wifimsg').textContent = '改配中…（设备侧重连，最长约 20 s）';
+  try{
+    const r = await fetch(`/api/action?device=${encodeURIComponent(currentDev||'')}`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({op:'wifi_set', ssid: ssid, password: pass})});
+    const j = await r.json();
+    $('wifimsg').textContent = (j.ok? '✔ ' : '✗ ') + (j.msg||'');
+  }catch(e){ $('wifimsg').textContent = '✗ ' + e; }
+  setTimeout(tick, 1500); setTimeout(tick, 9000); setTimeout(tick, 22000);
+}
 
 $('btn-refresh').onclick = tick;
 tick(); setInterval(tick, __POLL_MS__);
@@ -1022,6 +1059,46 @@ def self_test(verbose: bool = True) -> int:
             bad = dv.post_action({"op": "play", "path": "/spiffs/rec/aec-00001.wav"})
             check("非 SD 路径被拒绝（/spiffs 不上板播放）",
                   bool(bad) and not bad.get("ok"), (bad or {}).get("msg", ""))
+
+        # 4d) Wi-Fi 配网面：状态字段（含凭据来源）+ 运行期改配（成功/失败分支）
+        wf = (dv.status or {}).get("wifi", {})
+        check("Wi-Fi 状态含 ssid/source（配网来源可核对）",
+              all(k in wf for k in ("connected", "ip", "ssid", "source")) and bool(wf.get("ssid")),
+              f"ssid={wf.get('ssid')} source={wf.get('source')}")
+        check("凭据来源标注为 SD 文件",
+              (wf.get("source") or "").startswith("file:"), str(wf.get("source")))
+        set_ok = dv.post_action({"op": "wifi_set", "ssid": "panel-ssid", "password": "secret"})
+        check("运行期改配（POST /api/action wifi_set）", bool(set_ok and set_ok.get("ok")),
+              (set_ok or {}).get("msg", ""))
+        dv.poll()
+        wf2 = (dv.status or {}).get("wifi", {})
+        check("改配后状态回显新 SSID + api 来源",
+              wf2.get("ssid") == "panel-ssid" and wf2.get("source") == "api",
+              f"ssid={wf2.get('ssid')} source={wf2.get('source')}")
+        bad_wifi = dv.post_action({"op": "wifi_set", "ssid": ""})
+        check("空 SSID 被拒绝（wifi_set 参数校验）",
+              bool(bad_wifi) and not bad_wifi.get("ok"), (bad_wifi or {}).get("msg", ""))
+        fail_wifi = dv.post_action({"op": "wifi_set", "ssid": "bad-ssid"})
+        check("改配失败可观测（connected=false + 原因）",
+              bool(fail_wifi) and not fail_wifi.get("ok"), (fail_wifi or {}).get("msg", ""))
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{dev_port}/mock/wifi-cred?ssid=file-ssid",
+                                        timeout=3) as r:
+                json.loads(r.read().decode())
+        except Exception as exc:  # noqa: BLE001
+            check("凭据文件配网回落（mock /mock/wifi-cred）", False, str(exc))
+        else:
+            dv.poll()
+            wf3 = (dv.status or {}).get("wifi", {})
+            check("凭据文件配网回落（mock /mock/wifi-cred）",
+                  wf3.get("ssid") == "file-ssid" and (wf3.get("source") or "").startswith("file:"),
+                  f"ssid={wf3.get('ssid')} source={wf3.get('source')}")
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:18787/", timeout=3) as r:
+                page2 = r.read().decode("utf-8", "replace")
+            check("首页含 Wi-Fi 配网卡片", "Wi-Fi 配网" in page2 and "wifiSet()" in page2)
+        except Exception as exc:  # noqa: BLE001
+            check("首页含 Wi-Fi 配网卡片", False, str(exc))
 
         # 5) 设备离线时的降级（不崩、状态可见）
         mock.stop()

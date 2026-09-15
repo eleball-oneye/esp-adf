@@ -1,0 +1,16 @@
+# oneye-wifi.txt —— korvo2_oneye 板级固件配网凭据（放到 microSD 卡**根目录**）
+#
+# 用法：
+#   ① 把本文件拷到 SD 卡根目录，文件名必须是 oneye-wifi.txt；
+#   ② 填好下面的 ssid / password（等号两侧空白会被去掉，# 开头为注释）；
+#   ③ 插卡、复位设备：串口出现
+#        [wifi_prov] 从凭据文件读取 Wi-Fi：/sdcard/oneye-wifi.txt（ssid=…，密码已提供）
+#        [wifi_prov] Wi-Fi 已获取 IP：192.168.x.x（ssid=…，来源=file:/sdcard/oneye-wifi.txt）
+#      即配网成功；随后固件自动上云并启动本地验证面板（http://<设备IP>/api/status）。
+#
+# 查找顺序：/sdcard/oneye-wifi.txt → /spiffs/oneye-wifi.txt → Kconfig(CONFIG_ONEYE_FW_WIFI_SSID)
+# 键名：ssid（或 wifi_ssid）、password（或 pass / psk / wifi_password）
+# 也接受 `key: value` 形式；文件为 UTF-8、LF 或 CRLF 均可（行尾 CR 会被去掉）。
+
+ssid=your-ssid
+password=your-password

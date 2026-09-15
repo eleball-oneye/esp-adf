@@ -250,6 +250,9 @@ class MockDevice:
         # 板上回放状态（mock：不真的出声，只维护状态机）
         self.player = {"playing": False, "path": "", "codec": "-", "rate_hz": 0,
                        "channels": 0, "elapsed_ms": 0, "volume": 80, "msg": "就绪"}
+        # Wi-Fi 配网（mock：模拟「启动读 SD 凭据文件 → 自动配网」与运行期 wifi_set 的最简语义）
+        self.wifi = {"connected": True, "ip": "127.0.0.1", "ssid": "mock-ssid",
+                     "source": "file:/sdcard/oneye-wifi.txt"}
 
     # ------------------------------------------------------------ 媒体（模拟 AEC 产物）
     def _make_recording(self, seconds: float = 2.0) -> str:
@@ -490,6 +493,29 @@ class MockDevice:
                     self.log(f"[mock] 收到云端 ack：{eid}")
                     break
 
+    # ------------------------------------------------------------ Wi-Fi 配网（mock）
+    def wifi_from_file(self, ssid: str = "mock-ssid") -> dict:
+        """模拟固件读到 SD 卡凭据文件后的状态（source=file:/sdcard/oneye-wifi.txt）。"""
+        with self._lock:
+            self.wifi.update({"connected": True, "ip": "127.0.0.1", "ssid": ssid,
+                              "source": "file:/sdcard/oneye-wifi.txt"})
+        self.log(f"[mock] 凭据文件配网（oneye-wifi.txt）：ssid={ssid}")
+        return {"ok": True, "wifi": dict(self.wifi)}
+
+    def wifi_set(self, ssid: str, password: str = "") -> dict:
+        """模拟运行期改配：ssid 以 bad- 开头视为连接超时（供自检覆盖失败分支）。"""
+        if not ssid:
+            return {"ok": False, "msg": "missing ssid", "wifi": dict(self.wifi)}
+        if ssid.startswith("bad-"):
+            with self._lock:
+                self.wifi.update({"connected": False, "ip": "", "ssid": ssid, "source": "api"})
+            return {"ok": False, "msg": "connect timeout", "wifi": dict(self.wifi)}
+        with self._lock:
+            self.wifi.update({"connected": True, "ip": "127.0.0.1", "ssid": ssid, "source": "api"})
+        self.log(f"[mock] 运行期改配 Wi-Fi：ssid={ssid}（密码{'已提供' if password else '为空'}）")
+        return {"ok": True, "msg": "connecting (see /api/status wifi)", "ssid": ssid,
+                "wifi": dict(self.wifi)}
+
     # ------------------------------------------------------------ HTTP
     def _status(self) -> dict:
         with self._lock:
@@ -497,7 +523,7 @@ class MockDevice:
             return {
                 "fw": self.fw, "board": "ESP32-S3-Korvo-2 v3 (mock)",
                 "uptime_ms": _now_ms() % 10_000_000,
-                "wifi": {"connected": True, "ip": "127.0.0.1"},
+                "wifi": dict(self.wifi),
                 "cloud": {"link_up": True, "transport": "mqtt-tcp",
                           "tx_frames": self.counters["total"], "rx_frames": self.counters["total"]},
                 "selftest": {"total": len(self.checks), "failed": 0},
@@ -562,6 +588,8 @@ class MockDevice:
                     key = q.get("key", ["play"])[0]
                     action = q.get("action", ["click"])[0]
                     self._json(mock.press(key, action))
+                elif parsed.path == "/mock/wifi-cred":
+                    self._json(mock.wifi_from_file(q.get("ssid", ["mock-ssid"])[0]))
                 else:
                     self._json({"error": "not_found"}, 404)
 
@@ -625,6 +653,9 @@ class MockDevice:
                     self._json(mock.player_stop())
                 elif op == "set_volume":
                     self._json(mock.set_volume(int(doc.get("volume") or 0)))
+                elif op == "wifi_set":
+                    self._json(mock.wifi_set((doc.get("ssid") or "").strip(),
+                                             doc.get("password") or ""))
                 else:
                     self._json({"ok": False, "msg": "unknown op"}, 200)
 
@@ -651,7 +682,8 @@ def main() -> int:
                 i += 1
         threading.Thread(target=auto, daemon=True).start()
     print(f"[mock] 就绪：http://127.0.0.1:{args.http_port}/api/status ; "
-          f"按键：curl 'http://127.0.0.1:{args.http_port}/mock/press?key=play&action=click'")
+          f"按键：curl 'http://127.0.0.1:{args.http_port}/mock/press?key=play&action=click' ; "
+          f"凭据文件配网：curl 'http://127.0.0.1:{args.http_port}/mock/wifi-cred?ssid=my-ssid'")
     try:
         while True:
             time.sleep(1)

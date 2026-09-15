@@ -25,13 +25,9 @@
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_timer.h"
-#include "esp_netif.h"
-#include "esp_event.h"
-#include "esp_wifi.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/event_groups.h"
 
 #include "board.h"
 #include "es7210.h"
@@ -44,6 +40,7 @@
 #include "panel_api.h"
 #include "aec_capture.h"
 #include "player.h"
+#include "wifi_prov.h"
 
 static const char *TAG = "korvo2_oneye";
 
@@ -317,64 +314,100 @@ static void keys_start(void)
 #endif
 }
 
-/* ---------------------------------------------------------------- Wi-Fi（板级无关，仅为上云前置） */
+/* ---------------------------------------------------------------- Wi-Fi（配网实现见 wifi_prov.c） */
 
-static EventGroupHandle_t s_wifi_eg;
-#define WIFI_CONNECTED_BIT BIT0
+/* 定义在文件后部（上云入口 / 面板链路快照同步），此处前置声明供 wifi_prov_boot() 调用 */
+static void oneye_start(void);
+static void panel_sync_task(void *arg);
+static void panel_start_if_enabled(void);
 
-static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+/* 联网就绪 → 启动上云。放在独立任务里跑（oneye_start 需较大栈；事件任务只置位）。
+ * 回调会随重连反复触发，故用一次性标志保证 SDK 只启动一次；面板启动本身幂等。 */
+static void cloud_start_task(void *arg)
 {
     (void)arg;
-    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        (void)esp_wifi_connect();
-    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGW(TAG, "Wi-Fi 断开，重连");
-        panel_api_set_wifi(false, NULL);
-        (void)esp_wifi_connect();
-    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t *evt = (ip_event_got_ip_t *)data;
-        char ip[20] = "";
-        esp_ip4addr_ntoa(&evt->ip_info.ip, ip, sizeof(ip));
-        ESP_LOGI(TAG, "Wi-Fi 已获取 IP：%s", ip);
-        panel_api_set_wifi(true, ip);
-#if CONFIG_ONEYE_FW_ENABLE_PANEL_API
-        /* 本地验证面（面板）需要 IP；此处启动，与云端链路是否可用无关 */
-        if (panel_api_start(0) == ESP_OK) {
-            ESP_LOGI(TAG, "验证面板：浏览器打开宿主面板服务，或直接访问 http://%s/api/status", ip);
-        }
-#endif
-        if (s_wifi_eg != NULL) {
-            xEventGroupSetBits(s_wifi_eg, WIFI_CONNECTED_BIT);
-        }
-    }
+    oneye_start();
+    (void)xTaskCreate(panel_sync_task, "panel_sync", 3072, NULL, 3, NULL);
+    vTaskDelete(NULL);
 }
 
-static bool wifi_connect(const char *ssid, const char *password)
+static void on_wifi_ready(void)
 {
-    wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
-    wifi_config_t sta = { 0 };
-
-    s_wifi_eg = xEventGroupCreate();
-    if (s_wifi_eg == NULL) {
-        return false;
+    static bool started;
+    if (started) {
+        return;
     }
-    strncpy((char *)sta.sta.ssid, ssid, sizeof(sta.sta.ssid) - 1);
-    strncpy((char *)sta.sta.password, password, sizeof(sta.sta.password) - 1);
+    started = true;
+    panel_start_if_enabled();     /* 掉线重连后拿到 IP 也能补起本地验证面 */
+    if (xTaskCreate(cloud_start_task, "cloud_start", 6144, NULL, 4, NULL) != pdPASS) {
+        started = false;
+        ESP_LOGE(TAG, "上云任务创建失败（内存不足）");
+        return;
+    }
+    ESP_LOGI(TAG, "已联网 → 启动上云（oneye-dev-sdk）");
+}
 
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    (void)esp_netif_create_default_wifi_sta();
-    ESP_ERROR_CHECK(esp_wifi_init(&init_cfg));
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL));
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta));
-    ESP_ERROR_CHECK(esp_wifi_start());
+/** 启动本地验证面（需已联网获得 IP；与云端链路是否可用无关） */
+static void panel_start_if_enabled(void)
+{
+#if CONFIG_ONEYE_FW_ENABLE_PANEL_API
+    panel_api_set_wifi(wifi_prov_is_connected(), wifi_prov_ip(), wifi_prov_ssid(), wifi_prov_source());
+    if (!wifi_prov_is_connected()) {
+        ESP_LOGW(TAG, "未联网 → 本地验证面板未启动（/api/* 需设备 IP 才可访问）");
+        return;
+    }
+    if (panel_api_start(0) == ESP_OK) {
+        ESP_LOGI(TAG, "本地验证面板：http://%s/api/status（宿主 tools/panel/panel.py 亦可聚合）",
+                 wifi_prov_ip());
+    } else {
+        ESP_LOGE(TAG, "本地验证面板启动失败（端口 %d 被占用？）", CONFIG_ONEYE_FW_PANEL_PORT);
+    }
+#else
+    ESP_LOGI(TAG, "本地验证面板已按 Kconfig 关闭（ONEYE_FW_ENABLE_PANEL_API=n）");
+#endif
+}
 
-    ESP_LOGI(TAG, "等待 Wi-Fi 连接（SSID=%s）…", ssid);
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_eg, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE,
-                                           pdMS_TO_TICKS(20000));
-    return (bits & WIFI_CONNECTED_BIT) != 0;
+/** 配网：凭据来源 = SD/SPIFFS 凭据文件 → Kconfig（SSID 非空时） */
+static void wifi_prov_boot(void)
+{
+    char ssid[WIFI_PROV_SSID_MAX] = { 0 };
+    char pass[WIFI_PROV_PASS_MAX] = { 0 };
+    char src[64] = { 0 };
+    bool have = false;
+
+#if CONFIG_ONEYE_FW_ENABLE_WIFI_FILE
+    /* SD 卡根目录 oneye-wifi.txt（用户投放）；SD 未挂载时自动试 SPIFFS 同名文件 */
+    if (wifi_prov_load_file(ssid, sizeof(ssid), pass, sizeof(pass), src, sizeof(src)) == ESP_OK &&
+        ssid[0] != '\0') {
+        have = true;
+    }
+#endif
+
+    if (!have && CONFIG_ONEYE_FW_WIFI_SSID[0] != '\0') {
+        snprintf(ssid, sizeof(ssid), "%s", CONFIG_ONEYE_FW_WIFI_SSID);
+        snprintf(pass, sizeof(pass), "%s", CONFIG_ONEYE_FW_WIFI_PASSWORD);
+        snprintf(src, sizeof(src), "%s", "kconfig");
+        have = true;
+    }
+
+    if (!have) {
+        ESP_LOGW(TAG, "未找到 Wi-Fi 凭据 → 跳过上云；板级自检/按键/录音/本地回放继续运行");
+        ESP_LOGW(TAG, "配网方式：把 oneye-wifi.txt（内容 ssid=… 与 password=…）放 SD 卡根目录后复位设备");
+        panel_start_if_enabled();     /* 无 IP ⇒ 提示并直接返回 */
+        return;
+    }
+
+    (void)wifi_prov_set_source(src);
+    if (wifi_prov_connect(ssid, pass, 0) != ESP_OK) {
+        ESP_LOGE(TAG, "Wi-Fi 连接失败（来源 %s，ssid=%s）→ 跳过上云；"
+                      "请核对凭据文件内容后复位（也可用面板 /api/action wifi_set 改配）", src, ssid);
+        panel_start_if_enabled();
+        return;
+    }
+
+    ESP_LOGI(TAG, "Wi-Fi 已连接：ip=%s（ssid=%s，来源 %s）", wifi_prov_ip(), ssid, src);
+    panel_start_if_enabled();         /* 本地验证面与云端链路解耦：拿到 IP 就起 */
+    /* 上云由 on_wifi_ready()（联网就绪回调）启动；此处无需重复调用 */
 }
 
 /* ---------------------------------------------------------------- oneye 上云 */
@@ -557,17 +590,11 @@ void app_main(void)
     }
 #endif
 
-    /* ④ 联网 + ⑤ oneye 上云（SSID 为空 → 只跑板级自检与按键） */
-    if (CONFIG_ONEYE_FW_WIFI_SSID[0] == '\0') {
-        ESP_LOGW(TAG, "未配置 Wi-Fi SSID → 跳过上云；板级自检与按键服务继续运行");
-    } else if (!wifi_connect(CONFIG_ONEYE_FW_WIFI_SSID, CONFIG_ONEYE_FW_WIFI_PASSWORD)) {
-        ESP_LOGE(TAG, "Wi-Fi 连接超时 → 跳过上云");
-    } else {
-        ESP_LOGI(TAG, "Wi-Fi 已连接");
-        oneye_start();
-        /* 面板链路快照同步（本地验证面；与云端链路状态解耦） */
-        (void)xTaskCreate(panel_sync_task, "panel_sync", 3072, NULL, 3, NULL);
-    }
+    /* ④ 配网（SD 卡凭据文件优先 → Kconfig 兜底）+ ⑤ oneye 上云
+     * 无凭据/连不上 ⇒ 不中止：板级自检、按键、AEC 录音、板上回放、串口日志仍可用；
+     * 本地验证面板需设备 IP，故仅在联网成功时启动（见 panel_start_if_enabled）。 */
+    wifi_prov_set_ready_cb(on_wifi_ready);
+    wifi_prov_boot();
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(10000));

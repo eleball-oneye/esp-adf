@@ -8,8 +8,9 @@
 #      否则那句 "Please add a line(Name=model) …" 只是赋给一个未被使用的 CMake 变量（上游不会打印），
 #      **构建照常成功、模型却从未投放** ⇒ 真机 AFE 会因为找不到模型而失败。
 #      （已核实：上游 `examples/advanced_examples/{aec,algorithm}` 的 partitions.csv 同样没有 model 分区。）
-#   ② 应用镜像（含 ADF + esp-sr 代码 + oneye-dev-sdk 四库）实测 ~390 KB，但 IDF 缺省 `factory` 仅 1 MB，
-#      留出余量后取 2 MB；
+#   ② 应用镜像（ADF + esp-sr + oneye-dev-sdk 四库 + Wi-Fi/HTTP + ADF 播放链）实测 **~1.93 MB**（`-Og` 未优化；
+#      旧记录里的 ~390 KB **不含 Wi-Fi**，见 README §8），IDF 缺省 `factory` 仅 1 MB ⇒ 取 2 MB（余量约 8%）；
+#      若后续功能继续增长，首选把 `CONFIG_COMPILER_OPTIMIZATION_SIZE=y`（-Os）打开换空间；
 #   ③ 无 SD 卡时录音需要本地兜底存储 ⇒ `storage`(SPIFFS) 1 MB（/spiffs/rec）。
 #
 # 布局（8 MB flash，总占用约 5.1 MB）：

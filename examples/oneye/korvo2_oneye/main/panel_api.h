@@ -66,8 +66,8 @@ void panel_api_key_ack(const char *payload, size_t len);
 /** 链路/统计快照（由 oneye 回调或轮询处更新） */
 void panel_api_set_link(bool cloud_link_up, const char *transport, uint32_t tx_frames, uint32_t rx_frames);
 
-/** Wi-Fi 状态 */
-void panel_api_set_wifi(bool connected, const char *ip);
+/** Wi-Fi 状态（ssid/source 供面板显示配网来源；source 形如 "file:/sdcard/oneye-wifi.txt"） */
+void panel_api_set_wifi(bool connected, const char *ip, const char *ssid, const char *source);
 
 #ifdef __cplusplus
 }

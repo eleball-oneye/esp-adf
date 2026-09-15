@@ -51,3 +51,12 @@ CONFIG_FATFS_FS_LOCK=5
 # SPIFFS（兜底录音存储）
 #
 CONFIG_SPIFFS_MAX_PARTITIONS=3
+
+#
+# 板级功能开关（Kconfig 缺省已为 y；此处显式固化，保证「删掉 sdkconfig 后重建」结果一致——
+# Kconfig 的 default 只对**新建** sdkconfig 生效，改 default 不会改动既有 sdkconfig）
+#
+# 凭据文件配网：SD 卡根目录 oneye-wifi.txt → 开机自动配网（量产固件必须置 n）
+CONFIG_ONEYE_FW_ENABLE_WIFI_FILE=y
+# microSD：凭据文件、AEC 录音落盘、板上回放都依赖它（未插卡仅告警，不阻塞启动）
+CONFIG_ONEYE_FW_ENABLE_SDCARD=y

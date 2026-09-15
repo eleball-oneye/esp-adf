@@ -50,12 +50,22 @@ menu "korvo2_oneye 板级固件配置"
 
     menu "Wi-Fi"
 
+        config ONEYE_FW_ENABLE_WIFI_FILE
+            bool "启用凭据文件配网（SD 卡 /sdcard/oneye-wifi.txt → SPIFFS 兜底）"
+            default y
+            help
+                置 y：启动时先读凭据文件（`ssid=` / `password=` 逐行，`#` 注释），
+                命中即以文件为准连接；未命中再回落到下面的 Kconfig SSID。
+                该文件在 SD 卡上是**明文** Wi-Fi 密码，仅用于**台面/研发配网**；
+                量产形态必须关闭（n），改走 claim + 一机一密凭据（ADR-0007）。
+                同时该开关控制本地验证面的 /api/action wifi_set（运行期换网）。
+
         config ONEYE_FW_WIFI_SSID
-            string "Wi-Fi SSID（空 = 不联网，仅跑板级自检）"
+            string "Wi-Fi SSID（兜底；空且无凭据文件 = 不联网，仅跑板级自检）"
             default ""
 
         config ONEYE_FW_WIFI_PASSWORD
-            string "Wi-Fi 密码"
+            string "Wi-Fi 密码（兜底）"
             default ""
     endmenu
 
@@ -63,10 +73,12 @@ menu "korvo2_oneye 板级固件配置"
 
         config ONEYE_FW_ENABLE_SDCARD
             bool "启用 microSD（1-line；无卡检测引脚）"
-            default n
+            default y
             help
                 本板仅支持 SD_MODE_1_LINE（board.c:173-201），
                 SDCARD_INTR_GPIO = -1（board_def.h:61）⇒ 无插拔事件，只上报挂载成败。
+                缺省 y：Wi-Fi 凭据文件（oneye-wifi.txt）与 AEC 录音/板上回放都落在 SD 卡；
+                未插卡只是挂载失败并打印告警，不阻塞启动（录音自动落 SPIFFS）。
 
         config ONEYE_FW_ENABLE_LCD
             bool "启用 LCD（ILI9341 320x240，SPI2 + TCA9554）"

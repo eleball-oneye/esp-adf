@@ -11,10 +11,14 @@
 #include "esp_log.h"
 #include "esp_http_server.h"
 #include "cJSON.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "media_api.h"
 #include "aec_capture.h"
 #include "player.h"
+#include "panel_api.h"
+#include "wifi_prov.h"
 
 static const char *TAG = "media_api";
 
@@ -353,6 +357,49 @@ static esp_err_t h_media_get(httpd_req_t *req)
 
 /* ------------------------------------------------------------------ 动作（写操作：仅台面验证） */
 
+#if CONFIG_ONEYE_FW_ENABLE_WIFI_FILE
+/* 运行期改配（面板便利：不重烧固件即可换网）。连接过程阻塞最长约 20 s，故放进独立任务，
+ * 避免占住 httpd 任务（httpd 为单任务顺序处理请求）。持久化仍以 SD 卡凭据文件为准——
+ * 本操作只改本次运行，不写回文件。 */
+typedef struct {
+    char ssid[WIFI_PROV_SSID_MAX];
+    char pass[WIFI_PROV_PASS_MAX];
+} wifi_set_req_t;
+
+static void wifi_set_task(void *arg)
+{
+    wifi_set_req_t *r = (wifi_set_req_t *)arg;
+    (void)wifi_prov_set_source("api");
+    esp_err_t rc = wifi_prov_connect(r->ssid, r->pass, 0);
+    panel_api_set_wifi(wifi_prov_is_connected(), wifi_prov_ip(), wifi_prov_ssid(), wifi_prov_source());
+    if (rc == ESP_OK) {
+        ESP_LOGI(TAG, "运行期改配成功：ssid=%s ip=%s", r->ssid, wifi_prov_ip());
+    } else {
+        ESP_LOGE(TAG, "运行期改配失败：ssid=%s（%s）", r->ssid, esp_err_to_name(rc));
+    }
+    free(r);
+    vTaskDelete(NULL);
+}
+
+static esp_err_t wifi_set_start(const char *ssid, const char *pass)
+{
+    wifi_set_req_t *r = (wifi_set_req_t *)calloc(1, sizeof(*r));
+    if (r == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    snprintf(r->ssid, sizeof(r->ssid), "%s", ssid);
+    if (pass) {
+        snprintf(r->pass, sizeof(r->pass), "%s", pass);
+    }
+    if (xTaskCreate(wifi_set_task, "wifi_set", 4096, r, 4, NULL) != pdPASS) {
+        free(r);
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGW(TAG, "运行期改配 Wi-Fi（明文，仅台面/联调）→ ssid=%s", ssid);
+    return ESP_OK;
+}
+#endif /* CONFIG_ONEYE_FW_ENABLE_WIFI_FILE */
+
 static esp_err_t h_action(httpd_req_t *req)
 {
     char body[320];
@@ -412,6 +459,20 @@ static esp_err_t h_action(httpd_req_t *req)
             rc = player_set_volume((int)vol->valuedouble);
             msg = (rc == ESP_OK) ? "volume set" : "volume failed";
         }
+#if CONFIG_ONEYE_FW_ENABLE_WIFI_FILE
+    } else if (strcmp(op_str, "wifi_set") == 0) {
+        /* 面板便利：运行期换网（不落盘；持久化见 SD 卡 oneye-wifi.txt） */
+        const cJSON *ssid = cJSON_GetObjectItem(doc, "ssid");
+        const cJSON *wpass = cJSON_GetObjectItem(doc, "password");
+        if (!cJSON_IsString(ssid) || ssid->valuestring[0] == '\0') {
+            rc = ESP_ERR_INVALID_ARG;
+            msg = "missing ssid";
+        } else {
+            rc = wifi_set_start(ssid->valuestring, cJSON_IsString(wpass) ? wpass->valuestring : "");
+            msg = (rc == ESP_OK) ? "connecting (see /api/status wifi)"
+                                 : "cannot start (no memory)";
+        }
+#endif
     } else {
         msg = "unknown op";
         rc = ESP_ERR_INVALID_ARG;
@@ -465,6 +526,13 @@ esp_err_t media_api_register(httpd_handle_t httpd)
             rc = one;
         }
     }
-    ESP_LOGI(TAG, "媒体/动作 API 已注册：/media/list、/media/<alias>/<path>（支持 Range）、POST /api/action");
+    ESP_LOGI(TAG, "媒体/动作 API 已注册：/media/list、/media/<alias>/<path>（支持 Range）、POST /api/action"
+                  "（aec_start/aec_stop/play/stop/set_volume%s）",
+#if CONFIG_ONEYE_FW_ENABLE_WIFI_FILE
+             "/wifi_set"
+#else
+             ""
+#endif
+             );
     return rc;
 }

@@ -59,19 +59,23 @@ python3 panel.py --device korvo2-0001=http://192.168.1.50 --serial /dev/ttyUSB0@
      状态行显示正在播放的文件、编码、采样率与已播时长（数据来自 `/api/status.player{}`）；
    图片/视频文件提供**网页预览**（板上视频解码本轮不做）；
 5. **设备与链路** —— 固件版本、板卡、运行时长、Wi-Fi IP、云端链路与收发帧、最近错误；
-6. **串口兜底** —— 最近日志尾部（无网时仍能核对按键与自检输出）。
+6. **Wi-Fi 配网** —— 显示连接状态 / SSID / **凭据来源**（`file:/sdcard/oneye-wifi.txt`（SD 凭据文件）、
+   `kconfig`、`api`），并提供运行期改配表单（SSID + 密码 → 设备重连，最长约 20 s 出结果）。
+   持久化以 SD 卡凭据文件为准（见 [固件 README `../../examples/oneye/korvo2_oneye/README.md`](../../examples/oneye/korvo2_oneye/README.md)）；
+   表单只改本次运行、**不写文件**（明文，仅台面/联调）；
+7. **串口兜底** —— 最近日志尾部（无网时仍能核对按键与自检输出）。
 
 ## 4. 设备侧 API（本地验证面）
 
 | 路由 | 返回（要点） |
 | --- | --- |
 | `GET /api/ping` | `{"ok":true,"api_version":"1","role":"local-verification-only"}` |
-| `GET /api/status` | `fw`、`board`、`uptime_ms`、`wifi{connected,ip}`、`cloud{link_up,transport,tx_frames,rx_frames}`、`selftest{total,failed}`、`keys{count,events,history_max}`、**`aec{enabled,recording,last_file,last_bytes,total_files,root}`**、**`media{sd_mounted,rec_root}`** |
+| `GET /api/status` | `fw`、`board`、`uptime_ms`、`wifi{connected,ip,ssid,source}`、`cloud{link_up,transport,tx_frames,rx_frames}`、`selftest{total,failed}`、`keys{count,events,history_max}`、**`aec{enabled,recording,last_file,last_bytes,total_files,root}`**、**`media{sd_mounted,rec_root}`** |
 | `GET /api/selftest` | `{total,failed,note,items:[{item,expect,actual,pass}]}`（运行期核对明细） |
 | `GET /api/keys?limit=N` | `keys[]`（6 键标签）、`current{seq,id,key,action,ts_ms,uplink,ack_ms}`、`counters{}`、`history[]`（**新→旧**，含 `uplink`/`ack_ms`） |
 | `GET /media/list` | `{count,rec_root,aec_enabled,aec_recording,files:[{alias,name,size,mtime,kind,item{url}}]}`（SD 与 SPIFFS；按扩展名判 `audio`/`image`/`video`） |
 | `GET /media/<alias>/<path>` | 文件下载/流式播放，**支持 `Range`**（`206` + `Content-Range` + `Accept-Ranges`）⇒ 浏览器 `<audio>` 可拖动；`alias`=`sdcard`\|`spiffs`；含目录穿越防护 |
-| `POST /api/action` | `{"op":"aec_start","duration_s":N}` / `{"op":"aec_stop"}` / `{"op":"play","path":"/sdcard/..."}` / `{"op":"stop"}` / `{"op":"set_volume","volume":0-100}` ⇒ `{ok,msg,file,recording,playing,volume,last_bytes}`（**写操作，仅台面验证**；`play` 仅接受 SD 卡上的 wav/mp3） |
+| `POST /api/action` | `{"op":"aec_start","duration_s":N}` / `{"op":"aec_stop"}` / `{"op":"play","path":"/sdcard/..."}` / `{"op":"stop"}` / `{"op":"set_volume","volume":0-100}` / `{"op":"wifi_set","ssid":"...","password":"..."}` ⇒ `{ok,msg,file,recording,playing,volume,last_bytes}`（**写操作，仅台面验证**；`play` 仅接受 SD 卡上的 wav/mp3；`wifi_set` 仅当 `CONFIG_ONEYE_FW_ENABLE_WIFI_FILE=y`） |
 
 事件 id 由固件生成（`key-00001`…）并作为 `event/up` 的幂等 `id`；云端 ack 的 `data.ref` 与之对齐 ⇒ **设备侧**能自报三态，
 **面板侧**再用 MQTT 独立验证一次。
@@ -89,7 +93,7 @@ python3 panel.py --device korvo2-0001=http://192.168.1.50 --serial /dev/ttyUSB0@
 | 文件 | 作用 |
 | --- | --- |
 | `panel.py` | 面板服务（HTTP + 设备轮询 + 极简 MQTT 客户端 + 串口兜底 + 内嵌页面 + `--self-test`） |
-| `mock_device.py` | 模拟 Korvo-2 设备（与固件同形的 `/api/*`）+ 极简 MQTT broker + `GET /mock/press?key=&action=` 触发按键；并自扮云端回 `event/down` ack |
+| `mock_device.py` | 模拟 Korvo-2 设备（与固件同形的 `/api/*`）+ 极简 MQTT broker + `GET /mock/press?key=&action=` 触发按键 + `GET /mock/wifi-cred?ssid=` 模拟凭据文件配网；并自扮云端回 `event/down` ack |
 | `devices.example.json` | 设备清单示例 |
 | `README.md` | 本文件 |
 
@@ -97,9 +101,9 @@ python3 panel.py --device korvo2-0001=http://192.168.1.50 --serial /dev/ttyUSB0@
 
 | 项 | 命令 | 结果 |
 | --- | --- | --- |
-| 面板自检（无硬件） | `python3 panel.py --self-test`（内置 mock 设备 + mock broker + 模拟 AEC 录音 WAV + SD 卡媒体） | **25 项全部通过，rc=0**：设备 HTTP、自检明细 15 行、固件标识、MQTT 连接、按键历史（新→旧、**云端确认 3/3**、端到端时延、动作覆盖）、`/api/health`、首页渲染、**首页含音频/AEC 卡片**、**媒体列表非空**、**绝对播放地址**、**Range 206 + Content-Range + RIFF 头**、**触发 AEC 采集**、**采集后列表增长**、**停止采集**、**SD 卡媒体可板上回放标记**、**触发板上播放**、**播放状态回显**、**音量设置**、**停止播放**、**非 SD 路径被拒绝**、设备离线降级 |
-| 设备侧 API + AEC 采集 + 板上回放编译 | `idf.py build`（IDF v5.5.5 / esp32s3 / KORVO2_V3；自定义分区表 + esp-sr AFE） | 见本页 §7.1 构建记录 |
-| 真机联调 | —— | **未做**（本轮只出构建产物；烧录后：配 Wi-Fi → 面板 `--device name=http://<IP>` → 按键三态 + 录 5 s 网页播放 + 插 SD 卡后「板上播放」） |
+| 面板自检（无硬件） | `python3 panel.py --self-test`（内置 mock 设备 + mock broker + 模拟 AEC 录音 WAV + SD 卡媒体 + 凭据文件配网） | **33 项全部通过，rc=0**：设备 HTTP、自检明细 15 行、固件标识、MQTT 连接、按键历史（新→旧、**云端确认 3/3**、端到端时延、动作覆盖）、`/api/health`、首页渲染、**首页含音频/AEC 卡片**、**媒体列表非空**、**绝对播放地址**、**Range 206 + Content-Range + RIFF 头**、**触发 AEC 采集**、**采集后列表增长**、**停止采集**、**SD 卡媒体可板上回放标记**、**触发板上播放**、**播放状态回显**、**音量设置**、**停止播放**、**非 SD 路径被拒绝**、**Wi-Fi 状态含 ssid/source**、**凭据来源标注为 SD 文件**、**运行期改配 wifi_set**、**改配后状态回显新 SSID + api 来源**、**空 SSID 被拒绝**、**改配失败可观测**、**凭据文件配网回落**、**首页含 Wi-Fi 配网卡片**、设备离线降级 |
+| 设备侧 API + AEC 采集 + 板上回放 + 配网编译 | `./build-all.sh --toolchains esp32s3@5.5.5 --firmware`（IDF v5.5.5 / esp32s3 / KORVO2_V3；自定义分区表 + esp-sr AFE + Wi-Fi 配网） | 见本页 §7.1 构建记录 |
+| 真机联调 | —— | **未做**（本轮只出构建产物；烧录后：SD 卡放 `oneye-wifi.txt` → 复位 → 面板 `--device name=http://<IP>` → 按键三态 + 录 5 s 网页播放 + 插 SD 卡后「板上播放」+ Wi-Fi 卡片核对凭据来源） |
 
 ### 7.1 构建记录（AEC 采集 + 媒体 API）
 

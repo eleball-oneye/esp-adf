@@ -117,6 +117,26 @@ menu "korvo2_oneye 板级固件配置"
 
     endmenu
 
+    menu "AEC 采集（录音 → web 播放）"
+
+        config ONEYE_FW_ENABLE_AEC_CAPTURE
+            bool "启用 AEC 采集（esp-sr AFE：AEC + 降噪 → WAV 落盘）"
+            default y
+            help
+                采集链：I2S0 16 kHz/32 bit/RIGHT_LEFT（ES7210 四通道 "RMNM"）→ algorithm_stream
+                （AFE_TYPE_SR 双麦）→ wav_encoder（16 kHz/16 bit 单声道）→ fatfs_stream。
+                落盘：SD 可用 → /sdcard/rec/aec-N.wav；否则 SPIFFS 兜底 → /spiffs/rec/aec-N.wav。
+                文件由本地验证面 GET /media/list 列出、GET /media/<alias>/<path> 播放（带 Range）。
+                关闭后固件不再链接 esp-sr AFE（体积更小；面板音频卡片显示不可用）。
+
+        config ONEYE_FW_AEC_DEFAULT_S
+            depends on ONEYE_FW_ENABLE_AEC_CAPTURE
+            int "缺省录音时长（秒，0 表示由请求指定）"
+            range 1 120
+            default 5
+
+    endmenu
+
     config ONEYE_FW_SELFTEST_STRICT
         bool "板级自检失败即中止上云（推荐）"
         default y

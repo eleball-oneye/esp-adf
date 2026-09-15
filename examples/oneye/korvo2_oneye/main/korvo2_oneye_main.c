@@ -42,6 +42,7 @@
 
 #include "board_expect.h"
 #include "panel_api.h"
+#include "aec_capture.h"
 
 static const char *TAG = "korvo2_oneye";
 
@@ -175,10 +176,14 @@ static void board_init_peripherals(void)
     /* rst：一线模式 microSD（无卡检测；board.c:173-201）——无卡时失败属预期，单独告警 */
     if (audio_board_sdcard_init(s_periph_set, SD_MODE_1_LINE) == ESP_OK) {
         chk_ok("sdcard mount (1-line)", true, "mounted");
+        aec_capture_set_sd_mounted(true);
     } else {
         ESP_LOGW(TAG, "[board-check] %-34s fail（无卡检测引脚 ⇒ 无卡时属预期，需人工核对）",
                  "sdcard mount (1-line)");
+        aec_capture_set_sd_mounted(false);      /* AEC 录音改用 SPIFFS 兜底 */
     }
+#else
+    aec_capture_set_sd_mounted(false);          /* 未启用 SD ⇒ 录音落 SPIFFS */
 #endif
 
 #if CONFIG_ONEYE_FW_ENABLE_LCD
@@ -524,6 +529,13 @@ void app_main(void)
     board_selftest();
     board_init_peripherals();
     keys_start();
+
+    /* ③b AEC 采集（录音 → WAV 落 SD/SPIFFS；供验证面板在 web 播放） */
+    if (aec_capture_init() == ESP_OK) {
+        ESP_LOGI(TAG, "AEC 采集就绪（面板可触发录音：POST /api/action {\"op\":\"aec_start\"}）");
+    } else {
+        ESP_LOGW(TAG, "AEC 采集初始化失败（面板将显示 aec.enabled=false 或不可用）");
+    }
 
     ESP_LOGI(TAG, "[board-check] 自检汇总：%d 项，失败 %d 项", s_check_total, s_check_failed);
 

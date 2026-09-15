@@ -20,6 +20,8 @@
 #include "freertos/semphr.h"
 
 #include "panel_api.h"
+#include "media_api.h"
+#include "aec_capture.h"
 
 static const char *TAG = "panel_api";
 
@@ -388,6 +390,24 @@ static esp_err_t h_status(httpd_req_t *req)
     sb_kv_i(&s, "history_max", PANEL_KEY_HISTORY_MAX);
     sb_raw(&s, "},");
 
+    /* 媒体与 AEC 采集（本地验证面：面板"音频"卡片据此启用/禁用录音按钮） */
+    aec_capture_status_t aec;
+    aec_capture_get_status(&aec);
+    sb_raw(&s, "\"aec\":{");
+    sb_fmt(&s, "\"enabled\":%s,", aec.enabled ? "true" : "false");
+    sb_fmt(&s, "\"recording\":%s,", aec.recording ? "true" : "false");
+    sb_kv_str(&s, "last_file", aec.last_file); sb_raw(&s, ",");
+    sb_kv_i(&s, "last_bytes", (long long)aec.last_bytes); sb_raw(&s, ",");
+    sb_kv_i(&s, "total_files", (long long)aec.total_files); sb_raw(&s, ",");
+    sb_kv_str(&s, "root", aec_capture_root());
+    sb_raw(&s, "},");
+
+    sb_raw(&s, "\"media\":{");
+    sb_fmt(&s, "\"sd_mounted\":%s,", aec.sd_mounted ? "true" : "false");
+    sb_kv_str(&s, "rec_root", aec_capture_root()); sb_raw(&s, ",");
+    sb_kv_i(&s, "poll_hint_ms", 1000);
+    sb_raw(&s, "},");
+
     sb_raw(&s, "\"panel\":{");
     sb_kv_str(&s, "api_version", "1");
     sb_raw(&s, ",");
@@ -544,11 +564,11 @@ esp_err_t panel_api_start(uint16_t port)
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = port;
-    cfg.max_uri_handlers = 8;
+    cfg.max_uri_handlers = 12;          /* 4 个 /api 只读 + /media/list + 媒体通配 + /api/action（留余量） */
     cfg.lru_purge_enable = true;
     cfg.stack_size = 6144;
     cfg.recv_wait_timeout = 5;
-    cfg.send_wait_timeout = 5;
+    cfg.send_wait_timeout = 10;
 
     esp_err_t rc = httpd_start(&s_httpd, &cfg);
     if (rc != ESP_OK) {
@@ -570,6 +590,8 @@ esp_err_t panel_api_start(uint16_t port)
         }
     }
     ESP_LOGI(TAG, "本地验证面已启动：http://<设备IP>:%u/api/{ping,status,selftest,keys}", (unsigned)port);
+    /* 媒体与动作（/media/list、/media/<alias>/<path>、POST /api/action）注册到同一实例 */
+    (void)media_api_register(s_httpd);
     ESP_LOGW(TAG, "提示：该 API 仅为台面/联调验证面，不是云端设备面契约；量产应置 CONFIG_ONEYE_FW_ENABLE_PANEL_API=n");
     return ESP_OK;
 }

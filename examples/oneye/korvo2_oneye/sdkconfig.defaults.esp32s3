@@ -20,3 +20,20 @@ CONFIG_ESP32_S3_KORVO2_V3_BOARD=y
 
 # ADF 音频通路对系统事件任务栈的要求（与 ADF 例程口径一致）
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=3072
+
+#
+# ESP-SR / AFE（AEC 采集所需）
+#
+# 口径说明（重要）：AEC 采集走 **AFE_TYPE_VC**（语音通信型前端：AEC + 降噪），
+#   与「唤醒词/命令词（WakeNet/MultiNet）」无关 ⇒ **不选任何唤醒词与命令词模型**，
+#   只保留降噪（NSNET2）与 VAD（WebRTC）——既省 flash，也避免"模型装了却用不到"。
+#   模型由 esp-sr 打包为 `srmodels/srmodels.bin` 并烧写到分区表中名为 **`model`** 的分区
+#   （见 partitions.csv 与 components/esp-sr/CMakeLists.txt:78-100：缺该分区则**模型根本不会投放**，
+#    而构建仍会成功——上游 examples/advanced_examples/{aec,algorithm} 的 partitions.csv 即缺此分区）。
+#
+CONFIG_MODEL_IN_FLASH=y
+CONFIG_AFE_INTERFACE_V1=y
+CONFIG_SR_NSN_NSNET2=y
+CONFIG_SR_VADN_WEBRTC=y
+CONFIG_SR_MN_CN_NONE=y
+CONFIG_SR_MN_EN_NONE=y

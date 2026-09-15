@@ -1,0 +1,25 @@
+# =============================================================================
+# korvo2_oneye 分区表（自定义）
+#
+# 为什么不用 IDF 缺省的 single-app：
+#   ① AEC 采集走 esp-sr AFE（AEC/降噪），而 **esp-sr 要求分区表里存在名为 `model` 的分区**：
+#      components/esp-sr/CMakeLists.txt:78-100 —— 仅当 `CONFIG_PARTITION_TABLE_CUSTOM=y`
+#      **且** 能查到名为 `model` 的分区（size/offset 非空）时，才会生成并烧写 `srmodels/srmodels.bin`；
+#      否则那句 "Please add a line(Name=model) …" 只是赋给一个未被使用的 CMake 变量（上游不会打印），
+#      **构建照常成功、模型却从未投放** ⇒ 真机 AFE 会因为找不到模型而失败。
+#      （已核实：上游 `examples/advanced_examples/{aec,algorithm}` 的 partitions.csv 同样没有 model 分区。）
+#   ② 应用镜像（含 ADF + esp-sr 代码 + oneye-dev-sdk 四库）实测 ~390 KB，但 IDF 缺省 `factory` 仅 1 MB，
+#      留出余量后取 2 MB；
+#   ③ 无 SD 卡时录音需要本地兜底存储 ⇒ `storage`(SPIFFS) 1 MB（/spiffs/rec）。
+#
+# 布局（8 MB flash，总占用约 5.1 MB）：
+#   nvs      24 KB   phy_init 4 KB   factory 2 MB   model 2 MB   storage 1 MB
+#
+# 注意：改 phy_init/factory 偏移须同步 IDF bootloader 配置（保持 0x10000）。
+# =============================================================================
+# Name,   Type, SubType, Offset,  Size, Flags
+nvs,      data, nvs,     0x9000,  0x6000,
+phy_init, data, phy,     0xf000,  0x1000,
+factory,  app,  factory, 0x10000, 2M,
+model,    data, spiffs,  0x210000, 2M,
+storage,  data, spiffs,  0x410000, 1M,

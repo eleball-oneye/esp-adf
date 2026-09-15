@@ -100,7 +100,33 @@ I (xxx) korvo2_oneye: [board-check] 结果：15 项，失败 0 项
 
 `CONFIG_ONEYE_FW_SELFTEST_STRICT=y`（缺省）时，任一项 FAIL 即**中止上云**并保持自检结论可见——不静默继续。
 
-## 5.1 本地验证面（HTTP JSON API）与验证面板
+## 5.2 AEC 采集（录音 → web 播放）
+
+`CONFIG_ONEYE_FW_ENABLE_AEC_CAPTURE=y`（缺省开）时固件内建 AEC 采集链：
+
+```
+I2S0(CODEC_ADC_I2S_PORT) 16 kHz / 32 bit / RIGHT_LEFT     ← ES7210 四通道按 "RMNM" 排布（2 麦 + AEC 回采）
+  → algorithm_stream（esp-sr AFE，**AFE_TYPE_VC**：AEC + 降噪；不含唤醒词/命令词模型）
+  → wav_encoder（16 kHz / 16 bit / 单声道）
+  → fatfs_stream 落盘
+```
+
+- **落盘位置**：SD 卡可用 → `/sdcard/rec/aec-N.wav`；否则 SPIFFS 兜底 → `/spiffs/rec/aec-N.wav`。
+- **触发方式**：`POST /api/action {"op":"aec_start","duration_s":5}`（到时自动停止）或 `{"op":"aec_stop"}`；
+  验证面板上有「录 5/10/30 s」「停止录音」按钮，并在「音频」卡片里直接播放/下载 WAV（`Range` 已支持拖动）。
+- **分区口径（自定义 `partitions.csv`）**：`factory 2M` + **`model 2M`** + `storage(spiffs) 1M`。
+
+> **⚠️ 关键坑位（已修复，勿踩）——esp-sr 的模型分区**：`components/esp-sr/CMakeLists.txt:78-100` 只在
+> **`CONFIG_PARTITION_TABLE_CUSTOM=y` 且分区表中存在名为 `model` 的分区**时，才生成 `srmodels/srmodels.bin`
+> 并把模型烧到该分区；否则那句提示只是赋给一个未被使用的 CMake 变量（**上游不打印**）⇒ **构建成功、模型从未投放**，
+> 真机 AFE 会因找不到模型而失败。**上游 `examples/advanced_examples/{aec,algorithm}` 的 `partitions.csv` 即缺 `model` 分区**。
+> 本工程已修正：`partitions.csv` 含 `model`（2 M），构建产出 `srmodels.bin` **337,952 B**（仅 NSNET2 + WebRTC VAD；
+> 不含 WakeNet/MultiNet ⇒ 与 `AFE_TYPE_VC` 口径一致，且省下约 3.8 MB flash）。
+- **前置条件**：AFE 需要 PSRAM（`CONFIG_SPIRAM*`，本板 ESP32-S3-WROOM-1 带 Octal PSRAM）。
+- **⚠️ 待真机核对**：① 模组 PSRAM 为 Octal 还是 Quad（若 Quad，把 `CONFIG_SPIRAM_MODE_OCT` 改为 `MODE_QUAD`）；
+  ② 采集链路真实出声与降噪效果（模型已投放是**构建级证据**，运行期仍需实测）；③ SD 卡（一线模式）与 SPIFFS 兜底两条落盘路径。
+
+## 5.3 本地验证面（HTTP JSON API）与验证面板
 
 固件内置一个**本地验证面**（`main/panel_api.c`），供宿主**验证面板**（[`tools/panel/`](../../../tools/panel/README.md)）
 与其他联调工具读取设备状态。**它不是云端设备面契约**（不进 `backend/contracts`、不新增 topic/影子键），
@@ -112,7 +138,9 @@ I (xxx) korvo2_oneye: [board-check] 结果：15 项，失败 0 项
 | `GET /api/status` | 固件/板卡、运行时长、Wi-Fi IP、云端链路与收发帧、自检汇总、按键计数 |
 | `GET /api/selftest` | 板级核对**逐行** `item/expect/actual/pass`（与串口 `[board-check]` 同源） |
 | `GET /api/keys?limit=N` | 6 键标签、`current`（最近一次）、`counters`、`history[]`（新→旧，含上行状态与 ack 时间） |
-| 预留（下一轮） | `GET /media/list`、`GET /media/<path>`（带 `Range`）、`POST /api/action`（录音/回放触发） |
+| `GET /media/list` | 可播放文件清单（SD 与 SPIFFS 兜底存储；按扩展名判定 `audio`/`image`/`video`），并带 `aec_enabled`/`aec_recording`/`rec_root` |
+| `GET /media/<alias>/<path>` | 文件下载/流式播放，**支持 `Range`**（206 + `Content-Range`，浏览器可拖动进度）；`alias` = `sdcard` \| `spiffs`；含目录穿越防护 |
+| `POST /api/action` | `{"op":"aec_start","duration_s":N}` / `{"op":"aec_stop"}`（**写操作，仅台面验证**） |
 
 **按键"历史响应"三态**：本地检测（`pending`）→ 交 SDK 上报（`sent`，失败 `failed`）→ 收到云端 `event/down` ack
 （`acked`，按 `data.ref == 事件 id` 关联，固件生成的 id 形如 `key-00001`）。
@@ -169,6 +197,8 @@ python3 tools/panel/panel.py --self-test
 | 固件轨（推荐入口） | `./build-all.sh --toolchains esp32s3@5.5.5 --firmware` → **rc=0**；产物 `output/firmware/xtensa-esp32s3-elf-gcc-14.2.0/korvo2_oneye/` |
 | 固件产物 | `korvo2_oneye.bin` **301,152 B**（SHA256 `516738fb65fd8cd11409574940ba05ca1cd5baa7371c95b88697688e653dc38a`）；`korvo2_oneye.elf` 5,312,804 B；`bootloader.bin` 20,832 B；`partition-table.bin` 3,072 B |
 | 固件产物（**含本地验证 API 后**，2026-09-15 第二轮） | `korvo2_oneye.bin` **302,496 B**（`0x49da0`；分区余量 71%）；新增 `main/panel_api.c`（`esp_http_server`）+ 按键历史/ack 关联 ⇒ 相对上一版 +1,344 B |
+| 固件产物（**含 AEC 采集 + 媒体 API 后**，2026-09-15 第三轮） | 自定义分区表：`factory 2M` + `model 2M` + `storage(spiffs) 1M`；`korvo2_oneye.bin` **390,128 B**（`0x5f3f0`，分区余量 81%）；`srmodels/srmodels.bin` **337,952 B**（烧写偏移 `0x210000`）；`flash_args` 已含 `0x210000 srmodels/srmodels.bin` |
+| AEC 编译期硬伤拦截 | 本轮构建先后拦下 4 类问题并修复：`/api/*` 注释内嵌 `/*`（`-Werror=comment`）、`HTTPD_416_*` 在本 IDF 版本不存在（改手工置状态码）、`I2S_CHANNEL_FMT_*` 需显式 `#include "driver/i2s.h"`、`snprintf` 路径拼接可能截断（`-Werror=format-truncation`，改用 512 B 缓冲 + 显式长度校验）；**并查出 esp-sr 缺 `model` 分区导致模型从不投放的上游坑位**（见 §5.2） |
 | 板卡选择核对 | `board-config.txt` = `CONFIG_IDF_TARGET_ESP32S3=y` + `CONFIG_ESP32_S3_KORVO2_V3_BOARD=y`（由 `--firmware` 轨自动核对） |
 | SDK 链接形态 | 构建日志：`链接预编译库（4 分域库，toolchain=xtensa-esp32s3-elf-gcc-14.2.0）` |
 | 编译期断言 | `board_expect.h` 40+ 条 `_Static_assert` 全部通过（**失败即构建失败**，本轮已用它拦住 4 处真实问题，见总控集成说明 §10.3） |

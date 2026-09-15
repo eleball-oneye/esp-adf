@@ -51,6 +51,12 @@
 #   ./build-all.sh --toolchains host --no-demo --no-tests
 #   ./build-all.sh --deps-list
 #   ./build-all.sh --no-gates --toolchains host
+#   ./build-all.sh --toolchains esp32s3@5.5.5 --firmware     # 额外构建 Korvo-2 板级固件
+#
+# 固件轨（--firmware，可选；仅对 esp32s3 生效）：
+#   构建 examples/oneye/korvo2_oneye（ESP32-S3-Korvo-2 板级固件：板级参数自检 + oneye-dev-sdk 接入），
+#   产物落 output/firmware/<toolchain-id>/korvo2_oneye/{.bin,.elf,bootloader,partition-table,build.log,SHA256SUMS}。
+#   前置：ADF v2.8 官方仅支持 IDF v5.1–v5.5 ⇒ 请用 esp32s3@5.5.5（6.0.x 会因 esp-sr 依赖 json 而失败）。
 # =============================================================================
 
 set -uo pipefail
@@ -71,6 +77,7 @@ DEPS_MODE="auto"
 DEPS_STRICT=0
 VENDOR_IDF_HEADERS=0
 DEPS_LIST_ONLY=0
+WITH_FIRMWARE=0
 TRANSPORT="mqtt-tcp,mqtt-tls,mqtt-ws,mqtt-wss"
 
 VENDOR_CJSON_PREFIX="oev_cjson_"
@@ -100,6 +107,7 @@ while [ $# -gt 0 ]; do
         --deps-strict)   DEPS_STRICT=1; shift ;;
         --deps-list)     DEPS_LIST_ONLY=1; shift ;;
         --vendor-idf-headers) VENDOR_IDF_HEADERS=1; shift ;;
+        --firmware)      WITH_FIRMWARE=1; shift ;;
         --no-deps)       DEPS_MODE="none"; shift ;;
         --clean)         DO_CLEAN=1; shift ;;
         --list)          DO_LIST=1; shift ;;
@@ -861,6 +869,46 @@ build_demo_esp() { # $1=idf 版本, $2=target
     fi
 }
 
+build_firmware_esp() { # $1=idf 版本, $2=target —— Korvo-2 板级固件（仅 esp32s3；--firmware 时启用）
+    local idfv="$1" target="$2" idf cc tcid out ex bdir
+    [ "$WITH_FIRMWARE" = "1" ] || return 0
+    if [ "$target" != "esp32s3" ]; then
+        warn "固件轨仅支持 esp32s3（ESP32-S3-Korvo-2），跳过：$target"
+        return 0
+    fi
+    idf="$IDF_ROOT/esp-idf-$idfv"; [ -d "$idf" ] || { warn "未找到 IDF：$idf，跳过固件轨"; return 0; }
+    cc="$(esp_cc_for "$idf" "$target")"; [ -n "$cc" ] || return 0
+    tcid="$(basename "$cc" | sed 's/-gcc$//')-gcc-$("$cc" -dumpversion)"
+    ex="$SCRIPT_DIR/examples/oneye/korvo2_oneye"
+    [ -d "$ex" ] || { warn "固件工程不存在：examples/oneye/korvo2_oneye"; return 2; }
+    out="$OUT_ROOT/firmware/$tcid/korvo2_oneye"; mkdir -p "$out"
+    bdir="$OUT_ROOT/.build/korvo2_oneye-$tcid"
+    info "构建 Korvo-2 板级固件 korvo2_oneye（$target @ IDF v$idfv）→ output/firmware/$tcid/korvo2_oneye/"
+    (
+        set +u
+        . "$idf/export.sh" >/dev/null 2>&1
+        export ADF_PATH="$SCRIPT_DIR"
+        export CCACHE_ENABLE="${CCACHE_ENABLE:-0}"   # 并行构建时 ccache 竞争会 ICE
+        cd "$ex" || exit 4
+        rm -rf "$bdir" build                          # 残留 build 会让 set-target 静默回退
+        idf.py -B "$bdir" set-target "$target" > "$out/build.log" 2>&1 \
+            && idf.py -B "$bdir" build >> "$out/build.log" 2>&1
+    ) || { warn "korvo2_oneye 构建失败（见 firmware/$tcid/korvo2_oneye/build.log）"; return 2; }
+
+    # 板卡选择核对（sdkconfig 落在**工程目录**，不在构建目录）
+    grep -E '^CONFIG_IDF_TARGET=|^CONFIG_IDF_TARGET_ESP32S3=|^CONFIG_ESP32_S3_KORVO2_V3_BOARD=' \
+        "$ex/sdkconfig" > "$out/board-config.txt" 2>/dev/null || true
+    cp -f "$bdir"/korvo2_oneye.bin "$bdir"/korvo2_oneye.elf "$bdir"/bootloader/bootloader.bin \
+          "$bdir"/partition_table/partition-table.bin "$out/" 2>/dev/null || true
+    ( cd "$out" && sha256sum ./*.bin ./*.elf > SHA256SUMS 2>/dev/null ) || true
+    if grep -q '^CONFIG_IDF_TARGET_ESP32S3=y' "$out/board-config.txt" 2>/dev/null \
+       && grep -q '^CONFIG_ESP32_S3_KORVO2_V3_BOARD=y' "$out/board-config.txt" 2>/dev/null; then
+        ok "korvo2_oneye 构建通过（板卡选择已核对：esp32s3 + KORVO2_V3）"
+    else
+        warn "korvo2_oneye 构建完成，但 board-config.txt 未确认 esp32s3 + KORVO2_V3（请人工核对）"
+    fi
+}
+
 # ---------------------------------------------------------------- 主流程
 info "oneye-dev-sdk 统一编译 v$SDK_VERSION：SDK=$SDK_DIR"
 info "交付库：${LIBS[*]}（链接顺序 base → mpp → event → log；无聚合库）"
@@ -912,6 +960,14 @@ for entry in "${ESP_OUTS[@]:-}"; do
     IFS='|' read -r _tcid _t _v <<< "$entry"
     build_demo_esp "$_v" "$_t"
 done
+FIRMWARE_RC=0
+if [ "$WITH_FIRMWARE" = "1" ]; then
+    for entry in "${ESP_OUTS[@]:-}"; do
+        [ -n "$entry" ] || continue
+        IFS='|' read -r _tcid _t _v <<< "$entry"
+        build_firmware_esp "$_v" "$_t" || FIRMWARE_RC=1
+    done
+fi
 
 # ------------------------------------------------------------ 汇总报告
 REPORT="$OUT_ROOT/BUILD-REPORT.md"
@@ -974,6 +1030,22 @@ PY
         echo "| \`$(basename "$d")\` | $files |"
     done
     echo
+    echo "## 板级固件（--firmware）"
+    echo
+    if [ "$WITH_FIRMWARE" = "1" ]; then
+        echo "| 工具链目录 | 产物 | 板卡选择（sdkconfig） |"
+        echo "| --- | --- | --- |"
+        for d in "$OUT_ROOT"/firmware/*/korvo2_oneye/; do
+            [ -d "$d" ] || continue
+            tcid="$(basename "$(dirname "$d")")"
+            files="$(cd "$d" && ls -1 | tr '\n' ' ')"
+            board="$(tr '\n' ' ' < "$d/board-config.txt" 2>/dev/null || true)"
+            echo "| \`$tcid\` | $files | ${board:-（未记录）} |"
+        done
+    else
+        echo "（未启用：加 \`--firmware\` 并指定 \`esp32s3@5.5.5\` 可构建 \`examples/oneye/korvo2_oneye\`）"
+    fi
+    echo
     echo "## 契约对账"
     echo
     echo "- 契约一致性：\`tools/check-topics.py\`（SDK topic 字面量 ↔ \`backend/contracts/api/mqtt/asyncapi.yaml\`）"
@@ -986,4 +1058,5 @@ info "完成。产物树："
 info "汇总报告：$REPORT"
 [ "$DEPS_FAIL" = "1" ] && { err "存在 required 依赖缺失（--deps-strict 生效），构建判定失败"; LASTRC=1; }
 [ "$GATE_RC" = "1" ] && { err "门禁未通过（见上）"; LASTRC=1; }
+[ "$FIRMWARE_RC" = "1" ] && { err "板级固件构建失败（见上）"; LASTRC=1; }
 exit $LASTRC

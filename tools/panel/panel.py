@@ -79,6 +79,8 @@ class MiniMqtt:
         self._out_pid = 1
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._buf = b""
+        self._connack_seen = False
 
     # ---------------------------------------------------------------- 报文编码
     @staticmethod
@@ -144,8 +146,25 @@ class MiniMqtt:
         while not self._stop.is_set():
             try:
                 self.sock = socket.create_connection((self.host, self.port), timeout=5)
-                self.sock.sendall(self._connect_packet())
                 self.sock.settimeout(1.0)
+                self._buf = b""
+                self._connack_seen = False
+                self.sock.sendall(self._connect_packet())
+                # ⚠️ MQTT 3.1.1：CONNECT 之后必须**先收到 CONNACK 再发其他报文**。
+                # 此前在 CONNECT 后立刻发 SUBSCRIBE，部分 broker（如 EMQX）会丢弃该订阅
+                # ⇒ 症状 = 「connected=True、订阅列表正常，但一条消息都收不到」
+                # （真机联调：设备的 15 条 event/up 全部未被面板收到，云端桩因此没回 ack）。
+                deadline = time.time() + 5.0
+                while not self._connack_seen and time.time() < deadline:
+                    try:
+                        data = self.sock.recv(4096)
+                    except socket.timeout:
+                        continue
+                    if not data:
+                        break
+                    self._feed(data)
+                if not self._connack_seen:
+                    raise OSError("CONNACK 超时")
                 self.connected = True
                 self.last_error = None
                 self.log(f"[panel] MQTT 已连接 {self.host}:{self.port}")
@@ -209,6 +228,7 @@ class MiniMqtt:
             if ptype == 3:                     # PUBLISH
                 self._handle_publish(body)
             elif ptype == 2:                   # CONNACK
+                self._connack_seen = True
                 if len(body) >= 2 and body[1] != 0:
                     self.last_error = f"CONNACK rc={body[1]}"
             elif ptype in (4, 5, 6, 7, 9, 11, 13):
@@ -796,6 +816,37 @@ def make_handler(state: PanelState, poll_ms: int):
         def do_POST(self):  # noqa: N802
             parsed = urllib.parse.urlparse(self.path)
             q = urllib.parse.parse_qs(parsed.query)
+            if parsed.path == "/api/mqtt/ack":
+                # 台面工具：直接向某节点投一条 event/down ack（不依赖设备上行）。
+                # 用于复现/验证设备侧的 ack 接收路径（如崩溃排查、三态演示）。
+                if not (state.mqtt.get("enabled") and getattr(state, "mqtt_client", None)):
+                    self._send(503, b'{"error":"mqtt_disabled"}')
+                    return
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b"{}"
+                try:
+                    doc = json.loads(raw.decode("utf-8", "replace") or "{}")
+                except ValueError:
+                    self._send(400, b'{"error":"invalid_json"}')
+                    return
+                node = doc.get("node")
+                ref = doc.get("ref")
+                if not node or not ref:
+                    self._send(400, b'{"error":"node_and_ref_required"}')
+                    return
+                env = {"v": 1, "id": f"ack-{ref}", "ts": _now_ms(), "type": "ack",
+                       "data": {"ref": ref, "code": doc.get("code", "ok"),
+                                "msg": doc.get("msg", "panel manual ack")}}
+                ok = state.mqtt_client.publish(f"rmng/dev/{node}/event/down",
+                                               json.dumps(env, ensure_ascii=False).encode("utf-8"))
+                state.mqtt.setdefault("ack_stub", {}).setdefault("manual", 0)
+                if ok:
+                    state.mqtt["ack_stub"]["manual"] += 1
+                state.log(f"[panel] 手动投递 ack → rmng/dev/{node}/event/down ref={ref} ok={ok}")
+                self._send(200 if ok else 500,
+                           json.dumps({"ok": bool(ok), "topic": f"rmng/dev/{node}/event/down",
+                                       "payload": env}, ensure_ascii=False).encode("utf-8"))
+                return
             if parsed.path != "/api/action":
                 self._send(404, b'{"error":"not_found"}')
                 return

@@ -16,6 +16,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_http_server.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
@@ -436,6 +437,18 @@ static esp_err_t h_status(httpd_req_t *req)
     sb_raw(&s, "\"panel\":{");
     sb_kv_str(&s, "api_version", "1");
     sb_raw(&s, ",");
+    /* 内存视图（本地验证面）：排查「SD 写入失败（DMA 内存不足）/ 任务栈不足」这类问题必需 */
+    sb_raw(&s, "\"heap\":{");
+    sb_kv_i(&s, "internal_free", (long long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    sb_raw(&s, ",");
+    sb_kv_i(&s, "internal_largest", (long long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    sb_raw(&s, ",");
+    sb_kv_i(&s, "dma_free", (long long)heap_caps_get_free_size(MALLOC_CAP_DMA));
+    sb_raw(&s, ",");
+    sb_kv_i(&s, "dma_largest", (long long)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+    sb_raw(&s, ",");
+    sb_kv_i(&s, "psram_free", (long long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    sb_raw(&s, "},");
     sb_kv_str(&s, "scope", "local-verification-only");
     sb_raw(&s, "}");
     sb_raw(&s, "}");

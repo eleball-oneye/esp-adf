@@ -189,17 +189,76 @@ void aec_capture_set_sd_mounted(bool mounted)
 
 /* ------------------------------------------------------------------ 采集线程 */
 
+/* 计时口径（真机修复 2026-09-15，两轮）：
+ *   ① 原实现「起管线即计时」把 AFE 预热算进时长（请求 5 s 只得 ~4 s）；
+ *   ② 改为「按文件大小探测首帧」又受 FATFS 写缓冲滞后影响（请求 5 s 得 ~8.4 s）；
+ *   ③ 现按**写入元素已写字节数**（fatfs_stream 用 audio_element_update_byte_pos() 维护，
+ *      无缓冲滞后）精确计时：写到 `duration_s × 采样率 × 2 B + 44 B 头` 即停。
+ *   同时保留「5 s 内一个字节都没写」的告警（对应 SD/DMA 写入失败）。 */
+#define AEC_NO_DATA_WARN_MS 5000u
+
 static void aec_stop_task(void *arg)
 {
     uint32_t seconds = (uint32_t)(uintptr_t)arg;
-    vTaskDelay(pdMS_TO_TICKS(seconds * 1000));
-    ESP_LOGI(TAG, "采集时长（%u s）已到，自动停止", (unsigned)seconds);
+    const uint32_t target_bytes = (uint32_t)44u + seconds * AEC_CAPTURE_RATE * 2u; /* 16 bit 单声道 */
+    uint32_t waited = 0;
+    bool got_data = false;
+
+    while (waited < (seconds * 1000u) + 15000u) {
+        audio_element_info_t info;
+        memset(&info, 0, sizeof(info));
+        audio_element_handle_t w = s_writer;
+        if (w != NULL && audio_element_getinfo(w, &info) == ESP_OK) {
+            if (info.byte_pos > 44u && !got_data) {
+                got_data = true;
+                ESP_LOGI(TAG, "首帧已写入（%d 字节）→ 采集 %u s 后自动停止",
+                         (int)info.byte_pos, (unsigned)seconds);
+            }
+            if (info.byte_pos >= target_bytes) {
+                ESP_LOGI(TAG, "已达到目标时长（%u s / %u 字节）",
+                         (unsigned)seconds, (unsigned)info.byte_pos);
+                break;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+        waited += 50u;
+        if (!got_data && waited >= AEC_NO_DATA_WARN_MS) {
+            ESP_LOGW(TAG, "启动 %u ms 仍无音频数据写入——若最终文件仅 44 字节，"
+                          "请查 SD 写入失败（DMA/内部内存）或 AFE 取帧任务创建失败",
+                     (unsigned)waited);
+            got_data = true;   /* 只告警一次 */
+        }
+    }
+
     (void)aec_capture_stop();
     s_stop_task = NULL;
     vTaskDelete(NULL);
 }
 
 /* ------------------------------------------------------------------ 启停 */
+
+/* 写盘预检（真机修复 2026-09-15）：SD 写入在 DMA/内部内存紧张时会直接失败
+ *   sdmmc_cmd: allocate_dma_buf: not enough mem, err=0x101
+ *   diskio_sdmmc: sdmmc_write_blocks failed (0x101)
+ * 结果是**录出 0 字节文件**（面板表现为"录不满时长/没声音"）。这里在起管线前先写
+ * 512 B（FATFS 一个扇区）探针；失败即把落盘根切到 SPIFFS 兜底，避免产出空文件。 */
+static bool root_writable(const char *root)
+{
+    char probe[AEC_CAPTURE_PATH_MAX];
+    int n = snprintf(probe, sizeof(probe), "%s/.write-probe", root);
+    if (n <= 0 || (size_t)n >= sizeof(probe)) {
+        return false;
+    }
+    FILE *fp = fopen(probe, "wb");
+    if (fp == NULL) {
+        return false;
+    }
+    uint8_t buf[512] = { 0 };
+    size_t w = fwrite(buf, 1, sizeof(buf), fp);
+    (void)fclose(fp);
+    (void)remove(probe);
+    return w == sizeof(buf);
+}
 
 esp_err_t aec_capture_start(uint32_t duration_s, char *out_path, size_t cap)
 {
@@ -216,6 +275,13 @@ esp_err_t aec_capture_start(uint32_t duration_s, char *out_path, size_t cap)
     s_st.last_err = ESP_OK;
     if (duration_s == 0) {
         duration_s = AEC_DEFAULT_DURATION_S;
+    }
+    /* 写盘预检：SD 不可写则回落 SPIFFS（避免空文件） */
+    if (s_st.sd_mounted && !root_writable(AEC_ROOT_SD)) {
+        ESP_LOGE(TAG, "SD 写盘预检失败（DMA/内部内存不足？）→ 本次改用 SPIFFS 兜底：%s",
+                 AEC_ROOT_SPIFFS);
+        s_st.sd_mounted = false;
+        snprintf(s_st.root, sizeof(s_st.root), "%s", AEC_ROOT_SPIFFS);
     }
     char path[AEC_CAPTURE_PATH_MAX];
     ensure_dir(s_st.sd_mounted ? "/sdcard" : "/spiffs");
@@ -338,6 +404,14 @@ esp_err_t aec_capture_stop(void)
     s_st.last_duration_ms = (uint32_t)(esp_timer_get_time() / 1000 % 1000000);
     aec_unlock();
     ESP_LOGI(TAG, "采集结束：%s（%u 字节）；可用面板 /media/list 播放", path, (unsigned)bytes);
+    /* 0 字节 = 一个字都没写进去：真机实测该现象对应 SD 写入失败（DMA 内存不足），
+     * 串口会出现 `sdmmc_cmd: allocate_dma_buf: not enough mem` /
+     * `diskio_sdmmc: sdmmc_write_blocks failed (0x101)`。
+     * 这里显式报错（不静默），并把可能原因写进面板可见的 last_msg。 */
+    if (bytes == 0) {
+        ESP_LOGE(TAG, "采集未写入任何数据（0 字节）——检查 SD 写入是否失败（DMA/内部内存不足），"
+                      "或换用 SPIFFS 兜底路径");
+    }
     return ESP_OK;
 #endif
 }

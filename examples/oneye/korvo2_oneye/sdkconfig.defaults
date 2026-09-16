@@ -38,6 +38,24 @@ CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+#
+# 内部/DMA 内存保留（真机修复 2026-09-15）：Wi-Fi + oneye-dev-sdk + esp-sr AFE 同时跑时，
+# SDMMC 写卡需要 MALLOC_CAP_DMA 的内部缓冲，缺了会报
+#   sdmmc_cmd: allocate_dma_buf: not enough mem, err=0x101
+#   diskio_sdmmc: sdmmc_write_blocks failed (0x101)
+# ⇒ 录音文件只有 0 字节（"录不满时长/没声音"的真因）。把保留量从缺省 32 KB 提到 64 KB。
+#
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
+#
+# 内部 RAM 减压（真机修复 2026-09-15）：IDF 缺省把「小于 16 KB 的一般分配」都放内部 RAM，
+# 于是 Wi-Fi + SDK + AFE 迅速吃光内部 RAM，出现
+#   AUDIO_THREAD: Error creating RestrictedPinnedToCore algo_fetch
+#   ALGORITHM_STREAM: Failed to create algo_fetch task
+#   AFE: afe_feed: handle or input data is NULL!
+# ⇒ AFE 取不到帧 ⇒ 录音只有 44 B 头。把阈值降到 4 KB，让中等分配走 PSRAM。
+#   实测：internal_free 39 KB→88 KB、internal_largest 15 KB→40 KB，录音恢复正常。
+#
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
 
 #
 # FATFS（SD 卡上的录音/媒体文件名可能较长）

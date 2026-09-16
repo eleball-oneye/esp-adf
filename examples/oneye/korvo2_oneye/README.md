@@ -211,6 +211,8 @@ I2S0(CODEC_ADC_I2S_PORT) 16 kHz / 32 bit / ONLY_LEFT        ← 单麦口径：i
 | `POST /api/lcd/draw?pattern=<bars\|grid\|checker\|test\|status>` | **板载 LCD 图案下发**（第十七轮新增）：设备真重绘（`panel.lcd.draws` 递增），人眼/拍照对账（§5.7） |
 | `POST /api/camera/capture` | **板载摄像头抓帧**（第十八轮新增）：抓一帧 → `/sdcard/cam/cap-%05u.jpg`，返回 `path/bytes/w/h/ms/url/err`；`url` 可直接经 `/media` 显示（§5.8） |
 | `POST /api/camera/reinit?fmt=&fb=&fbc=&grab=&xclk=&psram=&q=` | **摄像头取帧配置旋钮**（第十八轮新增，仅台面排障）：在同一块板子上对比定位取帧失败，回显生效配置（§5.8） |
+| `POST /api/camera/snapshot` | **抓一帧不落盘**（第十九轮新增）：直接回 `image/jpeg` 字节 —— 面板「预览」的**回落通道**（~1 帧/s 轮询即得近实时画面，且不给 SD 卡写放大） |
+| `GET http://<设备>:81/stream` | **MJPEG 预览流**（第十九轮新增，**独立 httpd 实例**）：`multipart/x-mixed-replace`，浏览器 `<img>` 直接显示；主验证面（:80）轮询不受影响（§5.8） |
 
 **按键"历史响应"三态**：本地检测（`pending`）→ 交 SDK 上报（`sent`，失败 `failed`）→ 收到云端 `event/down` ack
 （`acked`）。
@@ -277,7 +279,17 @@ python3 tools/panel/panel.py --self-test
 
 **关键坑（内部 DMA 内存）**：`cam_hal` 在 **`psram_mode=false`** 时会额外申请 `dma_buffer_size=30720 B` 的**内部 DMA** 缓冲（`cam_hal.c:522`，仅非 psram 分支）。本板默认 `CONFIG_CAMERA_PSRAM_DMA` 未开 ⇒ 串口 `PSRAM DMA mode disabled` ⇒ 内部 RAM 只剩 ~18 KB、最大连续块 7.6 KB，**SDK 上云直接 `base start 失败：out of memory`**（表现为"摄像头一开，云端确认就没了"）。修法：`esp_camera_set_psram_mode(true)`（帧缓冲直接作 DMA 目标）⇒ 内部 `internal_free` 18 KB → ~26 KB、云端与摄像头**同时可用**。该结论已固化为默认值与 `/api/camera/reinit` 旋钮。
 
-**排障旋钮（本地验证面）**：`POST /api/camera/reinit?fmt=jpeg|rgb565&fb=dram|psram&fbc=1|2|3&grab=when_empty|latest&xclk=10|20|40&psram=0|1&q=0..63` —— 在**同一块板子**上对比定位，不靠反复烧写猜；生效配置回显在 `/api/status.panel.camera{format,fb_loc,fb_count,grab,xclk_mhz,psram_dma,quality}`。
+**排障旋钮（本地验证面）**：`POST /api/camera/reinit?fmt=jpeg|rgb565&fb=dram|psram&fbc=1|2|3&grab=when_empty|latest&xclk=10|20|40&psram=0|1&q=0..63` —— 在**同一块板子**上对比定位，不靠反复烧写猜；生效配置回显在 `/api/status.panel.camera{format,fb_loc,fb_count,grab,xclk_mhz,psram_dma,quality,stream_port,stream_frames,stream_clients}`。
+
+**预览（第十九轮新增）**：两条通道，面板自动选优、失败自动回落——
+
+| 通道 | 设备侧 | 实测 | 特点 |
+| --- | --- | --- | --- |
+| **MJPEG 流**（首选） | `GET http://<设备>:81/stream`（`camera_api_stream_start()` 起**第二个 httpd 实例**） | 12 s 收到 **93 帧 ≈ 7.8 帧/s**、429 KB（320×240，编码 ~110 ms/帧） | 长连接；因为跑在独立实例上，**主验证面 `:80` 的轮询全程 49–89 ms 正常、云链路不掉**（真机实测） |
+| **单帧轮询**（回落） | `POST /api/camera/snapshot`（**不落盘**，内存 JPEG 直回） | 单帧 ~3.5–5.7 KB、~120 ms | 流端口连不上/浏览器不支持 MJPEG 时由面板自动切换（~1 帧/s），**不写 SD** |
+
+> ⚠️ **边界**：预览是**局域网本地验证面**（:81 长连接 / 内存 JPEG），**不是**云端设备面契约的媒体数据面（`mpp`/`http_upload`）。因此**不得**据此声明 `video.live`——该能力位要求「编码 + 上行数据面」在契约承载上落地（见 §7/§9）。
+> ⚠️ **内存代价**：第二个 httpd 实例占用内部 RAM（流任务栈 5 KB）⇒ 内部 `internal_free` 由 ~26 KB 降到 ~18 KB（真机读数）。若哪天起不来，串口会打 `预览流服务启动失败：…`，面板回落单帧轮询，**其余功能不受影响**。
 
 **边界（不得越过）**：抓帧只用于**验证面**（本地 HTTP + `/media` 只读面），**不声明 `video.live`** —— 采集声明的前提是"模组装配 + 真机取帧"（已满足，见映射页 §6-1），但 `video.live` 还要求**编码 + 上行数据面**（MJPEG/`http_upload`）落地，本工程未实现（见 §7/§9）。
 
@@ -371,6 +383,8 @@ python3 tools/panel/panel.py --self-test
 | **板载摄像头（真机，第十八轮已闭环）** | `panel.camera={inited:"true",sensor:"OV3660",pid:13920(0x3660),format:"rgb565",fb_loc:"psram",fb_count:2,grab:"when_empty",xclk_mhz:40,psram_dma:1,root:"/sdcard/cam"}`；串口 `Camera PID=0x3660 / Detected OV3660 camera / Detected camera at address=0x3c / sccb-ng: pin_sda 17 pin_scl 18`；`POST /api/camera/capture` → `/sdcard/cam/cap-0000N.jpg`（320×240，2.3–7.0 KB，110–130 ms），`/media/sdcard/cam/…` 下载后经宿主解码核对 = **真实图像**（均值亮度 54–148、17 档亮度分布，非纯色/花屏）；面板「板载摄像头」卡片抓拍 + 显示最近一帧已跑通 |
 | ⚠️ **摄像头 JPEG 直出不可用（真机，第十八轮查明）** | `fmt=jpeg` 时串口持续 `cam_hal: NO-SOI - JPEG start marker missing` → `Failed to get frame: timeout` ⇒ `esp_camera_fb_get()` 恒 NULL。改用 `rgb565` + 软件 `frame2jpg()` 落盘 JPEG 后正常（配置矩阵与判据见 §5.8） |
 | ⚠️ **摄像头吃内部 DMA ⇒ 上云 OOM（真机，第十八轮已修）** | `PSRAM DMA mode disabled` 时驱动额外申请 **30,720 B 内部 DMA**（`cam_hal.c:522` 非 psram 分支）⇒ 内部 `internal_free` 54 KB→18 KB、最大连续块 30 KB→7.6 KB ⇒ SDK `base start 失败：out of memory`（**云链路与摄像头互斥**）。修法 `esp_camera_set_psram_mode(true)`（`psram_dma=1`）：内部余量回到 ~26 KB，**云链路（`link_up=true`、`tx_frames=5`、授时 `synced=true`）与抓帧同时可用** |
+| ⚠️ **抓拍后网页无图（真机，第十九轮已修）** | 现象：面板提示「已抓拍」但图不显示。根因：`/media/list` 只扫 `rec/` 与根目录，**从不扫 `cam/`** ⇒ 面板按 `cam/*` 过滤媒体列表永远为空、`<img>` 拿不到 src（而文件本身 `GET /media/sdcard/cam/…` 一直是 200 + `image/jpeg`）。修法：① 设备侧 `/media/list` 增加 `cam` 目录扫描；② 面板抓拍后**直接用抓拍响应里的 `url` 贴图**，不再依赖媒体列表轮询 |
+| **预览流（真机，第十九轮新增）** | `panel.camera.stream_port=81`；`curl` 实测 12 s → **93 帧 / 429,540 B ≈ 7.8 帧/s**，首段为 `--oneyeframe / Content-Type: image/jpeg / Content-Length: …`；**同时** `GET /api/status` 49–89 ms 正常、`cloud.link_up=true`（独立 httpd 实例的价值）；面板「开始预览/停止预览」按钮 + `GET /api/camera/snapshot.jpg` 回落通道均已验证 |
 | **摄像头探测的初始化顺序（真机，第十八轮查明）** | 把 `camera_api_init()` 放到 `board_init_peripherals()` **之前**（照抄上游 `lcd_camera` 的 "camera init in advance" 注释）⇒ `camera probe … no sensor FAIL`（ADF I2C 总线尚未建立）；放在**板级初始化之后**⇒ 探测成功。另：该失败曾因计入硬自检而触发 `SELFTEST_STRICT` 中止上云 ⇒ 设备连 IP 都拿不到（**看不到失败原因**），故摄像头改用提示级 `chk_warn`（记红行、不中止） |
 | **待续（未闭环，明确记录）** | ① **可听性**：回放链路已把 PCM 完整时钟输出（`AEL_IO_DONE` + 时长吻合），但「扬声器是否真的出声」需人耳确认（PA `GPIO48` 已在 `es8311_codec_init` 打开、音量 80）；② **麦克风灵敏度**：原始幅度随环境变化（123→390），对着板子说话的幅度取证待补；③ **`video.live` 上行数据面**（MJPEG 编码 + `http_upload`/`mqtt_frame`）未实现 ⇒ 该能力位仍不得声明 |
 | ⚠️ **镜像余量告急（第十八轮）** | `korvo2_oneye.bin` **2,045,856 B**（`0x1f37a0`），`factory 2M` 分区**仅余 2%**（0xc860）。后续增长首选 `CONFIG_COMPILER_OPTIMIZATION_SIZE=y`（-Os），或扩 `factory` 分区（16 MB flash 尚有余量） |
@@ -383,7 +397,7 @@ LCD 状态屏与摄像头抓帧见 §5.7/§5.8（**已真机闭环**），`video
 
 - 本工程**不实现**：媒体数据面（webrtc/http_upload/mqtt_frame，含 `video.live` 上行）、PTZ/命令执行面、
   AI 端侧初筛、LED 显示服务、触摸、电池采集；
-- 板载 **LCD 状态屏**与**摄像头抓帧**属**本地验证面**（`/api/*` + `/media/*` 只读面），不是云端设备面契约的一部分：**不新增 topic / 影子键 / 能力位**；
+- 板载 **LCD 状态屏**、**摄像头抓帧**与**局域网 MJPEG 预览**（:81）属**本地验证面**（`/api/*`、`:81/stream`、既有 `/media/*` 只读面），不是云端设备面契约的一部分：**不新增 topic / 影子键 / 能力位**；预览也**不构成** `video.live` 的声明依据（缺契约承载的编码+上行数据面）；
 - 抓帧与云端链路共享内部 DMA 内存：改摄像头配置后必须同时核对 `panel.heap.internal_free` 与 `cloud.link_up`（见 §5.8 的关键坑）；
 - 上游资产纪律：`esp-adf` 上游分支（`master` / `release/*`）与 `esp-repo/` 镜像**只读**，我方改动只进集成分支；`esp32-camera` 以 `idf_component.yml` **按 commit pin** 引入（不静默跟随上游默认分支）；
 - 真机烧录/取证（录音可听性、麦克风灵敏度、SD 插拔）登记为后续卡，不在本工程内声称通过。

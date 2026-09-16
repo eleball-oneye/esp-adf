@@ -221,6 +221,9 @@ static esp_err_t h_media_list(httpd_req_t *req)
     int total = 0;
     for (size_t i = 0; i < sizeof(s_roots) / sizeof(s_roots[0]); i++) {
         total += scan_dir(files, s_roots[i].alias, s_roots[i].root, "rec", MEDIA_LIST_MAX);
+        /* 摄像头抓拍目录也要列：否则面板「板载摄像头」卡片拿不到最近一帧
+         * （第十八轮真机 symptom：抓拍成功、文件可下载，但列表里没有 cam 目录下的 jpg ⇒ 页面无图） */
+        total += scan_dir(files, s_roots[i].alias, s_roots[i].root, "cam", MEDIA_LIST_MAX);
         total += scan_dir(files, s_roots[i].alias, s_roots[i].root, NULL, MEDIA_LIST_MAX);
     }
     cJSON_AddNumberToObject(root, "count", total);

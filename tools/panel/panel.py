@@ -355,6 +355,18 @@ class DeviceView:
             self.last_error = f"/api/camera/capture: {exc}"
             return None
 
+    def post_camera_snapshot(self, timeout: float = 12.0) -> bytes | None:
+        """本地验证面：抓一帧**不落盘**，直接取回 JPEG 字节（面板预览的回落通道）。"""
+        req = urllib.request.Request(f"{self.base_url}/api/camera/snapshot", data=b"", method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if resp.status != 200:
+                    return None
+                return resp.read()
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            self.last_error = f"/api/camera/snapshot: {exc}"
+            return None
+
     def media_url(self, rel_url: str) -> str:
         """把设备返回的相对 url（media/<alias>/<path>）拼成可直接播放的绝对地址。"""
         return f"{self.base_url}/{rel_url.lstrip('/')}"
@@ -658,14 +670,16 @@ PAGE = r"""<!doctype html>
   </div>
 
   <div class="card">
-    <h2>板载摄像头 <small>OV3660（SCCB 0x3c）——抓一帧落 SD，走既有 /media 只读面在网页显示</small></h2>
+    <h2>板载摄像头 <small>OV3660（SCCB 0x3c）——抓一帧落 SD；预览走设备 MJPEG 流（端口 81），失败自动回落单帧轮询</small></h2>
     <div class="kv" id="cammeta"></div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px">
       <button onclick="camCapture()">抓拍一帧</button>
+      <button onclick="camPreview(true)">开始预览</button>
+      <button onclick="camPreview(false)">停止预览</button>
       <span class="mut" id="cammsg"></span>
     </div>
     <div style="margin-top:10px">
-      <img id="camimg" alt="（最近一帧：点上方按钮抓拍）" style="max-width:100%;border:1px solid var(--line);border-radius:8px;background:#0b1016">
+      <img id="camimg" alt="（最近一帧：点上方按钮抓拍；预览：点「开始预览」）" style="max-width:100%;border:1px solid var(--line);border-radius:8px;background:#0b1016">
     </div>
     <div class="mut" style="font-size:12px;margin-top:6px">
       引脚来自 <code>board_def.h</code> 的 <code>CAM_PIN_*</code>（XCLK=40 / SIOD=17 / SIOC=18 / D0..D7）；
@@ -714,6 +728,8 @@ let lastSeq = -1;
 //    抛 ReferenceError、**tick() 后续渲染全部中断**（症状：顶部芯片与按键格正常，其下各卡片全空）。
 //    自检里有对应回归断言（见 self_test 的「页面 JS 无未定义全局」）。
 let lastState = null;
+let camPreviewing = false;      // 预览中：tick() 不得覆盖 camimg.src（否则打断 MJPEG 流）
+let camPollTimer = null;        // 单帧轮询预览的定时器
 function firstNode(){
   // ⚠️ /api/state 的 devices 是**数组**（早期版本按字典写成 Object.keys(...)[0] ⇒ 会得到 "0"）。
   //    这里统一按数组/字典两种形状取，并优先用在线设备；取不到就让服务端回落（服务端对空 node 有兜底）。
@@ -841,8 +857,10 @@ async function tick(){
     <div>抓帧</div><div>成功 ${cm.frames||0} 次 · 失败 ${cm.errors||0} 次</div>
     <div>最近一帧</div><div>${cm.last_bytes? `${cm.last_w}×${cm.last_h} · ${(cm.last_bytes/1024).toFixed(1)} KB · <span class="mut">${cm.last_path||''}</span>` : '<span class="mut">—</span>'}</div>
     <div>最近失败</div><div>${cm.last_err? `<span class="pill bad">${cm.last_err}</span>` : '<span class="mut">无</span>'}</div>
-    <div>落盘目录</div><div class="mut">${cm.root||'—'}（SD 优先，SPIFFS 兜底）· 本面板可见 ${camFiles.length} 张</div>`;
-  if (newestCam && newestCam.play_url) {
+    <div>落盘目录</div><div class="mut">${cm.root||'—'}（SD 优先，SPIFFS 兜底）· 本面板可见 ${camFiles.length} 张</div>
+    <div>预览</div><div>${cm.stream_port? `<span class="pill ok">MJPEG 流已就绪</span> <span class="mut">:${cm.stream_port}/stream · 已发 ${cm.stream_frames||0} 帧 · 客户端 ${cm.stream_clients||0}</span>` : '<span class="pill pend">流未启动</span> <span class="mut">（回落单帧轮询预览）</span>'}</div>`;
+  // 抓拍结果与预览流的显示互不干扰：预览中 **不覆盖** img.src，否则会把流打断
+  if (!camPreviewing && newestCam && newestCam.play_url) {
     const want = newestCam.play_url + '?t=' + (cm.last_ms||0);
     if ($('camimg').getAttribute('data-src') !== want) {
       $('camimg').setAttribute('data-src', want);
@@ -961,7 +979,7 @@ async function simKey(){
   setTimeout(tick, 800);   // 稍等一轮轮询：让"上行/云端确认"两列显示出来
 }
 
-// 板载摄像头：抓一帧（本地验证面 /api/camera/capture，落 cam/ 后由 /media 面显示）
+// 板载摄像头：抓一帧（本地验证面 /api/camera/capture，落 SD 后**直接用返回的 url 显示**）
 async function camCapture(){
   const n = firstNode();
   const msg = $('cammsg');
@@ -970,12 +988,78 @@ async function camCapture(){
     const r = await fetch(`/api/action/camera?node=${encodeURIComponent(n)}`, {method:'POST'});
     const j = await r.json();
     const res = j.result || {};
+    if (j.ok && res.url) {
+      // ⚠️ 不再等 /media/list 轮询：历史上 cam/ 目录没进媒体列表，导致"已抓拍但无图"
+      const base = camDevBase();
+      const url = (base ? base.replace(/\/$/,'') + '/' + String(res.url).replace(/^\//,'') : res.url)
+                  + '?t=' + Date.now();
+      camPreviewing = false;                 // 抓拍优先：停掉预览再贴静态帧
+      $('camimg').setAttribute('data-src', url);
+      $('camimg').src = url;
+    }
     msg.textContent = j.ok
       ? `已抓拍：${res.path||''} · ${res.bytes||0} B · ${res.w||0}×${res.h||0} · ${res.ms||0} ms`
       : ('抓拍失败：' + JSON.stringify(j));
   } catch (e) { msg.textContent = '抓拍异常：' + e; }
   setTimeout(tick, 700);
 }
+
+// 预览：优先走设备 MJPEG 流（独立端口，长连接；不堵主验证面），
+// 失败（流未启动 / 浏览器不支持 / 网络不通）自动回落到「单帧轮询」——每 ~800 ms 拉一张 JPEG。
+function camDevBase(){
+  const arr = (lastState && lastState.devices) || [];
+  const list = Array.isArray(arr) ? arr : Object.values(arr);
+  const d = list.find(x=>x && x.online) || list[0] || null;
+  if (!d) return '';
+  const http = d.http || '';
+  const m = String(http).match(/^https?:\/\/([^/:]+)/);           // 设备 http://host[:port] → host
+  return m ? m[1] : '';
+}
+function camStreamPort(){
+  const arr = (lastState && lastState.devices) || [];
+  const list = Array.isArray(arr) ? arr : Object.values(arr);
+  const d = list.find(x=>x && x.online) || list[0] || null;
+  const cm = (((d && d.status)||{}).panel||{}).camera || {};
+  return cm.stream_port || 0;
+}
+function camPreview(on){
+  const msg = $('cammsg');
+  if (!on) {
+    camPreviewing = false;
+    if (camPollTimer) { clearInterval(camPollTimer); camPollTimer = null; }
+    msg.textContent = '预览已停止';
+    return;
+  }
+  const host = camDevBase(), port = camStreamPort();
+  if (!host) { msg.textContent = '预览失败：设备不可达'; return; }
+  if (port) {
+    camPreviewing = true;
+    if (camPollTimer) { clearInterval(camPollTimer); camPollTimer = null; }
+    $('camimg').setAttribute('data-src', 'stream');
+    $('camimg').src = `http://${host}:${port}/stream?t=${Date.now()}`;
+    msg.textContent = `预览中（MJPEG 流 :${port}/stream，约 7 帧/s）`;
+  } else {
+    camPollStart(`设备未启动 MJPEG 流 ⇒ 回落单帧轮询预览（约 1.2 帧/s）`);
+  }
+}
+function camPollStart(note){
+  camPreviewing = true;
+  if (camPollTimer) clearInterval(camPollTimer);
+  const n = firstNode();
+  camPollTimer = setInterval(()=>{
+    if (!camPreviewing) return;
+    $('camimg').src = `/api/camera/snapshot.jpg?node=${encodeURIComponent(n)}&t=${Date.now()}`;
+  }, 800);
+  $('camimg').src = `/api/camera/snapshot.jpg?node=${encodeURIComponent(n)}&t=${Date.now()}`;
+  $('cammsg').textContent = note;
+}
+// 流地址打不开（浏览器不支持 / 端口不通）⇒ 自动回落，不让用户看到"裂图"
+$('camimg').addEventListener('error', ()=>{
+  if (!camPreviewing) return;
+  if (String($('camimg').getAttribute('data-src')) === 'stream') {
+    camPollStart('MJPEG 流不可用（浏览器或端口问题）⇒ 已回落单帧轮询预览');
+  }
+});
 async function lcdDraw(pattern){
   const n = firstNode();
   const msg = $('lcdmsg');
@@ -1034,6 +1118,22 @@ def make_handler(state: PanelState, poll_ms: int):
                 self._send(200, json.dumps(doc, ensure_ascii=False).encode("utf-8"))
             elif path == "/api/health":
                 self._send(200, json.dumps({"ok": True, "version": PANEL_VERSION}).encode("utf-8"))
+            elif path == "/api/camera/snapshot.jpg":
+                # 预览回落通道：代理设备的 POST /api/camera/snapshot（**不落盘**，内存 JPEG 直回），
+                # 让 <img src="/api/camera/snapshot.jpg?t=…"> 每 ~800 ms 换一张即得近实时画面。
+                q = urllib.parse.parse_qs(parsed.query)      # do_GET 里没有全局 q，必须就地解析
+                node = (q.get("node") or [None])[0]
+                dv = state.devices.get(node) if node else None
+                if dv is None:
+                    dv = next(iter(state.devices.values()), None)
+                if dv is None:
+                    self._send(404, b'{"error":"no_device"}')
+                    return
+                img = dv.post_camera_snapshot()
+                if img is None:
+                    self._send(502, b'{"error":"snapshot_failed"}')
+                    return
+                self._send(200, img, "image/jpeg")
             else:
                 self._send(404, b'{"error":"not_found"}')
 
@@ -1507,6 +1607,16 @@ def self_test(verbose: bool = True) -> int:
                   f"{cres.get('path')} {cres.get('bytes')} B")
         except Exception as exc:  # noqa: BLE001
             check("摄像头抓帧代理（/api/action/camera）", False, str(exc))
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:18787/api/camera/snapshot.jpg"
+                                        "?node=korvo2-selftest", timeout=5) as r:
+                body = r.read()
+                snap_ok = (r.status == 200 and r.headers.get("Content-Type") == "image/jpeg"
+                           and body[:2] == b"\xff\xd8")
+            check("预览回落通道（GET /api/camera/snapshot.jpg → image/jpeg）", snap_ok,
+                  f"{len(body)} B, {body[:2].hex()}")
+        except Exception as exc:  # noqa: BLE001
+            check("预览回落通道（GET /api/camera/snapshot.jpg → image/jpeg）", False, str(exc))
 
         # 4e) 云端桩：对 event/up 回契约形状的 event/down ack（设备侧第三态的验证手段）
         stub_state = PanelState(log=lambda *a, **k: None)

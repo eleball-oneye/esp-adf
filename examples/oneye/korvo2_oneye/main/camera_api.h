@@ -64,6 +64,10 @@ typedef struct {
     int      xclk_mhz;      /* 10/20/40 */
     int      quality;       /* JPEG quality 0..63 */
     int      psram_dma;     /* 1 = 帧缓冲直接作 DMA 目标（省内部 DMA 缓冲）；0 = 走内部 dma_buffer */
+    /* MJPEG 预览流（本地验证面：面板「开始预览」用） */
+    int      stream_port;   /* 0 = 未启动 */
+    uint32_t stream_frames; /* 已发送帧数 */
+    int      stream_clients;/* 当前连接的预览客户端数（0/1） */
 } camera_state_t;
 
 /** 重配参数：任一项 <0 / 非法 = 保持当前值（见 camera_api_apply） */
@@ -88,6 +92,17 @@ bool camera_api_ready(void);
 
 /** 抓一帧并落盘（JPEG）；path_out 为空时自动命名 cap-%05u.jpg */
 esp_err_t camera_api_capture(camera_capture_t *out);
+
+/** 抓一帧并**就地**编码为 JPEG（不落盘）；成功时 *out 为 `malloc` 缓冲，调用方负责 `free()` */
+esp_err_t camera_api_grab_jpeg(uint8_t **out, size_t *out_len, int *width, int *height);
+
+/** 启动 MJPEG 预览流（**独立 httpd 实例**，避免长时间占住主验证面服务器的任务）：
+ *  `GET http://<设备>:<port>/stream`，`multipart/x-mixed-replace`，浏览器 `<img>` 直接显示。
+ *  port=0 用缺省 81。失败返回错误码（面板据此回落到「单帧轮询预览」）。 */
+esp_err_t camera_api_stream_start(uint16_t port);
+
+/** 预览流状态（未启动时 port=0） */
+void camera_api_stream_status(uint16_t *port, uint32_t *frames, int *clients);
 
 /** 状态快照 */
 void camera_api_get_state(camera_state_t *out);

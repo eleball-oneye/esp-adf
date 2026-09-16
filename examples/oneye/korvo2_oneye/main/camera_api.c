@@ -24,6 +24,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "esp_http_server.h"
 
 #include "esp_camera.h"
 #include "img_converters.h"     /* frame2jpg（RGB565 → JPEG，软件编码） */
@@ -62,6 +63,12 @@ static uint32_t        s_frames;
 static uint32_t        s_errors;
 static uint32_t        s_seq;
 static camera_state_t  s_last;                  /* 最近一次成功结果（用于状态上报） */
+
+/* MJPEG 预览流状态（独立 httpd 实例；见文件末「预览流」一节） */
+static httpd_handle_t    s_stream_httpd;
+static uint16_t          s_stream_port;
+static volatile uint32_t s_stream_frames;
+static volatile int      s_stream_clients;
 
 /* 生效配置（可经 camera_api_apply 改）——默认口径见文件头排障记录：
  * RGB565 原始帧（上游 lcd_camera 在本板实测可用的像素格式）+ fb 在 PSRAM（不占内部 DRAM 带宽/容量，
@@ -350,8 +357,163 @@ void camera_api_get_state(camera_state_t *out)
     }
     cam_snapshot_cfg();                                  /* 先刷新配置快照，再整体拷贝 */
     snprintf(s_last.root, sizeof(s_last.root), "%s", s_root);
+    s_last.stream_port = (int)s_stream_port;
+    s_last.stream_frames = s_stream_frames;
+    s_last.stream_clients = s_stream_clients;
     *out = s_last;
     out->inited = s_inited;
     out->frames = s_frames;
     out->errors = s_errors;
+}
+
+/* ---------------------------------------------------------------- 预览：抓帧 → 内存 JPEG（不落盘） */
+
+esp_err_t camera_api_grab_jpeg(uint8_t **out, size_t *out_len, int *width, int *height)
+{
+    if (out == NULL || out_len == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out = NULL;
+    *out_len = 0;
+    if (!s_inited) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (fb == NULL) {
+        s_errors++;
+        snprintf(s_last.last_err, sizeof(s_last.last_err), "fb timeout (NO-SOI?)");
+        return ESP_FAIL;
+    }
+
+    uint8_t *jpg = NULL;
+    size_t len = 0;
+    if (fb->format == PIXFORMAT_JPEG) {
+        /* 相机自身出 JPEG：拷一份，保证调用方统一 free()（避免混淆 fb 所有权） */
+        jpg = (uint8_t *)malloc(fb->len);
+        if (jpg != NULL) {
+            memcpy(jpg, fb->buf, fb->len);
+            len = fb->len;
+        }
+    } else if (!frame2jpg(fb, s_quality, &jpg, &len)) {
+        jpg = NULL;
+    }
+
+    if (width != NULL) { *width = (int)fb->width; }
+    if (height != NULL) { *height = (int)fb->height; }
+    esp_camera_fb_return(fb);
+
+    if (jpg == NULL || len == 0) {
+        s_errors++;
+        snprintf(s_last.last_err, sizeof(s_last.last_err), "frame2jpg failed");
+        free(jpg);
+        return ESP_FAIL;
+    }
+    *out = jpg;
+    *out_len = len;
+    return ESP_OK;
+}
+
+/* ---------------------------------------------------------------- MJPEG 预览流（独立 httpd 实例） */
+
+#define CAM_STREAM_BOUNDARY "oneyeframe"
+
+static esp_err_t h_cam_stream(httpd_req_t *req)
+{
+    if (!s_inited) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "camera 未就绪（SCCB 未探测到 sensor）");
+    }
+    if (s_stream_clients > 0) {
+        /* 单客户端：多路预览会互相抢帧缓冲/内部 DMA，本机也扛不住 */
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "已有预览客户端（本面只支持 1 路）");
+    }
+    s_stream_clients++;
+    esp_err_t rc = httpd_resp_set_type(req, "multipart/x-mixed-replace;boundary=" CAM_STREAM_BOUNDARY);
+    if (rc == ESP_OK) { rc = httpd_resp_set_hdr(req, "Cache-Control", "no-store"); }
+    if (rc == ESP_OK) { rc = httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*"); }
+
+    uint32_t sent = 0;
+    uint32_t t0 = (uint32_t)(esp_timer_get_time() / 1000);
+    while (rc == ESP_OK) {
+        uint8_t *jpg = NULL;
+        size_t len = 0;
+        int w = 0, h = 0;
+        if (camera_api_grab_jpeg(&jpg, &len, &w, &h) != ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(100));      /* 单帧失败不结束流（真机偶发 fb timeout） */
+            continue;
+        }
+        char head[128];
+        int n = snprintf(head, sizeof(head),
+                         "\r\n--" CAM_STREAM_BOUNDARY "\r\nContent-Type: image/jpeg\r\n"
+                         "Content-Length: %u\r\n\r\n", (unsigned)len);
+        rc = httpd_resp_send_chunk(req, head, (size_t)n);
+        if (rc == ESP_OK) {
+            rc = httpd_resp_send_chunk(req, (const char *)jpg, len);
+        }
+        free(jpg);
+        if (rc != ESP_OK) {
+            break;                               /* 客户端断开：正常收尾，不回 500 */
+        }
+        sent++;
+        s_stream_frames++;
+        vTaskDelay(pdMS_TO_TICKS(20));           /* 编码本身 ~110 ms ⇒ 实测约 7 帧/s */
+    }
+    s_stream_clients--;
+    uint32_t el = (uint32_t)(esp_timer_get_time() / 1000) - t0;
+    ESP_LOGI(TAG, "预览流结束：%u 帧 / %u ms（%s）", (unsigned)sent, (unsigned)el, esp_err_to_name(rc));
+    return ESP_OK;
+}
+
+esp_err_t camera_api_stream_start(uint16_t port)
+{
+    if (s_stream_httpd != NULL) {
+        return ESP_OK;
+    }
+    if (!s_inited) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (port == 0) {
+        port = 81;
+    }
+    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+    cfg.server_port = port;
+    cfg.ctrl_port = (uint16_t)(port + 1000);     /* 第二个实例必须用不同的控制端口 */
+    cfg.max_uri_handlers = 2;
+    cfg.stack_size = 5120;                       /* 流任务：抓帧 + 编码 + 分块发送 */
+    cfg.lru_purge_enable = true;
+    cfg.recv_wait_timeout = 5;
+    cfg.send_wait_timeout = 10;
+    cfg.uri_match_fn = httpd_uri_match_wildcard;
+
+    esp_err_t rc = httpd_start(&s_stream_httpd, &cfg);
+    if (rc != ESP_OK) {
+        /* 常见原因：内部 RAM 不足（流任务栈）、端口被占。降级：面板回落到「单帧轮询预览」 */
+        ESP_LOGW(TAG, "预览流服务启动失败：%s（端口 %u；面板将回落单帧轮询预览）",
+                 esp_err_to_name(rc), (unsigned)port);
+        s_stream_httpd = NULL;
+        return rc;
+    }
+    static const httpd_uri_t uri_stream = {
+        .uri = "/stream", .method = HTTP_GET, .handler = h_cam_stream,
+    };
+    rc = httpd_register_uri_handler(s_stream_httpd, &uri_stream);
+    if (rc != ESP_OK) {
+        ESP_LOGW(TAG, "预览流路由注册失败：%s", esp_err_to_name(rc));
+        httpd_stop(s_stream_httpd);
+        s_stream_httpd = NULL;
+        return rc;
+    }
+    s_stream_port = port;
+    ESP_LOGI(TAG, "预览流就绪：http://<设备IP>:%u/stream（MJPEG，multipart/x-mixed-replace）",
+             (unsigned)port);
+    return ESP_OK;
+}
+
+void camera_api_stream_status(uint16_t *port, uint32_t *frames, int *clients)
+{
+    if (port != NULL)    { *port = (s_stream_httpd != NULL) ? s_stream_port : 0; }
+    if (frames != NULL)  { *frames = s_stream_frames; }
+    if (clients != NULL) { *clients = s_stream_clients; }
 }

@@ -276,6 +276,14 @@ class MockDevice:
             return {"ok": True, "path": path, "bytes": self.camera["bytes"], "w": 320, "h": 240,
                     "ms": 118, "err": "", "url": f"media/sdcard/cam/cap-{self.camera['frames']:05d}.jpg"}
 
+    def camera_snapshot_jpeg(self) -> bytes:
+        """抓帧后内存 JPEG（mock：一张最小可用 JPEG 头 + 填充；不落盘）。"""
+        with self._lock:
+            self.camera["frames"] += 1
+            self.camera["bytes"] = 3200
+            self.camera["last_ms"] = int(time.time() * 1000)
+        return b"\xff\xd8\xff\xe0" + b"\x00" * 60 + b"\xff\xd9"
+
     # ------------------------------------------------------------ 媒体（模拟 AEC 产物）
     def _make_recording(self, seconds: float = 2.0) -> str:
         with self._lock:
@@ -685,6 +693,16 @@ class MockDevice:
                     return
                 if parsed.path == "/api/camera/capture":
                     self._json(mock.camera_capture())
+                    return
+                if parsed.path == "/api/camera/snapshot":
+                    # 与固件同形：抓一帧**不落盘**，直接回 JPEG 字节（面板预览的回落通道）
+                    jpg = mock.camera_snapshot_jpeg()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/jpeg")
+                    self.send_header("Content-Length", str(len(jpg)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(jpg)
                     return
                 if parsed.path == "/api/camera/reinit":
                     self._json({"ok": True, "err": "", "sensor": "OV3660",

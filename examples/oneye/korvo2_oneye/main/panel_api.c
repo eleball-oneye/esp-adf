@@ -615,7 +615,11 @@ static esp_err_t h_status(httpd_req_t *req)
         sb_kv_str(&s, "grab", cs.grab); sb_raw(&s, ",");
         sb_kv_i(&s, "xclk_mhz", cs.xclk_mhz); sb_raw(&s, ",");
         sb_kv_i(&s, "psram_dma", cs.psram_dma); sb_raw(&s, ",");
-        sb_kv_i(&s, "quality", cs.quality);
+        sb_kv_i(&s, "quality", cs.quality); sb_raw(&s, ",");
+        /* MJPEG 预览流（本地验证面）：port=0 ⇒ 未启动，面板回落到「单帧轮询预览」 */
+        sb_kv_i(&s, "stream_port", cs.stream_port); sb_raw(&s, ",");
+        sb_kv_i(&s, "stream_frames", (long long)cs.stream_frames); sb_raw(&s, ",");
+        sb_kv_i(&s, "stream_clients", cs.stream_clients);
         sb_raw(&s, "},");
     }
     sb_kv_str(&s, "scope", "local-verification-only");
@@ -929,6 +933,38 @@ static esp_err_t h_camera_reinit(httpd_req_t *req)
     return send_json(req, &s);
 }
 
+/* POST /api/camera/snapshot
+ *
+ * 本地验证面：抓一帧并**就地**编码为 JPEG 直接回给客户端（**不落盘**）。
+ * 用途：面板「预览」的回落通道 —— 主验证面按 ~1–2 fps 轮询本路由即可得到近实时画面，
+ * 不依赖 MJPEG 流服务（端口 81）是否启动成功；也不给 SD 卡制造写放大。 */
+static esp_err_t h_camera_snapshot(httpd_req_t *req)
+{
+    if (!camera_api_ready()) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "camera 未初始化（SCCB 未探测到 sensor？）");
+    }
+    uint8_t *jpg = NULL;
+    size_t len = 0;
+    int w = 0, h = 0;
+    if (camera_api_grab_jpeg(&jpg, &len, &w, &h) != ESP_OK || jpg == NULL) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "抓帧失败（fb 为空或编码失败；见串口 cam_hal）");
+    }
+    esp_err_t rc = httpd_resp_set_type(req, "image/jpeg");
+    if (rc == ESP_OK) {
+        rc = httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    }
+    if (rc == ESP_OK) {
+        rc = httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    }
+    if (rc == ESP_OK) {
+        rc = httpd_resp_send(req, (const char *)jpg, len);
+    }
+    free(jpg);
+    return rc;
+}
+
 esp_err_t panel_api_start(uint16_t port)
 {
     if (s_httpd != NULL) {
@@ -950,7 +986,7 @@ esp_err_t panel_api_start(uint16_t port)
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = port;
-    cfg.max_uri_handlers = 16;          /* 8 个 /api（keys/simulate/key/lcd/draw/camera/capture/camera/reinit）+ /media/list + 媒体通配 + /api/action */
+    cfg.max_uri_handlers = 17;          /* 9 个 /api（keys/simulate/key/lcd/draw/camera/capture/camera/reinit/camera/snapshot）+ /media/list + 媒体通配 + /api/action */
     cfg.lru_purge_enable = true;
     cfg.stack_size = 6144;
     cfg.recv_wait_timeout = 5;
@@ -978,6 +1014,7 @@ esp_err_t panel_api_start(uint16_t port)
         { .uri = "/api/lcd/draw",     .method = HTTP_POST, .handler = h_lcd_draw },
         { .uri = "/api/camera/capture", .method = HTTP_POST, .handler = h_camera_capture },
         { .uri = "/api/camera/reinit",  .method = HTTP_POST, .handler = h_camera_reinit },
+        { .uri = "/api/camera/snapshot", .method = HTTP_POST, .handler = h_camera_snapshot },
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
         rc = httpd_register_uri_handler(s_httpd, &uris[i]);
@@ -988,6 +1025,16 @@ esp_err_t panel_api_start(uint16_t port)
     ESP_LOGI(TAG, "本地验证面已启动：http://<设备IP>:%u/api/{ping,status,selftest,keys,simulate/key}", (unsigned)port);
     /* 媒体与动作（/media/list、/media/<alias>/<path>、POST /api/action）注册到同一实例 */
     (void)media_api_register(s_httpd);
+
+    /* 预览面：MJPEG 流跑在**独立 httpd 实例**（端口 81）——流是长连接，跑在主实例上会把
+     * /api/status 等轮询请求全堵住（面板会显示"面板服务不可达"）。启动失败不视为错误：
+     * 面板会自动回落到 POST /api/camera/snapshot 的单帧轮询预览。 */
+    if (camera_api_ready()) {
+        esp_err_t src = camera_api_stream_start(0);
+        if (src != ESP_OK) {
+            ESP_LOGW(TAG, "MJPEG 预览流未启动（%s）：面板将用单帧轮询预览", esp_err_to_name(src));
+        }
+    }
     ESP_LOGW(TAG, "提示：该 API 仅为台面/联调验证面，不是云端设备面契约；量产应置 CONFIG_ONEYE_FW_ENABLE_PANEL_API=n");
     return ESP_OK;
 }

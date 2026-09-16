@@ -218,14 +218,30 @@ static const char *evt_name(oneye_dev_event_t evt)
     }
 }
 
+/* 云确认关联的前向声明（sdk_event_cb 早于其定义使用；实现见「按键 → event/up」段） */
+static const char *key_pending_pop(void);
+static bool ack_payload_is_ok(const char *payload, size_t len);
+
 static void sdk_event_cb(oneye_dev_event_t evt, const void *payload, size_t len, void *ctx)
 {
     (void)ctx;
     ESP_LOGI(TAG, "[sdk-event] %s len=%u", evt_name(evt), (unsigned)len);
     if (evt == ONEYE_DEV_EVENT_EVT_ACK) {
-        /* 云端 ack：契约信封 data.ref == 上行事件 id ⇒ 关联到本地按键历史（"历史响应"第三态）
-         * 注意：a.c. 的 "ack" 指云端对 event/up 的确认帧；SDK 以原始负载投递。 */
-        panel_api_key_ack((const char *)payload, len);
+        /* 云端 ack：契约 §4.3 的 `data.ref` = **上行信封 id**（SDK 生成的 uuid），
+         * 不是本固件的事件 id ⇒ 先按"ref 内含本地 id"匹配（台面手动 ack 路径），
+         * 未命中再按**上报 FIFO** 关联（真链路路径：一次 report = 一帧 = 一 ack）。 */
+        const char *payload_s = (const char *)payload;
+        if (!panel_api_key_ack(payload_s, len)) {
+            const char *id = key_pending_pop();
+            if (id != NULL) {
+                bool ok = ack_payload_is_ok(payload_s, len);
+                (void)panel_api_key_ack_item(id, ok);
+                ESP_LOGI(TAG, "[cloud-ack] 云端确认批次（ref=%.*s）→ 本地事件 %s ⇒ %s",
+                         (int)(len < 48 ? len : 48), payload_s, id, ok ? "acked" : "failed");
+            } else {
+                ESP_LOGW(TAG, "[cloud-ack] 收到 ack 但无待确认本地事件（可能已确认或重启后到达）");
+            }
+        }
     }
     if (evt == ONEYE_DEV_SDK_EVT_COMMAND_RECEIVED && payload != NULL && len > 0) {
         /* 真机产品：解析命令 → 执行 → oneye_dev_base_ack_command(id, err)
@@ -261,20 +277,65 @@ static const char *key_user_str(int user_id)
     }
 }
 
-static esp_err_t input_key_service_cb(periph_service_handle_t handle, periph_service_event_t *evt, void *ctx)
-{
-    (void)handle;
-    (void)ctx;
-    if (evt == NULL) {
-        return ESP_OK;
-    }
-    const char *key = key_user_str((int)evt->data);
-    const char *act = key_action_str((int)evt->type);
+/* ---- 云确认关联：本端已上报 item id 的 FIFO ----
+ * 契约 §4.3 的 ack `data.ref` 指向**上行信封 id**，而信封 id 由 SDK 生成（uuid），不等于本固件
+ * 的 `key-%05u`。因此不能靠"在 ack 负载里找子串"关联，而按"上报顺序"关联：
+ * `oneye_dev_event_report()` 内部强制成帧（SDK `oneye_dev_event.c:1099`）⇒ 一次上报 = 一帧，
+ * 一帧一个 ack ⇒ FIFO 弹出最旧一条即可精确对应（容量与 SDK 的 EV_PENDING_MAX 一致）。 */
+#define KEY_PENDING_MAX 8
+static char s_pending_ids[KEY_PENDING_MAX][24];
+static int  s_pending_n;
+/* 两端在不同任务：上报侧 = 按键/HTTP 任务，确认侧 = SDK 回调（网络任务）⇒ 加临界区保护 */
+static portMUX_TYPE s_pending_mux = portMUX_INITIALIZER_UNLOCKED;
 
+static void key_pending_push(const char *id)
+{
+    if (id == NULL || id[0] == '\0') {
+        return;
+    }
+    portENTER_CRITICAL(&s_pending_mux);
+    if (s_pending_n == KEY_PENDING_MAX) {          /* 满：丢最旧（与 SDK 覆盖最旧同策） */
+        memmove(s_pending_ids[0], s_pending_ids[1], sizeof(s_pending_ids[0]) * (KEY_PENDING_MAX - 1));
+        s_pending_n--;
+    }
+    snprintf(s_pending_ids[s_pending_n], sizeof(s_pending_ids[0]), "%s", id);
+    s_pending_n++;
+    portEXIT_CRITICAL(&s_pending_mux);
+}
+
+static const char *key_pending_pop(void)
+{
+    static char out[24];
+    portENTER_CRITICAL(&s_pending_mux);
+    if (s_pending_n == 0) {
+        portEXIT_CRITICAL(&s_pending_mux);
+        return NULL;
+    }
+    snprintf(out, sizeof(out), "%s", s_pending_ids[0]);
+    memmove(s_pending_ids[0], s_pending_ids[1], sizeof(s_pending_ids[0]) * (KEY_PENDING_MAX - 1));
+    s_pending_n--;
+    portEXIT_CRITICAL(&s_pending_mux);
+    return out;
+}
+
+/* ack 负载里取 code（`"code":"ok"` 子串判定足够：负载由服务端按契约生成） */
+static bool ack_payload_is_ok(const char *payload, size_t len)
+{
+    char buf[256];
+    size_t n = len < sizeof(buf) - 1 ? len : sizeof(buf) - 1;
+    memcpy(buf, payload, n);
+    buf[n] = '\0';
+    return strstr(buf, "\"code\":\"ok\"") != NULL;
+}
+
+/* 按键 → event/up 的**唯一**上报路径：物理按键与本地验证面注入共用同一函数
+ * （同一幂等 id 生成、同一契约负载、同一 SDK 投递），保证"注入验证的就是真链路"。 */
+static void emit_key_event(const char *key, const char *act, bool injected)
+{
     /* 契约映射页 §2 行 18：按键事件走 `event/up`，data{key,action}；不为按键新开下行面 */
     char data[96];
     snprintf(data, sizeof(data), "{\"key\":\"%s\",\"action\":\"%s\"}", key, act);
-    ESP_LOGI(TAG, "[key] %s/%s", key, act);
+    ESP_LOGI(TAG, "[key] %s/%s%s", key, act, injected ? " (注入/local-verification-only)" : "");
 
     /* 本地验证面：先登记本地检测（pending），再上报；随后按 SDK 回执/云端 ack 推进状态 */
     static uint32_t s_key_id;
@@ -291,7 +352,55 @@ static esp_err_t input_key_service_cb(periph_service_handle_t handle, periph_ser
     item.data_json = data;
 
     oneye_dev_sdk_err_t rc = oneye_dev_event_report(&item, 1);
-    panel_api_key_uplink(id, rc == ONEYE_DEV_SDK_OK ? "sent" : "failed");
+    if (rc == ONEYE_DEV_SDK_OK) {
+        key_pending_push(id);         /* 交付成功：等待云端 ack 按 FIFO 关联 */
+        panel_api_key_uplink(id, "sent");
+    } else {
+        panel_api_key_uplink(id, "failed");
+    }
+}
+
+static bool key_name_valid(const char *key)
+{
+    static const char *names[] = { "volup", "voldown", "set", "play", "mode", "rec" };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        if (strcmp(key, names[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool key_action_valid(const char *act)
+{
+    static const char *acts[] = { "click", "click_release", "press", "press_release" };
+    for (size_t i = 0; i < sizeof(acts) / sizeof(acts[0]); i++) {
+        if (strcmp(act, acts[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* 本地验证面注入回调（POST /api/simulate/key）：只做参数校验，随后走同一 emit_key_event。
+ * 见 panel_api.h 的边界说明 —— 它是**验证/演示**手段，不是物理按键的替代验收证据。 */
+static esp_err_t sim_key_handler(const char *key, const char *action)
+{
+    if (key == NULL || action == NULL || !key_name_valid(key) || !key_action_valid(action)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    emit_key_event(key, action, true);
+    return ESP_OK;
+}
+
+static esp_err_t input_key_service_cb(periph_service_handle_t handle, periph_service_event_t *evt, void *ctx)
+{
+    (void)handle;
+    (void)ctx;
+    if (evt == NULL) {
+        return ESP_OK;
+    }
+    emit_key_event(key_user_str((int)evt->data), key_action_str((int)evt->type), false);
     return ESP_OK;
 }
 
@@ -567,6 +676,10 @@ void app_main(void)
     board_selftest();
     board_init_peripherals();
     keys_start();
+
+    /* ③a 本地验证面：注册按键事件注入（POST /api/simulate/key，走与物理按键同一条上报路径）。
+     *     用途 = 远程/自动化验证「上行 → 云端 ack → 面板第三态」；触发源是 HTTP，不是 ADC 按键。 */
+    panel_api_set_key_simulator(sim_key_handler);
 
     /* ③b AEC 采集（录音 → WAV 落 SD/SPIFFS；供验证面板在 web 播放）
      *     传板级 **ADC**（ES7210）句柄：`s_board->audio_hal` 是 ES8311（DAC），

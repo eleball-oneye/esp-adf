@@ -16,6 +16,7 @@
  *   GET /media/list          列出可播放文件（WAV/录像切片）
  *   GET /media/<path>        文件下载/流式播放（带 Range，便于浏览器拖动）
  *   POST /api/action         触发设备动作（开始/停止录音、播放指定文件）—— 须与面板一并冻结口径
+ *   POST /api/simulate/key   按键事件注入（本地验证面专用）—— 见下方「本地注入」段
  */
 
 #ifndef _PANEL_API_H_
@@ -60,14 +61,41 @@ void panel_api_key_event(const char *key, const char *action, const char *id, ui
 /** 上行状态推进：queued | sent | failed（ack 另见 panel_api_key_ack） */
 void panel_api_key_uplink(const char *id, const char *state);
 
-/** 云端 ack 关联：在 ack 负载里查找 data.ref == 已知 id，命中则标记 acked */
-void panel_api_key_ack(const char *payload, size_t len);
+/** 云端 ack 关联（台面手动 ack 路径）：在 ack 负载里查找本地事件 id 子串，命中即置 acked。
+ *  @return true = 命中并已推进状态 */
+bool panel_api_key_ack(const char *payload, size_t len);
+
+/** 云端 ack 关联（**真链路**路径）：按本地事件 id 精确置位。
+ *
+ *  为什么需要它：契约 §4.3 的 ack `data.ref` 指向**上行信封 id**，而信封 id 由 SDK 生成
+ *  （uuid，见 SDK `oneye_envelope_build(…, id=NULL, …)`），**不等于**本固件为 item 分配的
+ *  `key-%05u` ⇒ 仅靠"负载里找子串"永远匹配不上，真机三态会一直停在 `sent`。
+ *  因此固件维护"本端已上报 item id"的 FIFO（`oneye_dev_event_report()` 每调用一次即
+ *  **强制成帧**，见 SDK `oneye_dev_event.c:1099` ⇒ 一帧一条，确认按 FIFO 精确对应），
+ *  收到 `type=ack` 时弹出最旧一条并调用本函数。
+ *  @param ok code=="ok" → acked；否则 failed
+ *  @return true = 命中并已推进状态 */
+bool panel_api_key_ack_item(const char *id, bool ok);
 
 /** 链路/统计快照（由 oneye 回调或轮询处更新） */
 void panel_api_set_link(bool cloud_link_up, const char *transport, uint32_t tx_frames, uint32_t rx_frames);
 
 /** Wi-Fi 状态（ssid/source 供面板显示配网来源；source 形如 "file:/sdcard/oneye-wifi.txt"） */
 void panel_api_set_wifi(bool connected, const char *ip, const char *ssid, const char *source);
+
+/* ------------------------------------------------------------ 本地注入（验证专用） */
+
+/** 按键事件注入回调：由固件按键路径实现，走的是**与物理按键完全相同**的上报路径
+ *  （同一函数、同一幂等 id 生成、同一 `event/up` 组装与 SDK 投递）。
+ *
+ *  ⚠️ 边界（必须如实表述）：触发源是 **HTTP 而非 ADC 按键**。用途 = 在没有手指可按
+ *  （远程联调/自动化）时验证与演示「本地检测 → `event/up` → 云端 ack → 面板第三态」
+ *  这条链路；它**不能**替代「物理按键可用」的验收证据（后者仍须人手按一次）。
+ *  返回非 ESP_OK = key/action 非法（HTTP 层回 400）。 */
+typedef esp_err_t (*panel_key_sim_fn_t)(const char *key, const char *action);
+
+/** 注册按键注入回调（由 app_main 在按键服务初始化后调用；未注册时 `/api/simulate/key` 回 503） */
+void panel_api_set_key_simulator(panel_key_sim_fn_t fn);
 
 #ifdef __cplusplus
 }

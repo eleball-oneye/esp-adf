@@ -300,6 +300,21 @@ class DeviceView:
             self.media_error = f"/api/action: {exc}"
             return None
 
+    def post_simulate_key(self, key: str, action: str = "click", timeout: float = 5.0) -> dict | None:
+        """本地验证面：请设备**按与物理按键相同的上报路径**注入一次 event/up。
+
+        ⚠️ 触发源是 HTTP（不是 ADC 按键）⇒ 用于验证/演示「本地检测 → 上行 → 云端 ack → 面板
+        第三态」这条链路，**不能**替代「物理按键可用」的验收证据。
+        """
+        q = urllib.parse.urlencode({"key": key, "action": action})
+        req = urllib.request.Request(f"{self.base_url}/api/simulate/key?{q}", data=b"", method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8", "replace"))
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            self.last_error = f"/api/simulate/key: {exc}"
+            return None
+
     def media_url(self, rel_url: str) -> str:
         """把设备返回的相对 url（media/<alias>/<path>）拼成可直接播放的绝对地址。"""
         return f"{self.base_url}/{rel_url.lstrip('/')}"
@@ -549,6 +564,11 @@ PAGE = r"""<!doctype html>
     <h2>按键：实时状态 <small>本地检测（设备 HTTP）</small></h2>
     <div class="keys" id="keys"></div>
     <div class="kv" id="keymeta" style="margin-top:10px"></div>
+    <div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <span class="mut">模拟按键（本地验证面注入：与物理按键**同一上报路径**，触发源是 HTTP）</span>
+      <select id="sim-key"></select>
+      <button onclick="simKey()">注入一次</button>
+    </div>
   </div>
 
   <div class="grid2">
@@ -764,6 +784,19 @@ async function wifiSet(){
 }
 
 $('btn-refresh').onclick = tick;
+$('sim-key').innerHTML = ['volup','voldown','set','play','mode','rec']
+  .map(k=>`<option value="${k}">${KEYNAME[k]||k}</option>`).join('');
+async function simKey(){
+  const k = $('sim-key').value;
+  const n = (state.devices && Object.keys(state.devices)[0]) || '';
+  try {
+    const r = await fetch(`/api/simulate/key?node=${encodeURIComponent(n)}&key=${encodeURIComponent(k)}&action=click`,
+                          {method:'POST'});
+    const j = await r.json();
+    if (!j.ok) alert('注入失败：' + JSON.stringify(j));
+  } catch (e) { alert('注入异常：' + e); }
+  setTimeout(tick, 800);   // 稍等一轮轮询：让"上行/云端确认"两列显示出来
+}
 tick(); setInterval(tick, __POLL_MS__);
 </script></body></html>
 """
@@ -846,6 +879,25 @@ def make_handler(state: PanelState, poll_ms: int):
                 self._send(200 if ok else 500,
                            json.dumps({"ok": bool(ok), "topic": f"rmng/dev/{node}/event/down",
                                        "payload": env}, ensure_ascii=False).encode("utf-8"))
+                return
+            if parsed.path == "/api/simulate/key":
+                # 本地验证面：请设备注入一次按键事件（走**与物理按键相同**的上报路径）。
+                # ⚠️ 触发源是 HTTP —— 用途 = 远程/自动化验证「上行 → 云端 ack → 面板第三态」，
+                #    不是物理按压的验收证据（面板上已明示）。
+                node = (q.get("node") or [None])[0]
+                key = (q.get("key") or [None])[0]
+                action = (q.get("action") or ["click"])[0]
+                dv = state.devices.get(node) if node else None
+                if dv is None:
+                    dv = next(iter(state.devices.values()), None)
+                if dv is None or not key:
+                    self._send(400, b'{"error":"node_and_key_required"}')
+                    return
+                res = dv.post_simulate_key(key, action)
+                state.log(f"[panel] 注入按键 {dv.name} {key}/{action} ok={res is not None}")
+                self._send(200 if res else 502,
+                           json.dumps({"ok": res is not None, "device": dv.name, "result": res},
+                                      ensure_ascii=False).encode("utf-8"))
                 return
             if parsed.path != "/api/action":
                 self._send(404, b'{"error":"not_found"}')

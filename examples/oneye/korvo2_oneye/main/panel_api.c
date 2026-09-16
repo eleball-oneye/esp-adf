@@ -268,10 +268,21 @@ void panel_api_key_uplink(const char *id, const char *state)
     }
 }
 
-void panel_api_key_ack(const char *payload, size_t len)
+/* 把某条历史（按索引）标记为云端已确认；ok=false 记 failed */
+static void panel_key_mark_acked_locked(int i, bool ok)
+{
+    snprintf(s_hist[i].uplink, sizeof(s_hist[i].uplink), "%s", ok ? "acked" : "failed");
+    s_hist[i].ack_ms = ok ? (uint64_t)(esp_timer_get_time() / 1000) : 0;
+    if (strcmp(s_current.id, s_hist[i].id) == 0) {
+        s_current.ack_ms = s_hist[i].ack_ms;
+        snprintf(s_current.uplink, sizeof(s_current.uplink), "%s", s_hist[i].uplink);
+    }
+}
+
+bool panel_api_key_ack(const char *payload, size_t len)
 {
     if (payload == NULL || len == 0) {
-        return;
+        return false;
     }
     char buf[PANEL_ACK_PAYLOAD_MAX];
     size_t n = len < sizeof(buf) - 1 ? len : sizeof(buf) - 1;
@@ -281,24 +292,44 @@ void panel_api_key_ack(const char *payload, size_t len)
     if (s_lock) {
         xSemaphoreTake(s_lock, portMAX_DELAY);
     }
+    bool hit = false;
     for (int i = 0; i < s_hist_n; i++) {
         if (s_hist[i].id[0] == '\0' || strcmp(s_hist[i].uplink, "acked") == 0) {
             continue;
         }
-        if (strstr(buf, s_hist[i].id) != NULL) {   /* data.ref == 上行 id */
-            snprintf(s_hist[i].uplink, sizeof(s_hist[i].uplink), "acked");
-            s_hist[i].ack_ms = (uint64_t)(esp_timer_get_time() / 1000);
-            if (strcmp(s_current.id, s_hist[i].id) == 0) {
-                s_current.ack_ms = s_hist[i].ack_ms;
-                snprintf(s_current.uplink, sizeof(s_current.uplink), "acked");
-            }
-            ESP_LOGI(TAG, "key event %s 已被云端 ack", s_hist[i].id);
+        if (strstr(buf, s_hist[i].id) != NULL) {   /* 台面手动 ack：ref 恰为本地事件 id */
+            panel_key_mark_acked_locked(i, true);
+            ESP_LOGI(TAG, "key event %s 已被云端 ack（ref 内含本地 id）", s_hist[i].id);
+            hit = true;
             break;
         }
     }
     if (s_lock) {
         xSemaphoreGive(s_lock);
     }
+    return hit;
+}
+
+bool panel_api_key_ack_item(const char *id, bool ok)
+{
+    if (id == NULL || id[0] == '\0') {
+        return false;
+    }
+    if (s_lock) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+    }
+    bool hit = false;
+    for (int i = 0; i < s_hist_n; i++) {
+        if (strcmp(s_hist[i].id, id) == 0) {
+            panel_key_mark_acked_locked(i, ok);
+            hit = true;
+            break;
+        }
+    }
+    if (s_lock) {
+        xSemaphoreGive(s_lock);
+    }
+    return hit;
 }
 
 void panel_api_set_link(bool cloud_link_up, const char *transport, uint32_t tx_frames, uint32_t rx_frames)
@@ -343,6 +374,14 @@ static const char *panel_api_reset_reason(void)
         case ESP_RST_SDIO:     return "sdio";
         default:               return "unknown";
     }
+}
+
+/* 按键注入回调（由 korvo2_oneye_main.c 注册；未注册 = 该路由不可用） */
+static panel_key_sim_fn_t s_key_sim;
+
+void panel_api_set_key_simulator(panel_key_sim_fn_t fn)
+{
+    s_key_sim = fn;
 }
 
 static esp_err_t send_json(httpd_req_t *req, sb_t *s)
@@ -604,6 +643,49 @@ static esp_err_t h_keys(httpd_req_t *req)
     return send_json(req, &s);
 }
 
+/* POST /api/simulate/key?key=rec&action=click
+ *
+ * 本地验证面专用：把一次**按键事件**按与物理按键**完全相同**的路径上报（同一函数、同一 id
+ * 生成、同一 event/up 组装与 SDK 投递），用于远程/自动化验证「上行 → 云端 ack → 面板第三态」。
+ * 触发源是 HTTP 而非 ADC 按键 ⇒ 日志里带 `(注入)` 标记，且**不得**当作物理按键的验收证据。 */
+static esp_err_t h_simulate_key(httpd_req_t *req)
+{
+    char q[64];
+    char key[16] = { 0 };
+    char action[24] = { 0 };
+
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) != ESP_OK ||
+        httpd_query_key_value(q, "key", key, sizeof(key)) != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                   "need ?key=<volup|voldown|set|play|mode|rec>[&action=click|click_release|press|press_release]");
+    }
+    if (httpd_query_key_value(q, "action", action, sizeof(action)) != ESP_OK) {
+        snprintf(action, sizeof(action), "click");
+    }
+    if (s_key_sim == NULL) {
+        /* IDF 的 esp_http_server 没有 503 枚举，用 500 表示「注入器未注册」 */
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "key simulator 未注册（按键路径未就绪）");
+    }
+    if (s_key_sim(key, action) != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "key/action 非法");
+    }
+
+    sb_t s;
+    if (!sb_init(&s, 256)) {
+        return httpd_resp_send_500(req);
+    }
+    sb_raw(&s, "{");
+    sb_kv_str(&s, "ok", "true");
+    sb_raw(&s, ",");
+    sb_kv_str(&s, "key", key);
+    sb_raw(&s, ",");
+    sb_kv_str(&s, "action", action);
+    sb_raw(&s, ",");
+    sb_kv_str(&s, "note", "injected on the local verification surface; same uplink path as a physical key");
+    sb_raw(&s, "}");
+    return send_json(req, &s);
+}
+
 esp_err_t panel_api_start(uint16_t port)
 {
     if (s_httpd != NULL) {
@@ -625,7 +707,7 @@ esp_err_t panel_api_start(uint16_t port)
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = port;
-    cfg.max_uri_handlers = 12;          /* 4 个 /api 只读 + /media/list + 媒体通配 + /api/action（留余量） */
+    cfg.max_uri_handlers = 13;          /* 5 个 /api（含 /api/simulate/key）+ /media/list + 媒体通配 + /api/action（留余量） */
     cfg.lru_purge_enable = true;
     cfg.stack_size = 6144;
     cfg.recv_wait_timeout = 5;
@@ -649,6 +731,7 @@ esp_err_t panel_api_start(uint16_t port)
         { .uri = "/api/status",   .method = HTTP_GET, .handler = h_status },
         { .uri = "/api/selftest", .method = HTTP_GET, .handler = h_selftest },
         { .uri = "/api/keys",     .method = HTTP_GET, .handler = h_keys },
+        { .uri = "/api/simulate/key", .method = HTTP_POST, .handler = h_simulate_key },
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
         rc = httpd_register_uri_handler(s_httpd, &uris[i]);
@@ -656,7 +739,7 @@ esp_err_t panel_api_start(uint16_t port)
             ESP_LOGE(TAG, "注册 %s 失败：%s", uris[i].uri, esp_err_to_name(rc));
         }
     }
-    ESP_LOGI(TAG, "本地验证面已启动：http://<设备IP>:%u/api/{ping,status,selftest,keys}", (unsigned)port);
+    ESP_LOGI(TAG, "本地验证面已启动：http://<设备IP>:%u/api/{ping,status,selftest,keys,simulate/key}", (unsigned)port);
     /* 媒体与动作（/media/list、/media/<alias>/<path>、POST /api/action）注册到同一实例 */
     (void)media_api_register(s_httpd);
     ESP_LOGW(TAG, "提示：该 API 仅为台面/联调验证面，不是云端设备面契约；量产应置 CONFIG_ONEYE_FW_ENABLE_PANEL_API=n");

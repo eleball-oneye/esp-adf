@@ -205,9 +205,17 @@ I2S0(CODEC_ADC_I2S_PORT) 16 kHz / 32 bit / ONLY_LEFT        ← 单麦口径：i
 | `GET /media/list` | 可播放文件清单（SD 与 SPIFFS 兜底存储；按扩展名判定 `audio`/`image`/`video`），并带 `aec_enabled`/`aec_recording`/`rec_root` |
 | `GET /media/<alias>/<path>` | 文件下载/流式播放，**支持 `Range`**（206 + `Content-Range`，浏览器可拖动进度）；`alias` = `sdcard` \| `spiffs`；含目录穿越防护 |
 | `POST /api/action` | `{"op":"aec_start","duration_s":N}` / `{"op":"aec_stop"}` / `{"op":"play","path":"/sdcard/..."}` / `{"op":"stop"}` / `{"op":"set_volume","volume":0-100}`（**写操作，仅台面验证**） |
+| `POST /api/simulate/key?key=<volup\|voldown\|set\|play\|mode\|rec>[&action=click\|click_release\|press\|press_release]` | **按键事件注入**（第十五轮新增）：按与物理按键**完全相同**的上报路径发一次 `event/up`（同一函数、同一 id 生成、同一契约负载、同一 SDK 投递）。⚠️ 触发源是 **HTTP 而非 ADC 按键** ⇒ 用于远程/自动化验证与演示三态链路，串口日志带 `(注入/local-verification-only)` 标记；**不能**替代"物理按键可用"的验收证据 |
 
 **按键"历史响应"三态**：本地检测（`pending`）→ 交 SDK 上报（`sent`，失败 `failed`）→ 收到云端 `event/down` ack
-（`acked`，按 `data.ref == 事件 id` 关联，固件生成的 id 形如 `key-00001`）。
+（`acked`）。
+
+> ⚠️ **关联口径（第十五轮修正）**：契约 §4.3 的 ack `data.ref` 指向**上行信封 id**，而信封 id 由 SDK 生成
+> （uuid，`oneye_envelope_build(…, id=NULL, …)`），**不等于**固件为条目分配的 `key-%05u` ⇒ 早前按"在 ack
+> 负载里找本地 id 子串"的关联**永远匹配不上**（真机症状：`event/down` ack 确实到了、`rx_frames` 增长、
+> 串口 `EVENT_ACK` 有打印，但面板"云端确认"恒为 `sent`）。现按**上报 FIFO** 关联：`oneye_dev_event_report()`
+> 内部强制成帧（SDK `oneye_dev_event.c:1099`）⇒ 一次上报 = 一帧 = 一 ack，弹出最旧一条即精确对应；
+> 台面手动 ack（`POST /api/mqtt/ack`，ref 恰为本地 id）仍走子串匹配兜底。
 
 宿主面板（`tools/panel/`，Python 标准库零依赖）把三条通道聚合到一页：设备 HTTP（主）、MQTT `rmng/dev/+/event/up`（云端独立验证）、
 串口（无网兜底）：
@@ -290,8 +298,10 @@ python3 tools/panel/panel.py --self-test
 | ⚠️ **/media 通配路由从未命中（真机修复）** | 首轮真机 `GET /media/sdcard/rec/aec-00001.wav` 返回 `404 Nothing matches the given URI`（`/media/list` 正常）：IDF 的 `HTTPD_DEFAULT_CONFIG()` 中 **`uri_match_fn = NULL`**，而 `httpd_find_uri_handler()` 在 NULL 时退化为 `httpd_uri_match_simple`（精确串比较）⇒ 以星号结尾的通配路由永不命中。修法：`panel_api_start()` 显式 `cfg.uri_match_fn = httpd_uri_match_wildcard`。**主机 mock 用 Python 自写前缀匹配 ⇒ 该缺陷只能在真机暴露** |
 | ⚠️ **停止播放必崩（真机修复）** | 首轮真机 `stop` 使设备**重启**（`uptime_ms` 回退）：`assert failed: spinlock_acquire (lock->count == 0)` @ `xEventGroupSetBits` ← `audio_element_stop` ← `audio_element_deinit` ← `teardown_no_task (player.c:85)`。根因：**双重释放** —— ADF 的 `audio_pipeline_deinit()` 已逐个 deinit 并注销注册元素（`audio_pipeline.c:263-271`），我方随后又对元素逐个 `audio_element_deinit` ⇒ use-after-free。修法：管线销毁后仅置空元素句柄 |
 | **上云链路（真机，未闭环）** | SDK 已启动（`base initialized: node=korvo2-0001 transport=mqtt-tcp`、`module registered: log/event`），但按 Kconfig 占位端点 `192.168.1.100:1883` 反复 `connect ... failed` ⇒ **按键三态中的「云端 ack」需要真 broker 才能验证**（登记为后续项：把 `ONEYE_FW_CLOUD_HOST` 指向 dev-stack EMQX 后复测 `caps/up`/`status/up`/`shadow/up`/`log/up`/`event/up` 与 `event/down` ack 关联） |
+| **按键三态（真机，第十五轮**真后端**闭环）** | 台面服务器 `175.178.190.187` 跑真后端（backend `spec-0084`：`rmng/dev/+/event/up` 消费 + `event/down` ack 生产）。真机取证：注入/按键 → 上行 `event/up`（信封 id 为 uuid、条目 id 为 `key-00001`）→ 服务端回 `{"type":"ack","data":{"ref":"<信封 id>","code":"ok"}}` → 设备侧历史 `uplink=acked ack_ms=21728`，面板"云端确认"列亮起；串口同步可见 `[cloud-ack] 云端确认批次（ref=…）→ 本地事件 key-00001 ⇒ acked` |
+| ⚠️ **云端 ack 关联口径缺陷（真机，第十五轮已修）** | 症状：ack 帧**确实到达设备**（`rx_frames` 0→1、串口 `[sdk-event] EVENT_ACK len=123`）但面板"云端确认"恒为 `sent`。根因：契约 §4.3 的 `data.ref` = **上行信封 id**（SDK 生成 uuid，`oneye_envelope_build(…,id=NULL,…)`），而固件按"ack 负载里含本地 `key-%05u` 子串"关联 ⇒ 永不命中。修法：固件维护"已上报 item id"的 FIFO（`oneye_dev_event_report()` 强制成帧 ⇒ 一帧一条，FIFO 弹出精确对应；SDK `oneye_dev_event.c:1099`），命中即经 `panel_api_key_ack_item()` 置 `acked`；台面手动 ack 仍按子串兜底 |
 | **上云链路（真机，第十三轮已闭环）** | 端点指向临时服务器 `175.178.190.187:1883` 后：`link up: 175.178.190.187:1883 transport=mqtt-tcp node=korvo2-0001`；真 EMQX 抓包收到 `status/up`（含 LWT 遗言 `{"online":false,"reason":"lwt"}`）、`caps/up`（`data{node_id,model_version,fw_version,sdk_version,caps,attrs,events,cmds}`）、`shadow/up`（`esp.fw_version`/`esp.power`）、`log/up`（`items[0]={level,tag:"oneye_base",msg:"板级自检：19 项 / 失败 0 项"}`）、`event/up`（按键事件，`data.items[].id=key-0000N`） |
-| **按键三态（真机，第十三轮已闭环）** | 本地检测（串口 `[key] <名>/<动作>` + `panel_api: key event #N … id=key-0000N`）→ 上行（真 EMQX `event/up`）→ 云端 ack（面板云端桩 `event/down` `{"type":"ack","data":{"ref":"key-0000N","code":"ok"}}`，`ref` 与上行 id 对齐） |
+| **按键三态（真机，第十三轮：云端桩）** | 本地检测（串口 `[key] <名>/<动作>` + `panel_api: key event #N … id=key-0000N`）→ 上行（真 EMQX `event/up`）→ 云端 ack（面板云端桩 `event/down` `{"type":"ack","data":{"ref":"key-0000N","code":"ok"}}`，`ref` 与上行 id 对齐）——**注**：桩的 `ref` 恰为本地 id，掩盖了上表的关联口径缺陷；第十五轮改走**真后端**并修正关联（见同表两行） |
 | ⚠️ **真机崩溃链：ack 必崩（已修）** | 设备收到 `event/down` 即重启：`***ERROR*** A stack overflow in task oneye_net has been detected` + `Backtrace ... CORRUPTED`。根因 = **SDK 把 IDF `xTaskCreatePinnedToCore` 的栈单位当"字"**（IDF 是**字节**）⇒ 网络线程只有 4 KB 栈，回调一跑就溢出。修法：按字节传入 + 缺省 8 KB（SDK `3029bba`） |
 | ⚠️ **真机录音 0/44 字节（已修）** | 串口：`sdmmc_cmd: allocate_dma_buf: not enough mem` + `AUDIO_THREAD: Error creating RestrictedPinnedToCore algo_fetch` + `afe_feed: handle or input data is NULL!` ⇒ 内部 RAM 被 Wi-Fi+SDK+AFE 吃满。修法：`SPIRAM_MALLOC_ALWAYSINTERNAL=4096` + 内部保留量；实测 `internal_free 39 KB→88 KB`、`largest 15 KB→40 KB`，录音恢复正常 |
 | **录音时长精度（已修）** | ① 原「起管线即计时」把 AFE 预热算入（请求 5 s 得 ~4 s）；② 改「按文件大小探首帧」受 FATFS 写缓冲滞后（请求 5 s 得 ~8.4 s）；③ 现按 **fatfs_stream 的 `byte_pos`（已写字节数）** 精确计时：**请求 5 s → 163,884 B = 5.12 s** |

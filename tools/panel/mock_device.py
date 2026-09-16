@@ -632,6 +632,15 @@ class MockDevice:
 
             def do_POST(self):  # noqa: N802
                 parsed = urllib.parse.urlparse(self.path)
+                q = urllib.parse.parse_qs(parsed.query)
+                if parsed.path == "/api/simulate/key":
+                    # 与固件同形的本地验证面注入：只做参数校验后走同一「按键 → event/up」路径
+                    key = q.get("key", ["play"])[0]
+                    action = q.get("action", ["click"])[0]
+                    res = mock.press(key, action)
+                    self._json({"ok": True, "key": key, "action": action,
+                                "note": "mock: same uplink path as a physical key", "press": res})
+                    return
                 if parsed.path != "/api/action":
                     self._json({"error": "not_found"}, 404)
                     return

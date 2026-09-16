@@ -603,6 +603,7 @@ PAGE = r"""<!doctype html>
   <button id="btn-refresh">立即刷新</button>
 </header>
 <main>
+  <div id="jserr" class="card" style="display:none;border-color:#a33;background:#3a1620;color:#ffd7d7"></div>
   <div class="card">
     <h2>按键：实时状态 <small>本地检测（设备 HTTP）</small></h2>
     <div class="keys" id="keys"></div>
@@ -708,11 +709,34 @@ const $ = (id)=>document.getElementById(id);
 const ACT = {click:"短按", click_release:"短按释放", press:"长按", press_release:"长按释放", unknown:"未知"};
 const KEYNAME = {rec:"REC", mute:"MUTE", play:"PLAY", set:"SET", mode:"MODE", volup:"VOL+", voldown:"VOL-", unknown:"?"};
 let lastSeq = -1;
+// ⚠️ 页面级快照：tick() 每轮把 /api/state 存到这里，供按钮回调（注入/绘制/抓拍）取"当前节点名"。
+//    历史上这些回调误用了服务端才有的变量名 `state`（Python 侧的 self.devices）⇒ 浏览器每轮 tick()
+//    抛 ReferenceError、**tick() 后续渲染全部中断**（症状：顶部芯片与按键格正常，其下各卡片全空）。
+//    自检里有对应回归断言（见 self_test 的「页面 JS 无未定义全局」）。
+let lastState = null;
+function firstNode(){
+  // ⚠️ /api/state 的 devices 是**数组**（早期版本按字典写成 Object.keys(...)[0] ⇒ 会得到 "0"）。
+  //    这里统一按数组/字典两种形状取，并优先用在线设备；取不到就让服务端回落（服务端对空 node 有兜底）。
+  const arr = (lastState && lastState.devices) || [];
+  const list = Array.isArray(arr) ? arr : Object.values(arr);
+  const d = list.find(x=>x && x.online) || list[0] || null;
+  return (d && (d.node || d.name)) || currentDev || '';
+}
+// 客户端异常必须**上屏**：否则页面只会"某几块永远空白"，看不出是 JS 抛错（真机踩过）。
+window.addEventListener('error', (ev)=>{
+  const el = $('jserr');
+  if (!el) return;
+  el.style.display = 'block';
+  el.textContent = '页面 JS 异常：' + (ev.message||ev.type) +
+    (ev.filename? ` @${String(ev.filename).split('/').pop()}:${ev.lineno||0}` : '') +
+    '（面板数据本身可能正常；请把本行反馈给开发）';
+});
 
 async function tick(){
   let st;
   try{ st = await (await fetch('/api/state')).json(); }
   catch(e){ $('c-upd').textContent = '面板服务不可达'; return; }
+  lastState = st;                       // 供按钮回调取节点名（见 firstNode()）
   const dev = (st.devices||[]).find(d=>d.online) || (st.devices||[])[0] || {};
   currentDev = dev.name || null;
   const keys = dev.keys||{}, ks = keys.history||[];
@@ -912,7 +936,9 @@ $('btn-refresh').onclick = tick;
 // 注入用的按键清单取自**设备**（/api/keys 的 keys[].label，与板级 INPUT_KEY_DEFAULT_INFO 同源），
 // 设备不可达时才退回硬编码兜底（本板实际为 REC/MUTE/SET/PLAY/VOL+/VOL−，**无 MODE**）。
 function simKeyOptions(){
-  const dv = state.devices && Object.values(state.devices)[0];
+  const arr = (lastState && lastState.devices) || [];
+  const list = Array.isArray(arr) ? arr : Object.values(arr);
+  const dv = list.find(x=>x && x.online) || list[0] || null;
   const labels = ((dv && dv.keys && dv.keys.keys) || []).map(k=>k.label).filter(Boolean);
   return labels.length ? labels : ['rec','mute','set','play','volup','voldown'];
 }
@@ -925,7 +951,7 @@ function refreshSimKeys(){
 }
 async function simKey(){
   const k = $('sim-key').value;
-  const n = (state.devices && Object.keys(state.devices)[0]) || '';
+  const n = firstNode();
   try {
     const r = await fetch(`/api/simulate/key?node=${encodeURIComponent(n)}&key=${encodeURIComponent(k)}&action=click`,
                           {method:'POST'});
@@ -937,7 +963,7 @@ async function simKey(){
 
 // 板载摄像头：抓一帧（本地验证面 /api/camera/capture，落 cam/ 后由 /media 面显示）
 async function camCapture(){
-  const n = (state.devices && Object.keys(state.devices)[0]) || '';
+  const n = firstNode();
   const msg = $('cammsg');
   msg.textContent = '抓拍中…';
   try {
@@ -951,7 +977,7 @@ async function camCapture(){
   setTimeout(tick, 700);
 }
 async function lcdDraw(pattern){
-  const n = (state.devices && Object.keys(state.devices)[0]) || '';
+  const n = firstNode();
   const msg = $('lcdmsg');
   try {
     const r = await fetch(`/api/action/lcd?node=${encodeURIComponent(n)}&pattern=${encodeURIComponent(pattern)}`,
@@ -1336,6 +1362,16 @@ def self_test(verbose: bool = True) -> int:
                 page = r.read().decode("utf-8", "replace")
             check("首页渲染可用", "按键：实时状态" in page and "__POLL_MS__" not in page)
             check("首页含音频/AEC 卡片", "音频：AEC 采集" in page and "/api/action" in page)
+            # 回归断言（d8c8701c 起的真实缺陷）：页面 JS 里的按钮回调误用了服务端变量名 `state`，
+            # 浏览器每轮 tick() 抛 ReferenceError ⇒ tick() 之后的所有渲染全部中断（页面"半死"：
+            # 顶部芯片与按键格正常、其下卡片全空）。客户端异常无法被服务端自检发现，故此处做静态守卫。
+            js = page.split("<script>")[-1].split("</script>")[0] if "<script>" in page else ""
+            check("页面 JS 无未定义全局（不出现裸 state.devices）",
+                  "let lastState = null;" in js and "state.devices" not in js
+                  and js.count("lastState.devices") >= 1,
+                  f"lastState 声明={'有' if 'let lastState = null;' in js else '无'}")
+            check("页面含客户端异常横幅（JS 报错上屏，不再静默空白）",
+                  'id="jserr"' in page and "addEventListener('error'" in js)
         except Exception as exc:  # noqa: BLE001
             check("首页渲染可用", False, str(exc))
 

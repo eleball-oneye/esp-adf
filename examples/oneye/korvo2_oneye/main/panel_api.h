@@ -83,6 +83,10 @@ void panel_api_set_link(bool cloud_link_up, const char *transport, uint32_t tx_f
 /** Wi-Fi 状态（ssid/source 供面板显示配网来源；source 形如 "file:/sdcard/oneye-wifi.txt"） */
 void panel_api_set_wifi(bool connected, const char *ip, const char *ssid, const char *source);
 
+/** 授时状态（契约 §7）：synced=true 后所有时间戳为 UTC 毫秒；offset_ms = cloud_ts − 本地运行时刻，
+ *  source 形如 "caps/down.cloud_ts"。未授时时 synced=false、offset_ms=0（时间戳为运行时刻，并已告警）。 */
+void panel_api_set_time(bool synced, uint64_t cloud_ts_ms, int64_t offset_ms, const char *source);
+
 /* ------------------------------------------------------------ 本地注入（验证专用） */
 
 /** 按键事件注入回调：由固件按键路径实现，走的是**与物理按键完全相同**的上报路径

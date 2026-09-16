@@ -83,6 +83,12 @@ static uint32_t s_tx_frames, s_rx_frames;
 static bool     s_wifi_up;
 static char     s_ip[20] = "";
 static char     s_wifi_ssid[36] = "";
+
+/* 授时状态（契约 §7）：未授时时 synced=false、offset_ms=0 ⇒ 时间戳为运行时刻 */
+static bool     s_time_synced;
+static uint64_t s_time_cloud_ts_ms;
+static int64_t  s_time_offset_ms;
+static char     s_time_source[32] = "";
 static char     s_wifi_source[64] = "";   /* "file:/sdcard/oneye-wifi.txt" | "kconfig" | "api" */
 
 /* ------------------------------------------------------------------ 字符串构造器（JSON） */
@@ -278,11 +284,16 @@ void panel_api_key_uplink(const char *id, const char *state)
     }
 }
 
-/* 把某条历史（按索引）标记为云端已确认；ok=false 记 failed */
+/* 设备当前墙上时间（毫秒）：定义见下方（授时状态之后）；此处前置声明供 ack 时间戳使用 */
+static uint64_t panel_api_now_ms(void);
+
+/* 把某条历史（按索引）标记为云端已确认；ok=false 记 failed。
+ * ack 时间与事件时间用**同一时钟**（panel_api_now_ms：已授时=UTC 毫秒，未授时=运行时刻），
+ * 否则「端到端 = ack_ms − ts_ms」在授时前后会得到负值/天文数字。 */
 static void panel_key_mark_acked_locked(int i, bool ok)
 {
     snprintf(s_hist[i].uplink, sizeof(s_hist[i].uplink), "%s", ok ? "acked" : "failed");
-    s_hist[i].ack_ms = ok ? (uint64_t)(esp_timer_get_time() / 1000) : 0;
+    s_hist[i].ack_ms = ok ? panel_api_now_ms() : 0;
     if (strcmp(s_current.id, s_hist[i].id) == 0) {
         s_current.ack_ms = s_hist[i].ack_ms;
         snprintf(s_current.uplink, sizeof(s_current.uplink), "%s", s_hist[i].uplink);
@@ -368,9 +379,32 @@ void panel_api_set_wifi(bool connected, const char *ip, const char *ssid, const 
 
 /* ------------------------------------------------------------------ HTTP 处理 */
 
-/** 本次启动的复位原因（面板/联调判定"离线在线跳变"是否来自设备重启） */
-static const char *panel_api_reset_reason(void)
+/** 本地验证面：授时状态登记（契约 §7；由 TIME_SYNCED 事件驱动） */
+void panel_api_set_time(bool synced, uint64_t cloud_ts_ms, int64_t offset_ms, const char *source)
 {
+    if (s_lock) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+    }
+    s_time_synced = synced;
+    s_time_cloud_ts_ms = cloud_ts_ms;
+    s_time_offset_ms = offset_ms;
+    if (source != NULL) {
+        snprintf(s_time_source, sizeof(s_time_source), "%s", source);
+    }
+    if (s_lock) {
+        xSemaphoreGive(s_lock);
+    }
+}
+
+/** 设备当前墙上时间（毫秒）：未授时时为运行时刻（两段历史都由此口径自证一致） */
+static uint64_t panel_api_now_ms(void)
+{
+    uint64_t up = (uint64_t)(esp_timer_get_time() / 1000);
+    return s_time_synced ? (uint64_t)((int64_t)up + s_time_offset_ms) : up;
+}
+
+/** 本次启动的复位原因（面板/联调判定"离线在线跳变"是否来自设备重启） */
+static const char *panel_api_reset_reason(void){
     switch (esp_reset_reason()) {
         case ESP_RST_POWERON:  return "poweron";
         case ESP_RST_EXT:      return "ext";
@@ -521,6 +555,19 @@ static esp_err_t h_status(httpd_req_t *req)
      * 「设备在重启」与「网络抖动」——SW/panic 复位会给出确切复位码。 */
     sb_kv_str(&s, "reset_reason", panel_api_reset_reason());
     sb_raw(&s, ",");
+    /* 授时状态（契约 §7）：synced=true ⇒ 所有 ts 为 UTC 毫秒；否则为运行时刻（已告警）。
+     * now_ms 为设备当前墙上时间（未授时时 = 运行毫秒），供面板显示/对照。 */
+    sb_raw(&s, "\"time\":{");
+    sb_raw(&s, s_time_synced ? "\"synced\":true" : "\"synced\":false");   /* 契约口径：bool */
+    sb_raw(&s, ",");
+    sb_kv_i(&s, "cloud_ts_ms", (long long)s_time_cloud_ts_ms);
+    sb_raw(&s, ",");
+    sb_kv_i(&s, "offset_ms", (long long)s_time_offset_ms);
+    sb_raw(&s, ",");
+    sb_kv_str(&s, "source", s_time_source);
+    sb_raw(&s, ",");
+    sb_kv_i(&s, "now_ms", (long long)panel_api_now_ms());
+    sb_raw(&s, "},");
     sb_kv_str(&s, "scope", "local-verification-only");
     sb_raw(&s, "}");
     sb_raw(&s, "}");

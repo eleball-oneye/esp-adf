@@ -662,6 +662,9 @@ async function tick(){
   const dev = (st.devices||[]).find(d=>d.online) || (st.devices||[])[0] || {};
   currentDev = dev.name || null;
   const keys = dev.keys||{}, ks = keys.history||[];
+  // 授时状态（契约 §7）：synced=true 时设备时间戳为 UTC 毫秒，否则为运行时刻
+  const tinfo = ((dev.status && dev.status.panel && dev.status.panel.time) || {});
+  const timeSynced = tinfo.synced === true || String(tinfo.synced) === 'true';
 
   // 顶部状态
   $('c-mqtt').className = 'chip ' + (st.mqtt.connected ? 'on' : (st.mqtt.enabled ? 'err' : 'off'));
@@ -701,8 +704,13 @@ async function tick(){
                         : '<span class="pill bad" title="面板的 MQTT 观测通道未连通，本列无意义">未连通</span>');
     // 端到端 = 设备侧时钟内的 ack_ms - ts_ms（设备未授时，不能用面板墙上时钟相减）
     const delta = (e.ack_delta_ms!==undefined) ? (e.ack_delta_ms+' ms') : '—';
-    const t = e.ts_ms!==undefined ? ('运行 +'+(e.ts_ms/1000).toFixed(1)+' s') : '—';
-    return `<tr class="${e.seq>lastSeq?'flash':''}"><td>${e.seq}</td><td class="mut" title="设备侧 ts_ms（设备未授时，故显示运行时刻）">${t}</td>
+    const t = e.ts_ms!==undefined
+      ? (timeSynced ? new Date(e.ts_ms).toLocaleString()
+                    : ('运行 +'+(e.ts_ms/1000).toFixed(1)+' s'))
+      : '—';
+    const tTitle = timeSynced ? '设备已授时：ts 为 UTC 毫秒'
+                              : '设备未授时：ts 为运行时刻（契约 §7 告警位；等 caps/down.cloud_ts）';
+    return `<tr class="${e.seq>lastSeq?'flash':''}"><td>${e.seq}</td><td class="mut" title="${tTitle}">${t}</td>
       <td>${KEYNAME[e.key]||e.key}</td><td>${ACT[e.action]||e.action}</td>
       <td><span class="pill ${upCls}">${up}</span></td><td>${cloud}</td><td class="mut">${delta}</td></tr>`;
   });
@@ -728,6 +736,9 @@ async function tick(){
     <div>Wi-Fi</div><div>${wifi.connected? '已连接 '+ (wifi.ip||'') : '<span class="pill pend">未连接</span>'}</div>
     <div>云端链路</div><div>${cloud.link_up? '<span class="pill ok">已连接</span> '+ (cloud.transport||'') : '<span class="pill pend">未连接（按键仍可本地核对）</span>'}</div>
     <div>收发帧</div><div>tx ${cloud.tx_frames||0} / rx ${cloud.rx_frames||0}</div>
+    <div>授时</div><div>${timeSynced
+        ? `<span class="pill ok">已授时</span> <span class="mut">${tinfo.source||''}（偏移 ${tinfo.offset_ms||0} ms；时间戳为 UTC）</span>`
+        : '<span class="pill pend">未授时</span> <span class="mut">时间戳为设备运行时刻，等 caps/down.cloud_ts</span>'}</div>
     <div>错误</div><div class="mut">${dev.last_error||'—'}</div>`;
 
   // Wi-Fi 配网卡片

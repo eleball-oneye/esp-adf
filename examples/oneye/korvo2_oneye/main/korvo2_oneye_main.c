@@ -218,6 +218,67 @@ static const char *evt_name(oneye_dev_event_t evt)
     }
 }
 
+/* ---- 授时状态（契约 §7：`caps/down.cloud_ts` 首选来源）----
+ * 未授时时 offset=0 ⇒ 时间戳为**运行时刻**（并已在串口打告警），授时后立即纠偏；
+ * 面板/按键历史用同一 offset 显示真实 UTC 时间。 */
+static bool     s_time_synced;
+static uint64_t s_cloud_ts_ms;
+static int64_t  s_time_offset_ms;
+
+static uint64_t fw_wall_ms(void)
+{
+    uint64_t up = (uint64_t)(esp_timer_get_time() / 1000);
+    return s_time_synced ? (uint64_t)((int64_t)up + s_time_offset_ms) : up;
+}
+
+static void on_time_synced(const void *payload, size_t len)
+{
+    uint64_t cts = 0;
+    if (payload == NULL || len < sizeof(cts)) {
+        return;
+    }
+    memcpy(&cts, payload, sizeof(cts));
+    uint64_t up = (uint64_t)(esp_timer_get_time() / 1000);
+    s_cloud_ts_ms = cts;
+    s_time_offset_ms = (int64_t)cts - (int64_t)up;
+    s_time_synced = true;
+    panel_api_set_time(true, cts, s_time_offset_ms, "caps/down.cloud_ts");
+    ESP_LOGI(TAG, "[time] 已授时：cloud_ts=%llu ms、本地偏移=%lld ms（此后所有 ts 为 UTC 毫秒）",
+             (unsigned long long)cts, (long long)s_time_offset_ms);
+}
+
+/* 授时请求任务：`oneye_dev_base_sync_time()` 会**阻塞等待**云端应答，**不得**在 SDK 回调
+ * （网络线程）里调用（会自锁）；故链路建立后由本任务发起，并重试到成功或放弃
+ * （放弃后仍可由服务端在 `status/up` 时的周期性再同步兜底）。 */
+static volatile bool s_sync_task_running;
+
+static void time_sync_task(void *arg)
+{
+    (void)arg;
+    for (int i = 0; i < 6 && !s_time_synced; i++) {
+        oneye_dev_sdk_err_t rc = oneye_dev_base_sync_time(5000);
+        if (rc == ONEYE_DEV_SDK_OK) {
+            break;
+        }
+        ESP_LOGW(TAG, "授时请求第 %d 次未成功：%s（5 s 后重试）", i + 1, oneye_dev_strerror(rc));
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+    s_sync_task_running = false;
+    vTaskDelete(NULL);
+}
+
+static void request_time_sync(void)
+{
+    if (s_time_synced || s_sync_task_running) {
+        return;
+    }
+    s_sync_task_running = true;
+    if (xTaskCreate(time_sync_task, "time_sync", 4096, NULL, 3, NULL) != pdPASS) {
+        s_sync_task_running = false;
+        ESP_LOGW(TAG, "授时任务创建失败（内存不足），等待服务端周期性再同步");
+    }
+}
+
 /* 云确认关联的前向声明（sdk_event_cb 早于其定义使用；实现见「按键 → event/up」段） */
 static const char *key_pending_pop(void);
 static bool ack_payload_is_ok(const char *payload, size_t len);
@@ -226,6 +287,13 @@ static void sdk_event_cb(oneye_dev_event_t evt, const void *payload, size_t len,
 {
     (void)ctx;
     ESP_LOGI(TAG, "[sdk-event] %s len=%u", evt_name(evt), (unsigned)len);
+    if (evt == ONEYE_DEV_SDK_EVT_TIME_SYNCED) {
+        on_time_synced(payload, len);
+    }
+    if (evt == ONEYE_DEV_SDK_EVT_CLOUD_LINK_UP) {
+        /* 链路建立（含重连）后按需发起授时请求；不在本回调内阻塞（见 request_time_sync 注释） */
+        request_time_sync();
+    }
     if (evt == ONEYE_DEV_EVENT_EVT_ACK) {
         /* 云端 ack：契约 §4.3 的 `data.ref` = **上行信封 id**（SDK 生成的 uuid），
          * 不是本固件的事件 id ⇒ 先按"ref 内含本地 id"匹配（台面手动 ack 路径），
@@ -341,7 +409,7 @@ static void emit_key_event(const char *key, const char *act, bool injected)
     static uint32_t s_key_id;
     char id[24];
     snprintf(id, sizeof(id), "key-%05u", (unsigned)++s_key_id);
-    panel_api_key_event(key, act, id, (uint64_t)(esp_timer_get_time() / 1000));
+    panel_api_key_event(key, act, id, fw_wall_ms());
 
     oneye_dev_event_item_t item;
     memset(&item, 0, sizeof(item));   /* 事件条目无 struct_size/api_version（非配置结构体） */
@@ -610,6 +678,9 @@ static void oneye_start(void)
         return;
     }
     (void)oneye_dev_base_wait_event(3000);
+
+    /* 5b) 授时（契约 §7）由 CLOUD_LINK_UP 事件驱动的 `request_time_sync()` 发起（见 sdk_event_cb）：
+     *     `oneye_dev_base_sync_time()` 会阻塞等待云端应答，必须跑在独立任务里，不能在 SDK 回调内调用。 */
 
     /* 6) 自检结论 + 已登记影子键（esp.fw_version / esp.power） */
     ONEYE_LOGI(ONEYE_DEV_LOG_TAG_BASE,

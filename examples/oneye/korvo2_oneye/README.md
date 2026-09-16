@@ -231,6 +231,23 @@ python3 tools/panel/panel.py --device korvo2-0001=http://<设备IP>
 python3 tools/panel/panel.py --self-test
 ```
 
+## 5.6 时间同步（云端授时）
+
+契约（[传输规范 §7](../../../../backend/contracts/api/mqtt/传输规范.md)）规定：所有 `ts` 为 **UTC 毫秒**，**首选授时来源 = `caps/down.cloud_ts`**（回退 HTTPS `Date`，SNTP 为部署可选且设备默认关闭）。固件实现：
+
+1. **索取**：链路建立（`CLOUD_LINK_UP`，含重连）后由独立任务调用 `oneye_dev_base_sync_time()`（`caps/up{data.req:"time_sync"}`）。
+   ⚠️ **不得**在 SDK 回调内调用（它阻塞等待应答，会在网络线程上自锁）；失败重试 6 次、每次间隔 5 s，之后等服务端在 `status/up` 时的周期性再同步（每设备 ≥5 min）。
+2. **应用**：收到 `TIME_SYNCED` 即建立「采样点 + 单调时钟」偏移；此后**按键历史、ack 时间戳与所有上行 `ts` 统一走同一时钟**（`fw_wall_ms()`），未授时期间为设备运行时刻并带告警位（契约 §7）。
+3. **可观测**：`GET /api/status` → `panel.time{synced, cloud_ts_ms, offset_ms, source, now_ms}`；面板「设备与链路」卡片显示**授时**状态，历史「设备时刻」列在已授时后显示真实本地时间（未授时显示 `运行 +N s`）。
+
+`now_ms` 可直接与宿主时钟对照（例如宿主 `Date.now()`），差值即设备时钟相对宿主的偏差。
+
+> ⚠️ **台面构建陷阱（实测踩到）**：`./build-all.sh --firmware` 会**按 `sdkconfig.defaults` 重新生成 `sdkconfig`**，从而丢掉台面值
+> （`ONEYE_FW_CLOUD_HOST`/`_PORT`、`SPIRAM_MALLOC_RESERVE_INTERNAL`）——症状是设备去连占位地址 `192.168.1.100`。
+> 台面配置备忘见 `output/.build/bench-sdkconfig.txt`：临时服务器 `175.178.190.187:1883`、`SPIRAM_MALLOC_RESERVE_INTERNAL=131072`。
+> **另**：`src/internal/*.c` 等 SDK 内部源码**不参与固件编译**（固件链接 SDK 的**预编译库**）⇒ 改 SDK 内部实现后必须重跑
+> `./build-all.sh --toolchains esp32s3@5.5.5`（否则"改了没生效"）。
+
 ## 6. 配置（`idf.py menuconfig` → `korvo2_oneye 板级固件配置`）
 
 | 配置 | 缺省 | 说明 |
@@ -313,7 +330,9 @@ python3 tools/panel/panel.py --self-test
 | ⚠️ **回放永不出声且不结束（真机，第十四轮已修）** | 复现：播放 5.12 s 的录音，`playing=true` 持续 36 s 不结束、扬声器无声。逐级打点（新增诊断 `player_diag_dump()`：`file 已读 / decoder 已出 / i2s 已写` 字节数）定位为 **`i2s 已写 44 B` 即卡死** ⇒ 写元素不再被调度。根因：`player.c` 从 algorithm 例程抄了 **`i2s_cfg.task_stack = -1`**（那是「写元素由上游 `write_cb` 驱动」的用法），而本工程走的是官方播放例程 `pipeline_play_sdcard_music` 的 `decoder → i2s` 常规链路：**无任务元素经 `i2s_stream_set_clk()`（内部 `pause`→`resume`，日志可见 `[i2s] RESUME timeout`）后不再被调度**。修法：去掉 `task_stack = -1`（用默认任务栈），并按官方例程补上 `audio_element_setinfo(i2s, &music_info)` → `i2s_stream_set_clk(...)` 的顺序。修后串口 `IN-[i2s] AEL_IO_DONE` → **`player: 播放结束`**，`/api/status.player.playing=false` |
 | **录音/回放互斥（新增）** | 本板 ES7210(ADC) 与 ES8311(DAC) **共用 I2S0**：「播放中启动录音」会把两条管线都卡死（AFE 持续 `Ringbuffer of AFE is empty`，随后重启）⇒ `aec_capture_start()` 拒绝在回放中录音、`player_play()` 拒绝在录音中回放（`ESP_ERR_INVALID_STATE`，面板返回 `busy: already recording or playing (shared I2S0)`）。配套：录音的 I2S 读元素改为**按需创建、结束时销毁**（不再常驻占用端口） |
 | **稳定性复测（真机，第十四轮）** | `play → rec 5 s → play → rec 5 s → 守卫拒绝 → stop` 全流程：**重启 0 次**（`uptime_ms` 单调 8,246→76,220 ms）、两次录音均 163,884 B = 5.12 s、两次回放均 `播放结束`、`in-app 守卫` 正确拒绝重叠操作 |
-| ⚠️ **板载按键清单按下标猜标签（真机，第十五轮已修）** | 面板按键条与 `/api/keys` 的按键清单原按**下标 0..5** 猜标签（`volup/voldown/set/play/mode/rec`），而本板 `board_def.h` 的 `INPUT_KEY_DEFAULT_INFO()` 实为 **REC=1 / MUTE=7 / SET=2 / PLAY=3 / VOLUP=6 / VOLDOWN=5**（**且本板无 MODE 键**，id 也不从 0 起）⇒ 真机表现：历史里出现 `MUTE`，而按键条显示 `MODE`、VOL± 错位。修法：清单按 **ADF user_id** 定义（`panel_api.c` 的 `k_panel_keys`），`/api/keys` 与注入校验（`simulate/key`）同源取值 |
+| **云端授时闭环（真机，第十六轮）** | 服务端（backend spec-0085）回 `caps/down{cloud_ts}` → 串口 `[oneye][base][I] time synced: cloud_ts=1789542529385 offset=…` → `/api/status.panel.time = {synced:true, cloud_ts_ms:1789542811275, offset_ms:1789542806775, source:"caps/down.cloud_ts", now_ms:1789542821824}` ⇒ **按键上行帧 `ts` 由运行时刻（≈8e5）变为 UTC 毫秒（≈1.79e12）**，端到端时延 66–85 ms（设备侧时钟内相减） |
+| ⚠️ **授时即重启（真机，第十六轮已修）** | 收到 `caps/down` 后必现 `***ERROR*** A stack overflow in task oneye_net has been detected.` + `rst:0xc (RTC_SW_CPU_RST)`（表现为"一授时就重启"）。根因：SDK 网络线程栈上放 `oneye_envelope_t`（内含 `data[4096]`）+ `local[1024]`，叠加 `TIME_SYNCED` 应用回调链后突破 8 KB 缺省栈。修法：网络线程栈 **8 KB → 16 KB**（`oneye_internal.c` 的 `oneye_bint_start`），且 `caps/down` 处理的两个缓冲改**静态**（该面仅网络线程串行处理）。**注**：SDK 以预编译库链接，改内部源码须重跑 `build-all.sh`（见 §5.6 陷阱） |
+| ⚠️ **`build-all.sh --firmware` 会重置 sdkconfig（真机，第十六轮踩到）** | 台面云地址与内存保留值被 `sdkconfig.defaults` 覆盖 ⇒ 设备改连占位 `192.168.1.100:1883`、AFE 录音内存不足。处置：台面值备忘 `output/.build/bench-sdkconfig.txt` + §5.6 的构建注意 | 面板按键条与 `/api/keys` 的按键清单原按**下标 0..5** 猜标签（`volup/voldown/set/play/mode/rec`），而本板 `board_def.h` 的 `INPUT_KEY_DEFAULT_INFO()` 实为 **REC=1 / MUTE=7 / SET=2 / PLAY=3 / VOLUP=6 / VOLDOWN=5**（**且本板无 MODE 键**，id 也不从 0 起）⇒ 真机表现：历史里出现 `MUTE`，而按键条显示 `MODE`、VOL± 错位。修法：清单按 **ADF user_id** 定义（`panel_api.c` 的 `k_panel_keys`），`/api/keys` 与注入校验（`simulate/key`）同源取值 |
 | ⚠️ **面板 MQTT 观测通道静默死链（第十五轮已修，面板侧）** | 症状：12 次真机按键，面板只观测到 1 次 event/up，其余"云端确认"恒为**未见**，而 `mqtt.connected` 一直显示 true。根因：`MiniMqtt` 只在**收到数据**时才发 PINGREQ ⇒ 空闲超过 broker 的 `keepalive×1.5` 被判失联；对端关闭后 `recv` 返回 EOF、`fileno()` 仍有效 ⇒ 旧代码把它当超时 `continue`，**既不重连也不报错**。修法：空闲也按 `keepalive/2` 发 PINGREQ、EOF 即判对端关闭、`keepalive×2` 无入站数据判死链重连；"云端确认"列在 MQTT 未连通时显示**未连通**（而非误导性的"未见"）。复测：注入 6 次 + **空闲 80 s** + 再注入 2 次 ⇒ 8/8 全部观测到、连接未断 |
 | **待续（未闭环，明确记录）** | ① **可听性**：回放链路已把 PCM 完整时钟输出（`AEL_IO_DONE` + 时长吻合），但「扬声器是否真的出声」需人耳确认（PA `GPIO48` 已在 `es8311_codec_init` 打开、音量 80）；② **麦克风灵敏度**：原始幅度随环境变化（123→390），对着板子说话的幅度取证待补；③ LCD/摄像头取帧、时间同步未闭环 |
 

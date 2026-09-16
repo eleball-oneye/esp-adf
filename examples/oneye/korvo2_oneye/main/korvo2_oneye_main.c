@@ -40,6 +40,7 @@
 #include "panel_api.h"
 #include "aec_capture.h"
 #include "player.h"
+#include "lcd_ui.h"
 #include "wifi_prov.h"
 
 static const char *TAG = "korvo2_oneye";
@@ -189,8 +190,13 @@ static void board_init_peripherals(void)
 #endif
 
 #if CONFIG_ONEYE_FW_ENABLE_LCD
-    /* rst：ILI9341 320x240 + TCA9554 CS/RST/BL（board.c:89-153） */
-    chk_ok("lcd init (ILI9341 320x240)", audio_board_lcd_init(s_periph_set, NULL) != NULL, "panel");
+    /* rst：ILI9341 320x240 + TCA9554 CS/RST/BL（board.c:89-153）——与 ADF 例程同源
+     * （examples/display/lcd_jpeg|lcd_camera 均用 audio_board_lcd_init + esp_lcd_panel_draw_bitmap）。 */
+    void *lcd_panel = audio_board_lcd_init(s_periph_set, NULL);
+    chk_ok("lcd init (ILI9341 320x240)", lcd_panel != NULL, "panel");
+    if (lcd_panel != NULL && lcd_ui_attach(lcd_panel) == ESP_OK) {
+        (void)lcd_ui_set_pattern("status");        /* 初始状态屏（后续随按键/链路刷新） */
+    }
 #endif
 }
 
@@ -279,6 +285,29 @@ static void request_time_sync(void)
     }
 }
 
+/* ---------------------------------------------------------------- LCD 状态屏
+ * 板载 ILI9341 的**本地验证面**展示：链路 + 最近按键（人眼/拍照即可核对，
+ * 与验证面板显示的是同一份事实）。未启用 LCD（Kconfig）时全部为 no-op。 */
+static bool s_lcd_cloud_up;
+static char s_lcd_key[32] = "KEY -";
+
+static void lcd_update(const char *key_line)
+{
+#if CONFIG_ONEYE_FW_ENABLE_LCD
+    if (!lcd_ui_ready()) {
+        return;
+    }
+    if (key_line != NULL) {
+        snprintf(s_lcd_key, sizeof(s_lcd_key), "%s", key_line);
+    }
+    char l2[32];
+    snprintf(l2, sizeof(l2), "CLOUD %s", s_lcd_cloud_up ? "UP" : "DOWN");
+    (void)lcd_ui_show_status("LCD OK 320X240", l2, s_lcd_key);
+#else
+    (void)key_line;
+#endif
+}
+
 /* 云确认关联的前向声明（sdk_event_cb 早于其定义使用；实现见「按键 → event/up」段） */
 static const char *key_pending_pop(void);
 static bool ack_payload_is_ok(const char *payload, size_t len);
@@ -291,8 +320,14 @@ static void sdk_event_cb(oneye_dev_event_t evt, const void *payload, size_t len,
         on_time_synced(payload, len);
     }
     if (evt == ONEYE_DEV_SDK_EVT_CLOUD_LINK_UP) {
+        s_lcd_cloud_up = true;
+        lcd_update(NULL);
         /* 链路建立（含重连）后按需发起授时请求；不在本回调内阻塞（见 request_time_sync 注释） */
         request_time_sync();
+    }
+    if (evt == ONEYE_DEV_SDK_EVT_CLOUD_LINK_DOWN) {
+        s_lcd_cloud_up = false;
+        lcd_update(NULL);
     }
     if (evt == ONEYE_DEV_EVENT_EVT_ACK) {
         /* 云端 ack：契约 §4.3 的 `data.ref` = **上行信封 id**（SDK 生成的 uuid），
@@ -404,6 +439,13 @@ static void emit_key_event(const char *key, const char *act, bool injected)
     char data[96];
     snprintf(data, sizeof(data), "{\"key\":\"%s\",\"action\":\"%s\"}", key, act);
     ESP_LOGI(TAG, "[key] %s/%s%s", key, act, injected ? " (注入/local-verification-only)" : "");
+
+    /* 板载 LCD 状态屏同步（本地验证面：屏幕上看到的与面板显示同一份事实） */
+    {
+        char kl[32];
+        snprintf(kl, sizeof(kl), "KEY %s %s", key, act);
+        lcd_update(kl);
+    }
 
     /* 本地验证面：先登记本地检测（pending），再上报；随后按 SDK 回执/云端 ack 推进状态 */
     static uint32_t s_key_id;

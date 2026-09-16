@@ -334,6 +334,17 @@ class DeviceView:
             self.last_error = f"/api/simulate/key: {exc}"
             return None
 
+    def post_lcd_draw(self, pattern: str, timeout: float = 5.0) -> dict | None:
+        """本地验证面：让设备在板载 LCD 上绘制指定图案（bars/grid/checker/test/status）。"""
+        q = urllib.parse.urlencode({"pattern": pattern})
+        req = urllib.request.Request(f"{self.base_url}/api/lcd/draw?{q}", data=b"", method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8", "replace"))
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            self.last_error = f"/api/lcd/draw: {exc}"
+            return None
+
     def media_url(self, rel_url: str) -> str:
         """把设备返回的相对 url（media/<alias>/<path>）拼成可直接播放的绝对地址。"""
         return f"{self.base_url}/{rel_url.lstrip('/')}"
@@ -619,6 +630,23 @@ PAGE = r"""<!doctype html>
   </div>
 
   <div class="card">
+    <h2>板载 LCD <small>ILI9341 320×240（TCA9554 CS/RST/BL）——本地验证面驱动，人眼/拍照即可对账</small></h2>
+    <div class="kv" id="lcdmeta"></div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+      <button onclick="lcdDraw('bars')">彩条</button>
+      <button onclick="lcdDraw('grid')">网格</button>
+      <button onclick="lcdDraw('checker')">棋盘</button>
+      <button onclick="lcdDraw('test')">分辨率测试图</button>
+      <button onclick="lcdDraw('status')">状态屏</button>
+      <span class="mut" id="lcdmsg"></span>
+    </div>
+    <div class="mut" style="font-size:12px;margin-top:6px">
+      「分辨率测试图」四角为 红/绿/蓝/品红 方块 + 双向对角线：用于核对分辨率、镜像与偏移；
+      状态屏会随按键与云端链路刷新（与上方按键面板同源）。
+    </div>
+  </div>
+
+  <div class="card">
     <h2>Wi-Fi 配网 <small>启动读 SD 卡凭据文件；此处可运行期改配</small></h2>
     <div class="kv" id="wifimeta"></div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px">
@@ -741,6 +769,15 @@ async function tick(){
         : '<span class="pill pend">未授时</span> <span class="mut">时间戳为设备运行时刻，等 caps/down.cloud_ts</span>'}</div>
     <div>错误</div><div class="mut">${dev.last_error||'—'}</div>`;
 
+  // 板载 LCD（本地验证面：状态 + 图案下发）
+  const lc = (s.panel && s.panel.lcd) || {};
+  $('lcdmeta').innerHTML = `
+    <div>状态</div><div>${lc.ready ? '<span class="pill ok">已就绪</span>' : '<span class="pill pend">未启用（CONFIG_ONEYE_FW_ENABLE_LCD）</span>'}</div>
+    <div>分辨率</div><div>${lc.w||'—'} × ${lc.h||'—'}（RGB565）</div>
+    <div>当前图案</div><div>${lc.pattern? `<span class="pill ok">${lc.pattern}</span>` : '<span class="mut">—</span>'}</div>
+    <div>刷新</div><div>${lc.draws||0} 次${lc.last_ms? ' · 最近 '.concat((lc.last_ms/1000).toFixed(1),' s（设备运行）') : ''}</div>
+    <div>帧缓冲</div><div class="mut">${lc.fb_bytes? (lc.fb_bytes/1024).toFixed(0)+' KB @ '+(lc.fb_mem||'—') : '—'}</div>`;
+
   // Wi-Fi 配网卡片
   const wf = s.wifi||{};
   $('wifimeta').innerHTML = `
@@ -849,6 +886,20 @@ async function simKey(){
   } catch (e) { alert('注入异常：' + e); }
   setTimeout(tick, 800);   // 稍等一轮轮询：让"上行/云端确认"两列显示出来
 }
+
+// 板载 LCD：下发图案（本地验证面 /api/lcd/draw）——设备真的会重绘，人眼/拍照即可核对
+async function lcdDraw(pattern){
+  const n = (state.devices && Object.keys(state.devices)[0]) || '';
+  const msg = $('lcdmsg');
+  try {
+    const r = await fetch(`/api/action/lcd?node=${encodeURIComponent(n)}&pattern=${encodeURIComponent(pattern)}`,
+                          {method:'POST'});
+    const j = await r.json();
+    msg.textContent = j.ok ? ('已下发：' + (j.result && j.result.pattern || pattern)) : ('下发失败：' + JSON.stringify(j));
+    if (!j.ok) { /* 面板代理不可用时回退：直连设备（浏览器跨源，仅当设备允许 CORS） */ }
+  } catch (e) { msg.textContent = '下发异常：' + e; }
+  setTimeout(tick, 600);
+}
 tick(); setInterval(tick, __POLL_MS__);
 </script></body></html>
 """
@@ -931,6 +982,22 @@ def make_handler(state: PanelState, poll_ms: int):
                 self._send(200 if ok else 500,
                            json.dumps({"ok": bool(ok), "topic": f"rmng/dev/{node}/event/down",
                                        "payload": env}, ensure_ascii=False).encode("utf-8"))
+                return
+            if parsed.path == "/api/action/lcd":
+                # 本地验证面代理：让设备在板载 LCD 上绘制图案（设备真重绘，人眼/拍照可核对）
+                node = (q.get("node") or [None])[0]
+                pattern = (q.get("pattern") or [None])[0]
+                dv = state.devices.get(node) if node else None
+                if dv is None:
+                    dv = next(iter(state.devices.values()), None)
+                if dv is None or not pattern:
+                    self._send(400, b'{"error":"node_and_pattern_required"}')
+                    return
+                res = dv.post_lcd_draw(pattern)
+                state.log(f"[panel] LCD 图案下发 {dv.name} pattern={pattern} ok={res is not None}")
+                self._send(200 if res else 502,
+                           json.dumps({"ok": res is not None, "device": dv.name, "result": res},
+                                      ensure_ascii=False).encode("utf-8"))
                 return
             if parsed.path == "/api/simulate/key":
                 # 本地验证面：请设备注入一次按键事件（走**与物理按键相同**的上报路径）。

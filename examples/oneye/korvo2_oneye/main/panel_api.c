@@ -25,6 +25,7 @@
 #include "media_api.h"
 #include "aec_capture.h"
 #include "player.h"
+#include "lcd_ui.h"
 
 static const char *TAG = "panel_api";
 
@@ -568,6 +569,22 @@ static esp_err_t h_status(httpd_req_t *req)
     sb_raw(&s, ",");
     sb_kv_i(&s, "now_ms", (long long)panel_api_now_ms());
     sb_raw(&s, "},");
+    /* 板载 LCD（本地验证面）：面板可读状态并可下发绘制；未启用 LCD 时 ready=false */
+    {
+        lcd_ui_state_t lc;
+        lcd_ui_get_state(&lc);
+        sb_raw(&s, "\"lcd\":{");
+        sb_kv_str(&s, "ready", lc.ready ? "true" : "false");
+        sb_raw(&s, ",");
+        sb_kv_i(&s, "w", lc.w); sb_raw(&s, ",");
+        sb_kv_i(&s, "h", lc.h); sb_raw(&s, ",");
+        sb_kv_str(&s, "pattern", lc.pattern); sb_raw(&s, ",");
+        sb_kv_i(&s, "draws", (long long)lc.draws); sb_raw(&s, ",");
+        sb_kv_i(&s, "last_ms", (long long)lc.last_ms); sb_raw(&s, ",");
+        sb_kv_i(&s, "fb_bytes", (long long)lc.fb_bytes); sb_raw(&s, ",");
+        sb_kv_str(&s, "fb_mem", lc.fb_in_psram ? "psram" : (lc.ready ? "internal" : "-"));
+        sb_raw(&s, "},");
+    }
     sb_kv_str(&s, "scope", "local-verification-only");
     sb_raw(&s, "}");
     sb_raw(&s, "}");
@@ -732,6 +749,45 @@ static esp_err_t h_simulate_key(httpd_req_t *req)
     return send_json(req, &s);
 }
 
+/* POST /api/lcd/draw?pattern=bars|grid|checker|test|status
+ *
+ * 本地验证面：驱动板载 ILI9341 绘制**可对账**的图案（bars/grid/checker/test 用于核对分辨率、
+ * 镜像、颜色与偏移；status 为状态屏）。面板据此验证"设备真的会显示"，人眼/拍照即可复核。 */
+static esp_err_t h_lcd_draw(httpd_req_t *req)
+{
+    char q[64];
+    char pattern[16] = { 0 };
+
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) != ESP_OK ||
+        httpd_query_key_value(q, "pattern", pattern, sizeof(pattern)) != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                   "need ?pattern=bars|grid|checker|test|status");
+    }
+    esp_err_t rc = lcd_ui_set_pattern(pattern);
+    if (rc == ESP_ERR_INVALID_STATE) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "LCD 未启用/未就绪（CONFIG_ONEYE_FW_ENABLE_LCD）");
+    }
+    if (rc != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "pattern 非法");
+    }
+
+    sb_t s;
+    if (!sb_init(&s, 256)) {
+        return httpd_resp_send_500(req);
+    }
+    lcd_ui_state_t lc;
+    lcd_ui_get_state(&lc);
+    sb_raw(&s, "{");
+    sb_kv_str(&s, "ok", "true");
+    sb_raw(&s, ",");
+    sb_kv_str(&s, "pattern", lc.pattern);
+    sb_raw(&s, ",");
+    sb_kv_i(&s, "draws", (long long)lc.draws);
+    sb_raw(&s, "}");
+    return send_json(req, &s);
+}
+
 esp_err_t panel_api_start(uint16_t port)
 {
     if (s_httpd != NULL) {
@@ -753,7 +809,7 @@ esp_err_t panel_api_start(uint16_t port)
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = port;
-    cfg.max_uri_handlers = 13;          /* 5 个 /api（含 /api/simulate/key）+ /media/list + 媒体通配 + /api/action（留余量） */
+    cfg.max_uri_handlers = 14;          /* 6 个 /api（keys/simulate/key/lcd/draw）+ /media/list + 媒体通配 + /api/action（留余量） */
     cfg.lru_purge_enable = true;
     cfg.stack_size = 6144;
     cfg.recv_wait_timeout = 5;
@@ -778,6 +834,7 @@ esp_err_t panel_api_start(uint16_t port)
         { .uri = "/api/selftest", .method = HTTP_GET, .handler = h_selftest },
         { .uri = "/api/keys",     .method = HTTP_GET, .handler = h_keys },
         { .uri = "/api/simulate/key", .method = HTTP_POST, .handler = h_simulate_key },
+        { .uri = "/api/lcd/draw",     .method = HTTP_POST, .handler = h_lcd_draw },
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
         rc = httpd_register_uri_handler(s_httpd, &uris[i]);

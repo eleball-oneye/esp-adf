@@ -620,10 +620,11 @@ async function tick(){
       <span>${on?(ACT[cur.action]||cur.action):'待触发'}</span></div>`;
   }).join('');
   const c = keys.counters||{};
+  const ackStub = (st.mqtt&&st.mqtt.ack_stub)||{};
   $('keymeta').innerHTML = `
     <div>当前</div><div>${cur? `${KEYNAME[cur.key]||cur.key} / ${ACT[cur.action]||cur.action} <span class="pill ${cur.uplink==='acked'?'ok':(cur.uplink==='failed'?'bad':'pend')}">${cur.uplink}</span>` : '<span class="mut">尚无按键</span>'}</div>
     <div>计数</div><div>共 ${c.total||0} 次（短按 ${c.click||0} / 长按 ${c.press||0} / 释放 ${(c.click_release||0)+(c.press_release||0)}）</div>
-    <div>云端事件</div><div>${dev.cloud_event_count||0} 条（MQTT 视角）</div>`;
+    <div>云端事件</div><div>${dev.cloud_event_count||0} 条（MQTT 视角）${ackStub.enabled? ` · <span class="pill ok">云端桩已发 ack ${ackStub.sent||0} 条</span>`:''}</div>`;
 
   // 历史响应
   const rows = ks.map(e=>{
@@ -823,7 +824,8 @@ def make_handler(state: PanelState, poll_ms: int):
 # ============================================================================
 
 def start_panel(state: PanelState, port: int, poll_ms: int, devices: list[tuple[str, str, str | None]],
-                mqtt: str | None = None, serial: str | None = None, log=print):
+                mqtt: str | None = None, serial: str | None = None, log=print,
+                ack_stub: bool = False, ack_delay_ms: int = 150):
     """启动面板全部组件；返回 (httpd, 线程列表) 供自检复用。"""
     for name, url, node in devices:
         state.add_device(name, url, node)
@@ -856,6 +858,26 @@ def start_panel(state: PanelState, port: int, poll_ms: int, devices: list[tuple[
         mqtt_client = MiniMqtt(host, int(port_s or 1883), on_message=None, log=log)
         state.mqtt.update({"enabled": True, "host": f"{host}:{port_s or 1883}"})
         topics = ["rmng/dev/+/event/up", "rmng/dev/+/status/up"]
+        state.mqtt["ack_stub"] = {"enabled": bool(ack_stub), "sent": 0, "delay_ms": ack_delay_ms}
+
+        def send_ack_stub(node: str, item_id: str):
+            """云端桩：按契约回 event/down（type=ack，data.ref=上行事件 id）。
+
+            ⚠️ 仅用于**设备侧三态验证**（本地检测 → 上行 → 云端 ack）：真后端当前只登记了
+            topic（backend/src/rmneo/deviceface/topics.go），尚未实现 event/up 的消费者与 ack 生产者。
+            本桩按 SDK 认可的 ack 形状（oneye_envelope.c:180-206）构造，供真机端到端复现第三态。
+            """
+            env = {
+                "v": 1,
+                "id": f"ack-{item_id}",
+                "ts": _now_ms(),
+                "type": "ack",
+                "data": {"ref": item_id, "code": "ok", "msg": "panel ack stub"},
+            }
+            mqtt_client.publish(f"rmng/dev/{node}/event/down",
+                               json.dumps(env, ensure_ascii=False).encode("utf-8"))
+            state.mqtt["ack_stub"]["sent"] += 1
+            state.log(f"[panel] 云端桩 ack → rmng/dev/{node}/event/down ref={item_id}")
 
         def on_msg(topic: str, payload: bytes):
             parts = topic.split("/")
@@ -865,8 +887,19 @@ def start_panel(state: PanelState, port: int, poll_ms: int, devices: list[tuple[
                 for dv in state.devices.values():
                     if dv.node == node:
                         if face == "event/up":
-                            if dv.note_cloud_event(payload):
+                            noted = dv.note_cloud_event(payload)
+                            if noted:
                                 state.mqtt["cloud_events"] = state.mqtt.get("cloud_events", 0) + 1
+                                if ack_stub:
+                                    for item in noted.get("items", []):
+                                        iid = item.get("id")
+                                        if iid:
+                                            if ack_delay_ms > 0:
+                                                threading.Timer(
+                                                    ack_delay_ms / 1000.0, send_ack_stub, (node, iid)
+                                                ).start()
+                                            else:
+                                                send_ack_stub(node, iid)
                         dv.cloud.setdefault("_last_topic", {})["topic"] = topic
 
         mqtt_client.on_message = on_msg
@@ -1100,6 +1133,34 @@ def self_test(verbose: bool = True) -> int:
         except Exception as exc:  # noqa: BLE001
             check("首页含 Wi-Fi 配网卡片", False, str(exc))
 
+        # 4e) 云端桩：对 event/up 回契约形状的 event/down ack（设备侧第三态的验证手段）
+        stub_state = PanelState(log=lambda *a, **k: None)
+        stub_dev = stub_state.add_device("korvo2-selftest", f"http://127.0.0.1:{dev_port}", "korvo2-selftest")
+        stub_httpd, stub_mqtt, _ = start_panel(
+            stub_state, port=18789, poll_ms=500,
+            devices=[("korvo2-selftest", f"http://127.0.0.1:{dev_port}", "korvo2-selftest")],
+            mqtt=f"127.0.0.1:{broker_port}", log=lambda *a, **k: None,
+            ack_stub=True, ack_delay_ms=0)
+        try:
+            deadline = time.time() + 6
+            while time.time() < deadline and not stub_mqtt.connected:
+                time.sleep(0.2)
+            mock.press("mode", "click")
+            deadline = time.time() + 8
+            while time.time() < deadline and (stub_state.mqtt.get("ack_stub", {}).get("sent", 0) == 0):
+                time.sleep(0.2)
+            sent = stub_state.mqtt.get("ack_stub", {}).get("sent", 0)
+            check("云端桩回 event/down ack（type=ack / data.ref=事件 id）", sent >= 1, f"已发 {sent} 条")
+            acked = [e for e in mock.history if e.get("uplink") == "acked"]
+            check("设备侧收到 ack 后置为 acked（三态闭环）", len(acked) >= 1,
+                  f"{len(acked)} 条 acked；id={acked[0].get('id') if acked else '-'}")
+        finally:
+            try:
+                stub_httpd.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+            stub_mqtt.stop()
+
         # 5) 设备离线时的降级（不崩、状态可见）
         mock.stop()
         time.sleep(1.2)
@@ -1132,6 +1193,11 @@ def main(argv=None) -> int:
     ap.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"面板端口（缺省 {DEFAULT_PORT}）")
     ap.add_argument("--poll-ms", type=int, default=DEFAULT_POLL_MS, help="设备轮询间隔（缺省 600 ms）")
     ap.add_argument("--mqtt", metavar="HOST[:PORT]", help="MQTT broker（dev-stack EMQX 或 mock）")
+    ap.add_argument("--ack-stub", action="store_true",
+                    help="启用「云端桩」：按契约对 event/up 回 event/down ack（仅供设备侧三态验证；"
+                         "真后端当前只登记 topic、尚无 ack 生产者）")
+    ap.add_argument("--ack-delay-ms", type=int, default=150,
+                    help="云端桩回 ack 延迟（缺省 150 ms，便于在面板上看到 pending→sent→acked 跃迁）")
     ap.add_argument("--serial", metavar="PORT[@BAUD]", help="串口兜底（无网时核对）")
     ap.add_argument("--self-test", action="store_true", help="内置 mock 设备自检（无硬件）")
     args = ap.parse_args(argv)
@@ -1146,7 +1212,11 @@ def main(argv=None) -> int:
         return 2
     state = PanelState()
     httpd, mqtt_client, serial_reader = start_panel(state, args.port, args.poll_ms, devices,
-                                                    mqtt=args.mqtt, serial=args.serial)
+                                                    mqtt=args.mqtt, serial=args.serial,
+                                                    ack_stub=args.ack_stub,
+                                                    ack_delay_ms=args.ack_delay_ms)
+    if args.ack_stub:
+        print("[panel] 云端桩已启用：对每条 event/up 回 event/down ack（type=ack, data.ref=事件 id）")
     try:
         while True:
             time.sleep(1.0)

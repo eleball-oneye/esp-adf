@@ -65,6 +65,23 @@ python3 panel.py --device korvo2-0001=http://192.168.1.50 --serial /dev/ttyUSB0@
    表单只改本次运行、**不写文件**（明文，仅台面/联调）；
 7. **串口兜底** —— 最近日志尾部（无网时仍能核对按键与自检输出）。
 
+### 3.1 「云端桩」`--ack-stub`：验证设备侧第三态（本地检测 → 上行 → 云端 ack）
+
+面板可开启**云端桩**：订阅 `rmng/dev/+/event/up`，对每条事件按契约回
+`rmng/dev/<node>/event/down`（信封 `type=ack`，`data{ref=事件 id, code="ok"}`，与 SDK
+`oneye_envelope.c:180-206` 一致），使设备侧把按键历史推进到 **`acked`**、面板侧同时以
+独立订阅确认"云端确实收到"。
+
+> **为什么需要它**：真后端目前**只登记了 topic**（`backend/src/rmneo/deviceface/topics.go`），
+> **尚未实现** `event/up` 的消费者与 ack 生产者 ⇒ 不计云端桩时，第三态没有服务端生产者。
+> 本桩是**台面验证手段**（并作为后端实现该生产者时的对照口径），**不是后端实现**。
+
+```bash
+python3 panel.py --device korvo2-0001=http://<设备IP> \
+                 --mqtt <broker>:1883 --ack-stub --ack-delay-ms 150
+# 页面上「计数」行显示：云端桩已发 ack N 条；历史表「上行」列随之出现 acked
+```
+
 ## 4. 设备侧 API（本地验证面）
 
 | 路由 | 返回（要点） |
@@ -101,9 +118,8 @@ python3 panel.py --device korvo2-0001=http://192.168.1.50 --serial /dev/ttyUSB0@
 
 | 项 | 命令 | 结果 |
 | --- | --- | --- |
-| 面板自检（无硬件） | `python3 panel.py --self-test`（内置 mock 设备 + mock broker + 模拟 AEC 录音 WAV + SD 卡媒体 + 凭据文件配网） | **33 项全部通过，rc=0**：设备 HTTP、自检明细 15 行、固件标识、MQTT 连接、按键历史（新→旧、**云端确认 3/3**、端到端时延、动作覆盖）、`/api/health`、首页渲染、**首页含音频/AEC 卡片**、**媒体列表非空**、**绝对播放地址**、**Range 206 + Content-Range + RIFF 头**、**触发 AEC 采集**、**采集后列表增长**、**停止采集**、**SD 卡媒体可板上回放标记**、**触发板上播放**、**播放状态回显**、**音量设置**、**停止播放**、**非 SD 路径被拒绝**、**Wi-Fi 状态含 ssid/source**、**凭据来源标注为 SD 文件**、**运行期改配 wifi_set**、**改配后状态回显新 SSID + api 来源**、**空 SSID 被拒绝**、**改配失败可观测**、**凭据文件配网回落**、**首页含 Wi-Fi 配网卡片**、设备离线降级 |
-| 设备侧 API + AEC 采集 + 板上回放 + 配网编译 | `./build-all.sh --toolchains esp32s3@5.5.5 --firmware`（IDF v5.5.5 / esp32s3 / KORVO2_V3；自定义分区表 + esp-sr AFE + Wi-Fi 配网） | 见本页 §7.1 构建记录 |
-| 真机联调 | —— | **未做**（本轮只出构建产物；烧录后：SD 卡放 `oneye-wifi.txt` → 复位 → 面板 `--device name=http://<IP>` → 按键三态 + 录 5 s 网页播放 + 插 SD 卡后「板上播放」+ Wi-Fi 卡片核对凭据来源） |
+| 面板自检（无硬件） | `python3 panel.py --self-test`（内置 mock 设备 + mock broker + 模拟 AEC 录音 WAV + SD 卡媒体 + 凭据文件配网 + 云端桩） | **35 项全部通过，rc=0**：设备 HTTP、自检明细 15 行、固件标识、MQTT 连接、按键历史（新→旧、**云端确认 3/3**、端到端时延、动作覆盖）、`/api/health`、首页渲染、**首页含音频/AEC 卡片**、**媒体列表非空**、**绝对播放地址**、**Range 206 + Content-Range + RIFF 头**、**触发 AEC 采集**、**采集后列表增长**、**停止采集**、**SD 卡媒体可板上回放标记**、**触发板上播放**、**播放状态回显**、**音量设置**、**停止播放**、**非 SD 路径被拒绝**、**Wi-Fi 状态含 ssid/source**、**凭据来源标注为 SD 文件**、**运行期改配 wifi_set**、**改配后状态回显新 SSID + api 来源**、**空 SSID 被拒绝**、**改配失败可观测**、**凭据文件配网回落**、**首页含 Wi-Fi 配网卡片**、**云端桩回 event/down ack**、**设备侧置 acked（三态闭环）**、设备离线降级 |
+| 真机联调（2026-09-15，第十二轮） | 板子 COM12 + `192.168.110.79`；面板 `--device korvo2-0001=http://192.168.110.79 --mqtt 175.178.190.187:1883 --ack-stub` | 面板聚合成功（自检 19/0、`wifi.source=file:/sdcard/oneye-wifi.txt`、媒体 1 个可上板文件、player 状态/音量）；**云端桩在真 EMQX 上实发 `event/down`**（`data.ref` 与上行 id 一致）；设备侧 `/media/<alias>/<path>` Range 与板上回放均真机验证通过（详见 [固件 README §8](../../examples/oneye/korvo2_oneye/README.md)） |
 
 ### 7.1 构建记录（AEC 采集 + 媒体 API）
 

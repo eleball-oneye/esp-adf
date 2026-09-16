@@ -25,6 +25,7 @@
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "esp_http_server.h"
+#include "esp_cache.h"
 
 #include "esp_camera.h"
 #include "img_converters.h"     /* frame2jpg（RGB565 → JPEG，软件编码） */
@@ -37,7 +38,24 @@ static const char *TAG = "camera_api";
 /* 与上游 ADF 例程一致：QVGA=320×240；帧编码 JPEG quality 12 */
 #define CAM_FRAME_SIZE   FRAMESIZE_QVGA
 #define CAM_JPEG_QUALITY 12
-#define CAM_XCLK_HZ      40000000
+/* ⚠️ XCLK 10 MHz（**不是**上游例程的 40 MHz）——真机实测定下的口径：
+ *   40 MHz → PCLK 20 MHz（≈40 MB/s）时，**只要面板在并发轮询 /api/status**（约每 600 ms 一次 HTTP）
+ *   抓到的帧就会出现水平彩带（DVP 数据在 DVP→PSRAM 路径上被丢字节 ⇒ 整行错位 + 假彩色）；
+ *   面板停止轮询时同一配置干净 ⇒ 与"并发网络负载 + 高数据率"强相关。
+ *   逐档实测（都在并发 HTTP 下）：QVGA/40 花、QVGA/20 花、QQVGA/40 花、QQVGA/20 干净、**QVGA/10 干净**。
+ *   ⇒ 保留 320×240 分辨率，把 XCLK 降到 10 MHz（PCLK 5 MHz ≈10 MB/s）即可稳定；
+ *   代价是帧率下降（抓帧/预览仍够验证用）。旋钮：/api/camera/reinit?xclk=10|20|40。 */
+#define CAM_XCLK_HZ      10000000
+
+/* 抓帧策略（第二十轮引入，用于抑制真机间歇性水平噪带；详见文件末「抓帧对策」注释）：
+ * capture/snapshot 连采 3 帧挑最干净的一帧；stream 连采 2 帧（帧率 7.8 → ~4 帧/s 的取舍）。
+ * 评分低于 CAM_NOISE_GOOD 即认为足够干净，提前结束采样。 */
+#define CAM_GRAB_TRIES_CAPTURE 3
+#define CAM_GRAB_TRIES_STREAM  2
+#define CAM_NOISE_GOOD         60
+
+static esp_err_t cam_grab_jpeg_tries(uint8_t **out, size_t *out_len, int *width, int *height,
+                                     int tries);
 
 /* sensor PID → 型号名（esp32-camera 的 sensor.h 里 PID 常量；此处只做展示用映射） */
 static const char *cam_pid_name(int pid)
@@ -90,6 +108,10 @@ static int s_quality = CAM_JPEG_QUALITY;
  * 开启后帧缓冲直接在 PSRAM 上被 DMA 写，内部 DMA 缓冲退回（实测 internal_free 18 KB → 约 48 KB）。
  */
 static int s_psram_dma = 1;
+/* 帧尺寸：真机实测在**并发负载**下 QVGA(320×240) 会间歇出现水平噪带（PSRAM/DVP 争用），
+ * QQVGA(160×120) 数据量只有 1/4，明显更稳；默认仍是 QVGA（清晰度优先），面板可用
+ * /api/camera/reinit?size=qqvga 切换，抓帧质量与"预览稳定性"可现场权衡。 */
+static int s_frame_size = FRAMESIZE_QVGA;
 
 static esp_err_t cam_mkdir(const char *path)
 {
@@ -116,6 +138,11 @@ static void cam_snapshot_cfg(void)
     s_last.xclk_mhz = s_xclk_hz / 1000000;
     s_last.quality = s_quality;
     s_last.psram_dma = s_psram_dma;
+    switch (s_frame_size) {
+    case FRAMESIZE_QQVGA: snprintf(s_last.size, sizeof(s_last.size), "%s", "qqvga"); break;
+    case FRAMESIZE_VGA:   snprintf(s_last.size, sizeof(s_last.size), "%s", "vga");   break;
+    default:              snprintf(s_last.size, sizeof(s_last.size), "%s", "qvga");  break;
+    }
 }
 
 esp_err_t camera_api_apply(const camera_cfg_t *cfg)
@@ -147,6 +174,9 @@ esp_err_t camera_api_apply(const camera_cfg_t *cfg)
         if (cfg->psram_dma == 0 || cfg->psram_dma == 1) {
             s_psram_dma = cfg->psram_dma;
         }
+        if (cfg->frame_size >= 0) {
+            s_frame_size = cfg->frame_size;
+        }
     }
 
     camera_config_t c = { 0 };
@@ -170,7 +200,7 @@ esp_err_t camera_api_apply(const camera_cfg_t *cfg)
     c.ledc_timer = LEDC_TIMER_0;
     c.ledc_channel = LEDC_CHANNEL_0;
     c.pixel_format = (pixformat_t)s_pixel_format;
-    c.frame_size = CAM_FRAME_SIZE;
+    c.frame_size = (framesize_t)s_frame_size;
     c.jpeg_quality = s_quality;
     c.fb_count = s_fb_count;
     c.fb_location = (camera_fb_location_t)s_fb_location;
@@ -190,6 +220,18 @@ esp_err_t camera_api_apply(const camera_cfg_t *cfg)
     sensor_t *s = esp_camera_sensor_get();
     s_last.pid = (s != NULL) ? s->id.PID : -1;
     snprintf(s_last.sensor, sizeof(s_last.sensor), "%s", cam_pid_name(s_last.pid));
+
+    /* 显式打开自动控制（AWB/AEC/AGC）：反复 reinit 后若不显式打开，偶发出现整体偏色
+     * （真机现象：白条变粉、灰面偏绿）——传感器需要几帧才收敛，且部分寄存器会被重配流程复位。
+     * 与上游 CameraWebServer 例程一致：白平衡 / 白平衡增益 / 曝光 / 增益 全开。 */
+    if (s != NULL) {
+        (void)s->set_whitebal(s, 1);
+        (void)s->set_awb_gain(s, 1);
+        (void)s->set_exposure_ctrl(s, 1);
+        (void)s->set_gain_ctrl(s, 1);
+        (void)s->set_brightness(s, 0);
+        (void)s->set_saturation(s, 0);
+    }
 
     /* PSRAM DMA 模式：驱动内部只在 psram_mode=false 时申请 30 KB 内部 DMA 缓冲，
      * 故此处按 s_psram_dma 显式设置（esp_camera_set_psram_mode 会用已保存配置重配一次）。 */
@@ -270,17 +312,19 @@ esp_err_t camera_api_capture(camera_capture_t *out)
     char name[32];
     char path[96] = "";
     uint32_t t0 = (uint32_t)(esp_timer_get_time() / 1000);
-    uint8_t *jpg = NULL;          /* RGB565 路径的软件编码结果 */
+    uint8_t *jpg = NULL;          /* cam_grab_jpeg_tries 交回的 JPEG（调用方 free） */
+    size_t payload_len = 0;
+    int gw = 0, gh = 0;
 
-    camera_fb_t *fb = esp_camera_fb_get();
-    if (fb == NULL) {
-        s_errors++;
-        snprintf(s_last.last_err, sizeof(s_last.last_err), "fb timeout (NO-SOI?)");
-        ESP_LOGW(TAG, "抓帧失败：fb 为空（fmt=%s fb=%s×%d grab=%s xclk=%dMHz；"
+    /* 统一走「连采 N 帧挑最干净一帧」：真机间歇性水平噪带的对策（见本文件顶部排障记录） */
+    if (cam_grab_jpeg_tries(&jpg, &payload_len, &gw, &gh, CAM_GRAB_TRIES_CAPTURE) != ESP_OK ||
+        jpg == NULL) {
+        ESP_LOGW(TAG, "抓帧失败：fb 为空或编码失败（fmt=%s fb=%s×%d grab=%s xclk=%dMHz；"
                       "cam_hal 若刷 NO-SOI 见 camera_api.c 排障记录）",
                  s_last.format, s_last.fb_loc, s_fb_count, s_last.grab, s_last.xclk_mhz);
         if (out != NULL) {
-            snprintf(out->err, sizeof(out->err), "%s", s_last.last_err);
+            snprintf(out->err, sizeof(out->err), "%s",
+                     s_last.last_err[0] ? s_last.last_err : "grab failed");
         }
         return ESP_FAIL;
     }
@@ -288,47 +332,25 @@ esp_err_t camera_api_capture(camera_capture_t *out)
     s_seq++;
     snprintf(name, sizeof(name), "cap-%05u.jpg", (unsigned)s_seq);
 
-    const uint8_t *payload = fb->buf;
-    size_t payload_len = fb->len;
-    if (fb->format != PIXFORMAT_JPEG) {
-        /* 原始帧（RGB565）→ JPEG：上游 esp32-camera 自带 frame2jpg（esp_jpeg 实现） */
-        if (!frame2jpg(fb, s_quality, &jpg, &payload_len) || jpg == NULL) {
-            esp_camera_fb_return(fb);
-            s_errors++;
-            snprintf(s_last.last_err, sizeof(s_last.last_err), "frame2jpg failed");
-            ESP_LOGW(TAG, "软件 JPEG 编码失败（fmt=%s %dx%d）", s_last.format,
-                     (int)fb->width, (int)fb->height);
-            if (out != NULL) {
-                snprintf(out->err, sizeof(out->err), "%s", s_last.last_err);
-            }
-            return ESP_FAIL;
-        }
-        payload = jpg;
-    }
-
     size_t written = payload_len;
-    if (cam_write(name, payload, payload_len, path, sizeof(path), &written) != ESP_OK) {
+    if (cam_write(name, jpg, payload_len, path, sizeof(path), &written) != ESP_OK) {
         rc = ESP_FAIL;
     }
-    if (jpg != NULL) {
-        free(jpg);
-        jpg = NULL;
-    }
+    free(jpg);
+    jpg = NULL;
 
     uint32_t el = (uint32_t)(esp_timer_get_time() / 1000) - t0;
-    ESP_LOGI(TAG, "抓帧：%dx%d 编码后 %u B → %s（%u ms，fmt=%s fb=%u B）",
-             (int)fb->width, (int)fb->height, (unsigned)payload_len, path, (unsigned)el,
-             s_last.format, (unsigned)fb->len);
+    ESP_LOGI(TAG, "抓帧：%dx%d 编码后 %u B → %s（%u ms，fmt=%s，取样 %d 帧，彩噪评分 %u）",
+             gw, gh, (unsigned)payload_len, path, (unsigned)el,
+             s_last.format, s_last.last_grabs, (unsigned)s_last.last_noise);
 
     s_last.frames = ++s_frames;
     s_last.last_bytes = payload_len;
-    s_last.last_width = (int)fb->width;
-    s_last.last_height = (int)fb->height;
+    s_last.last_width = gw;
+    s_last.last_height = gh;
     s_last.last_ms = (uint32_t)(esp_timer_get_time() / 1000);
     snprintf(s_last.last_path, sizeof(s_last.last_path), "%s", path);
     s_last.sd_ok = (strncmp(path, "/sdcard", 7) == 0);
-
-    esp_camera_fb_return(fb);
 
     if (rc == ESP_OK) {
         s_last.last_err[0] = '\0';
@@ -372,7 +394,59 @@ void camera_api_get_state(camera_state_t *out)
 
 /* ---------------------------------------------------------------- 预览：抓帧 → 内存 JPEG（不落盘） */
 
-esp_err_t camera_api_grab_jpeg(uint8_t **out, size_t *out_len, int *width, int *height)
+/*
+ * 真机实测（2026-09-16 第二十轮）：PSRAM-DMA 模式下抓到的帧会**间歇性**出现水平噪带
+ * （≈24 行的整块数据不对 = 一个 DMA 半缓冲的量），且**与并发负载强相关**：
+ * 面板停止轮询时抓帧干净，面板 600 ms 轮询 + MQTT 在跑时同一配置就会出现噪带；
+ * 串口**没有** `FB-OVF`（不是 FIFO 溢出），XCLK 40→20 MHz 也无效。⇒ 判为
+ * 「PSRAM 直写 + CPU 经 cache 读回」这条路径在系统繁忙时可见性不稳。
+ * 两条对策（都在本文件）：
+ *   ① 读之前显式 `esp_cache_msync(M2C|INVALIDATE)`（对驱动侧失效做兜底）；
+ *   ② 连采 N 帧、用**彩噪评分**挑最干净的一帧（评分只看"亮度接近但色相跳变"的相邻像素对，
+ *      噪带会把它打满，而普通彩色画面不会）。
+ */
+static void cam_invalidate_psram(const void *addr, size_t len)
+{
+    if (addr == NULL || len == 0) {
+        return;
+    }
+    const size_t line = 32;                                   /* ESP32-S3 DCache 行 = 32 B */
+    uintptr_t start = (uintptr_t)addr & ~(uintptr_t)(line - 1);
+    size_t head = (uintptr_t)addr - start;
+    size_t sync_len = (len + head + line - 1) & ~(size_t)(line - 1);
+    esp_cache_msync((void *)start, sync_len,
+                    ESP_CACHE_MSYNC_FLAG_DIR_M2C | ESP_CACHE_MSYNC_FLAG_INVALIDATE);
+}
+
+/* 彩噪评分：RGB565 下"相邻像素亮度接近、色相跳变"的对数（越大越像花屏） */
+static uint32_t cam_noise_score(const camera_fb_t *fb)
+{
+    if (fb == NULL || fb->format != PIXFORMAT_RGB565 || fb->buf == NULL) {
+        return 0;
+    }
+    const uint16_t *px = (const uint16_t *)fb->buf;
+    const int w = (int)fb->width;
+    const int h = (int)fb->height;
+    uint32_t noisy = 0;
+    for (int y = 0; y < h; y += 2) {
+        const uint16_t *row = px + (size_t)y * (size_t)w;
+        for (int x = 2; x < w; x += 2) {
+            const uint16_t a = row[x - 2], b = row[x];
+            const int ra = (a >> 11) & 0x1f, ga = (a >> 5) & 0x3f, ba = a & 0x1f;
+            const int rb = (b >> 11) & 0x1f, gb = (b >> 5) & 0x3f, bb = b & 0x1f;
+            const int lum = (ra + ga + ba) - (rb + gb + bb);
+            const int chr = (ra > rb ? ra - rb : rb - ra) + (ga > gb ? ga - gb : gb - ga) +
+                            (ba > bb ? ba - bb : bb - ba);
+            if (lum > -12 && lum < 12 && chr > 24) {
+                noisy++;
+            }
+        }
+    }
+    return noisy;
+}
+
+/* 真机默认抓 3 帧挑最干净的一帧；stream 路径连采 2 帧（见文件顶部宏定义） */
+static esp_err_t cam_grab_jpeg_tries(uint8_t **out, size_t *out_len, int *width, int *height, int tries)
 {
     if (out == NULL || out_len == NULL) {
         return ESP_ERR_INVALID_ARG;
@@ -382,40 +456,88 @@ esp_err_t camera_api_grab_jpeg(uint8_t **out, size_t *out_len, int *width, int *
     if (!s_inited) {
         return ESP_ERR_INVALID_STATE;
     }
-
-    camera_fb_t *fb = esp_camera_fb_get();
-    if (fb == NULL) {
-        s_errors++;
-        snprintf(s_last.last_err, sizeof(s_last.last_err), "fb timeout (NO-SOI?)");
-        return ESP_FAIL;
+    if (tries < 1) {
+        tries = 1;
     }
 
-    uint8_t *jpg = NULL;
-    size_t len = 0;
-    if (fb->format == PIXFORMAT_JPEG) {
-        /* 相机自身出 JPEG：拷一份，保证调用方统一 free()（避免混淆 fb 所有权） */
-        jpg = (uint8_t *)malloc(fb->len);
-        if (jpg != NULL) {
-            memcpy(jpg, fb->buf, fb->len);
-            len = fb->len;
+    uint8_t *best = NULL;
+    size_t best_len = 0;
+    uint32_t best_score = UINT32_MAX;
+    int best_w = 0, best_h = 0;
+    uint32_t scores[8];
+    int n_scores = 0;
+
+    for (int i = 0; i < tries; i++) {
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (fb == NULL) {
+            s_errors++;
+            snprintf(s_last.last_err, sizeof(s_last.last_err), "fb timeout (NO-SOI?)");
+            if (best == NULL) {
+                return ESP_FAIL;
+            }
+            break;
         }
-    } else if (!frame2jpg(fb, s_quality, &jpg, &len)) {
-        jpg = NULL;
+        cam_invalidate_psram(fb->buf, fb->len);           /* 兜底：DMA 直写 PSRAM 后的 cache 可见性 */
+
+        const uint32_t score = cam_noise_score(fb);
+        uint8_t *jpg = NULL;
+        size_t len = 0;
+        bool enc_ok;
+        if (fb->format == PIXFORMAT_JPEG) {
+            jpg = (uint8_t *)malloc(fb->len);
+            if (jpg != NULL) {
+                memcpy(jpg, fb->buf, fb->len);
+                len = fb->len;
+            }
+            enc_ok = (jpg != NULL);
+        } else {
+            enc_ok = frame2jpg(fb, s_quality, &jpg, &len);
+        }
+        if (n_scores < (int)(sizeof(scores) / sizeof(scores[0]))) {
+            scores[n_scores++] = score;
+        }
+        if (enc_ok && jpg != NULL && len > 0) {
+            if (score < best_score) {                     /* 取最干净的一帧 */
+                free(best);
+                best = jpg;
+                best_len = len;
+                best_score = score;
+                best_w = (int)fb->width;
+                best_h = (int)fb->height;
+            } else {
+                free(jpg);
+            }
+        } else {
+            free(jpg);
+            s_errors++;
+            snprintf(s_last.last_err, sizeof(s_last.last_err), "frame2jpg failed");
+        }
+        esp_camera_fb_return(fb);
+
+        /* 第一帧已经足够干净就不再多采（省时间）；否则继续采到 tries 次 */
+        if (best_score <= CAM_NOISE_GOOD) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(15));
     }
 
-    if (width != NULL) { *width = (int)fb->width; }
-    if (height != NULL) { *height = (int)fb->height; }
-    esp_camera_fb_return(fb);
-
-    if (jpg == NULL || len == 0) {
-        s_errors++;
-        snprintf(s_last.last_err, sizeof(s_last.last_err), "frame2jpg failed");
-        free(jpg);
+    if (best == NULL) {
         return ESP_FAIL;
     }
-    *out = jpg;
-    *out_len = len;
+    if (width != NULL)  { *width = best_w; }
+    if (height != NULL) { *height = best_h; }
+    ESP_LOGD(TAG, "抓帧评分：%u/%u/%u（样本 %d 帧）", (unsigned)scores[0],
+             (unsigned)(n_scores > 1 ? scores[1] : 0), (unsigned)best_score, n_scores);
+    *out = best;
+    *out_len = best_len;
+    s_last.last_noise = best_score;
+    s_last.last_grabs = n_scores;
     return ESP_OK;
+}
+
+esp_err_t camera_api_grab_jpeg(uint8_t **out, size_t *out_len, int *width, int *height)
+{
+    return cam_grab_jpeg_tries(out, out_len, width, height, CAM_GRAB_TRIES_CAPTURE);
 }
 
 /* ---------------------------------------------------------------- MJPEG 预览流（独立 httpd 实例） */
@@ -444,11 +566,11 @@ static esp_err_t h_cam_stream(httpd_req_t *req)
         uint8_t *jpg = NULL;
         size_t len = 0;
         int w = 0, h = 0;
-        if (camera_api_grab_jpeg(&jpg, &len, &w, &h) != ESP_OK) {
+        /* 流路径也做「连采 2 帧挑最干净」：帧率约 7.8 → 4 帧/s，但画面上噪带明显更少（真机权衡） */
+        if (cam_grab_jpeg_tries(&jpg, &len, &w, &h, CAM_GRAB_TRIES_STREAM) != ESP_OK) {
             vTaskDelay(pdMS_TO_TICKS(100));      /* 单帧失败不结束流（真机偶发 fb timeout） */
             continue;
-        }
-        /* multipart 分段按 RFC 2046 写规范（真机踩过"画面花屏/错位"，故把边界字节写死并核对）：
+        }        /* multipart 分段按 RFC 2046 写规范（真机踩过"画面花屏/错位"，故把边界字节写死并核对）：
          *   --boundary CRLF headers CRLF CRLF <jpeg> CRLF   （下一段的 --boundary 紧跟其后）
          * 即：**每段数据后补一个 CRLF**，段前**不再**加 CRLF（否则会多出空行 = 双 CRLF）。 */
         char head[128];

@@ -1,7 +1,15 @@
 dependencies:
   # 板载摄像头驱动（ESP32-S3-Korvo-2 板载 OV3660，见 board_def.h CAM_PIN_*）
-  # 与 ESP-ADF 官方 examples/display/lcd_camera 使用同一上游组件；按提交号 pin，
-  # 禁止静默跟随上游默认分支（AGENTS.md §2/§4）。
-  esp32-camera:
-    git: https://github.com/espressif/esp32-camera.git
-    version: 3fb41a99d61a853313d1cd5543ebf2c109ef7c0e
+  #
+  # ⚠️ 本工程**已把 esp32-camera 固化为工程内组件**：`components/esp32-camera/`
+  #    （来源 = 上游 github.com/espressif/esp32-camera 提交 3fb41a99d61a853313d1cd5543ebf2c109ef7c0e，
+  #      与 ESP-ADF 官方 examples/display/lcd_camera 所用同一版本；Apache-2.0，LICENSE 随源码保留）。
+  #    原因：组件管理器每轮 reconfigure 都要向 GitHub `git fetch`，而本机到 GitHub 的连接**时好时坏**
+  #    （已两次因 `GnuTLS recv error (-110)` / 连接超时 139 s 直接卡住构建）⇒ 改为随工程入库，
+  #    构建**不再依赖 GitHub 连通性**。升级上游版本 = 显式替换该目录并在提交信息里写明上游提交号。
+  #
+  # 如需回到组件管理器方式（联网环境），把下面注释打开并删除 components/esp32-camera 目录即可：
+  #   esp32-camera:
+  #     git: https://github.com/espressif/esp32-camera.git
+  #     version: 3fb41a99d61a853313d1cd5543ebf2c109ef7c0e
+  espressif/esp_jpeg: "^1.3.1"     # 摄像头组件声明依赖（软件 JPEG 编解码），来自组件注册表

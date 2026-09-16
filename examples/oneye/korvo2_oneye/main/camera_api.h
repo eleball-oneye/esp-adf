@@ -64,12 +64,16 @@ typedef struct {
     int      xclk_mhz;      /* 10/20/40 */
     int      quality;       /* JPEG quality 0..63 */
     int      psram_dma;     /* 1 = 帧缓冲直接作 DMA 目标（省内部 DMA 缓冲）；0 = 走内部 dma_buffer */
+    char     size[8];       /* "qvga"(320x240) | "qqvga"(160x120) | "vga"(640x480) */
     /* MJPEG 预览流（本地验证面：面板「开始预览」用） */
     int      stream_port;   /* 0 = 未启动 */
     uint32_t stream_frames; /* 已发送帧数 */
     int      stream_clients;/* 当前连接的预览客户端数（0/1） */
     uint32_t stream_ends;   /* 已结束的预览会话数 */
     char     stream_end_reason[64]; /* 上次流结束原因（client-gone / send-error ...） */
+    /* 花屏对策的可观测性：连续抓帧的彩噪评分（越小越干净）与实际取样帧数 */
+    uint32_t last_noise;
+    int      last_grabs;
 } camera_state_t;
 
 /** 重配参数：任一项 <0 / 非法 = 保持当前值（见 camera_api_apply） */
@@ -81,6 +85,7 @@ typedef struct {
     int xclk_mhz;       /* 10/20/40；-1=不改 */
     int jpeg_quality;   /* 0..63；-1=不改 */
     int psram_dma;      /* 0/1；-1=不改 */
+    int frame_size;     /* framesize_t（FRAMESIZE_QVGA/QQVGA/...）；-1=不改 */
 } camera_cfg_t;
 
 /** 初始化摄像头（power on + SCCB 探测 + 配置）；失败返回非 0（错误码即"探测失败"依据） */

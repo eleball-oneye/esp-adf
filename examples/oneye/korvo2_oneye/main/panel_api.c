@@ -606,6 +606,9 @@ static esp_err_t h_status(httpd_req_t *req)
         sb_kv_i(&s, "last_ms", (long long)cs.last_ms); sb_raw(&s, ",");
         sb_kv_str(&s, "last_path", cs.last_path); sb_raw(&s, ",");
         sb_kv_str(&s, "last_err", cs.last_err); sb_raw(&s, ",");
+        /* 花屏对策可观测性：彩噪评分（越小越干净）与实际取样帧数 */
+        sb_kv_i(&s, "last_noise", (long long)cs.last_noise); sb_raw(&s, ",");
+        sb_kv_i(&s, "last_grabs", cs.last_grabs); sb_raw(&s, ",");
         sb_kv_str(&s, "root", cs.root);
         sb_raw(&s, ",");
         /* 生效配置（排障用：NO-SOI 类取帧失败靠这几个旋钮在真机上对比定位） */
@@ -615,6 +618,7 @@ static esp_err_t h_status(httpd_req_t *req)
         sb_kv_str(&s, "grab", cs.grab); sb_raw(&s, ",");
         sb_kv_i(&s, "xclk_mhz", cs.xclk_mhz); sb_raw(&s, ",");
         sb_kv_i(&s, "psram_dma", cs.psram_dma); sb_raw(&s, ",");
+        sb_kv_str(&s, "size", cs.size); sb_raw(&s, ",");
         sb_kv_i(&s, "quality", cs.quality); sb_raw(&s, ",");
         /* MJPEG 预览流（本地验证面）：port=0 ⇒ 未启动，面板回落到「单帧轮询预览」 */
         sb_kv_i(&s, "stream_port", cs.stream_port); sb_raw(&s, ",");
@@ -884,7 +888,7 @@ static esp_err_t h_camera_reinit(httpd_req_t *req)
         return httpd_resp_send_500(req);
     }
     char v[24];
-    camera_cfg_t cfg = { -1, -1, -1, -1, -1, -1, -1 };
+    camera_cfg_t cfg = { -1, -1, -1, -1, -1, -1, -1, -1 };
 
     if (qlen > 1 && httpd_req_get_url_query_str(req, q, qlen) == ESP_OK) {
         if (httpd_query_key_value(q, "fb", v, sizeof(v)) == ESP_OK) {
@@ -907,6 +911,15 @@ static esp_err_t h_camera_reinit(httpd_req_t *req)
         }
         if (httpd_query_key_value(q, "psram", v, sizeof(v)) == ESP_OK) {
             cfg.psram_dma = (strcmp(v, "0") == 0) ? 0 : 1;
+        }
+        if (httpd_query_key_value(q, "size", v, sizeof(v)) == ESP_OK) {
+            if (strcmp(v, "qqvga") == 0) {
+                cfg.frame_size = FRAMESIZE_QQVGA;
+            } else if (strcmp(v, "vga") == 0) {
+                cfg.frame_size = FRAMESIZE_VGA;
+            } else if (strcmp(v, "qvga") == 0) {
+                cfg.frame_size = FRAMESIZE_QVGA;
+            }
         }
     }
     free(q);

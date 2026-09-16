@@ -18,6 +18,7 @@ idf_component_register(SRCS "korvo2_oneye_main.c"
                                 input_key_service
                                 esp_http_server
                                 esp32-camera
+                                esp_mm
                                 esp_wifi
                                 esp_netif
                                 esp_event

@@ -33,13 +33,18 @@
 #include "es7210.h"
 
 #include "aec_capture.h"
+#include "player.h"     /* 录音/回放共用 I2S0，需互斥 */
 
 static const char *TAG = "aec_capture";
 
 #define AEC_CAPTURE_I2S_PORT   CODEC_ADC_I2S_PORT
 #define AEC_CAPTURE_RATE       16000
 #define AEC_CAPTURE_BITS       CODEC_ADC_BITS_PER_SAMPLE      /* 32 bit（16 麦 + 16 回采） */
-#define AEC_CAPTURE_I2S_CH     I2S_CHANNEL_FMT_RIGHT_LEFT
+/* 单麦配方（照抄 ADF 例程 algorithm 的 Korvo-2 单麦分支；见 aec_capture.h 头注）：
+ *   input_format "RM"（2 通道：麦 + AEC 回采）＋ I2S 只取左声道。
+ *   例程双麦分支才是 `AUDIO_ADC_INPUT_CH_FORMAT`("RMNM") + I2S_CHANNEL_FMT_RIGHT_LEFT。 */
+#define AEC_CAPTURE_INPUT_FORMAT  "RM"
+#define AEC_CAPTURE_I2S_CH     I2S_CHANNEL_FMT_ONLY_LEFT
 #define AEC_CAPTURE_WAV_CH     1
 #define AEC_CAPTURE_WAV_BITS   16
 
@@ -58,8 +63,100 @@ static audio_pipeline_handle_t s_pipeline;
 static audio_element_handle_t s_algo, s_wav, s_writer;
 static TaskHandle_t       s_stop_task;
 static aec_capture_status_t s_st;
+static audio_hal_handle_t s_codec;      /* 板级 audio_hal（ES7210 ADC 启停用） */
 
 /* ------------------------------------------------------------------ 内部工具 */
+
+/** 启动 ADC：与例程同序 —— 先 `AUDIO_HAL_CTRL_START`，再重设增益。
+ *  原因见 es7210 驱动：`es7210_start()` 内部会 `es7210_mic_select()`，把**所有**已选麦位
+ *  统一刷成 `es7210_handle.gain`（最后一次 set_gain 的值）；若不在 START 之后重设，
+ *  MIC1/MIC2 的 33 dB 会被冲掉。板上回放结束会 `AUDIO_HAL_CTRL_STOP` 把 ADC 整体断电，
+ *  所以每次录音前都要重新 arm。 */
+static void aec_codec_arm(void)
+{
+    if (s_codec == NULL) {
+        ESP_LOGW(TAG, "无 audio_hal 句柄，跳过 ADC START（录音幅度可能异常）");
+        return;
+    }
+    esp_err_t rc = audio_hal_ctrl_codec(s_codec, AUDIO_HAL_CODEC_MODE_ENCODE, AUDIO_HAL_CTRL_START);
+    if (rc != ESP_OK) {
+        /* 注意：`es7210_adc_ctrl_state()` 的返回值**不是状态码**——它把 CLOCK_OFF 寄存器的读值
+         * 直接当返回值（真机实测返回 0x20），所以这里非 0 属正常。只在**写入动作**上判断，
+         * 用 INFO 记录原始值以便对照（避免把成功误报成失败）。 */
+        ESP_LOGI(TAG, "ADC START（驱动返回寄存器值 0x%x，非错误码；MIC 使能与 TDM 已按上述日志生效）",
+                 (unsigned)rc);
+    }
+    (void)es7210_adc_set_gain(ES7210_INPUT_MIC3, GAIN_24DB);
+    (void)es7210_adc_set_gain(ES7210_INPUT_MIC2 | ES7210_INPUT_MIC1, GAIN_33DB);
+}
+
+/* I2S 原始幅度诊断（真机取证用）：AFE 输出为 16 bit 单声道 WAV，一旦幅度异常（近乎静音）
+ * 无法区分「麦/编解码器没出声」与「AFE 通道配方不对」。这里在录音前若干帧统计 I2S 原始
+ * 数据的 RMS/峰值并打日志——正常说话时 RMS 应显著高于静音底噪（此前实测异常值 RMS≈137/32768）。*/
+#define AEC_RMS_CHUNKS   20
+static uint64_t s_rms_sum_sq;
+static uint32_t s_rms_peak;
+static uint32_t s_rms_samples;
+static int      s_rms_chunks;
+
+/** 整数平方根（避免为一个诊断量引入 libm 依赖） */
+static uint32_t aec_isqrt(uint64_t v)
+{
+    uint64_t r = 0;
+    uint64_t bit = (uint64_t)1 << 62;
+    while (bit > v) {
+        bit >>= 2;
+    }
+    while (bit != 0) {
+        if (v >= r + bit) {
+            v -= r + bit;
+            r = (r >> 1) + bit;
+        } else {
+            r >>= 1;
+        }
+        bit >>= 2;
+    }
+    return (uint32_t)r;
+}
+
+static void aec_rms_probe(const char *buf, int len)
+{
+    if (s_rms_chunks >= AEC_RMS_CHUNKS) {
+        return;
+    }
+    if (s_rms_chunks == 0) {
+        /* 首帧原始内容（对齐/左右对齐方式排查用）：按 16 bit 与 32 bit 两种视角各打几个值 */
+        ESP_LOGW(TAG, "[诊断] 首帧 %d 字节", len);
+        if (len >= 16) {
+            const int16_t *w16 = (const int16_t *)buf;
+            ESP_LOGW(TAG, "[诊断] 同帧 int16[0..7]=%d,%d,%d,%d,%d,%d,%d,%d",
+                     w16[0], w16[1], w16[2], w16[3], w16[4], w16[5], w16[6], w16[7]);
+            const uint32_t *w32 = (const uint32_t *)buf;
+            ESP_LOGW(TAG, "[诊断] 同帧 int32[0..3]=0x%08x 0x%08x 0x%08x 0x%08x",
+                     (unsigned)w32[0], (unsigned)w32[1], (unsigned)w32[2], (unsigned)w32[3]);
+        }
+    }
+    const int16_t *s = (const int16_t *)buf;
+    int n = len / (int)sizeof(int16_t);
+    for (int i = 0; i < n; i++) {
+        int32_t v = s[i];
+        s_rms_sum_sq += (uint64_t)((int64_t)v * v);
+        uint32_t a = (uint32_t)(v < 0 ? -v : v);
+        if (a > s_rms_peak) {
+            s_rms_peak = a;
+        }
+    }
+    s_rms_samples += (uint32_t)n;
+    if (++s_rms_chunks == AEC_RMS_CHUNKS && s_rms_samples > 0) {
+        uint32_t rms = aec_isqrt(s_rms_sum_sq / s_rms_samples);
+        ESP_LOGW(TAG, "[诊断] I2S 原始幅度（前 %d 帧 / %u 样点）：RMS=%u 峰值=%u（满量程 32768）",
+                 AEC_RMS_CHUNKS, (unsigned)s_rms_samples, (unsigned)rms, (unsigned)s_rms_peak);
+        if (rms < 20) {
+            ESP_LOGE(TAG, "[诊断] 原始数据近乎为零 → 排查 ES7210（ADC START/增益/麦克风供电），"
+                          "而非 AFE 通道配方；安静房间底噪通常也有数十到数百");
+        }
+    }
+}
 
 static int i2s_read_cb(audio_element_handle_t el, char *buf, int len, TickType_t wait, void *ctx)
 {
@@ -67,6 +164,8 @@ static int i2s_read_cb(audio_element_handle_t el, char *buf, int len, TickType_t
     int r = audio_element_input(s_i2s_reader, buf, len);
     if (r <= 0) {
         ESP_LOGW(TAG, "I2S 读取失败/结束：%d", r);
+    } else {
+        aec_rms_probe(buf, r);
     }
     return r;
 }
@@ -95,7 +194,7 @@ static void aec_unlock(void)
 
 /* ------------------------------------------------------------------ 初始化 */
 
-esp_err_t aec_capture_init(void)
+esp_err_t aec_capture_init(audio_hal_handle_t codec_hal)
 {
     if (s_lock == NULL) {
         s_lock = xSemaphoreCreateMutex();
@@ -105,11 +204,13 @@ esp_err_t aec_capture_init(void)
     }
 
 #if !CONFIG_ONEYE_FW_ENABLE_AEC_CAPTURE
+    (void)codec_hal;
     s_st.enabled = false;
     ESP_LOGW(TAG, "AEC 采集未启用（CONFIG_ONEYE_FW_ENABLE_AEC_CAPTURE=n）");
     return ESP_OK;
 #else
     s_st.enabled = true;
+    s_codec = codec_hal;
 
     /* SPIFFS 兜底存储（无 SD 卡时用）；已注册则忽略错误 */
     esp_vfs_spiffs_conf_t spiffs = {
@@ -127,23 +228,19 @@ esp_err_t aec_capture_init(void)
         ESP_LOGI(TAG, "SPIFFS 兜底存储：total=%u KB, used=%u KB", (unsigned)(total / 1024), (unsigned)(used / 1024));
     }
 
-    /* ADC 增益：与 ADF algorithm 例程的本板口径一致（MIC1/2 = 33 dB，MIC3(AEC 回采) = 24 dB） */
-    (void)es7210_adc_set_gain(ES7210_INPUT_MIC2 | ES7210_INPUT_MIC1, GAIN_33DB);
-    (void)es7210_adc_set_gain(ES7210_INPUT_MIC3, GAIN_24DB);
+    /* ADC 启动 + 增益：与例程同序（START 会把所有麦位刷成同一增益，故增益在其后设）。
+     * 真机问题：此前录音路径从不调用 `audio_hal_ctrl_codec(START)`，而板上回放结束会 STOP
+     * （ES7210 断电：模拟块 0xc0 / MIC 偏置 0xff / 时钟 0x7f），导致录音近乎静音。 */
+    aec_codec_arm();
 
-    /* I2S 读元素（常驻；采集时由 pipeline 拉起） */
-    i2s_stream_cfg_t i2s_r_cfg = I2S_STREAM_CFG_DEFAULT_WITH_PARA(
-        AEC_CAPTURE_I2S_PORT, AEC_CAPTURE_RATE, AEC_CAPTURE_BITS, AUDIO_STREAM_READER);
-    i2s_r_cfg.task_stack = -1;                     /* 复用 pipeline 任务栈 */
-    i2s_stream_set_channel_type(&i2s_r_cfg, AEC_CAPTURE_I2S_CH);
-    s_i2s_reader = i2s_stream_init(&i2s_r_cfg);
-    if (s_i2s_reader == NULL) {
-        s_st.last_err = ESP_FAIL;
-        ESP_LOGE(TAG, "I2S 读元素创建失败");
-        return ESP_FAIL;
-    }
-    ESP_LOGI(TAG, "AEC 采集已就绪（%d Hz / %d bit / %s → AFE → WAV %d Hz %d bit 单声道）",
-             AEC_CAPTURE_RATE, (int)AEC_CAPTURE_BITS, AUDIO_ADC_INPUT_CH_FORMAT,
+    /* 注意：I2S 读元素**不在 init 里常驻**，改为每次采集时按需创建、结束时销毁。
+     * 原因（真机取证 2026-09-16）：本板录音（ES7210）与回放（ES8311）**共用 I2S0**，常驻的
+     * 32 bit/ONLY_LEFT 读元素会一直占着端口，回放的 16 bit 写元素拿不到端口而**永久阻塞**
+     * ——表现为「回放一直显示播放中、扬声器没有声音」（实测 elapsed_ms 涨到 36 s 仍不结束，
+     * 而文件只有 5.12 s）。应用层已保证录音/回放互斥，故这里串行独占端口即可。 */
+    ESP_LOGI(TAG, "AEC 采集已就绪（%d Hz / %d bit / %s → AFE(TYPE1,AFE_TYPE_VC) → WAV %d Hz %d bit 单声道；"
+                  "I2S 读元素按需创建）",
+             AEC_CAPTURE_RATE, (int)AEC_CAPTURE_BITS, AEC_CAPTURE_INPUT_FORMAT,
              AEC_CAPTURE_RATE, AEC_CAPTURE_WAV_BITS);
     return ESP_OK;
 #endif
@@ -271,6 +368,19 @@ esp_err_t aec_capture_start(uint32_t duration_s, char *out_path, size_t cap)
         aec_unlock();
         return ESP_ERR_INVALID_STATE;
     }
+    aec_unlock();
+
+    /* 录音/回放互斥：本板 ES7210(ADC) 与 ES8311(DAC) **共用 I2S0**，正在回放时起录音会把
+     * 两条管线都卡死（真机取证 2026-09-16：录音管线再也停不下来，AFE 持续空转，随后重启）。 */
+    if (player_is_playing()) {
+        aec_lock();
+        s_st.last_err = ESP_ERR_INVALID_STATE;
+        aec_unlock();
+        ESP_LOGW(TAG, "拒绝录音：正在回放（共用 I2S0）——请先停止回放");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    aec_lock();
     s_st.recording = true;
     s_st.last_err = ESP_OK;
     if (duration_s == 0) {
@@ -296,10 +406,29 @@ esp_err_t aec_capture_start(uint32_t duration_s, char *out_path, size_t cap)
     }
     int64_t t0 = esp_timer_get_time();
 
-    /* 1) AFE（AEC + 降噪）—— AFE_TYPE_VC（语音通信型，AEC 为强项；不含唤醒词/命令词模型）
-     *    参数与输入格式沿用本板口径：`AUDIO_ADC_INPUT_CH_FORMAT` = "RMNM"（2 麦 + AEC 回采） */
+    /* 0) ADC 重新 arm：板上回放结束会把 ES7210 整体断电（见 aec_codec_arm 注释），
+     *    所以每次录音前都重新 START + 重设增益，保证本次采集真的有麦克风信号。 */
+    aec_codec_arm();
+
+    /* 0b) I2S 读元素：本次采集内独占 I2S0（回放侧已由应用层互斥挡掉；见 init 注释） */
+    i2s_stream_cfg_t i2s_r_cfg = I2S_STREAM_CFG_DEFAULT_WITH_PARA(
+        AEC_CAPTURE_I2S_PORT, AEC_CAPTURE_RATE, AEC_CAPTURE_BITS, AUDIO_STREAM_READER);
+    i2s_r_cfg.task_stack = -1;                     /* 复用 pipeline 任务栈 */
+    i2s_stream_set_channel_type(&i2s_r_cfg, AEC_CAPTURE_I2S_CH);
+    s_i2s_reader = i2s_stream_init(&i2s_r_cfg);
+    if (s_i2s_reader == NULL) {
+        ESP_LOGE(TAG, "I2S 读元素创建失败");
+        goto fail;
+    }
+
+    /* 1) AFE（AEC + 降噪）—— 与例程单麦分支一致：ALGORITHM_STREAM_CFG_DEFAULT()
+     *    （TYPE1 + AFE_TYPE_VC + AEC|NS）+ input_format "RM"（麦 + AEC 回采两通道） */
+    s_rms_sum_sq = 0;
+    s_rms_peak = 0;
+    s_rms_samples = 0;
+    s_rms_chunks = 0;
     algorithm_stream_cfg_t algo_cfg = ALGORITHM_STREAM_CFG_DEFAULT();
-    algo_cfg.input_format = AUDIO_ADC_INPUT_CH_FORMAT;
+    algo_cfg.input_format = AEC_CAPTURE_INPUT_FORMAT;
     algo_cfg.task_prio = 5;
     algo_cfg.sample_rate = AEC_CAPTURE_RATE;
     algo_cfg.out_rb_size = 256;
@@ -389,9 +518,22 @@ esp_err_t aec_capture_stop(void)
         (void)audio_pipeline_deinit(s_pipeline);
         s_pipeline = NULL;
     }
-    if (s_writer) { audio_element_deinit(s_writer); s_writer = NULL; }
-    if (s_wav)    { audio_element_deinit(s_wav);    s_wav = NULL; }
-    if (s_algo)   { audio_element_deinit(s_algo);   s_algo = NULL; }
+    /* 不得再逐个 `audio_element_deinit`：`audio_pipeline_deinit()` 已把**已注册**的元素
+     * 全部 deinit + 反注册（components/audio_pipeline/audio_pipeline.c:263-271），
+     * 重复 deinit = 双释放。真机取证（2026-09-16）：录音到时自动停止时必崩并静默重启——
+     *   W (27293) AUDIO_ELEMENT: OUT-[algo] AEL_IO_ABORT
+     *   I (27333) AFE: exit
+     *   assert failed: spinlock_acquire spinlock.h:142 (lock->count == 0)
+     *   rst:0xc (RTC_SW_CPU_RST)
+     * 表现为面板上设备「离线/在线来回跳」、回放/再次录音随即失败。只置空句柄即可。 */
+    s_writer = NULL;
+    s_wav = NULL;
+    s_algo = NULL;
+    /* I2S 读元素不属管线（由 read_cb 取数），须在此自行销毁：释放 I2S0 给回放用 */
+    if (s_i2s_reader) {
+        audio_element_deinit(s_i2s_reader);
+        s_i2s_reader = NULL;
+    }
 
     /* 落盘结果（大小 = 文件实际长度；WAV 头由 wav_encoder 在结束时回填） */
     struct stat st;

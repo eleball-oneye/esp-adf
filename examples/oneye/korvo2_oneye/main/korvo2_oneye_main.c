@@ -568,8 +568,11 @@ void app_main(void)
     board_init_peripherals();
     keys_start();
 
-    /* ③b AEC 采集（录音 → WAV 落 SD/SPIFFS；供验证面板在 web 播放） */
-    if (aec_capture_init() == ESP_OK) {
+    /* ③b AEC 采集（录音 → WAV 落 SD/SPIFFS；供验证面板在 web 播放）
+     *     传板级 **ADC**（ES7210）句柄：`s_board->audio_hal` 是 ES8311（DAC），
+     *     `s_board->adc_hal` 才是 ES7210；录音前用它 `AUDIO_HAL_CTRL_START` 重新 arm ADC
+     *     （含 MIC 偏置/增益刷新），避免 STOP 之后录到近乎静音。 */
+    if (aec_capture_init(s_board != NULL ? s_board->adc_hal : NULL) == ESP_OK) {
         ESP_LOGI(TAG, "AEC 采集就绪（面板可触发录音：POST /api/action {\"op\":\"aec_start\"}）");
     } else {
         ESP_LOGW(TAG, "AEC 采集初始化失败（面板将显示 aec.enabled=false 或不可用）");

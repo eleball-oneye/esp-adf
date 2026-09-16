@@ -17,6 +17,7 @@
 #include "esp_timer.h"
 #include "esp_http_server.h"
 #include "esp_heap_caps.h"
+#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
@@ -326,6 +327,24 @@ void panel_api_set_wifi(bool connected, const char *ip, const char *ssid, const 
 
 /* ------------------------------------------------------------------ HTTP 处理 */
 
+/** 本次启动的复位原因（面板/联调判定"离线在线跳变"是否来自设备重启） */
+static const char *panel_api_reset_reason(void)
+{
+    switch (esp_reset_reason()) {
+        case ESP_RST_POWERON:  return "poweron";
+        case ESP_RST_EXT:      return "ext";
+        case ESP_RST_SW:       return "sw";        /* esp_restart() 或 assert/panic 后软复位 */
+        case ESP_RST_PANIC:    return "panic";
+        case ESP_RST_INT_WDT:  return "int_wdt";
+        case ESP_RST_TASK_WDT: return "task_wdt";
+        case ESP_RST_WDT:      return "wdt";
+        case ESP_RST_DEEPSLEEP:return "deepsleep";
+        case ESP_RST_BROWNOUT: return "brownout";
+        case ESP_RST_SDIO:     return "sdio";
+        default:               return "unknown";
+    }
+}
+
 static esp_err_t send_json(httpd_req_t *req, sb_t *s)
 {
     httpd_resp_set_type(req, "application/json; charset=utf-8");
@@ -449,6 +468,10 @@ static esp_err_t h_status(httpd_req_t *req)
     sb_raw(&s, ",");
     sb_kv_i(&s, "psram_free", (long long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     sb_raw(&s, "},");
+    /* 重启原因（本地验证面）：面板看到「设备离线/在线来回跳」时，用它区分
+     * 「设备在重启」与「网络抖动」——SW/panic 复位会给出确切复位码。 */
+    sb_kv_str(&s, "reset_reason", panel_api_reset_reason());
+    sb_raw(&s, ",");
     sb_kv_str(&s, "scope", "local-verification-only");
     sb_raw(&s, "}");
     sb_raw(&s, "}");

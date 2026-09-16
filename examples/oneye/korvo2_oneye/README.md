@@ -122,11 +122,20 @@ I (xxx) korvo2_oneye: [board-check] 结果：15 项，失败 0 项
 `CONFIG_ONEYE_FW_ENABLE_AEC_CAPTURE=y`（缺省开）时固件内建 AEC 采集链：
 
 ```
-I2S0(CODEC_ADC_I2S_PORT) 16 kHz / 32 bit / RIGHT_LEFT     ← ES7210 四通道按 "RMNM" 排布（2 麦 + AEC 回采）
-  → algorithm_stream（esp-sr AFE，**AFE_TYPE_VC**：AEC + 降噪；不含唤醒词/命令词模型）
+I2S0(CODEC_ADC_I2S_PORT) 16 kHz / 32 bit / ONLY_LEFT        ← 单麦口径：input_format "RM"（麦 + AEC 回采）
+  → algorithm_stream（esp-sr AFE，**TYPE1 + AFE_TYPE_VC**：AEC + 降噪；不含唤醒词/命令词模型）
   → wav_encoder（16 kHz / 16 bit / 单声道）
   → fatfs_stream 落盘
 ```
+
+> **⚠️ 通道配方（第十四轮真机修正，勿再混用）**：本板 `board_def.h:116` 定义 `RECORD_HARDWARE_AEC (true)`，
+> ADF 例程 `advanced_examples/algorithm` 因此走**单麦分支**：`input_format "RM"`（2 通道）+ `I2S_CHANNEL_FMT_ONLY_LEFT`
+> + `ALGORITHM_STREAM_CFG_DEFAULT()`（TYPE1 + `AFE_TYPE_VC`）。其**双麦分支**才是 `"RMNM"`（4 通道）
+> + `I2S_CHANNEL_FMT_RIGHT_LEFT` + `AFE_TYPE_SR`。把双麦的 I2S 口径喂给单麦 AFE，AFE 只取首通道并告警
+> （`For single microphone channel, SE is deactivated.`），录出来的**幅度近乎静音**（实测 RMS 137/32768）。
+> 修后串口可见 AFE 自述 `Input PCM Config: total 2 channels(1 microphone, 1 playback)`。
+> 另：录音前须 `audio_hal_ctrl_codec(s_board->adc_hal /* ES7210，不是 audio_hal */, ENCODE, START)`
+> 并按例程顺序（先 START 后设增益）重设 MIC 增益；`es7210_adc_ctrl_state()` 的返回值是寄存器读值、**非错误码**。
 
 - **落盘位置**：SD 卡可用 → `/sdcard/rec/aec-N.wav`；否则 SPIFFS 兜底 → `/spiffs/rec/aec-N.wav`。
 - **触发方式**：`POST /api/action {"op":"aec_start","duration_s":5}`（到时自动停止）或 `{"op":"aec_stop"}`；
@@ -140,8 +149,9 @@ I2S0(CODEC_ADC_I2S_PORT) 16 kHz / 32 bit / RIGHT_LEFT     ← ES7210 四通道�
 > 本工程已修正：`partitions.csv` 含 `model`（2 M），构建产出 `srmodels.bin` **337,952 B**（仅 NSNET2 + WebRTC VAD；
 > 不含 WakeNet/MultiNet ⇒ 与 `AFE_TYPE_VC` 口径一致，且省下约 3.8 MB flash）。
 - **前置条件**：AFE 需要 PSRAM（`CONFIG_SPIRAM*`，本板 ESP32-S3-WROOM-1 带 Octal PSRAM）。
-- **⚠️ 待真机核对**：① 模组 PSRAM 为 Octal 还是 Quad（若 Quad，把 `CONFIG_SPIRAM_MODE_OCT` 改为 `MODE_QUAD`）；
-  ② 采集链路真实出声与降噪效果（模型已投放是**构建级证据**，运行期仍需实测）；③ SD 卡（一线模式）与 SPIFFS 兜底两条落盘路径。
+- **真机状态（第十四轮）**：① PSRAM 已确认 Octal 8 MB @80 MHz；② 录音链路已闭环（请求 5 s → 163,884 B = 5.12 s，
+  原始 I2S 幅度 RMS 123–390 / 峰值 600–1600，安静房间量级）；③ SD 落盘与 SPIFFS 兜底两条路径均已实测；
+  ④ 「对麦说话」的灵敏度取证与扬声器可听性待补（见 §8 末行「待续」）。
 
 ## 5.3 板上回放（选 SD 卡文件 → 开发板扬声器出声）
 
@@ -155,6 +165,7 @@ I2S0(CODEC_ADC_I2S_PORT) 16 kHz / 32 bit / RIGHT_LEFT     ← ES7210 四通道�
 | 控制 | `POST /api/action {"op":"play","path":"/sdcard/music/x.wav"}`、`{"op":"stop"}`、`{"op":"set_volume","volume":0-100}` |
 | 状态 | `GET /api/status` 的 `player{playing,path,codec,rate_hz,channels,elapsed_ms,volume,msg}`；播完自动回收管线 |
 | 并发 | 管线与事件接口**由播放任务独占销毁**：外部 `stop` 只置标志并等待任务回收（≤3 s），避免 use-after-free |
+| 与录音互斥 | 本板 ES7210(ADC)/ES8311(DAC) **共用 I2S0**：录音中 `play` 返回 `ESP_ERR_INVALID_STATE`（`busy: recording (shared I2S0)`），回放中 `aec_start` 同样被拒（**串行独占端口**，实测重叠会把两条管线都卡死） |
 | 边界 | **板上视频回放（AVI/MJPEG → LCD）本轮不做**（需 LCD + esp_muxer + 视频解码链路）；SD 上的图片/视频可在**网页**预览 |
 
 验证面板的「音频」卡片里，SD 卡音频文件会多出一个 **「板上播放」** 按钮（`/media/list` 已带 `playable_on_board` 与 `device_path`），
@@ -285,8 +296,14 @@ python3 tools/panel/panel.py --self-test
 | ⚠️ **真机录音 0/44 字节（已修）** | 串口：`sdmmc_cmd: allocate_dma_buf: not enough mem` + `AUDIO_THREAD: Error creating RestrictedPinnedToCore algo_fetch` + `afe_feed: handle or input data is NULL!` ⇒ 内部 RAM 被 Wi-Fi+SDK+AFE 吃满。修法：`SPIRAM_MALLOC_ALWAYSINTERNAL=4096` + 内部保留量；实测 `internal_free 39 KB→88 KB`、`largest 15 KB→40 KB`，录音恢复正常 |
 | **录音时长精度（已修）** | ① 原「起管线即计时」把 AFE 预热算入（请求 5 s 得 ~4 s）；② 改「按文件大小探首帧」受 FATFS 写缓冲滞后（请求 5 s 得 ~8.4 s）；③ 现按 **fatfs_stream 的 `byte_pos`（已写字节数）** 精确计时：**请求 5 s → 163,884 B = 5.12 s** |
 | **落盘健壮性（新增）** | 起管线前 512 B **写盘预检**，SD 不可写即回落 SPIFFS；采集 0 字节时显式报错（不再静默产出空文件） |
-| **面板可观测性（新增）** | `/api/status.panel.heap{internal_free,internal_largest,dma_free,dma_largest,psram_free}`（本轮三类问题均靠它定位） |
-| **待续（未闭环，明确记录）** | 录到的音频**幅度极低**（RMS 137/32768 ≈ 0.42%、峰值 1035 ≈ 3.2%）⇒ 麦克风通路近乎静音，故"板上回放没声音"；需单独一轮音频链路排查（建议：绕开 AFE 直接录 ES7210 原始 4 通道比对、核对 `"RMNM"` 通道序与 TDM 槽位、`PERI_PWR_ON`(TCA9554 P5) 供电口径）。LCD/摄像头取帧、时间同步同样未闭环 |
+| **面板可观测性（新增）** | `/api/status.panel.heap{internal_free,internal_largest,dma_free,dma_largest,psram_free}`（本轮三类问题均靠它定位）；第十四轮再增 `panel.reset_reason`（`poweron/sw/panic/task_wdt/…`）——面板看到「离线/在线来回跳」时据此区分**设备重启**与网络抖动 |
+| **录音通道配方修正（真机，第十四轮已闭环）** | 原实现把**双麦**口径（`AUDIO_ADC_INPUT_CH_FORMAT` = `"RMNM"` 4 通道 + `I2S_CHANNEL_FMT_RIGHT_LEFT`）喂给**单麦** AFE（`AFE_TYPE_VC`），AFE 只取首通道 ⇒ 幅度近乎静音（RMS 137/32768 ≈ 0.42%）。按 ADF 例程 `advanced_examples/algorithm` 在本板 **`RECORD_HARDWARE_AEC == true`（`board_def.h:116`）** 下实际走的**单麦分支**逐项照抄：`input_format "RM"`（2 通道：麦 + AEC 回采）、`I2S_CHANNEL_FMT_ONLY_LEFT`、16 kHz/32 bit、`ALGORITHM_STREAM_CFG_DEFAULT()`（TYPE1 + `AFE_TYPE_VC` + AEC\|NS）。修后串口 AFE 自述由 4 通道告警变为 **`Input PCM Config: total 2 channels(1 microphone, 1 playback)`**，原始 I2S 幅度回到环境噪声量级（RMS 123–390、峰值 600–1600，安静房间；此前异常样本 137 是 AFE **输出**幅度） |
+| **录音前 ADC 重新 arm（新增）** | 例程同款：`audio_hal_ctrl_codec(adc_hal, AUDIO_HAL_CODEC_MODE_ENCODE, AUDIO_HAL_CTRL_START)` + 逐麦重设增益（MIC3=24 dB、MIC1\|MIC2=33 dB）。注意两点真机坑：① `s_board->audio_hal` 是 **ES8311（DAC）**，ADC 句柄是 **`s_board->adc_hal`（ES7210）**；② `es7210_adc_ctrl_state()` 的返回值是 **CLOCK_OFF 寄存器读值**（实测 0x20）而非错误码，**非 0 属正常**（曾误报 `ADC START 返回 ERROR`） |
+| ⚠️ **录音到时必崩（真机，第十四轮已修）** | 录音到时自动停止后设备静默重启（`uptime_ms` 回退、面板显示离线/在线反复跳）：`assert failed: spinlock_acquire spinlock.h:142 (lock->count == 0)` @ `AFE: exit` 之后，`rst:0xc (RTC_SW_CPU_RST)`。根因与第七轮播放 `stop` **同一类**：`aec_capture_stop()` 在 `audio_pipeline_deinit()` 之后又对 `s_writer/s_wav/s_algo` 逐个 `audio_element_deinit()`（**双释放**）。修法：管线销毁后只置空句柄；I2S 读元素不属管线、另行销毁 |
+| ⚠️ **回放永不出声且不结束（真机，第十四轮已修）** | 复现：播放 5.12 s 的录音，`playing=true` 持续 36 s 不结束、扬声器无声。逐级打点（新增诊断 `player_diag_dump()`：`file 已读 / decoder 已出 / i2s 已写` 字节数）定位为 **`i2s 已写 44 B` 即卡死** ⇒ 写元素不再被调度。根因：`player.c` 从 algorithm 例程抄了 **`i2s_cfg.task_stack = -1`**（那是「写元素由上游 `write_cb` 驱动」的用法），而本工程走的是官方播放例程 `pipeline_play_sdcard_music` 的 `decoder → i2s` 常规链路：**无任务元素经 `i2s_stream_set_clk()`（内部 `pause`→`resume`，日志可见 `[i2s] RESUME timeout`）后不再被调度**。修法：去掉 `task_stack = -1`（用默认任务栈），并按官方例程补上 `audio_element_setinfo(i2s, &music_info)` → `i2s_stream_set_clk(...)` 的顺序。修后串口 `IN-[i2s] AEL_IO_DONE` → **`player: 播放结束`**，`/api/status.player.playing=false` |
+| **录音/回放互斥（新增）** | 本板 ES7210(ADC) 与 ES8311(DAC) **共用 I2S0**：「播放中启动录音」会把两条管线都卡死（AFE 持续 `Ringbuffer of AFE is empty`，随后重启）⇒ `aec_capture_start()` 拒绝在回放中录音、`player_play()` 拒绝在录音中回放（`ESP_ERR_INVALID_STATE`，面板返回 `busy: already recording or playing (shared I2S0)`）。配套：录音的 I2S 读元素改为**按需创建、结束时销毁**（不再常驻占用端口） |
+| **稳定性复测（真机，第十四轮）** | `play → rec 5 s → play → rec 5 s → 守卫拒绝 → stop` 全流程：**重启 0 次**（`uptime_ms` 单调 8,246→76,220 ms）、两次录音均 163,884 B = 5.12 s、两次回放均 `播放结束`、`in-app 守卫` 正确拒绝重叠操作 |
+| **待续（未闭环，明确记录）** | ① **可听性**：回放链路已把 PCM 完整时钟输出（`AEL_IO_DONE` + 时长吻合），但「扬声器是否真的出声」需人耳确认（PA `GPIO48` 已在 `es8311_codec_init` 打开、音量 80）；② **麦克风灵敏度**：原始幅度随环境变化（123→390），对着板子说话的幅度取证待补；③ LCD/摄像头取帧、时间同步未闭环 |
 
 **后续（真机）**：`idf.py -p <COM> flash monitor` → 核对自检逐行 PASS → **SD 卡放 `oneye-wifi.txt` 复位自动配网** → 观察
 `caps/up` / `status/up`（retained + LWT）/ `shadow/up` / `log/up` 与按键 `event/up`；其间可用面板「Wi-Fi 配网」卡片核对**凭据来源**；

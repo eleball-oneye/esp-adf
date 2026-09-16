@@ -31,6 +31,7 @@
 #include "board.h"          /* CODEC_ADC_I2S_PORT（板级 I2S 端口） */
 
 #include "player.h"
+#include "aec_capture.h"    /* 录音/回放共用 I2S0，需互斥（见 player_play 顶部守卫） */
 
 static const char *TAG = "player";
 
@@ -186,22 +187,52 @@ esp_err_t player_stop(void)
     return ESP_OK;
 }
 
+/* 播放阶段诊断（真机取证用）：曾出现「一直显示播放中、扬声器无声、且永不结束」，
+ * 需要区分是**文件读**、**解码**还是**I2S 写出**卡住，故按字节位置逐级打点。 */
+static void player_diag_dump(const char *why)
+{
+    audio_element_info_t ri = { 0 }, di = { 0 }, wi = { 0 };
+    if (s_reader) {
+        (void)audio_element_getinfo(s_reader, &ri);
+    }
+    if (s_decoder) {
+        (void)audio_element_getinfo(s_decoder, &di);
+    }
+    if (s_writer) {
+        (void)audio_element_getinfo(s_writer, &wi);
+    }
+    ESP_LOGW(TAG, "[诊断] %s：file 已读 %d B / decoder 已出 %d B / i2s 已写 %d B"
+                  "（i2s 配置 %d Hz %d bit %d ch）",
+             why, (int)ri.byte_pos, (int)di.byte_pos, (int)wi.byte_pos,
+             (int)wi.sample_rates, (int)wi.bits, (int)wi.channels);
+}
+
 /* 播放任务：事件循环 + 停止标志轮询；退出前独占回收并清句柄 */
 static void player_task(void *arg)
 {
     (void)arg;
+    int idle = 0;
     while (!s_stop_req) {
         audio_event_iface_msg_t msg;
         esp_err_t rc = audio_event_iface_listen(s_evt, &msg, pdMS_TO_TICKS(500));
         if (rc != ESP_OK) {
+            /* 无事件（500 ms 一次）：6 s 时打一次数据流诊断，之后每 10 s 一次 */
+            idle++;
+            if (idle == 12 || (idle > 12 && (idle % 20) == 0)) {
+                player_diag_dump(idle == 12 ? "播放 6 s 仍未结束" : "播放持续未结束");
+            }
             continue;
         }
+        idle = 0;
         if (msg.source_type == AUDIO_ELEMENT_TYPE_ELEMENT && msg.source == (void *)s_decoder &&
             msg.cmd == AEL_MSG_CMD_REPORT_MUSIC_INFO) {
             audio_element_info_t info = { 0 };
             audio_element_getinfo(s_decoder, &info);
             if (info.sample_rates > 0) {
                 ESP_LOGI(TAG, "解码信息：%d Hz / %d bit / %d ch", info.sample_rates, info.bits, info.channels);
+                /* 与 ADF 官方播放例程同序：先把解码信息写到 i2s 元素，再改时钟
+                 * （examples/player/pipeline_play_sdcard_music：setinfo → i2s_stream_set_clk） */
+                audio_element_setinfo(s_writer, &info);
                 (void)i2s_stream_set_clk(s_writer, info.sample_rates,
                                          info.bits > 0 ? info.bits : 16,
                                          info.channels > 0 ? info.channels : 1);
@@ -233,6 +264,18 @@ static void player_task(void *arg)
 
 esp_err_t player_play(const char *path)
 {
+    /* 录音/回放互斥（真机取证 2026-09-16）：本板 ES7210(ADC) 与 ES8311(DAC) **共用 I2S0**，
+     * 一边录音一边回放会让两边争抢同一端口——实测「播放中启动录音」后录音管线永不停止、
+     * AFE 持续 `Ringbuffer of AFE is empty`、随后设备重启。这里显式拒绝（不静默）：
+     * 先停录音再回放（AEC 回采场景另开任务卡，不走本条验证路径）。 */
+    if (aec_capture_is_recording()) {
+        pl_lock();
+        s_st.last_err = ESP_ERR_INVALID_STATE;
+        set_msg_locked("录音中：录音与回放共用 I2S0，请先停止录音");
+        pl_unlock();
+        ESP_LOGW(TAG, "拒绝回放：正在录音（共用 I2S0）");
+        return ESP_ERR_INVALID_STATE;
+    }
     if (!path_ok(path)) {
         pl_lock();
         s_st.last_err = ESP_ERR_INVALID_ARG;
@@ -282,7 +325,11 @@ esp_err_t player_play(const char *path)
 
     i2s_stream_cfg_t i2s_cfg = I2S_STREAM_CFG_DEFAULT_WITH_PARA(
         PLAYER_I2S_PORT, PLAYER_DEFAULT_RATE, PLAYER_I2S_BITS, AUDIO_STREAM_WRITER);
-    i2s_cfg.task_stack = -1;
+    /* 注意：**不要**设 `task_stack = -1`。那是 ADF algorithm 例程里「写元素由上游 write_cb
+     * 驱动」的用法；这里走的是官方播放例程（pipeline_play_sdcard_music）的
+     * decoder → i2s 常规链路，写元素必须有自己的任务——真机取证（2026-09-16）：
+     * 无任务写法下 `i2s_stream_set_clk()`（内部 pause→resume）之后写元素再也不被调度，
+     * 表现为「一直显示播放中、i2s 只写出 44 B、扬声器无声、永不结束」。 */
     s_writer = i2s_stream_init(&i2s_cfg);
     if (s_writer == NULL) {
         goto fail;

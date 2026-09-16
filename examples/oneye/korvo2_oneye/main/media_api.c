@@ -427,7 +427,8 @@ static esp_err_t h_action(httpd_req_t *req)
                                ? (uint32_t)dur->valuedouble : 0;
         rc = aec_capture_start(seconds, file, sizeof(file));
         if (rc != ESP_OK) {
-            msg = (rc == ESP_ERR_INVALID_STATE) ? "already recording"
+            /* INVALID_STATE 有两种成因：已在录音，或正在回放（二者共用 I2S0，见 player.c 守卫） */
+            msg = (rc == ESP_ERR_INVALID_STATE) ? "busy: already recording or playing (shared I2S0)"
                                                 : (rc == ESP_ERR_NOT_SUPPORTED ? "aec disabled" : "start failed");
         }
     } else if (strcmp(op_str, "aec_stop") == 0) {
@@ -442,7 +443,8 @@ static esp_err_t h_action(httpd_req_t *req)
             if (rc != ESP_OK) {
                 msg = (rc == ESP_ERR_NOT_SUPPORTED) ? "unsupported codec (wav/mp3 only)"
                       : (rc == ESP_ERR_INVALID_ARG ? "invalid path (must be /sdcard/...)"
-                                                   : "play failed");
+                      : (rc == ESP_ERR_INVALID_STATE ? "busy: recording (shared I2S0)"
+                                                     : "play failed"));
             } else {
                 msg = "playing";
                 snprintf(file, sizeof(file), "%s", path->valuestring);

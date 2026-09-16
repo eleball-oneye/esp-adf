@@ -68,7 +68,12 @@ python3 panel.py --device korvo2-0001=http://192.168.1.50 --serial /dev/ttyUSB0@
    `kconfig`、`api`），并提供运行期改配表单（SSID + 密码 → 设备重连，最长约 20 s 出结果）。
    持久化以 SD 卡凭据文件为准（见 [固件 README `../../examples/oneye/korvo2_oneye/README.md`](../../examples/oneye/korvo2_oneye/README.md)）；
    表单只改本次运行、**不写文件**（明文，仅台面/联调）；
-7. **串口兜底** —— 最近日志尾部（无网时仍能核对按键与自检输出）。
+7. **板载 LCD**（第十七轮）—— 显示设备侧 `panel.lcd{}`（就绪/分辨率/当前图案/绘制次数/帧缓冲与所在内存），
+   并提供图案下拉 + 「下发」按钮（`POST /api/action/lcd` → 设备真重绘，人眼/拍照即可对账）；
+8. **板载摄像头**（第十八轮）—— 显示 `panel.camera{}`（型号/PID、**取帧配置** `format/fb_loc/fb_count/grab/xclk/psram_dma/quality`、
+   成功与失败计数、最近一帧、最近失败原因），提供「抓拍」按钮（`POST /api/action/camera`）并把最近一帧经设备 `/media` 面渲染出来
+   （抓拍落 `/sdcard/cam/`，与「音频」卡片共用同一只读媒体面）；
+9. **串口兜底** —— 最近日志尾部（无网时仍能核对按键与自检输出）。
 
 ### 3.1 「云端桩」`--ack-stub`：验证设备侧第三态（本地检测 → 上行 → 云端 ack）
 
@@ -98,6 +103,9 @@ python3 panel.py --device korvo2-0001=http://<设备IP> \
 | `GET /media/list` | `{count,rec_root,aec_enabled,aec_recording,files:[{alias,name,size,mtime,kind,item{url}}]}`（SD 与 SPIFFS；按扩展名判 `audio`/`image`/`video`） |
 | `GET /media/<alias>/<path>` | 文件下载/流式播放，**支持 `Range`**（`206` + `Content-Range` + `Accept-Ranges`）⇒ 浏览器 `<audio>` 可拖动；`alias`=`sdcard`\|`spiffs`；含目录穿越防护 |
 | `POST /api/action` | `{"op":"aec_start","duration_s":N}` / `{"op":"aec_stop"}` / `{"op":"play","path":"/sdcard/..."}` / `{"op":"stop"}` / `{"op":"set_volume","volume":0-100}` / `{"op":"wifi_set","ssid":"...","password":"..."}` ⇒ `{ok,msg,file,recording,playing,volume,last_bytes}`（**写操作，仅台面验证**；`play` 仅接受 SD 卡上的 wav/mp3；`wifi_set` 仅当 `CONFIG_ONEYE_FW_ENABLE_WIFI_FILE=y`） |
+| `POST /api/lcd/draw?pattern=bars\|grid\|checker\|test\|status` | 图案下发（设备真重绘）⇒ `{ok,pattern,draws,w,h,fb_bytes,fb_mem}`（第十七轮） |
+| `POST /api/camera/capture` | 抓一帧落盘 ⇒ `{ok,path,bytes,w,h,ms,err,url}`（`url` 形如 `media/sdcard/cam/cap-0000N.jpg`，可直接经 `/media` 显示）（第十八轮） |
+| `POST /api/camera/reinit?fmt=jpeg\|rgb565&fb=dram\|psram&fbc=1..3&grab=when_empty\|latest&xclk=10\|20\|40&psram=0\|1&q=0..63` | 取帧配置旋钮（**仅台面排障**）：回显生效配置，用于在同一块板子上对比定位取帧失败（第十八轮） |
 
 事件 id 由固件生成（`key-00001`…）并作为 `event/up` 的幂等 `id`；云端 ack 的 `data.ref` 与之对齐 ⇒ **设备侧**能自报三态，
 **面板侧**再用 MQTT 独立验证一次。
@@ -109,6 +117,10 @@ python3 panel.py --device korvo2-0001=http://<设备IP> \
 | `GET /` | 单页 UI（内嵌，无 CDN；轮询 `/api/state`，缺省 600 ms，可用 `--poll-ms`） |
 | `GET /api/state` | 聚合快照：`mqtt{}`、`serial{}`、`devices[]`（`status`/`selftest`/`keys`/`history`（含云端关联字段）/`serial_tail`） |
 | `GET /api/health` | `{"ok":true,"version":"0.1.0"}` |
+| `POST /api/action/lcd?node=&pattern=` | 代理到设备的 `/api/lcd/draw`（浏览器同源调用，避免跨源直连设备）（第十七轮） |
+| `POST /api/action/camera?node=` | 代理到设备的 `/api/camera/capture`（第十八轮） |
+| `POST /api/simulate/key?node=&key=&action=` | 代理到设备的 `/api/simulate/key`（按键注入，仅验证用） |
+| `POST /api/mqtt/ack` | 台面手动投递 `event/down` ack（`--ack-stub` 之外的手动兜底） |
 
 ## 6. 文件
 
@@ -123,7 +135,7 @@ python3 panel.py --device korvo2-0001=http://<设备IP> \
 
 | 项 | 命令 | 结果 |
 | --- | --- | --- |
-| 面板自检（无硬件） | `python3 panel.py --self-test`（内置 mock 设备 + mock broker + 模拟 AEC 录音 WAV + SD 卡媒体 + 凭据文件配网 + 云端桩） | **35 项全部通过，rc=0**：设备 HTTP、自检明细 15 行、固件标识、MQTT 连接、按键历史（新→旧、**云端确认 3/3**、端到端时延、动作覆盖）、`/api/health`、首页渲染、**首页含音频/AEC 卡片**、**媒体列表非空**、**绝对播放地址**、**Range 206 + Content-Range + RIFF 头**、**触发 AEC 采集**、**采集后列表增长**、**停止采集**、**SD 卡媒体可板上回放标记**、**触发板上播放**、**播放状态回显**、**音量设置**、**停止播放**、**非 SD 路径被拒绝**、**Wi-Fi 状态含 ssid/source**、**凭据来源标注为 SD 文件**、**运行期改配 wifi_set**、**改配后状态回显新 SSID + api 来源**、**空 SSID 被拒绝**、**改配失败可观测**、**凭据文件配网回落**、**首页含 Wi-Fi 配网卡片**、**云端桩回 event/down ack**、**设备侧置 acked（三态闭环）**、设备离线降级 |
+| 面板自检（无硬件） | `python3 panel.py --self-test`（内置 mock 设备 + mock broker + 模拟 AEC 录音 WAV + SD 卡媒体 + 凭据文件配网 + 云端桩 + LCD/摄像头本地验证面） | **39 项全部通过，rc=0**：设备 HTTP、自检明细 15 行、固件标识、MQTT 连接、按键历史（新→旧、**云端确认 3/3**、端到端时延、动作覆盖）、`/api/health`、首页渲染、**首页含音频/AEC 卡片**、**媒体列表非空**、**绝对播放地址**、**Range 206 + Content-Range + RIFF 头**、**触发 AEC 采集**、**采集后列表增长**、**停止采集**、**SD 卡媒体可板上回放标记**、**触发板上播放**、**播放状态回显**、**音量设置**、**停止播放**、**非 SD 路径被拒绝**、**Wi-Fi 状态含 ssid/source**、**凭据来源标注为 SD 文件**、**运行期改配 wifi_set**、**改配后状态回显新 SSID + api 来源**、**空 SSID 被拒绝**、**改配失败可观测**、**凭据文件配网回落**、**首页含 Wi-Fi 配网卡片**、**LCD 状态字段齐备（ready/w/h/pattern/fb_bytes）**、**摄像头状态字段齐备（sensor/pid/取帧配置）**、**LCD 图案下发代理（`/api/action/lcd`）**、**摄像头抓帧代理（`/api/action/camera`）**、**云端桩回 event/down ack**、**设备侧置 acked（三态闭环）**、设备离线降级 |
 | 真机联调（2026-09-15，第十二轮） | 板子 COM12 + `192.168.110.79`；面板 `--device korvo2-0001=http://192.168.110.79 --mqtt 175.178.190.187:1883 --ack-stub` | 面板聚合成功（自检 19/0、`wifi.source=file:/sdcard/oneye-wifi.txt`、媒体 1 个可上板文件、player 状态/音量）；**云端桩在真 EMQX 上实发 `event/down`**（`data.ref` 与上行 id 一致）；设备侧 `/media/<alias>/<path>` Range 与板上回放均真机验证通过（详见 [固件 README §8](../../examples/oneye/korvo2_oneye/README.md)） |
 
 ### 7.1 构建记录（AEC 采集 + 媒体 API）

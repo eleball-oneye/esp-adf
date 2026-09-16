@@ -41,6 +41,7 @@
 #include "aec_capture.h"
 #include "player.h"
 #include "lcd_ui.h"
+#include "camera_api.h"
 #include "wifi_prov.h"
 
 static const char *TAG = "korvo2_oneye";
@@ -98,6 +99,28 @@ static void chk_ok(const char *item, bool ok, const char *note)
     } else {
         s_check_failed++;
         ESP_LOGE(TAG, "[board-check] %-34s %s FAIL", item, note ? note : "fail");
+        panel_api_record_check(item, "ok", note ? note : "fail", false);
+    }
+}
+
+/*
+ * 提示级检查（WARN）：**不计入 s_check_failed**，因此不会触发 STRICT 中止。
+ * 用于"配件类"模块（如摄像头）：它缺失时板子其余功能（上云/按键/录音/回放/LCD）仍应可用，
+ * 面板照实渲染为红行即可（/api/status.panel.camera 同时也给 inited=false）。
+ * 真机教训（2026-09-16）：把摄像头探测算作硬失败 ⇒ 未装配/探测失败时整机中止上云，
+ * 设备连 IP 都拿不到，反而**看不到**失败原因。
+ */
+static int s_check_warn;
+
+static void chk_warn(const char *item, bool ok, const char *note)
+{
+    s_check_total++;
+    if (ok) {
+        ESP_LOGI(TAG, "[board-check] %-34s %s PASS", item, note ? note : "ok");
+        panel_api_record_check(item, "ok", note ? note : "ok", true);
+    } else {
+        s_check_warn++;
+        ESP_LOGW(TAG, "[board-check] %-34s %s WARN（不计入 STRICT 中止）", item, note ? note : "fail");
         panel_api_record_check(item, "ok", note ? note : "fail", false);
     }
 }
@@ -812,7 +835,30 @@ void app_main(void)
         ESP_LOGI(TAG, "板上回放就绪（仅 SD 卡 /sdcard 下的 wav、mp3）");
     }
 
-    ESP_LOGI(TAG, "[board-check] 自检汇总：%d 项，失败 %d 项", s_check_total, s_check_failed);
+    /* ③d 摄像头（OV3660，board_def 的 CAM_PIN_*；面板可触发：POST /api/camera/capture）
+     *
+     * 初始化顺序（真机两次实测定的口径，与上游注释**不完全一致**，此处以实测为准）：
+     *   ① 放在 `board_init_peripherals()` **之前**（照抄上游 lcd_camera 的"camera init in advance"）
+     *      ⇒ SCCB 探测失败（`camera probe ... no sensor FAIL`，t≈1.7 s）：此时 ADF 的 I2C 总线尚未建立；
+     *   ② 放在 `board_init_peripherals()` **之后**（本实现）
+     *      ⇒ 探测成功（`Camera PID=0x3660 / Detected OV3660 / address=0x3c`），LCD 也能正常刷新。
+     *   即：上游那句注释针对的是"扩展芯片操作可能异常"，在**本板本固件**上并不要求摄像头先于 LCD。
+     *
+     * 失败**不中止启动**，且按 chk_warn 计（提示级）：摄像头属配件，缺了不应阻断上云/按键/录音/回放/LCD，
+     * 否则设备连 IP 都拿不到、反而看不到失败原因（真机教训见 chk_warn 注释）。 */
+    if (camera_api_init() == ESP_OK) {
+        camera_state_t cs;
+        camera_api_get_state(&cs);
+        ESP_LOGI(TAG, "摄像头就绪（%s PID=0x%04x，fmt=%s fb=%s×%d）：面板可抓拍 POST /api/camera/capture",
+                 cs.sensor, (unsigned)cs.pid, cs.format, cs.fb_loc, cs.fb_count);
+        chk_warn("camera probe (OV3660, SCCB 0x3c)", true, cs.sensor);
+    } else {
+        ESP_LOGW(TAG, "摄像头未就绪（按「未装配/接线问题」取证，不得声明 video.* 能力位）");
+        chk_warn("camera probe (OV3660, SCCB 0x3c)", false, "no sensor");
+    }
+
+    ESP_LOGI(TAG, "[board-check] 自检汇总：%d 项，失败 %d 项，提示 %d 项",
+             s_check_total, s_check_failed, s_check_warn);
 
 #if CONFIG_ONEYE_FW_SELFTEST_STRICT
     if (s_check_failed > 0) {

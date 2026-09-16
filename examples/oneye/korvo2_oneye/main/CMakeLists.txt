@@ -4,6 +4,7 @@ idf_component_register(SRCS "korvo2_oneye_main.c"
                             "aec_capture.c"
                             "player.c"
                             "lcd_ui.c"
+                            "camera_api.c"
                             "wifi_prov.c"
                        INCLUDE_DIRS "."
                        REQUIRES oneye-dev-sdk
@@ -16,6 +17,7 @@ idf_component_register(SRCS "korvo2_oneye_main.c"
                                 esp_peripherals
                                 input_key_service
                                 esp_http_server
+                                esp32-camera
                                 esp_wifi
                                 esp_netif
                                 esp_event

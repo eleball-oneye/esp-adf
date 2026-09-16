@@ -26,6 +26,8 @@
 #include "aec_capture.h"
 #include "player.h"
 #include "lcd_ui.h"
+#include "camera_api.h"
+#include "esp_camera.h"     /* CAMERA_FB_IN_PSRAM / PIXFORMAT_*（仅本地验证面重配旋钮用） */
 
 static const char *TAG = "panel_api";
 
@@ -585,6 +587,37 @@ static esp_err_t h_status(httpd_req_t *req)
         sb_kv_str(&s, "fb_mem", lc.fb_in_psram ? "psram" : (lc.ready ? "internal" : "-"));
         sb_raw(&s, "},");
     }
+    /* 板载摄像头（本地验证面）：sensor PID 是"模组是否装配"的取证依据（0 = 未识别/未装配） */
+    {
+        camera_state_t cs;
+        camera_api_get_state(&cs);
+        sb_raw(&s, "\"camera\":{");
+        sb_kv_str(&s, "inited", cs.inited ? "true" : "false");
+        sb_raw(&s, ",");
+        sb_kv_str(&s, "sensor", cs.sensor);
+        sb_raw(&s, ",");
+        sb_kv_i(&s, "pid", (long long)cs.pid); sb_raw(&s, ",");
+        sb_kv_i(&s, "pid_hex", (long long)cs.pid); sb_raw(&s, ",");   /* 面板按 hex 展示 */
+        sb_kv_i(&s, "frames", (long long)cs.frames); sb_raw(&s, ",");
+        sb_kv_i(&s, "errors", (long long)cs.errors); sb_raw(&s, ",");
+        sb_kv_i(&s, "last_bytes", (long long)cs.last_bytes); sb_raw(&s, ",");
+        sb_kv_i(&s, "last_w", cs.last_width); sb_raw(&s, ",");
+        sb_kv_i(&s, "last_h", cs.last_height); sb_raw(&s, ",");
+        sb_kv_i(&s, "last_ms", (long long)cs.last_ms); sb_raw(&s, ",");
+        sb_kv_str(&s, "last_path", cs.last_path); sb_raw(&s, ",");
+        sb_kv_str(&s, "last_err", cs.last_err); sb_raw(&s, ",");
+        sb_kv_str(&s, "root", cs.root);
+        sb_raw(&s, ",");
+        /* 生效配置（排障用：NO-SOI 类取帧失败靠这几个旋钮在真机上对比定位） */
+        sb_kv_str(&s, "format", cs.format); sb_raw(&s, ",");
+        sb_kv_str(&s, "fb_loc", cs.fb_loc); sb_raw(&s, ",");
+        sb_kv_i(&s, "fb_count", cs.fb_count); sb_raw(&s, ",");
+        sb_kv_str(&s, "grab", cs.grab); sb_raw(&s, ",");
+        sb_kv_i(&s, "xclk_mhz", cs.xclk_mhz); sb_raw(&s, ",");
+        sb_kv_i(&s, "psram_dma", cs.psram_dma); sb_raw(&s, ",");
+        sb_kv_i(&s, "quality", cs.quality);
+        sb_raw(&s, "},");
+    }
     sb_kv_str(&s, "scope", "local-verification-only");
     sb_raw(&s, "}");
     sb_raw(&s, "}");
@@ -788,6 +821,114 @@ static esp_err_t h_lcd_draw(httpd_req_t *req)
     return send_json(req, &s);
 }
 
+/* POST /api/camera/capture
+ *
+ * 本地验证面：抓一帧 JPEG 并落盘（SD 优先、SPIFFS 兜底）。落盘目录 `cam/` 走既有
+ * `/media/<alias>/<path>` 只读面（带 Range）供网页显示 —— 不新增对外形态。 */
+static esp_err_t h_camera_capture(httpd_req_t *req)
+{
+    if (!camera_api_ready()) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "camera 未初始化（SCCB 未探测到 sensor？）");
+    }
+    camera_capture_t cap;
+    esp_err_t rc = camera_api_capture(&cap);
+
+    sb_t s;
+    if (!sb_init(&s, 512)) {
+        return httpd_resp_send_500(req);
+    }
+    sb_raw(&s, "{");
+    sb_kv_str(&s, "ok", rc == ESP_OK ? "true" : "false");
+    sb_raw(&s, ",");
+    sb_kv_str(&s, "path", cap.path);
+    sb_raw(&s, ",");
+    sb_kv_i(&s, "bytes", (long long)cap.bytes); sb_raw(&s, ",");
+    sb_kv_i(&s, "w", cap.width); sb_raw(&s, ",");
+    sb_kv_i(&s, "h", cap.height); sb_raw(&s, ",");
+    sb_kv_i(&s, "ms", (long long)cap.ms); sb_raw(&s, ",");
+    sb_kv_str(&s, "err", cap.err); sb_raw(&s, ",");
+    /* 网页可直接用的地址（经设备 /media 面） */
+    {
+        char rel[104];
+        char url[128];
+        const char *alias = (strncmp(cap.path, "/spiffs/", 8) == 0) ? "spiffs" : "sdcard";
+        const char *p = cap.path;
+        if (strncmp(p, "/sdcard/", 8) == 0 || strncmp(p, "/spiffs/", 8) == 0) {
+            p += 8;
+        }
+        snprintf(rel, sizeof(rel), "%.*s", (int)sizeof(cap.path) - 1, p);
+        snprintf(url, sizeof(url), "media/%s/%s", alias, rel);
+        sb_kv_str(&s, "url", url);
+    }
+    sb_raw(&s, "}");
+    return send_json(req, &s);
+}
+
+/* POST /api/camera/reinit?fb=dram|psram&fmt=jpeg|rgb565&fbc=1|2|3&grab=when_empty|latest&xclk=10|20|40&q=0..63
+ *
+ * 本地验证面：以运行时旋钮重配摄像头，用于在**同一块板子**上对比定位取帧失败
+ * （真机实测教训：NO-SOI / fb timeout 与 fb 位置、像素格式相关，靠反复烧写猜测代价太高）。
+ * 缺省参数 = 保持当前值；只在本地面使用，不进云端契约。 */
+static esp_err_t h_camera_reinit(httpd_req_t *req)
+{
+    size_t qlen = httpd_req_get_url_query_len(req) + 1;
+    char *q = (char *)malloc(qlen > 1 ? qlen : 2);
+    if (q == NULL) {
+        return httpd_resp_send_500(req);
+    }
+    char v[24];
+    camera_cfg_t cfg = { -1, -1, -1, -1, -1, -1, -1 };
+
+    if (qlen > 1 && httpd_req_get_url_query_str(req, q, qlen) == ESP_OK) {
+        if (httpd_query_key_value(q, "fb", v, sizeof(v)) == ESP_OK) {
+            cfg.fb_location = (strcmp(v, "psram") == 0) ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
+        }
+        if (httpd_query_key_value(q, "fmt", v, sizeof(v)) == ESP_OK) {
+            cfg.pixel_format = (strcmp(v, "jpeg") == 0) ? PIXFORMAT_JPEG : PIXFORMAT_RGB565;
+        }
+        if (httpd_query_key_value(q, "fbc", v, sizeof(v)) == ESP_OK) {
+            cfg.fb_count = atoi(v);
+        }
+        if (httpd_query_key_value(q, "grab", v, sizeof(v)) == ESP_OK) {
+            cfg.grab_mode = (strcmp(v, "latest") == 0) ? CAMERA_GRAB_LATEST : CAMERA_GRAB_WHEN_EMPTY;
+        }
+        if (httpd_query_key_value(q, "xclk", v, sizeof(v)) == ESP_OK) {
+            cfg.xclk_mhz = atoi(v);
+        }
+        if (httpd_query_key_value(q, "q", v, sizeof(v)) == ESP_OK) {
+            cfg.jpeg_quality = atoi(v);
+        }
+        if (httpd_query_key_value(q, "psram", v, sizeof(v)) == ESP_OK) {
+            cfg.psram_dma = (strcmp(v, "0") == 0) ? 0 : 1;
+        }
+    }
+    free(q);
+
+    esp_err_t rc = camera_api_apply(&cfg);
+
+    sb_t s;
+    if (!sb_init(&s, 384)) {
+        return httpd_resp_send_500(req);
+    }
+    camera_state_t cs;
+    camera_api_get_state(&cs);
+    sb_raw(&s, "{");
+    sb_kv_str(&s, "ok", rc == ESP_OK ? "true" : "false");
+    sb_raw(&s, ",");
+    sb_kv_str(&s, "err", rc == ESP_OK ? "" : esp_err_to_name(rc)); sb_raw(&s, ",");
+    sb_kv_str(&s, "sensor", cs.sensor); sb_raw(&s, ",");
+    sb_kv_str(&s, "format", cs.format); sb_raw(&s, ",");
+    sb_kv_str(&s, "fb_loc", cs.fb_loc); sb_raw(&s, ",");
+    sb_kv_i(&s, "fb_count", cs.fb_count); sb_raw(&s, ",");
+    sb_kv_str(&s, "grab", cs.grab); sb_raw(&s, ",");
+    sb_kv_i(&s, "xclk_mhz", cs.xclk_mhz); sb_raw(&s, ",");
+    sb_kv_i(&s, "psram_dma", cs.psram_dma); sb_raw(&s, ",");
+    sb_kv_i(&s, "quality", cs.quality);
+    sb_raw(&s, "}");
+    return send_json(req, &s);
+}
+
 esp_err_t panel_api_start(uint16_t port)
 {
     if (s_httpd != NULL) {
@@ -809,7 +950,7 @@ esp_err_t panel_api_start(uint16_t port)
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = port;
-    cfg.max_uri_handlers = 14;          /* 6 个 /api（keys/simulate/key/lcd/draw）+ /media/list + 媒体通配 + /api/action（留余量） */
+    cfg.max_uri_handlers = 16;          /* 8 个 /api（keys/simulate/key/lcd/draw/camera/capture/camera/reinit）+ /media/list + 媒体通配 + /api/action */
     cfg.lru_purge_enable = true;
     cfg.stack_size = 6144;
     cfg.recv_wait_timeout = 5;
@@ -835,6 +976,8 @@ esp_err_t panel_api_start(uint16_t port)
         { .uri = "/api/keys",     .method = HTTP_GET, .handler = h_keys },
         { .uri = "/api/simulate/key", .method = HTTP_POST, .handler = h_simulate_key },
         { .uri = "/api/lcd/draw",     .method = HTTP_POST, .handler = h_lcd_draw },
+        { .uri = "/api/camera/capture", .method = HTTP_POST, .handler = h_camera_capture },
+        { .uri = "/api/camera/reinit",  .method = HTTP_POST, .handler = h_camera_reinit },
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
         rc = httpd_register_uri_handler(s_httpd, &uris[i]);

@@ -1,0 +1,7 @@
+dependencies:
+  # 板载摄像头驱动（ESP32-S3-Korvo-2 板载 OV3660，见 board_def.h CAM_PIN_*）
+  # 与 ESP-ADF 官方 examples/display/lcd_camera 使用同一上游组件；按提交号 pin，
+  # 禁止静默跟随上游默认分支（AGENTS.md §2/§4）。
+  esp32-camera:
+    git: https://github.com/espressif/esp32-camera.git
+    version: 3fb41a99d61a853313d1cd5543ebf2c109ef7c0e

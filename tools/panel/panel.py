@@ -345,6 +345,16 @@ class DeviceView:
             self.last_error = f"/api/lcd/draw: {exc}"
             return None
 
+    def post_camera_capture(self, timeout: float = 12.0) -> dict | None:
+        """本地验证面：请设备抓拍一帧（JPEG 落 /sdcard/cam/），返回 path/bytes/w/h/ms。"""
+        req = urllib.request.Request(f"{self.base_url}/api/camera/capture", data=b"", method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8", "replace"))
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            self.last_error = f"/api/camera/capture: {exc}"
+            return None
+
     def media_url(self, rel_url: str) -> str:
         """把设备返回的相对 url（media/<alias>/<path>）拼成可直接播放的绝对地址。"""
         return f"{self.base_url}/{rel_url.lstrip('/')}"
@@ -647,6 +657,22 @@ PAGE = r"""<!doctype html>
   </div>
 
   <div class="card">
+    <h2>板载摄像头 <small>OV3660（SCCB 0x3c）——抓一帧落 SD，走既有 /media 只读面在网页显示</small></h2>
+    <div class="kv" id="cammeta"></div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px">
+      <button onclick="camCapture()">抓拍一帧</button>
+      <span class="mut" id="cammsg"></span>
+    </div>
+    <div style="margin-top:10px">
+      <img id="camimg" alt="（最近一帧：点上方按钮抓拍）" style="max-width:100%;border:1px solid var(--line);border-radius:8px;background:#0b1016">
+    </div>
+    <div class="mut" style="font-size:12px;margin-top:6px">
+      引脚来自 <code>board_def.h</code> 的 <code>CAM_PIN_*</code>（XCLK=40 / SIOD=17 / SIOC=18 / D0..D7）；
+      <code>pid</code> 非 0 即「模组已装配」的取证依据，为 0/未就绪说明 SCCB 探测失败（未装配或接线问题）。
+    </div>
+  </div>
+
+  <div class="card">
     <h2>Wi-Fi 配网 <small>启动读 SD 卡凭据文件；此处可运行期改配</small></h2>
     <div class="kv" id="wifimeta"></div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px">
@@ -778,6 +804,28 @@ async function tick(){
     <div>刷新</div><div>${lc.draws||0} 次${lc.last_ms? ' · 最近 '.concat((lc.last_ms/1000).toFixed(1),' s（设备运行）') : ''}</div>
     <div>帧缓冲</div><div class="mut">${lc.fb_bytes? (lc.fb_bytes/1024).toFixed(0)+' KB @ '+(lc.fb_mem||'—') : '—'}</div>`;
 
+  // 板载摄像头（本地验证面：状态 + 抓拍 + 最近一帧）
+  const cm = (s.panel && s.panel.camera) || {};
+  const camFiles = ((dev.media && dev.media.files) || [])
+      .filter(f => String(f.name||'').startsWith('cam/'))
+      .sort((a,b) => String(b.name).localeCompare(String(a.name)));
+  const newestCam = camFiles[0];
+  $('cammeta').innerHTML = `
+    <div>状态</div><div>${cm.inited ? '<span class="pill ok">已初始化</span>' : '<span class="pill bad">未就绪（SCCB 未探测到 sensor）</span>'}</div>
+    <div>型号 / PID</div><div>${cm.sensor||'—'} ${cm.pid? '<span class="mut">0x'+Number(cm.pid).toString(16)+'</span>' : ''}</div>
+    <div>取帧配置</div><div class="mut">${cm.format||'—'} · fb=${cm.fb_loc||'—'}×${cm.fb_count||0} · grab=${cm.grab||'—'} · xclk=${cm.xclk_mhz||0}MHz · psram_dma=${cm.psram_dma?1:0} · q=${cm.quality??'—'}</div>
+    <div>抓帧</div><div>成功 ${cm.frames||0} 次 · 失败 ${cm.errors||0} 次</div>
+    <div>最近一帧</div><div>${cm.last_bytes? `${cm.last_w}×${cm.last_h} · ${(cm.last_bytes/1024).toFixed(1)} KB · <span class="mut">${cm.last_path||''}</span>` : '<span class="mut">—</span>'}</div>
+    <div>最近失败</div><div>${cm.last_err? `<span class="pill bad">${cm.last_err}</span>` : '<span class="mut">无</span>'}</div>
+    <div>落盘目录</div><div class="mut">${cm.root||'—'}（SD 优先，SPIFFS 兜底）· 本面板可见 ${camFiles.length} 张</div>`;
+  if (newestCam && newestCam.play_url) {
+    const want = newestCam.play_url + '?t=' + (cm.last_ms||0);
+    if ($('camimg').getAttribute('data-src') !== want) {
+      $('camimg').setAttribute('data-src', want);
+      $('camimg').src = want;
+    }
+  }
+
   // Wi-Fi 配网卡片
   const wf = s.wifi||{};
   $('wifimeta').innerHTML = `
@@ -887,7 +935,21 @@ async function simKey(){
   setTimeout(tick, 800);   // 稍等一轮轮询：让"上行/云端确认"两列显示出来
 }
 
-// 板载 LCD：下发图案（本地验证面 /api/lcd/draw）——设备真的会重绘，人眼/拍照即可核对
+// 板载摄像头：抓一帧（本地验证面 /api/camera/capture，落 cam/ 后由 /media 面显示）
+async function camCapture(){
+  const n = (state.devices && Object.keys(state.devices)[0]) || '';
+  const msg = $('cammsg');
+  msg.textContent = '抓拍中…';
+  try {
+    const r = await fetch(`/api/action/camera?node=${encodeURIComponent(n)}`, {method:'POST'});
+    const j = await r.json();
+    const res = j.result || {};
+    msg.textContent = j.ok
+      ? `已抓拍：${res.path||''} · ${res.bytes||0} B · ${res.w||0}×${res.h||0} · ${res.ms||0} ms`
+      : ('抓拍失败：' + JSON.stringify(j));
+  } catch (e) { msg.textContent = '抓拍异常：' + e; }
+  setTimeout(tick, 700);
+}
 async function lcdDraw(pattern){
   const n = (state.devices && Object.keys(state.devices)[0]) || '';
   const msg = $('lcdmsg');
@@ -995,6 +1057,21 @@ def make_handler(state: PanelState, poll_ms: int):
                     return
                 res = dv.post_lcd_draw(pattern)
                 state.log(f"[panel] LCD 图案下发 {dv.name} pattern={pattern} ok={res is not None}")
+                self._send(200 if res else 502,
+                           json.dumps({"ok": res is not None, "device": dv.name, "result": res},
+                                      ensure_ascii=False).encode("utf-8"))
+                return
+            if parsed.path == "/api/action/camera":
+                # 本地验证面代理：请设备抓拍一帧（板载 OV3660 → JPEG 落 /sdcard/cam/）
+                node = (q.get("node") or [None])[0]
+                dv = state.devices.get(node) if node else None
+                if dv is None:
+                    dv = next(iter(state.devices.values()), None)
+                if dv is None:
+                    self._send(400, b'{"error":"node_required"}')
+                    return
+                res = dv.post_camera_capture()
+                state.log(f"[panel] 摄像头抓拍 {dv.name} ok={res is not None}")
                 self._send(200 if res else 502,
                            json.dumps({"ok": res is not None, "device": dv.name, "result": res},
                                       ensure_ascii=False).encode("utf-8"))
@@ -1356,6 +1433,44 @@ def self_test(verbose: bool = True) -> int:
             check("首页含 Wi-Fi 配网卡片", "Wi-Fi 配网" in page2 and "wifiSet()" in page2)
         except Exception as exc:  # noqa: BLE001
             check("首页含 Wi-Fi 配网卡片", False, str(exc))
+
+        # 4f) 板载 LCD / 摄像头（本地验证面：状态字段 + 两条代理路由；第十七/十八轮）
+        dv.poll()
+        lcd_st = ((dv.status or {}).get("panel") or {}).get("lcd") or {}
+        cam_st = ((dv.status or {}).get("panel") or {}).get("camera") or {}
+        check("LCD 状态字段齐备（ready/w/h/pattern/fb_bytes）",
+              str(lcd_st.get("ready")) == "true" and lcd_st.get("w") == 320
+              and lcd_st.get("h") == 240 and bool(lcd_st.get("pattern"))
+              and lcd_st.get("fb_bytes") == 153600,
+              f"{lcd_st.get('pattern')} {lcd_st.get('fb_bytes')} B {lcd_st.get('fb_mem')}")
+        check("摄像头状态字段齐备（sensor/pid/取帧配置）",
+              cam_st.get("sensor") == "OV3660" and cam_st.get("pid") == 0x3660
+              and all(k in cam_st for k in ("format", "fb_loc", "fb_count", "grab",
+                                           "xclk_mhz", "psram_dma", "quality")),
+              f"{cam_st.get('sensor')} 0x{int(cam_st.get('pid') or 0):04x} "
+              f"{cam_st.get('format')}/{cam_st.get('fb_loc')}×{cam_st.get('fb_count')}")
+        try:
+            req = urllib.request.Request("http://127.0.0.1:18787/api/action/lcd?node=korvo2-selftest"
+                                         "&pattern=grid", data=b"", method="POST")
+            with urllib.request.urlopen(req, timeout=5) as r:
+                lcd_res = json.loads(r.read().decode("utf-8", "replace"))
+            check("LCD 图案下发代理（/api/action/lcd）",
+                  bool(lcd_res.get("ok")) and (lcd_res.get("result") or {}).get("pattern") == "grid",
+                  str((lcd_res.get("result") or {}).get("draws")))
+        except Exception as exc:  # noqa: BLE001
+            check("LCD 图案下发代理（/api/action/lcd）", False, str(exc))
+        try:
+            req = urllib.request.Request("http://127.0.0.1:18787/api/action/camera"
+                                         "?node=korvo2-selftest", data=b"", method="POST")
+            with urllib.request.urlopen(req, timeout=5) as r:
+                cam_res = json.loads(r.read().decode("utf-8", "replace"))
+            cres = cam_res.get("result") or {}
+            check("摄像头抓帧代理（/api/action/camera）",
+                  bool(cam_res.get("ok")) and bool(cres.get("path"))
+                  and str(cres.get("url") or "").startswith("media/"),
+                  f"{cres.get('path')} {cres.get('bytes')} B")
+        except Exception as exc:  # noqa: BLE001
+            check("摄像头抓帧代理（/api/action/camera）", False, str(exc))
 
         # 4e) 云端桩：对 event/up 回契约形状的 event/down ack（设备侧第三态的验证手段）
         stub_state = PanelState(log=lambda *a, **k: None)

@@ -86,8 +86,10 @@ idf.py -p <COMx> flash monitor        # Windows；Linux/macOS 为 /dev/ttyUSB0 �
 3. **触摸面板**（TP_I2C + TP_INT=P4）：`FUNC_LCD_TOUCH_EN=1` 只是参数宏，`board.c` 无触摸控制器初始化（§6-2）。
 4. **microSD 热插拔**：`SDCARD_INTR_GPIO = -1` + `ESP_SD_PIN_CD = -1` ⇒ 无卡检测线路；固件**只能上报挂载成败**，
    不得伪造插入/拔出事件（§6-3、R3-5）。
-5. **摄像头模组是否装配 + 真机取帧**：代码侧只证明"声明为支持 + 引脚齐备 + 树内存在以本板为默认板的取帧例程"
-   （`examples/display/lcd_camera` 等），物理装配需硬件核对、取帧需真机（§6-1）。
+5. ~~**摄像头模组是否装配 + 真机取帧**~~ → **已确认（2026-09-16，第十八轮）**：模组已装配且真机取帧可用
+   —— `Camera PID=0x3660 / Detected OV3660 camera / Detected camera at address=0x3c`，抓帧 320×240 落 SD 并经
+   `/media` 在网页显示（实现与实测见 §5.8）。**注意**：该确认只覆盖"采集（取帧）"，
+   `video.live` 还要求编码 + 上行数据面，本工程未实现（见 §7）。
 6. **摄像头数据脚命名偏移**：rst「摄像头连接器」用 `D2…D9` 命名，ADF `cam_pin_d0…d7` 为**同一物理网络、编号整体前移两位**
    （ADF `D0`=IO13=rst `D2`、ADF `D7`=IO39=rst `D9`）。这是**命名口径差异**、非引脚冲突；本工程按 ADF 命名断言。
 7. **LCD 分辨率口径**：rst 写"240×320（面板）"，ADF 用 `LCD_H_RES=320 / LCD_V_RES=240 + LCD_SWAP_XY=false`
@@ -206,6 +208,9 @@ I2S0(CODEC_ADC_I2S_PORT) 16 kHz / 32 bit / ONLY_LEFT        ← 单麦口径：i
 | `GET /media/<alias>/<path>` | 文件下载/流式播放，**支持 `Range`**（206 + `Content-Range`，浏览器可拖动进度）；`alias` = `sdcard` \| `spiffs`；含目录穿越防护 |
 | `POST /api/action` | `{"op":"aec_start","duration_s":N}` / `{"op":"aec_stop"}` / `{"op":"play","path":"/sdcard/..."}` / `{"op":"stop"}` / `{"op":"set_volume","volume":0-100}`（**写操作，仅台面验证**） |
 | `POST /api/simulate/key?key=<volup\|voldown\|set\|play\|mode\|rec>[&action=click\|click_release\|press\|press_release]` | **按键事件注入**（第十五轮新增）：按与物理按键**完全相同**的上报路径发一次 `event/up`（同一函数、同一 id 生成、同一契约负载、同一 SDK 投递）。⚠️ 触发源是 **HTTP 而非 ADC 按键** ⇒ 用于远程/自动化验证与演示三态链路，串口日志带 `(注入/local-verification-only)` 标记；**不能**替代"物理按键可用"的验收证据 |
+| `POST /api/lcd/draw?pattern=<bars\|grid\|checker\|test\|status>` | **板载 LCD 图案下发**（第十七轮新增）：设备真重绘（`panel.lcd.draws` 递增），人眼/拍照对账（§5.7） |
+| `POST /api/camera/capture` | **板载摄像头抓帧**（第十八轮新增）：抓一帧 → `/sdcard/cam/cap-%05u.jpg`，返回 `path/bytes/w/h/ms/url/err`；`url` 可直接经 `/media` 显示（§5.8） |
+| `POST /api/camera/reinit?fmt=&fb=&fbc=&grab=&xclk=&psram=&q=` | **摄像头取帧配置旋钮**（第十八轮新增，仅台面排障）：在同一块板子上对比定位取帧失败，回显生效配置（§5.8） |
 
 **按键"历史响应"三态**：本地检测（`pending`）→ 交 SDK 上报（`sent`，失败 `failed`）→ 收到云端 `event/down` ack
 （`acked`）。
@@ -248,6 +253,34 @@ python3 tools/panel/panel.py --self-test
 > **另**：`src/internal/*.c` 等 SDK 内部源码**不参与固件编译**（固件链接 SDK 的**预编译库**）⇒ 改 SDK 内部实现后必须重跑
 > `./build-all.sh --toolchains esp32s3@5.5.5`（否则"改了没生效"）。
 
+## 5.7 板载 LCD（ILI9341 320×240 状态屏）
+
+板载 LCD 走 ADF 板级 API（`audio_board_lcd_init()` → `esp_lcd_panel_draw_bitmap()`，与 `examples/display/lcd_jpeg|lcd_camera` 同源），我方只加**帧缓冲与图案**（`main/lcd_ui.c`）：
+
+1. **帧缓冲在 PSRAM**：320×240 RGB565 = **153,600 B**，分 **40 行/带** 刷新（`esp_lcd_panel_draw_bitmap` 逐带写），避免一次性大传输挤占内部 DMA；
+2. **图案**：`bars` / `grid` / `checker` / `test` / `status`（`status` = 实时状态屏：链路、Wi-Fi、授时、最近按键）；
+3. **可观测**：`GET /api/status` → `panel.lcd{ready,w,h,pattern,draws,last_ms,fb_bytes,fb_mem}`；`POST /api/lcd/draw?pattern=…` 下发图案，面板「板载 LCD」卡片可切换（**人眼/拍照即可对账**）。
+
+真机实测：`lcd.ready=true`、`w=320 h=240`、`fb_bytes=153600`、`fb_mem=psram`、图案切换后 `draws` 递增、按键注入即触发状态屏重绘。
+
+## 5.8 板载摄像头（OV3660 抓帧 → SD → 网页显示）
+
+链路：`esp_camera`（外部组件 `esp32-camera`，见 `main/idf_component.yml`，**按 commit pin**）→ 抓帧 → 落 `/sdcard/cam/cap-%05u.jpg` → 经既有 `/media/<alias>/<path>` 只读面在网页显示（SPIFFS 兜底）。面板「板载摄像头」卡片可抓拍并显示最近一帧。
+
+**可用配置（真机实测，2026-09-16）**——同一块板子上逐项对比得出：
+
+| 配置 | 结果 |
+| --- | --- |
+| `fmt=rgb565` + `fb=psram` + `fbc=2` + `grab=when_empty` + **`psram_dma=1`** | ✅ 抓帧成功（320×240 JPEG 约 2.3–7 KB，110–130 ms/帧）；上云链路同时可用 |
+| `fmt=jpeg` + `fb=psram`（`fbc=2`、`when_empty`） | ❌ `cam_hal: NO-SOI - JPEG start marker missing` → `Failed to get frame: timeout` ⇒ `fb=NULL`（**该模组本驱动下 JPEG 直出不可用**） |
+| `fmt=rgb565` + `fb=dram`（上游 `lcd_camera` 例程的原始口径） | ❌ `esp_camera_init` 直接失败：单机跑例程时内部 DRAM 够，**本固件还跑 Wi-Fi/AEC/云链路**，2×153,600 B 内部帧缓冲拿不到 ⇒ `ESP_FAIL` |
+
+**关键坑（内部 DMA 内存）**：`cam_hal` 在 **`psram_mode=false`** 时会额外申请 `dma_buffer_size=30720 B` 的**内部 DMA** 缓冲（`cam_hal.c:522`，仅非 psram 分支）。本板默认 `CONFIG_CAMERA_PSRAM_DMA` 未开 ⇒ 串口 `PSRAM DMA mode disabled` ⇒ 内部 RAM 只剩 ~18 KB、最大连续块 7.6 KB，**SDK 上云直接 `base start 失败：out of memory`**（表现为"摄像头一开，云端确认就没了"）。修法：`esp_camera_set_psram_mode(true)`（帧缓冲直接作 DMA 目标）⇒ 内部 `internal_free` 18 KB → ~26 KB、云端与摄像头**同时可用**。该结论已固化为默认值与 `/api/camera/reinit` 旋钮。
+
+**排障旋钮（本地验证面）**：`POST /api/camera/reinit?fmt=jpeg|rgb565&fb=dram|psram&fbc=1|2|3&grab=when_empty|latest&xclk=10|20|40&psram=0|1&q=0..63` —— 在**同一块板子**上对比定位，不靠反复烧写猜；生效配置回显在 `/api/status.panel.camera{format,fb_loc,fb_count,grab,xclk_mhz,psram_dma,quality}`。
+
+**边界（不得越过）**：抓帧只用于**验证面**（本地 HTTP + `/media` 只读面），**不声明 `video.live`** —— 采集声明的前提是"模组装配 + 真机取帧"（已满足，见映射页 §6-1），但 `video.live` 还要求**编码 + 上行数据面**（MJPEG/`http_upload`）落地，本工程未实现（见 §7/§9）。
+
 ## 6. 配置（`idf.py menuconfig` → `korvo2_oneye 板级固件配置`）
 
 | 配置 | 缺省 | 说明 |
@@ -260,10 +293,10 @@ python3 tools/panel/panel.py --self-test
 | `ONEYE_FW_ENABLE_WIFI_FILE` | **y** | 凭据文件配网（SD/SPIFFS `oneye-wifi.txt`）+ `/api/action wifi_set`；**量产置 n** |
 | `ONEYE_FW_WIFI_SSID` / `_PASSWORD` | 空 | 兜底凭据；空且无凭据文件 = 只跑板级自检与按键，不上云 |
 | `ONEYE_FW_ENABLE_KEYS` | y | 6 键 → `event/up` |
-| `ONEYE_FW_ENABLE_SDCARD` / `_LCD` | **y** / n | SD 缺省开（凭据文件、录音、板上回放都依赖它；未插卡只告警不阻塞）；LCD 仍未确认，保持 n |
+| `ONEYE_FW_ENABLE_SDCARD` / `_LCD` | **y** / **y** | SD 缺省开（凭据文件、录音、板上回放都依赖它；未插卡只告警不阻塞）；LCD 已于 **2026-09-16 真机验证**（`panel.lcd.ready=true`、320×240、PSRAM 帧缓冲），故缺省开 |
 | `ONEYE_FW_ENABLE_MPP` | n | 只初始化 mpp 域，不发起会话 |
 | `ONEYE_FW_ENABLE_PANEL_API` | y | 设备侧本地验证 HTTP API（**量产置 n**）；`_PANEL_PORT` 缺省 80、`_KEY_HISTORY_MAX` 缺省 64 |
-| `ONEYE_FW_DECLARE_VIDEO_LIVE` | **n** | 真机取帧取证通过后才可开；`audio.intercom` 无开关（WebRTC 数据面未落地前一律不得声明） |
+| `ONEYE_FW_DECLARE_VIDEO_LIVE` | **n** | 声明前提 = ① 模组装配 + ② 真机取帧（**均已满足**，映射页 §6-1 已转"确认"）**+ ③ 编码与上行数据面落地**（MJPEG/`http_upload`，本工程未实现）⇒ 仍保持 **n**；`audio.intercom` 无开关（WebRTC 数据面未落地前一律不得声明） |
 | `ONEYE_FW_SELFTEST_STRICT` | y | 自检失败中止上云 |
 
 ## 7. 契约对接（设备面）
@@ -334,15 +367,23 @@ python3 tools/panel/panel.py --self-test
 | ⚠️ **授时即重启（真机，第十六轮已修）** | 收到 `caps/down` 后必现 `***ERROR*** A stack overflow in task oneye_net has been detected.` + `rst:0xc (RTC_SW_CPU_RST)`（表现为"一授时就重启"）。根因：SDK 网络线程栈上放 `oneye_envelope_t`（内含 `data[4096]`）+ `local[1024]`，叠加 `TIME_SYNCED` 应用回调链后突破 8 KB 缺省栈。修法：网络线程栈 **8 KB → 16 KB**（`oneye_internal.c` 的 `oneye_bint_start`），且 `caps/down` 处理的两个缓冲改**静态**（该面仅网络线程串行处理）。**注**：SDK 以预编译库链接，改内部源码须重跑 `build-all.sh`（见 §5.6 陷阱） |
 | ⚠️ **`build-all.sh --firmware` 会重置 sdkconfig（真机，第十六轮踩到）** | 台面云地址与内存保留值被 `sdkconfig.defaults` 覆盖 ⇒ 设备改连占位 `192.168.1.100:1883`、AFE 录音内存不足。处置：台面值备忘 `output/.build/bench-sdkconfig.txt` + §5.6 的构建注意 | 面板按键条与 `/api/keys` 的按键清单原按**下标 0..5** 猜标签（`volup/voldown/set/play/mode/rec`），而本板 `board_def.h` 的 `INPUT_KEY_DEFAULT_INFO()` 实为 **REC=1 / MUTE=7 / SET=2 / PLAY=3 / VOLUP=6 / VOLDOWN=5**（**且本板无 MODE 键**，id 也不从 0 起）⇒ 真机表现：历史里出现 `MUTE`，而按键条显示 `MODE`、VOL± 错位。修法：清单按 **ADF user_id** 定义（`panel_api.c` 的 `k_panel_keys`），`/api/keys` 与注入校验（`simulate/key`）同源取值 |
 | ⚠️ **面板 MQTT 观测通道静默死链（第十五轮已修，面板侧）** | 症状：12 次真机按键，面板只观测到 1 次 event/up，其余"云端确认"恒为**未见**，而 `mqtt.connected` 一直显示 true。根因：`MiniMqtt` 只在**收到数据**时才发 PINGREQ ⇒ 空闲超过 broker 的 `keepalive×1.5` 被判失联；对端关闭后 `recv` 返回 EOF、`fileno()` 仍有效 ⇒ 旧代码把它当超时 `continue`，**既不重连也不报错**。修法：空闲也按 `keepalive/2` 发 PINGREQ、EOF 即判对端关闭、`keepalive×2` 无入站数据判死链重连；"云端确认"列在 MQTT 未连通时显示**未连通**（而非误导性的"未见"）。复测：注入 6 次 + **空闲 80 s** + 再注入 2 次 ⇒ 8/8 全部观测到、连接未断 |
-| **待续（未闭环，明确记录）** | ① **可听性**：回放链路已把 PCM 完整时钟输出（`AEL_IO_DONE` + 时长吻合），但「扬声器是否真的出声」需人耳确认（PA `GPIO48` 已在 `es8311_codec_init` 打开、音量 80）；② **麦克风灵敏度**：原始幅度随环境变化（123→390），对着板子说话的幅度取证待补；③ LCD/摄像头取帧、时间同步未闭环 |
+| **板载 LCD（真机，第十七轮已闭环）** | `panel.lcd={ready:"true",w:320,h:240,pattern:"status",draws:N,fb_bytes:153600,fb_mem:"psram"}`；`POST /api/lcd/draw?pattern=bars\|grid\|checker\|test\|status` 逐个生效（`draws` 递增、`last_ms` 更新），按键注入即触发状态屏重绘；面板「板载 LCD」卡片 + `/api/action/lcd` 代理已验证（人眼/拍照对账） |
+| **板载摄像头（真机，第十八轮已闭环）** | `panel.camera={inited:"true",sensor:"OV3660",pid:13920(0x3660),format:"rgb565",fb_loc:"psram",fb_count:2,grab:"when_empty",xclk_mhz:40,psram_dma:1,root:"/sdcard/cam"}`；串口 `Camera PID=0x3660 / Detected OV3660 camera / Detected camera at address=0x3c / sccb-ng: pin_sda 17 pin_scl 18`；`POST /api/camera/capture` → `/sdcard/cam/cap-0000N.jpg`（320×240，2.3–7.0 KB，110–130 ms），`/media/sdcard/cam/…` 下载后经宿主解码核对 = **真实图像**（均值亮度 54–148、17 档亮度分布，非纯色/花屏）；面板「板载摄像头」卡片抓拍 + 显示最近一帧已跑通 |
+| ⚠️ **摄像头 JPEG 直出不可用（真机，第十八轮查明）** | `fmt=jpeg` 时串口持续 `cam_hal: NO-SOI - JPEG start marker missing` → `Failed to get frame: timeout` ⇒ `esp_camera_fb_get()` 恒 NULL。改用 `rgb565` + 软件 `frame2jpg()` 落盘 JPEG 后正常（配置矩阵与判据见 §5.8） |
+| ⚠️ **摄像头吃内部 DMA ⇒ 上云 OOM（真机，第十八轮已修）** | `PSRAM DMA mode disabled` 时驱动额外申请 **30,720 B 内部 DMA**（`cam_hal.c:522` 非 psram 分支）⇒ 内部 `internal_free` 54 KB→18 KB、最大连续块 30 KB→7.6 KB ⇒ SDK `base start 失败：out of memory`（**云链路与摄像头互斥**）。修法 `esp_camera_set_psram_mode(true)`（`psram_dma=1`）：内部余量回到 ~26 KB，**云链路（`link_up=true`、`tx_frames=5`、授时 `synced=true`）与抓帧同时可用** |
+| **摄像头探测的初始化顺序（真机，第十八轮查明）** | 把 `camera_api_init()` 放到 `board_init_peripherals()` **之前**（照抄上游 `lcd_camera` 的 "camera init in advance" 注释）⇒ `camera probe … no sensor FAIL`（ADF I2C 总线尚未建立）；放在**板级初始化之后**⇒ 探测成功。另：该失败曾因计入硬自检而触发 `SELFTEST_STRICT` 中止上云 ⇒ 设备连 IP 都拿不到（**看不到失败原因**），故摄像头改用提示级 `chk_warn`（记红行、不中止） |
+| **待续（未闭环，明确记录）** | ① **可听性**：回放链路已把 PCM 完整时钟输出（`AEL_IO_DONE` + 时长吻合），但「扬声器是否真的出声」需人耳确认（PA `GPIO48` 已在 `es8311_codec_init` 打开、音量 80）；② **麦克风灵敏度**：原始幅度随环境变化（123→390），对着板子说话的幅度取证待补；③ **`video.live` 上行数据面**（MJPEG 编码 + `http_upload`/`mqtt_frame`）未实现 ⇒ 该能力位仍不得声明 |
+| ⚠️ **镜像余量告急（第十八轮）** | `korvo2_oneye.bin` **2,045,856 B**（`0x1f37a0`），`factory 2M` 分区**仅余 2%**（0xc860）。后续增长首选 `CONFIG_COMPILER_OPTIMIZATION_SIZE=y`（-Os），或扩 `factory` 分区（16 MB flash 尚有余量） |
 
 **后续（真机）**：`idf.py -p <COM> flash monitor` → 核对自检逐行 PASS → **SD 卡放 `oneye-wifi.txt` 复位自动配网** → 观察
 `caps/up` / `status/up`（retained + LWT）/ `shadow/up` / `log/up` 与按键 `event/up`；其间可用面板「Wi-Fi 配网」卡片核对**凭据来源**；
-摄像头取帧另行取证（决定 `video.live` 是否可声明）。
+LCD 状态屏与摄像头抓帧见 §5.7/§5.8（**已真机闭环**），`video.live` 仍须等编码+上行数据面落地。
 
 ## 9. 边界
 
-- 本工程**不实现**：媒体数据面（webrtc/http_upload/mqtt_frame）、PTZ/命令执行面、AI 端侧初筛、LED 显示服务、
-  触摸、电池采集、camera 取帧（依赖外部 `esp32-camera`）；
-- 上游资产纪律：`esp-adf` 上游分支（`master` / `release/*`）与 `esp-repo/` 镜像**只读**，我方改动只进集成分支；
-- 真机烧录/取证（录音、取帧、LCD、按键、SD 插拔）登记为后续卡，不在本工程内声称通过。
+- 本工程**不实现**：媒体数据面（webrtc/http_upload/mqtt_frame，含 `video.live` 上行）、PTZ/命令执行面、
+  AI 端侧初筛、LED 显示服务、触摸、电池采集；
+- 板载 **LCD 状态屏**与**摄像头抓帧**属**本地验证面**（`/api/*` + `/media/*` 只读面），不是云端设备面契约的一部分：**不新增 topic / 影子键 / 能力位**；
+- 抓帧与云端链路共享内部 DMA 内存：改摄像头配置后必须同时核对 `panel.heap.internal_free` 与 `cloud.link_up`（见 §5.8 的关键坑）；
+- 上游资产纪律：`esp-adf` 上游分支（`master` / `release/*`）与 `esp-repo/` 镜像**只读**，我方改动只进集成分支；`esp32-camera` 以 `idf_component.yml` **按 commit pin** 引入（不静默跟随上游默认分支）；
+- 真机烧录/取证（录音可听性、麦克风灵敏度、SD 插拔）登记为后续卡，不在本工程内声称通过。

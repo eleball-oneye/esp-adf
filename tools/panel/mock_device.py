@@ -253,6 +253,28 @@ class MockDevice:
         # Wi-Fi 配网（mock：模拟「启动读 SD 凭据文件 → 自动配网」与运行期 wifi_set 的最简语义）
         self.wifi = {"connected": True, "ip": "127.0.0.1", "ssid": "mock-ssid",
                      "source": "file:/sdcard/oneye-wifi.txt"}
+        # 板载 LCD / 摄像头（本地验证面，第十七/十八轮）：只维护状态与计数，形状与真机一致
+        self.lcd = {"pattern": "status", "draws": 0, "last_ms": 0}
+        self.camera = {"frames": 0, "bytes": 0, "last_ms": 0, "path": ""}
+
+    # ------------------------------------------------------------ 板载 LCD / 摄像头（本地验证面）
+    def lcd_draw(self, pattern: str) -> dict:
+        with self._lock:
+            self.lcd["pattern"] = pattern
+            self.lcd["draws"] += 1
+            self.lcd["last_ms"] = int(time.time() * 1000)
+            return {"ok": True, "pattern": pattern, "draws": self.lcd["draws"],
+                    "w": 320, "h": 240, "fb_bytes": 153600, "fb_mem": "psram"}
+
+    def camera_capture(self) -> dict:
+        with self._lock:
+            self.camera["frames"] += 1
+            self.camera["bytes"] = 3200
+            self.camera["last_ms"] = int(time.time() * 1000)
+            path = f"/sdcard/cam/cap-{self.camera['frames']:05d}.jpg"
+            self.camera["path"] = path
+            return {"ok": True, "path": path, "bytes": self.camera["bytes"], "w": 320, "h": 240,
+                    "ms": 118, "err": "", "url": f"media/sdcard/cam/cap-{self.camera['frames']:05d}.jpg"}
 
     # ------------------------------------------------------------ 媒体（模拟 AEC 产物）
     def _make_recording(self, seconds: float = 2.0) -> str:
@@ -536,7 +558,23 @@ class MockDevice:
                         "root": "/spiffs/rec"},
                 "media": {"sd_mounted": True, "rec_root": "/spiffs/rec", "poll_hint_ms": 1000},
                 "player": dict(self.player),
-                "panel": {"api_version": "1", "scope": "local-verification-only"},
+                "panel": {"api_version": "1", "scope": "local-verification-only",
+                          # 板载 LCD / 摄像头（本地验证面，第十七/十八轮）：形状与真机一致，
+                          # 面板「板载 LCD」「板载摄像头」两张卡片的渲染与代理路由靠它自检。
+                          "lcd": {"ready": "true", "w": 320, "h": 240,
+                                  "pattern": self.lcd["pattern"], "draws": self.lcd["draws"],
+                                  "last_ms": self.lcd["last_ms"], "fb_bytes": 153600,
+                                  "fb_mem": "psram"},
+                          "camera": {"inited": "true", "sensor": "OV3660", "pid": 0x3660,
+                                     "pid_hex": 0x3660, "frames": self.camera["frames"],
+                                     "errors": 0, "last_bytes": self.camera["bytes"],
+                                     "last_w": 320, "last_h": 240,
+                                     "last_ms": self.camera["last_ms"],
+                                     "last_path": self.camera["path"],
+                                     "last_err": "", "root": "/sdcard/cam",
+                                     "format": "rgb565", "fb_loc": "psram", "fb_count": 2,
+                                     "grab": "when_empty", "xclk_mhz": 40,
+                                     "psram_dma": 1, "quality": 12}},
             }
 
     def _keys(self, limit: int) -> dict:
@@ -640,6 +678,24 @@ class MockDevice:
                     res = mock.press(key, action)
                     self._json({"ok": True, "key": key, "action": action,
                                 "note": "mock: same uplink path as a physical key", "press": res})
+                    return
+                if parsed.path == "/api/lcd/draw":
+                    # 与固件同形的本地验证面：图案下发（真机会真重绘，mock 只回计数与帧缓冲口径）
+                    self._json(mock.lcd_draw(q.get("pattern", ["status"])[0]))
+                    return
+                if parsed.path == "/api/camera/capture":
+                    self._json(mock.camera_capture())
+                    return
+                if parsed.path == "/api/camera/reinit":
+                    self._json({"ok": True, "err": "", "sensor": "OV3660",
+                                "format": ("jpeg" if q.get("fmt", ["rgb565"])[0] == "jpeg"
+                                           else "rgb565"),
+                                "fb_loc": q.get("fb", ["psram"])[0],
+                                "fb_count": int(q.get("fbc", ["2"])[0]),
+                                "grab": q.get("grab", ["when_empty"])[0],
+                                "xclk_mhz": int(q.get("xclk", ["40"])[0]),
+                                "psram_dma": 0 if q.get("psram", ["1"])[0] == "0" else 1,
+                                "quality": int(q.get("q", ["12"])[0])})
                     return
                 if parsed.path != "/api/action":
                     self._json({"error": "not_found"}, 404)

@@ -135,7 +135,7 @@ python3 panel.py --device korvo2-0001=http://<设备IP> \
 
 | 项 | 命令 | 结果 |
 | --- | --- | --- |
-| 面板自检（无硬件） | `python3 panel.py --self-test`（内置 mock 设备 + mock broker + 模拟 AEC 录音 WAV + SD 卡媒体 + 凭据文件配网 + 云端桩 + LCD/摄像头本地验证面） | **39 项全部通过，rc=0**：设备 HTTP、自检明细 15 行、固件标识、MQTT 连接、按键历史（新→旧、**云端确认 3/3**、端到端时延、动作覆盖）、`/api/health`、首页渲染、**首页含音频/AEC 卡片**、**媒体列表非空**、**绝对播放地址**、**Range 206 + Content-Range + RIFF 头**、**触发 AEC 采集**、**采集后列表增长**、**停止采集**、**SD 卡媒体可板上回放标记**、**触发板上播放**、**播放状态回显**、**音量设置**、**停止播放**、**非 SD 路径被拒绝**、**Wi-Fi 状态含 ssid/source**、**凭据来源标注为 SD 文件**、**运行期改配 wifi_set**、**改配后状态回显新 SSID + api 来源**、**空 SSID 被拒绝**、**改配失败可观测**、**凭据文件配网回落**、**首页含 Wi-Fi 配网卡片**、**LCD 状态字段齐备（ready/w/h/pattern/fb_bytes）**、**摄像头状态字段齐备（sensor/pid/取帧配置）**、**LCD 图案下发代理（`/api/action/lcd`）**、**摄像头抓帧代理（`/api/action/camera`）**、**云端桩回 event/down ack**、**设备侧置 acked（三态闭环）**、设备离线降级 |
+| 面板自检（无硬件） | `python3 panel.py --self-test`（内置 mock 设备 + mock broker + 模拟 AEC 录音 WAV + SD 卡媒体 + 凭据文件配网 + 云端桩 + LCD/摄像头本地验证面） | **41 项全部通过，rc=0**：设备 HTTP、自检明细 15 行、固件标识、MQTT 连接、按键历史（新→旧、**云端确认 3/3**、端到端时延、动作覆盖）、`/api/health`、首页渲染、**首页含音频/AEC 卡片**、**媒体列表非空**、**绝对播放地址**、**Range 206 + Content-Range + RIFF 头**、**触发 AEC 采集**、**采集后列表增长**、**停止采集**、**SD 卡媒体可板上回放标记**、**触发板上播放**、**播放状态回显**、**音量设置**、**停止播放**、**非 SD 路径被拒绝**、**Wi-Fi 状态含 ssid/source**、**凭据来源标注为 SD 文件**、**运行期改配 wifi_set**、**改配后状态回显新 SSID + api 来源**、**空 SSID 被拒绝**、**改配失败可观测**、**凭据文件配网回落**、**首页含 Wi-Fi 配网卡片**、**LCD 状态字段齐备（ready/w/h/pattern/fb_bytes）**、**摄像头状态字段齐备（sensor/pid/取帧配置）**、**LCD 图案下发代理（`/api/action/lcd`）**、**摄像头抓帧代理（`/api/action/camera`）**、**云端桩回 event/down ack**、**设备侧置 acked（三态闭环）**、设备离线降级 |
 | 真机联调（2026-09-15，第十二轮） | 板子 COM12 + `192.168.110.79`；面板 `--device korvo2-0001=http://192.168.110.79 --mqtt 175.178.190.187:1883 --ack-stub` | 面板聚合成功（自检 19/0、`wifi.source=file:/sdcard/oneye-wifi.txt`、媒体 1 个可上板文件、player 状态/音量）；**云端桩在真 EMQX 上实发 `event/down`**（`data.ref` 与上行 id 一致）；设备侧 `/media/<alias>/<path>` Range 与板上回放均真机验证通过（详见 [固件 README §8](../../examples/oneye/korvo2_oneye/README.md)） |
 
 ### 7.1 构建记录（AEC 采集 + 媒体 API）
@@ -148,6 +148,15 @@ python3 panel.py --device korvo2-0001=http://<设备IP> \
 | 坑位（已修） | esp-sr 只在分区表存在 `model` 分区时才投放模型（上游 AEC/algorithm 例程缺该分区 ⇒ 模型从未投放）；另有 4 类编译期错误（注释内嵌 `/*`、`HTTPD_416_*` 缺失、`I2S_CHANNEL_FMT_*` 需 `driver/i2s.h`、`snprintf` 截断告警） |
 
 复跑：`python3 panel.py --self-test`（日志落 `output/.build/panel-selftest.log`）。
+
+### 7.2 页面"半死"缺陷修复（2026-09-16 第十九轮）
+
+| 项 | 结果 |
+| --- | --- |
+| **现象** | 顶部芯片（MQTT/串口/设备）与按键实时状态格正常，**其下所有动态区块空白**：按键历史、板级核对表、设备与链路、板载 LCD/摄像头卡片数据、Wi-Fi 配网、音频列表；而 `/api/state` 数据完整（`selftest` 21 项、`keys.history` 10 条、`media.files` 2 项） |
+| **根因** | 页面内嵌 JS 的按钮回调（`simKeyOptions()`/`simKey()`/`lcdDraw()`/`camCapture()`）引用了**服务端才有的**变量名 `state`（Python 侧的 `self.devices`），而页面内的快照变量是 `tick()` 内局部的 `st` ⇒ 浏览器每轮 `tick()` 在 `refreshSimKeys()` 处抛 `ReferenceError: state is not defined`，**其后的全部渲染被中断**（自 `d8c8701c` 引入；服务端自检/HTTP 验证都发现不了，只有真正执行页面 JS 才暴露） |
+| **修法** | ① 新增页面级 `let lastState`（`tick()` 每轮写入）+ `firstNode()` 统一取当前节点（注意 `/api/state.devices` 是**数组**，早期 `Object.keys(...)[0]` 会得到 `"0"`）；② 四处回调改用 `lastState`/`firstNode()`；③ 新增 `#jserr` 异常横幅 + `window.addEventListener('error')` —— 客户端 JS 报错**直接上屏**，不再以"某几块永远空白"的形式静默失败；④ 自检新增 2 条守卫（39 → **41** 项）：必须声明 `lastState`、不得出现裸 `state.devices`、必须含异常横幅 |
+| **离线复现器**（本轮新增） | `node output/.build/panel-repro.js <dump 目录>`：把面板页面 + 真实 `/api/state` 落盘后用 Node 执行页面 JS 并调用 `tick()`（`panel-dump.py` 负责取数）。修复前 `TICK THROW: ReferenceError: state is not defined`，修复后 `tick() ok` / `firstNode() = korvo2-0001` |
 
 ## 8. 后续（同一面板继续接）
 

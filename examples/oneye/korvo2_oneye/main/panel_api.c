@@ -28,9 +28,19 @@
 
 static const char *TAG = "panel_api";
 
-#define PANEL_KEYS               6
 #define PANEL_HISTORY_DEFAULT    50
 #define PANEL_ACK_PAYLOAD_MAX    512
+
+/* 板载按键清单：**按 ADF 的 user_id 取值**（`board_def.h` 的 `INPUT_KEY_DEFAULT_INFO()`：
+ * REC=1 / MUTE=7 / SET=2 / PLAY=3 / VOLUP=6 / VOLDOWN=5 —— 注意本板**没有 MODE 键**，
+ * 且 id 不是 0..5；早前按下标 0..5 猜标签会把 MUTE 显示成 MODE、并把 VOLUP/VOLDOWN 错位）。 */
+static const struct {
+    int         id;
+    const char *label;
+} k_panel_keys[] = {
+    { 1, "rec" }, { 7, "mute" }, { 2, "set" }, { 3, "play" }, { 6, "volup" }, { 5, "voldown" },
+};
+#define PANEL_KEY_COUNT ((int)(sizeof(k_panel_keys) / sizeof(k_panel_keys[0])))
 
 typedef struct {
     uint32_t seq;
@@ -455,7 +465,7 @@ static esp_err_t h_status(httpd_req_t *req)
     sb_kv_i(&s, "failed", (long long)s_check_fail); sb_raw(&s, "},");
 
     sb_raw(&s, "\"keys\":{");
-    sb_kv_i(&s, "count", PANEL_KEYS); sb_raw(&s, ",");
+    sb_kv_i(&s, "count", PANEL_KEY_COUNT); sb_raw(&s, ",");
     sb_kv_i(&s, "events", (long long)s_key_seq); sb_raw(&s, ",");
     sb_kv_i(&s, "history_max", PANEL_KEY_HISTORY_MAX);
     sb_raw(&s, "},");
@@ -552,18 +562,7 @@ static esp_err_t h_selftest(httpd_req_t *req)
     return send_json(req, &s);
 }
 
-static const char *key_label(int id)
-{
-    switch (id) {
-    case 0: return "volup";
-    case 1: return "voldown";
-    case 2: return "set";
-    case 3: return "play";
-    case 4: return "mode";
-    case 5: return "rec";
-    default: return "unknown";
-    }
-}
+/* 板载按键清单（定义见文件顶部 `k_panel_keys`；标签按 ADF user_id 取值，非下标） */
 
 static void sb_key_entry(sb_t *s, const panel_key_hist_t *e, bool with_seq)
 {
@@ -596,13 +595,13 @@ static esp_err_t h_keys(httpd_req_t *req)
     }
     sb_raw(&s, "{");
     sb_raw(&s, "\"keys\":[");
-    for (int i = 0; i < PANEL_KEYS; i++) {
+    for (int i = 0; i < PANEL_KEY_COUNT; i++) {
         if (i) {
             sb_raw(&s, ",");
         }
         sb_raw(&s, "{");
-        sb_kv_i(&s, "id", i); sb_raw(&s, ",");
-        sb_kv_str(&s, "label", key_label(i));
+        sb_kv_i(&s, "id", k_panel_keys[i].id); sb_raw(&s, ",");
+        sb_kv_str(&s, "label", k_panel_keys[i].label);
         sb_raw(&s, "}");
     }
     sb_raw(&s, "],");

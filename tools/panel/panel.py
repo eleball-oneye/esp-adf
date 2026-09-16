@@ -81,6 +81,8 @@ class MiniMqtt:
         self._thread: threading.Thread | None = None
         self._buf = b""
         self._connack_seen = False
+        self.last_rx_s = 0.0          # 最近一次收到任何入站报文的时间（秒，单调地用于死链判定）
+        self.connected_since_s = 0.0
 
     # ---------------------------------------------------------------- 报文编码
     @staticmethod
@@ -167,27 +169,44 @@ class MiniMqtt:
                     raise OSError("CONNACK 超时")
                 self.connected = True
                 self.last_error = None
+                self.connected_since_s = time.time()
+                self.last_rx_s = time.time()
                 self.log(f"[panel] MQTT 已连接 {self.host}:{self.port}")
                 for f in list(self.subscribed):
                     self.subscribed.remove(f)
                     self.subscribe(f)
                 last_ping = time.time()
+                # ⚠️ 之前的实现在这里只处理"收到数据"的分支：recv 超时（data == b""）直接 continue，
+                #    于是 ① **空闲时从不发 PINGREQ**（broker 按 keepalive×1.5 判失联并断开）；
+                #    ② 对端已关闭时 recv 返回 b""、`fileno()` 仍有效 ⇒ 判定为超时继续死循环，
+                #    既不重连也不报错（`connected` 一直是 True）⇒ 症状 = 面板"看着已连接"却
+                #    再也收不到 event/up（真机表现：12 次按键只观测到 1 次、其余"云端确认=未见"）。
+                #    修法：空闲也按 keepalive/2 发 PINGREQ；recv 返回 b"" 视为对端关闭；
+                #    超过 keepalive×2 无任何入站数据则判死链并重连。
                 while not self._stop.is_set():
                     try:
                         data = self.sock.recv(4096)
                     except socket.timeout:
-                        data = b""
-                    if data == b"":
-                        if self.sock.fileno() == -1:
-                            break
-                        continue
-                    self._feed(data)
-                    if time.time() - last_ping > self.keepalive / 2:
+                        data = None            # 超时（非关闭）：只说明这段时间没数据
+                    except OSError as exc:
+                        raise OSError(f"recv: {exc}") from exc
+                    if data:
+                        self.last_rx_s = time.time()
+                        self._feed(data)
+                    elif data == b"":
+                        raise OSError("对端已关闭连接（recv 返回 EOF）")
+                    elif self.sock.fileno() == -1:
+                        raise OSError("socket 已关闭")
+
+                    now = time.time()
+                    if now - last_ping > self.keepalive / 2:
                         try:
-                            self.sock.sendall(self._packet(12, 0, b""))
-                        except OSError:
-                            break
-                        last_ping = time.time()
+                            self.sock.sendall(self._packet(12, 0, b""))   # PINGREQ：空闲也发
+                        except OSError as exc:
+                            raise OSError(f"ping: {exc}") from exc
+                        last_ping = now
+                    if self.last_rx_s and (now - self.last_rx_s) > self.keepalive * 2:
+                        raise OSError(f"keepalive 超时（{int(now - self.last_rx_s)}s 无入站数据）")
             except Exception as exc:  # noqa: BLE001 - 面板需容错
                 self.last_error = str(exc)
                 self.log(f"[panel] MQTT 连接失败：{exc}（1 s 后重试）")
@@ -336,12 +355,15 @@ class DeviceView:
             self.keys = ks
             hist = ks.get("history") or []
             for e in hist:
+                # 端到端时延必须在**同一时钟**内计算：设备 ts_ms/ack_ms 都是设备侧时钟（当前 = 运行
+                # 时刻，设备尚未授时），面板墙上时钟与它不可比 —— 早前用 recv_at_ms - ts_ms 会得到
+                # 天文数字（真机见过 1789539234592 ms）。正确口径 = ack_ms - ts_ms。
+                if e.get("ack_ms") and e.get("ts_ms"):
+                    e["ack_delta_ms"] = e["ack_ms"] - e["ts_ms"]
                 if e.get("id") in self.cloud:
                     c = self.cloud[e["id"]]
                     e["cloud_seen"] = True
                     e["cloud_recv_ts_ms"] = c.get("recv_at_ms")
-                    if c.get("recv_at_ms") and e.get("ts_ms"):
-                        e["cloud_delta_ms"] = c["recv_at_ms"] - e["ts_ms"]
                 else:
                     e["cloud_seen"] = False
             self.history = hist
@@ -573,8 +595,8 @@ PAGE = r"""<!doctype html>
 
   <div class="grid2">
     <div class="card">
-      <h2>按键：历史响应 <small>本地检测 → event/up 上行 → 云端 ack</small></h2>
-      <table><thead><tr><th>#</th><th>时间</th><th>按键</th><th>动作</th><th>上行</th><th>云端确认</th><th>端到端</th></tr></thead>
+      <h2>按键：历史响应 <small>本地检测 → event/up 上行 → 云端 ack（设备侧时刻；设备尚未授时，故"设备时刻"=运行时刻、"端到端"=设备侧 ack_ms−ts_ms）</small></h2>
+      <table><thead><tr><th>#</th><th>设备时刻</th><th>按键</th><th>动作</th><th>上行</th><th>云端确认</th><th>端到端</th></tr></thead>
       <tbody id="hist"></tbody></table>
     </div>
     <div class="card">
@@ -660,20 +682,27 @@ async function tick(){
       <span>${on?(ACT[cur.action]||cur.action):'待触发'}</span></div>`;
   }).join('');
   const c = keys.counters||{};
+  refreshSimKeys();   // 注入下拉跟随设备上报的按键清单（设备不可达时退回兜底清单）
   const ackStub = (st.mqtt&&st.mqtt.ack_stub)||{};
   $('keymeta').innerHTML = `
     <div>当前</div><div>${cur? `${KEYNAME[cur.key]||cur.key} / ${ACT[cur.action]||cur.action} <span class="pill ${cur.uplink==='acked'?'ok':(cur.uplink==='failed'?'bad':'pend')}">${cur.uplink}</span>` : '<span class="mut">尚无按键</span>'}</div>
     <div>计数</div><div>共 ${c.total||0} 次（短按 ${c.click||0} / 长按 ${c.press||0} / 释放 ${(c.click_release||0)+(c.press_release||0)}）</div>
-    <div>云端事件</div><div>${dev.cloud_event_count||0} 条（MQTT 视角）${ackStub.enabled? ` · <span class="pill ok">云端桩已发 ack ${ackStub.sent||0} 条</span>`:''}</div>`;
+    <div>云端事件</div><div>${dev.cloud_event_count||0} 条（MQTT 视角）${st.mqtt&&st.mqtt.connected? '' : ' · <span class="pill bad">面板 MQTT 未连通</span>'}${ackStub.enabled? ` · <span class="pill ok">云端桩已发 ack ${ackStub.sent||0} 条</span>`:''}</div>`;
 
   // 历史响应
+  const mqttUp = !!(st.mqtt && st.mqtt.connected);
   const rows = ks.map(e=>{
     const up = e.uplink||'pending';
     const upCls = up==='acked'?'ok':(up==='failed'?'bad':'pend');
-    const cloud = e.cloud_seen ? '<span class="pill ok">已收到</span>' : '<span class="pill pend">未见</span>';
-    const delta = (e.cloud_delta_ms!==undefined) ? (e.cloud_delta_ms+' ms') : '—';
-    const t = e.ts_ms ? new Date(e.ts_ms).toLocaleTimeString() : '—';
-    return `<tr class="${e.seq>lastSeq?'flash':''}"><td>${e.seq}</td><td>${t}</td>
+    // 「云端确认」这一列是**面板自己经 MQTT 独立观测**到的 event/up（与设备侧 ack 无关）：
+    // MQTT 未连通时必须说"未连通"，不能说"未见"——否则会把面板自己的断线误读成云端没收到。
+    const cloud = e.cloud_seen ? '<span class="pill ok">已收到</span>'
+              : (mqttUp ? '<span class="pill pend">未见</span>'
+                        : '<span class="pill bad" title="面板的 MQTT 观测通道未连通，本列无意义">未连通</span>');
+    // 端到端 = 设备侧时钟内的 ack_ms - ts_ms（设备未授时，不能用面板墙上时钟相减）
+    const delta = (e.ack_delta_ms!==undefined) ? (e.ack_delta_ms+' ms') : '—';
+    const t = e.ts_ms!==undefined ? ('运行 +'+(e.ts_ms/1000).toFixed(1)+' s') : '—';
+    return `<tr class="${e.seq>lastSeq?'flash':''}"><td>${e.seq}</td><td class="mut" title="设备侧 ts_ms（设备未授时，故显示运行时刻）">${t}</td>
       <td>${KEYNAME[e.key]||e.key}</td><td>${ACT[e.action]||e.action}</td>
       <td><span class="pill ${upCls}">${up}</span></td><td>${cloud}</td><td class="mut">${delta}</td></tr>`;
   });
@@ -784,8 +813,20 @@ async function wifiSet(){
 }
 
 $('btn-refresh').onclick = tick;
-$('sim-key').innerHTML = ['volup','voldown','set','play','mode','rec']
-  .map(k=>`<option value="${k}">${KEYNAME[k]||k}</option>`).join('');
+// 注入用的按键清单取自**设备**（/api/keys 的 keys[].label，与板级 INPUT_KEY_DEFAULT_INFO 同源），
+// 设备不可达时才退回硬编码兜底（本板实际为 REC/MUTE/SET/PLAY/VOL+/VOL−，**无 MODE**）。
+function simKeyOptions(){
+  const dv = state.devices && Object.values(state.devices)[0];
+  const labels = ((dv && dv.keys && dv.keys.keys) || []).map(k=>k.label).filter(Boolean);
+  return labels.length ? labels : ['rec','mute','set','play','volup','voldown'];
+}
+function refreshSimKeys(){
+  const sel = $('sim-key');
+  const want = simKeyOptions();
+  const cur = sel.value;
+  sel.innerHTML = want.map(k=>`<option value="${k}">${KEYNAME[k]||k}</option>`).join('');
+  if (want.includes(cur)) sel.value = cur;
+}
 async function simKey(){
   const k = $('sim-key').value;
   const n = (state.devices && Object.keys(state.devices)[0]) || '';
@@ -946,6 +987,8 @@ def start_panel(state: PanelState, port: int, poll_ms: int, devices: list[tuple[
             if mqtt_c is not None:
                 state.mqtt["connected"] = bool(mqtt_c.connected)
                 state.mqtt["last_error"] = mqtt_c.last_error
+                state.mqtt["last_rx_ms"] = int(getattr(mqtt_c, "last_rx_s", 0.0) * 1000) or None
+                state.mqtt["connected_since_ms"] = int(getattr(mqtt_c, "connected_since_s", 0.0) * 1000) or None
             ser = getattr(state, "serial_reader", None)
             if ser is not None:
                 state.serial["connected"] = bool(ser.connected)
@@ -1121,8 +1164,8 @@ def self_test(verbose: bool = True) -> int:
                   for i in range(len(dv.history) - 1)) if len(dv.history) > 1 else False)
         cloud_ok = sum(1 for e in dv.history if e.get("cloud_seen"))
         check("云端确认关联（MQTT 与本地 id 对齐）", cloud_ok >= 3, f"{cloud_ok} 条已确认")
-        delta_ok = all(e.get("cloud_delta_ms") is not None for e in dv.history if e.get("cloud_seen"))
-        check("端到端时延可计算", delta_ok)
+        delta_ok = all(e.get("ack_delta_ms") is not None for e in dv.history if e.get("ack_ms"))
+        check("端到端时延可计算（设备侧 ack_ms − ts_ms）", delta_ok)
         actions = {e["action"] for e in dv.history}
         check("动作类型覆盖 click/press", {"click", "press"} <= actions, str(sorted(actions)))
 

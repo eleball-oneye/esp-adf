@@ -360,9 +360,11 @@ static void emit_key_event(const char *key, const char *act, bool injected)
     }
 }
 
+/* 本板按键名集合（与 panel_api.c 的 `k_panel_keys` 同源；来自 board_def.h 的
+ * `INPUT_KEY_DEFAULT_INFO()`：REC/MUTE/SET/PLAY/VOLUP/VOLDOWN —— **本板无 MODE 键**）。 */
 static bool key_name_valid(const char *key)
 {
-    static const char *names[] = { "volup", "voldown", "set", "play", "mode", "rec" };
+    static const char *names[] = { "rec", "mute", "set", "play", "volup", "voldown" };
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
         if (strcmp(key, names[i]) == 0) {
             return true;

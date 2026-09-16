@@ -68,6 +68,8 @@ typedef struct {
     int      stream_port;   /* 0 = 未启动 */
     uint32_t stream_frames; /* 已发送帧数 */
     int      stream_clients;/* 当前连接的预览客户端数（0/1） */
+    uint32_t stream_ends;   /* 已结束的预览会话数 */
+    char     stream_end_reason[64]; /* 上次流结束原因（client-gone / send-error ...） */
 } camera_state_t;
 
 /** 重配参数：任一项 <0 / 非法 = 保持当前值（见 camera_api_apply） */

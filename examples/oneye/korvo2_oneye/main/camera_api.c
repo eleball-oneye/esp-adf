@@ -69,6 +69,8 @@ static httpd_handle_t    s_stream_httpd;
 static uint16_t          s_stream_port;
 static volatile uint32_t s_stream_frames;
 static volatile int      s_stream_clients;
+static char              s_stream_end_reason[64];   /* 上一次流结束的原因（正常/发送失败） */
+static uint32_t          s_stream_end_count;
 
 /* 生效配置（可经 camera_api_apply 改）——默认口径见文件头排障记录：
  * RGB565 原始帧（上游 lcd_camera 在本板实测可用的像素格式）+ fb 在 PSRAM（不占内部 DRAM 带宽/容量，
@@ -360,6 +362,8 @@ void camera_api_get_state(camera_state_t *out)
     s_last.stream_port = (int)s_stream_port;
     s_last.stream_frames = s_stream_frames;
     s_last.stream_clients = s_stream_clients;
+    s_last.stream_ends = s_stream_end_count;
+    snprintf(s_last.stream_end_reason, sizeof(s_last.stream_end_reason), "%s", s_stream_end_reason);
     *out = s_last;
     out->inited = s_inited;
     out->frames = s_frames;
@@ -444,13 +448,19 @@ static esp_err_t h_cam_stream(httpd_req_t *req)
             vTaskDelay(pdMS_TO_TICKS(100));      /* 单帧失败不结束流（真机偶发 fb timeout） */
             continue;
         }
+        /* multipart 分段按 RFC 2046 写规范（真机踩过"画面花屏/错位"，故把边界字节写死并核对）：
+         *   --boundary CRLF headers CRLF CRLF <jpeg> CRLF   （下一段的 --boundary 紧跟其后）
+         * 即：**每段数据后补一个 CRLF**，段前**不再**加 CRLF（否则会多出空行 = 双 CRLF）。 */
         char head[128];
         int n = snprintf(head, sizeof(head),
-                         "\r\n--" CAM_STREAM_BOUNDARY "\r\nContent-Type: image/jpeg\r\n"
+                         "--" CAM_STREAM_BOUNDARY "\r\nContent-Type: image/jpeg\r\n"
                          "Content-Length: %u\r\n\r\n", (unsigned)len);
         rc = httpd_resp_send_chunk(req, head, (size_t)n);
         if (rc == ESP_OK) {
             rc = httpd_resp_send_chunk(req, (const char *)jpg, len);
+        }
+        if (rc == ESP_OK) {
+            rc = httpd_resp_send_chunk(req, "\r\n", 2);
         }
         free(jpg);
         if (rc != ESP_OK) {
@@ -458,11 +468,17 @@ static esp_err_t h_cam_stream(httpd_req_t *req)
         }
         sent++;
         s_stream_frames++;
-        vTaskDelay(pdMS_TO_TICKS(20));           /* 编码本身 ~110 ms ⇒ 实测约 7 帧/s */
+        vTaskDelay(pdMS_TO_TICKS(20));           /* 编码本身 ~110 ms ⇒ 实测约 7–8 帧/s */
     }
     s_stream_clients--;
     uint32_t el = (uint32_t)(esp_timer_get_time() / 1000) - t0;
-    ESP_LOGI(TAG, "预览流结束：%u 帧 / %u ms（%s）", (unsigned)sent, (unsigned)el, esp_err_to_name(rc));
+    /* 结束原因要能上报：浏览器/网络中途不再收（send 失败）与客户端主动停止，现象完全不同，
+     * 但页面上的"预览中"字样是启动时写死的 ⇒ 必须靠这个字段把真相带到面板（真机踩过"花屏不恢复"）。 */
+    snprintf(s_stream_end_reason, sizeof(s_stream_end_reason), "%s (send=%s, %u 帧/%u ms)",
+             (rc == ESP_OK) ? "client-gone" : "send-error", esp_err_to_name(rc),
+             (unsigned)sent, (unsigned)el);
+    s_stream_end_count++;
+    ESP_LOGI(TAG, "预览流结束：%u 帧 / %u ms（send=%s）", (unsigned)sent, (unsigned)el, esp_err_to_name(rc));
     return ESP_OK;
 }
 
@@ -484,7 +500,7 @@ esp_err_t camera_api_stream_start(uint16_t port)
     cfg.stack_size = 5120;                       /* 流任务：抓帧 + 编码 + 分块发送 */
     cfg.lru_purge_enable = true;
     cfg.recv_wait_timeout = 5;
-    cfg.send_wait_timeout = 10;
+    cfg.send_wait_timeout = 20;                  /* 浏览器渲染繁忙时可能短暂不读 socket：别急着掐断流 */
     cfg.uri_match_fn = httpd_uri_match_wildcard;
 
     esp_err_t rc = httpd_start(&s_stream_httpd, &cfg);

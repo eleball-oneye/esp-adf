@@ -674,7 +674,8 @@ PAGE = r"""<!doctype html>
     <div class="kv" id="cammeta"></div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px">
       <button onclick="camCapture()">抓拍一帧</button>
-      <button onclick="camPreview(true)">开始预览</button>
+      <button onclick="camPreview(true)">预览（MJPEG 流）</button>
+      <button onclick="camPollStart('预览（轮询）：每次抓一帧不落盘，约 1 帧/s')">预览（轮询）</button>
       <button onclick="camPreview(false)">停止预览</button>
       <span class="mut" id="cammsg"></span>
     </div>
@@ -730,6 +731,8 @@ let lastSeq = -1;
 let lastState = null;
 let camPreviewing = false;      // 预览中：tick() 不得覆盖 camimg.src（否则打断 MJPEG 流）
 let camPollTimer = null;        // 单帧轮询预览的定时器
+// 预览健康看护（真机教训：页面写着"预览中"但流早已断/卡住，画面停在残帧上 ⇒ 必须用设备侧帧计数判定）
+let camWatch = {mode:null, frames:0, at:0, stall:0, restarts:0, since:0, fps:0};
 function firstNode(){
   // ⚠️ /api/state 的 devices 是**数组**（早期版本按字典写成 Object.keys(...)[0] ⇒ 会得到 "0"）。
   //    这里统一按数组/字典两种形状取，并优先用在线设备；取不到就让服务端回落（服务端对空 node 有兜底）。
@@ -844,8 +847,31 @@ async function tick(){
     <div>刷新</div><div>${lc.draws||0} 次${lc.last_ms? ' · 最近 '.concat((lc.last_ms/1000).toFixed(1),' s（设备运行）') : ''}</div>
     <div>帧缓冲</div><div class="mut">${lc.fb_bytes? (lc.fb_bytes/1024).toFixed(0)+' KB @ '+(lc.fb_mem||'—') : '—'}</div>`;
 
-  // 板载摄像头（本地验证面：状态 + 抓拍 + 最近一帧）
+  // 板载摄像头（本地验证面：状态 + 抓拍 + 预览）
   const cm = (s.panel && s.panel.camera) || {};
+  // 预览健康度：用设备侧真实帧计数判断"画面是否还在更新"——
+  // 光看页面上的"预览中"字样会被骗（启动时写死）：真机踩过"花屏/卡住但页面仍显示预览中"。
+  let camHealth = null;
+  if (camPreviewing) {
+    const now = Date.now();
+    const fr = cm.stream_frames || 0;
+    if (!camWatch.at) { camWatch.frames = fr; camWatch.at = now; camWatch.stall = 0; }
+    const dFrames = fr - (camWatch.frames||0);
+    const dMs = now - (camWatch.at||now);
+    camWatch.frames = fr; camWatch.at = now;
+    if (camWatch.mode === 'stream') {
+      if (dFrames > 0) {
+        camWatch.stall = 0;
+        camWatch.fps = dMs > 0 ? (dFrames * 1000 / dMs) : 0;
+        camHealth = `<span class="pill ok">流正常</span> <span class="mut">最近 ${dFrames} 帧 / ${dMs} ms ≈ ${camWatch.fps.toFixed(1)} 帧/s · 客户端 ${cm.stream_clients||0}</span>`;
+      } else {
+        camWatch.stall = (camWatch.stall||0) + 1;
+        camHealth = `<span class="pill pend">流无新帧（${camWatch.stall} 次轮询）</span> <span class="mut">将自动重启预览</span>`;
+      }
+    } else {
+      camHealth = `<span class="pill pend">轮询模式</span> <span class="mut">每 800 ms 一帧（不依赖 MJPEG 解析，画面必定完整）</span>`;
+    }
+  }
   const camFiles = ((dev.media && dev.media.files) || [])
       .filter(f => String(f.name||'').startsWith('cam/'))
       .sort((a,b) => String(b.name).localeCompare(String(a.name)));
@@ -858,8 +884,10 @@ async function tick(){
     <div>最近一帧</div><div>${cm.last_bytes? `${cm.last_w}×${cm.last_h} · ${(cm.last_bytes/1024).toFixed(1)} KB · <span class="mut">${cm.last_path||''}</span>` : '<span class="mut">—</span>'}</div>
     <div>最近失败</div><div>${cm.last_err? `<span class="pill bad">${cm.last_err}</span>` : '<span class="mut">无</span>'}</div>
     <div>落盘目录</div><div class="mut">${cm.root||'—'}（SD 优先，SPIFFS 兜底）· 本面板可见 ${camFiles.length} 张</div>
-    <div>预览</div><div>${cm.stream_port? `<span class="pill ok">MJPEG 流已就绪</span> <span class="mut">:${cm.stream_port}/stream · 已发 ${cm.stream_frames||0} 帧 · 客户端 ${cm.stream_clients||0}</span>` : '<span class="pill pend">流未启动</span> <span class="mut">（回落单帧轮询预览）</span>'}</div>`;
+    <div>预览</div><div>${cm.stream_port? `<span class="pill ok">MJPEG 流已就绪</span> <span class="mut">:${cm.stream_port}/stream · 客户端 ${cm.stream_clients||0} · 累计 ${cm.stream_frames||0} 帧</span>` : '<span class="pill pend">流未启动</span> <span class="mut">（回落单帧轮询预览）</span>'}${cm.stream_ends? `<div class="mut" style="font-size:12px">上次会话结束：${cm.stream_end_reason||'—'}</div>` : ''}</div>
+    <div>预览健康</div><div>${camHealth||'<span class="mut">未预览</span>'}</div>`;
   // 抓拍结果与预览流的显示互不干扰：预览中 **不覆盖** img.src，否则会把流打断
+  camWatchdog(cm);
   if (!camPreviewing && newestCam && newestCam.play_url) {
     const want = newestCam.play_url + '?t=' + (cm.last_ms||0);
     if ($('camimg').getAttribute('data-src') !== want) {
@@ -1026,6 +1054,7 @@ function camPreview(on){
   const msg = $('cammsg');
   if (!on) {
     camPreviewing = false;
+    camWatch.mode = null; camWatch.stall = 0; camWatch.fps = 0;
     if (camPollTimer) { clearInterval(camPollTimer); camPollTimer = null; }
     msg.textContent = '预览已停止';
     return;
@@ -1034,16 +1063,34 @@ function camPreview(on){
   if (!host) { msg.textContent = '预览失败：设备不可达'; return; }
   if (port) {
     camPreviewing = true;
+    camWatch.mode = 'stream';
+    camWatch.stall = 0; camWatch.restarts = 0; camWatch.since = Date.now();
     if (camPollTimer) { clearInterval(camPollTimer); camPollTimer = null; }
     $('camimg').setAttribute('data-src', 'stream');
     $('camimg').src = `http://${host}:${port}/stream?t=${Date.now()}`;
-    msg.textContent = `预览中（MJPEG 流 :${port}/stream，约 7 帧/s）`;
+    msg.textContent = `预览中（MJPEG 流 :${port}/stream）；若画面卡住/花屏，面板会按设备侧帧计数自动重启，连续失败则切轮询`;
   } else {
-    camPollStart(`设备未启动 MJPEG 流 ⇒ 回落单帧轮询预览（约 1.2 帧/s）`);
+    camPollStart('设备未启动 MJPEG 流 ⇒ 用单帧轮询预览（约 1 帧/s，画面必定完整）');
   }
+}
+// 健康看护：由 tick() 调用 —— 流长时间无新帧 ⇒ 重开一次；连续 2 次仍无 ⇒ 切单帧轮询
+function camWatchdog(cm){
+  if (!camPreviewing || camWatch.mode !== 'stream') return;
+  if ((camWatch.stall||0) < 3) return;                       // 3 次轮询（≈1.8 s）无新帧才动手
+  const host = camDevBase(), port = camStreamPort();
+  camWatch.stall = 0;
+  if (!host || !port || (camWatch.restarts||0) >= 2) {
+    camPollStart('MJPEG 流反复无新帧 ⇒ 已切换到单帧轮询预览（画面必定完整）');
+    return;
+  }
+  camWatch.restarts = (camWatch.restarts||0) + 1;
+  $('camimg').removeAttribute('src');                        // 先清掉可能残留的残帧
+  $('camimg').src = `http://${host}:${port}/stream?t=${Date.now()}`;
+  $('cammsg').textContent = `预览流无新帧 ⇒ 自动重连第 ${camWatch.restarts} 次`;
 }
 function camPollStart(note){
   camPreviewing = true;
+  camWatch.mode = 'poll'; camWatch.stall = 0;
   if (camPollTimer) clearInterval(camPollTimer);
   const n = firstNode();
   camPollTimer = setInterval(()=>{

@@ -619,7 +619,9 @@ static esp_err_t h_status(httpd_req_t *req)
         /* MJPEG 预览流（本地验证面）：port=0 ⇒ 未启动，面板回落到「单帧轮询预览」 */
         sb_kv_i(&s, "stream_port", cs.stream_port); sb_raw(&s, ",");
         sb_kv_i(&s, "stream_frames", (long long)cs.stream_frames); sb_raw(&s, ",");
-        sb_kv_i(&s, "stream_clients", cs.stream_clients);
+        sb_kv_i(&s, "stream_clients", cs.stream_clients); sb_raw(&s, ",");
+        sb_kv_i(&s, "stream_ends", (long long)cs.stream_ends); sb_raw(&s, ",");
+        sb_kv_str(&s, "stream_end_reason", cs.stream_end_reason);
         sb_raw(&s, "},");
     }
     sb_kv_str(&s, "scope", "local-verification-only");

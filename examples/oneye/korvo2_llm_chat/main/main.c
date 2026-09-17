@@ -256,7 +256,10 @@ static void net_ready_task(void *arg)
 static void on_net_ready(void)
 {
     /* 事件任务上下文：只投递任务 */
-    (void)xTaskCreate(net_ready_task, "net_ready", 6144, NULL, 5, NULL);
+    /* 栈 4096（**保持 ≤ `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL`**）：该任务会调用
+     * `esp_websocket_client_start()`；若栈落在 PSRAM，遇到关 cache 的窗口会触发
+     * `Interrupt wdt timeout`（真机取证 2026-09-17）。 */
+    (void)xTaskCreate(net_ready_task, "net_ready", 4096, NULL, 5, NULL);
 }
 
 /* ------------------------------------------------------------------ 单轮兜底 */

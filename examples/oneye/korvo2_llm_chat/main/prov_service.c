@@ -329,6 +329,10 @@ esp_err_t prov_service_init(esp_periph_set_handle_t periph_set, prov_ready_cb_t 
         ESP_LOGE(TAG, "esp_wifi_start 失败：%s", esp_err_to_name(werr));
         return werr;
     }
+    /* 关闭 Wi-Fi 省电（真机取证 2026-09-17）：本工程为 PSRAM + Wi-Fi + AFE 组合，
+     * 省电模式下 `wifi:pm start` 的睡眠/唤醒与 PSRAM 访问叠加，会在建 WebSocket 客户端
+     * （首次 socket 收发）时触发 `Interrupt wdt timeout`；持续收音/放音场景也不需要省电。 */
+    (void)esp_wifi_set_ps(WIFI_PS_NONE);
 
     /* SPIFFS（storage 分区）：凭据文件兜底存储 */
 #if CONFIG_ONEYE_LLM_ENABLE_WIFI_FILE

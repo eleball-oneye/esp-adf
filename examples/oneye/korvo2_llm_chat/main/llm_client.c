@@ -64,6 +64,15 @@ static char s_token[128];
 static TaskHandle_t s_ka_task;
 static bool s_ka_run;
 
+/* 连接守护（重连退避 + 保活）用的状态：事件回调里也要用，故声明在文件前部 */
+#define LLM_PING_MS      10000 /* 应用层 ping 周期（服务端据此刷新"会话活跃"判据） */
+#define LLM_BACKOFF_MS   5000  /* 普通断开后的重连退避 */
+#define LLM_CONFLICT_MS  30000 /* 并发冲突后的重连退避（等服务端接管陈旧会话） */
+static volatile int64_t s_reconnect_at_ms;
+static volatile bool    s_need_reconnect;
+static volatile bool    s_conflict_hint;
+static int64_t now_ms(void);
+
 /* 上行成帧缓冲：首字节 kind + 一帧 PCM */
 static uint8_t s_up_frame[1 + VOICE_IO_FRAME_BYTES];
 static size_t  s_up_fill;
@@ -293,6 +302,11 @@ static void handle_text(const char *json, size_t len)
         }
         s_st.errors++;
         ESP_LOGW(TAG, "服务端错误：%s（%s）%s", code, msg, retryable ? "[可重试]" : "");
+        /* 并发冲突：本设备已有活跃会话（多为上一条死会话未被服务端回收）。
+         * 标提示位，让断开后的重连退避到 30 s，等服务端接管陈旧会话。 */
+        if (strcmp(code, "conflict") == 0) {
+            s_conflict_hint = true;
+        }
         if (s_cbs.on_error) {
             s_cbs.on_error(code, msg, retryable, s_cbs.ctx);
         }
@@ -346,7 +360,11 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t event_id,
     case WEBSOCKET_EVENT_DISCONNECTED:
         s_st.connected = false;
         s_st.session_ready = false;
-        set_state(LLM_CLIENT_IDLE, "连接断开（组件将自动重连）");
+        /* 自主重连：冲突退避更久（等服务端接管陈旧会话） */
+        s_need_reconnect = true;
+        s_reconnect_at_ms = now_ms() + (s_conflict_hint ? LLM_CONFLICT_MS : LLM_BACKOFF_MS);
+        s_conflict_hint = false;
+        set_state(LLM_CLIENT_IDLE, s_need_reconnect ? "连接断开（按退避重连）" : "连接断开");
         break;
 
     case WEBSOCKET_EVENT_DATA: {
@@ -399,21 +417,44 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t event_id,
     }
 }
 
-/* ------------------------------------------------------------------ 保活任务 */
+/* ------------------------------------------------------------------ 连接守护 + 保活 */
 
-static void keepalive_task(void *arg)
+/*
+ * supervisor_task：同时承担两件事（取代原来的 keepalive_task）
+ *   ① 保活：已连接时每 10 s 发一帧 `ping`（契约帧，服务端回 `pong`）；
+ *      服务端据此刷新"陈旧会话"判据（>25 s 静默即允许被接管）。
+ *   ② 重连：断开后按退避重连 —— 普通断开 5 s，**并发冲突（conflict）30 s**
+ *      （服务端还需时间关闭上一个死会话并释放槽位，抢跑只会再次 conflict）。
+ */
+#define LLM_PING_MS      10000
+#define LLM_BACKOFF_MS   5000
+#define LLM_CONFLICT_MS  30000
+
+static int64_t now_ms(void)
+{
+    return esp_timer_get_time() / 1000;
+}
+
+static void supervisor_task(void *arg)
 {
     (void)arg;
+    int64_t last_ping = 0;
     while (s_ka_run) {
-        /* 分片睡眠：stop 时可及时退出（不必等满 25 s） */
-        for (int i = 0; i < (LLM_KEEPALIVE_MS / 1000) && s_ka_run; i++) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
-        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
         if (!s_ka_run) {
             break;
         }
         if (esp_websocket_client_is_connected(s_ws)) {
-            (void)llm_client_ping();
+            if (now_ms() - last_ping >= LLM_PING_MS) {
+                last_ping = now_ms();
+                (void)llm_client_ping();
+            }
+            continue;
+        }
+        if (s_need_reconnect && now_ms() >= s_reconnect_at_ms) {
+            /* 仅记录（重连由组件自动重连负责，见 llm_client_start 的注释） */
+            ESP_LOGD(TAG, "等待组件自动重连（%s）", s_uri);
+            s_need_reconnect = false;
         }
     }
     s_ka_task = NULL;
@@ -464,6 +505,13 @@ esp_err_t llm_client_start(void)
     cfg.buffer_size = 2048;
     cfg.reconnect_timeout_ms = 3000;
     cfg.network_timeout_ms = 8000;
+    /*
+     * 重连交给组件自动重连（`disable_auto_reconnect = false`）：
+     *   真机取证 2026-09-17：自管重连（关掉它 + 自己 start）在**首次连接**阶段即稳定触发
+     *   `Interrupt wdt timeout on CPU1`（3/3 复现），而放开让组件重连时能正常连上并拿到
+     *   `session.ready`。故这里只用 supervisor_task 做**保活 ping**，不接管重连。
+     *   并发冲突（`error{code:"conflict"}`）由服务端"陈旧会话接管"（Registry，25 s 窗口）收敛。
+     */
     cfg.disable_auto_reconnect = false;
 #if CONFIG_ONEYE_LLM_USE_TLS
     /* 生产形态：用证书包校验服务端证书；dev 自签场景请在 sdkconfig 打开
@@ -493,7 +541,7 @@ esp_err_t llm_client_start(void)
     }
     if (s_ka_task == NULL) {
         s_ka_run = true;
-        (void)xTaskCreate(keepalive_task, "llm_ka", 3072, NULL, 4, &s_ka_task);
+        (void)xTaskCreate(supervisor_task, "llm_sup", 4096, NULL, 4, &s_ka_task);
     }
     return ESP_OK;
 }

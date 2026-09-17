@@ -128,13 +128,18 @@ llm_client: 状态 → READY：会话就绪          ← 服务端 session.ready
 
 **仍未闭环（下一轮）**：
 
-1. **服务端 `conflict` + 重连期 WDT**：设备拿到 `session.ready` 后立刻收到
-   `error{code:"conflict", msg:"another session is active for this device"}`，随后服务端关闭连接、
-   客户端重连；重连路径上仍会 `Interrupt wdt timeout on CPU1`。
-   原因方向：① 设备**硬复位**（RTS）不产生 TCP FIN ⇒ chatd 侧注册表里的旧会话要等 TCP 超时才释放，
-   下一轮建议给 chatd 加"会话空闲/接管"策略（契约 §6 已有 conflict 语义，属于健壮性增强）；
-   ② 重连时序需要再收敛（例如在 `WEBSOCKET_EVENT_DISCONNECTED` 后显式延迟再让组件重连）。
-2. 台面自检轮（`ONEYE_LLM_SELFTEST_TURN_MS`）尚未实跑到 `asr.final/tts/turn.end` —— 被上面的重连问题挡住。
+1. **建 WebSocket 客户端时 `Interrupt wdt timeout on CPU1`**（本轮末稳定复现 3/3）：
+   串口在 `websocket_client: Started` 后 ~5 ms 内报 panic；`addr2line` 解码两核寄存器 dump 显示
+   两个核都在**正常阻塞**状态（Core 1 = `link_report_task` 卡在 `xQueueReceive`、Core 0 = idle
+   `esp_cpu_wait_for_intr`）⇒ 属"关中断期过长"型 WDT，触发者不在被 dump 的任务里（疑在 Wi-Fi ISR /
+   关 cache 窗口）。已排除/已试：`SPIRAM_TRY_ALLOCATE_WIFI_LWIP=n`、`ESP_INT_WDT_TIMEOUT_MS=1000`、
+   Wi-Fi 省电 `WIFI_PS_NONE`、把发起连接的任务栈压到 4096（保持内部 RAM）、关闭组件自动重连、
+   把我们自己的 supervisor/保活任务挪出（只保留 ping）。
+   **建议下一步**：① 打开 `esp_coredump`（flash 分区 + `idf.py coredump-info`）抓真实故障点；
+   ② 用最小 IDF 工程（仅 Wi-Fi + `esp_websocket_client`）复现，判定是组件/IDF 与该板配置的交互；
+   ③ 反查 PSRAM/关 cache 相关项（`SPIRAM_FETCH_INSTRUCTIONS`/`RODATA`、`SPIRAM_MALLOC_ALWAYSINTERNAL`）。
+2. chatd 侧 `conflict` 已修好并单测覆盖（见 backend `Registry` 陈旧会话接管 + WS 层 ping/读超时），
+   待上面 WDT 解决后再验一次"设备端到端一轮"（`ONEYE_LLM_SELFTEST_TURN_MS` 自动收音已在固件里就绪）。
 
 
 

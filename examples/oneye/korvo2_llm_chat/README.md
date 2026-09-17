@@ -480,10 +480,51 @@ SET 键单击 → `conv.new` → `conv.state{reason:"new"}`（新段不继承旧
 | 现象 | 第 2 层修完后、`prov.pair.ok` 发出后约 7 ms：`Interrupt wdt timeout on CPU0`；反解调用栈 = `esp_websocket_client_task → ws_poll_read → esp_transport_poll_read → lwip_select → sys_arch_sem_wait → xQueueSemaphoreTake → spinlock_acquire → esp_cpu_compare_and_set` ⇒ **WS 任务的信号量自旋锁被占死/踩坏**，关中断自旋触发中断看门狗 |
 | 机制 | `oneye_dev_ble.c:124 ble_tx_frame()` 里两个局部数组：`framed[12288+64]` + `out[12288+128]` ⇒ **单次调用栈需求 ≈24.7 KB**，而它在主机任务里被调用（第 1 层已把该栈提到 12 KB，仍差 ~12 KB）⇒ 溢出砸向相邻堆对象（正是 WS 客户端的 socket 信号量）——**与"`link_report_task` 4 KB 栈溢出踩坏自旋锁"同一形态**，只是这次在 SDK 发送路径 |
 | 修复 | 两缓冲改为**堆分配**（单一出口释放；`len` 超限先挡再分配）。不走 `static` 是因为静态化 = 24 KB `.bss`（内部 RAM 紧张，会挤掉音频管线）。大分配按 `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096` 落 PSRAM；发送是低频操作 |
-| 验收 | 待跑：重建 SDK 预编译库（`build-all.sh`）→ 重编例程 → 重跑 `_tmp-ble-e2e.ps1`，期望**无断言**且收到 `prov.status` |
+| 验收 | ✅ 已跑（本轮）：重建 SDK 预编译库 → 重编例程 → 重跑 `_tmp-ble-e2e.ps1`；`prov.pair.ok` 成功回帧（PC 侧收到**明文最后一帧**）——第 3 层修复生效，随即暴露第 4 层（见下） |
+
+**第 4 层：收帧→回包路径上 `oneye_dev_link_frame_t` 三份栈副本 ≈7 KB → 主机任务栈再次踩穿（本轮修复并端到端验收）**
+
+| 项 | 内容 |
+| --- | --- |
+| 现象 | 第 3 层修完后：`prov.pair.ok` 正常回帧；紧接着手机侧发**首个密文帧** `link.ping`（166 B）——串口只有 `RX 写入 166 B（头 00 03 00 a2）`，**没有** `RX 回调返回` 那一行 ⇒ `Guru Meditation Error: Core 0 panic'ed (Unhandled debug exception)` / `Debug exception reason: Stack canary watchpoint triggered (nimble_host)` |
+| 反解 | `xtensa-esp32s3-elf-addr2line`：`ble_on_rx → ble_handle_plain → oneye_dev_link_inject_frame → oneye_dev_link_send → oneye_link_frame_build_simple`（最内层即崩点） |
+| 机制 | `oneye_dev_link_frame_t` 内嵌 `char p[ONEYE_DEV_LINK_PAYLOAD_MAX + 1]`（≈2 KB），**单份栈副本 ≈2.3 KB**；而这条"解密 → 分发 → 回包"路径上原有**三份**：`ble_handle_plain()` 解析一份、`oneye_dev_link_inject_frame()` 解析一份、`oneye_link_frame_build_simple()` 组回包再一份 ⇒ ≈7 KB，叠加 NimBLE 主机调用链（`ble_hs → ble_att_svr → gatt_rx_access`，其中 `chunk[600]`）与 mbedTLS GCM 解密上下文，**超出 12 KB** ⇒ 栈金丝雀被踩 |
+| 为何明文阶段不崩 | `prov.pair.ok` 由 `oneye_dev_ble.c` 直接调 `ble_tx_frame()` 回复，**绕开** `oneye_link_frame_build_simple()`；只有走通用回包路径的**首个密文帧**才把第三份压上栈 —— 所以"明文能配对、一加密就崩"看起来像加密问题，实际是栈问题 |
+| 修复 | ① `oneye_link_frame_build_simple()` 不再在栈上放结构体：抽出**按字段直写**的 `frame_write()`（`oneye_link_frame_build()` 与 `build_simple()` 共用，零结构体、零堆）；② `oneye_dev_link_inject_frame()` 的解析结构体改**堆分配**（沿用本文件既有"公共 API 大缓冲走堆"先例）；③ `ble_handle_plain()` 拆成「堆分配包装 + 实现体」，栈上不再放第三份 |
+| 语义收紧 | `frame_write()` 对超长 `p_json`：由旧实现的 `strlcpy` **静默截断**（截断后不是合法 JSON 对象，属潜在缺陷）改为**直接返回 0 拒绝**；调用方 `oneye_dev_link_send()` 本就先挡超长 |
+| 自诊断（本轮加） | 平台层 `RX 回调返回` 探针追加 `nimble_host 栈历史最低余量 %u B`：修复后两次独立跑实测 `9032/8296 → **4808** B`（另一次 `9036/8300 → 4892 B`），即最重路径稳定用掉 12 KB 中的 ≈7.3~7.5 KB —— 与"三份结构体 ≈7 KB 会溢出"的推断**数量级吻合** |
+| 副产品教训 | 该探针**别提"任务栈总长"**：`CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE` 在 SDK **预编译库**里是 SDK 构建时的默认值（实测 4096），而设备实际任务栈由**应用侧** sdkconfig 决定（12288）——曾把它打成"栈共 4096 B"，与 `余量 9036 B` 自相矛盾（同一类"`CONFIG_*` 跨翻译单元不一致"陷阱，见本文件的平台判定注释） |
+| 验收 | ✅ 三层跳全通（见 §7.1.11），0 断言、0 复位 |
 
 **复现与取证脚本**：`E:\workspace\_tmp-ble-e2e.ps1`（纯 ASCII：复位抓 POP → 无复位抓串口 → bleak 驱动配网 → 按 ASCII 关键字 grep 现场）。
 **注意**：早期版本的同类脚本用中文 grep 模式，在 PS 5.1（GBK 解码）下全部变成乱码、**静默匹配不到任何行** —— 这也是本轮之前"看不出线索"的原因之一。
+
+### 7.1.11 ✅ BLE 配网端到端首次跑通：手机侧协议等价实现 ⇄ 设备（2026-09-17 第 48 轮）
+
+> 意义：BLE 配网此前只在 Android 代码里、**从未上机验证**。本节是"PC 侧以协议层等价方式（Python + bleak，
+> 模拟手机 GATT 客户端）跑通全链路"的取证。脚本 = `embedded/esp-adf/components/oneye-dev-sdk/tools/ble_prov_e2e.py`；
+> 现场驱动 = `E:\workspace\_tmp-ble-e2e.ps1`（复位抓 POP → 无复位抓串口 → bleak 驱动 → ASCII 关键字 grep → 判定）。
+
+三段跳（脚本逐跳打印机器可读的 `HOPx_*=PASS|FAIL`，避免按中文文案/帧名正则判定）：
+
+| 跳 | PC 侧（脚本输出） | 设备侧（串口现场） |
+| --- | --- | --- |
+| ① 明文配对 | `→ prov.hello（明文 135 B）`、`→ prov.pair（明文 121 B）` ⇒ `HOP1_PLAINTEXT_PAIR=PASS`；`✅ prov.pair.ok：{"node_id":"esp32s3korvo2","enc":"aes-128-gcm","ttl_s":300}` | `RX 写入 135 B → 回调 0`、`RX 写入 121 B → 回调 0`（栈历史最低余量 9036 / 8300 B） |
+| ② 密文往返（不动凭据） | `🔑 HKDF-SHA256(ikm=POP, salt=esp32s3korvo2, info=oneye-link-v1) → 16 B`；`→ link.ping（密文 166 B ctr=0）` ⇒ `HOP2_ENCRYPTED_ROUNDTRIP=PASS`；`✅ link.pong：nonce='app-e2e-1789645769278'`（**与发出值一致**） | `RX 写入 166 B → 回调 0`；`NimBLE: GATT procedure initiated: notify; att_handle=18`（栈历史最低余量 **4808 B**，即最重路径用掉 12 KB 中的 ≈7.5 KB） |
+| ③ 下发凭据 | `→ prov.connect.req（密文 180 B ctr=1）` ⇒ `HOP3_CREDENTIALS=PASS`；`✅ prov.status：{"state":"connecting","ssid":"wanya","ip":"","source":"ble","err":""}` | `prov_service: BLE 通道下发凭据（ssid=wanya；密码不打印）` → `prov_service: 已联网：ssid=wanya ip=192.168.110.80 **source=ble**` → `配网上报完成 state=5` |
+
+- 总判定：`BLE_E2E=PASS`、`bleak_exit_code=0`、`device_assert_seen=False`、`device_reset_count_in_window=0`。
+- **跨实现密码学实证**：PC 侧用 `cryptography`（HKDF-SHA256 + AES-128-GCM）与设备侧 mbedTLS 实现**双向密文互通**——
+  ② 的 `link.pong` 既被我们解开、其 `nonce` 又与发出值一致 ⇒ **两个方向都验证过**（设备解开我们的密文、我们解开设备的密文），
+  会话密钥以设备回报的 `node_id` 作 HKDF salt 派生（不靠猜）。这同时**反证**了"配对后强制加密"的口径：
+  此前配对后发明文的表现是 `RX 回调返回 -2`（= `ONEYE_BLE_PAIR_ERR_CRYPT`，解密失败）且**不回任何错帧**，对外只像"没反应"。
+- **凭据真的生效（不是协议层自嗨）**：设备联网来源由 `source=kconfig` 变为 `source=ble`，即 WiFi 凭据确实由 BLE 下发并应用。
+- 脚本自检：上机前先做**原始向量自检**（HKDF = RFC 5869 TC1、AES-128-GCM = NIST TC1/TC2），原语不真就拒绝上机。
+- 判定纪律：**外部脚本不得按帧名正则判成功**——失败文案里也含帧名（如 `未收到 link.pong`），现场脚本曾把 FAIL 读成 PASS。
+
+**尚未取证（诚实登记）**：Android 真机（`:sdk-android` 的 `BleLinkClient`）走同一条链路未上机；iOS 未建；设备侧"连续 3 次
+解密失败 → 解除配对"规则未做故障注入实测；`--assume-paired`（设备**未复位**仍是已配对态的重连路径）未实测；
+`prov.status` 的 `connected` 终态只有设备侧 `配网上报完成 state=5` 佐证（脚本按首个 `prov.status` 即返回）。
 
 ### 7.1.9 设备 SN 对齐（`esp32s3korvo2`）+ 10 段上限实测（2026-09-17 续）
 

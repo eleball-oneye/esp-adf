@@ -141,7 +141,42 @@ llm_client: 状态 → READY：会话就绪          ← 服务端 session.ready
 2. chatd 侧 `conflict` 已修好并单测覆盖（见 backend `Registry` 陈旧会话接管 + WS 层 ping/读超时），
    待上面 WDT 解决后再验一次"设备端到端一轮"（`ONEYE_LLM_SELFTEST_TURN_MS` 自动收音已在固件里就绪）。
 
-**第 6 轮结论（关键，含环境侧真相）**
+**第 7 轮取证：上行链路已在真机跑起来（下面是从开机到 LISTENING 的实录）**
+
+```
+[diag] HTTP GET http://192.168.110.208:9091/healthz → ESP_OK（status=200）
+websocket_client: Started → 状态 → SESSION_START：已连接，发 session.start
+状态 → READY：会话就绪                       ← 服务端 session.ready
+[selftest] 自动收音 3000 ms（台面自检，非按键路径）
+MODEL_LOADER: Successfully load srmodels     ← model 分区生效
+ALGORITHM_STREAM: Load: nsnet2
+AFE: AFE Version: (1MIC_V250121)
+AFE: Input PCM Config: total 2 channels(1 microphone, 1 playback), sample rate:16000
+AFE: AFE Pipeline: [input] -> |AEC(VOIP_LOW_COST)| -> |NS(nsnet2)| -> [output]
+AUDIO_PIPELINE: Pipeline started
+voice_io: 采集开始（每帧 1920 B = 60 ms @16 kHz/16 bit/单声道）
+llm_client: 状态 → LISTENING
+```
+
+⇒ 复现了例程目标前半段：**联网 → 会话就绪 → AFE（AEC+NS）启动 → 60 ms/帧上行收音**。
+
+**本轮修掉的关键问题：保活/读超时导致的"重复连接"噪声**
+`esp_websocket_client` 的 `network_timeout_ms` 被当作 **socket 读超时**：会话就绪后若一段时间没有下行数据，
+组件判"读失败"并重连 ⇒ 服务端按契约（每设备并发 1）把第二条连接拒为 `conflict` 并关闭 ⇒ 设备再重连，
+形成噪声循环（现象：`session.ready` 后 ~4 ms 收到 `conflict`）。处置：读超时 8 s → **15 s**，
+打开**协议层 ping**（`ping_interval_sec=10`，服务端 gorilla 自动回 pong），应用层契约帧 `ping` 放到 20 s。
+修复后该轮已能稳定走到 `LISTENING`。
+
+**仍未闭环：周期性 WDT 复位（本轮新结论）**
+
+串口捕获到复位原因 `rst:0x7 (TG0WDT_SYS_RST)` + `PRO/APP CPU has been reset by WDT`
+（`CONFIG_ESP_INT_WDT=n` 时不再打印 panic，改为硬件 WDT 静默复位），间隔约 7–20 s，
+足以打断"收音 3 s → 提交 → 服务端返回"这一轮（自检轮常被复位截断）。
+下一步：**打开 `CONFIG_ESP_TASK_WDT_PANIC=y`** 让任务看门狗打印"哪些任务没喂狗"
+（TG0 通常对应 Task WDT / idle 任务饥饿），据此定位是哪个高优先级任务长期不让出 CPU
+（嫌疑：WS 重连循环、AFE 管线任务、或我们自己的 supervisor/watchdog 任务）。
+
+
 
 1. **联调环境侧真相：Windows 防火墙按"程序完整路径"放行**。本机入站规则只对**历史出现过的
    chatd.exe 路径**放行（如 `%LOCALAPPDATA%\go-build\<hash>\chatd.exe`）；用 `go run`（每次新临时路径）

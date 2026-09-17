@@ -65,7 +65,8 @@ static TaskHandle_t s_ka_task;
 static bool s_ka_run;
 
 /* 连接守护（重连退避 + 保活）用的状态：事件回调里也要用，故声明在文件前部 */
-#define LLM_PING_MS      10000 /* 应用层 ping 周期（服务端据此刷新"会话活跃"判据） */
+#define LLM_PING_MS      20000 /* 应用层契约帧 ping（服务端据此刷新"会话活跃/陈旧"判据）；
+                                * 协议层 ping 由组件按 ping_interval_sec=10 s 负责 */
 #define LLM_BACKOFF_MS   5000  /* 普通断开后的重连退避 */
 #define LLM_CONFLICT_MS  30000 /* 并发冲突后的重连退避（等服务端接管陈旧会话） */
 static volatile int64_t s_reconnect_at_ms;
@@ -506,7 +507,18 @@ esp_err_t llm_client_start(void)
     cfg.task_stack = 8192;
     cfg.buffer_size = 4096;
     cfg.reconnect_timeout_ms = 3000;
-    cfg.network_timeout_ms = 8000;
+    /*
+     * 空闲与保活（真机取证 2026-09-17，重要）：
+     * `network_timeout_ms` 被组件当作 **socket 读超时**；会话就绪后若这段时间没有下行数据，
+     * 组件会判"读失败"并**重连**，于是服务端看到"同一 device_id 的第二条连接"（按契约并发 1
+     * 被拒为 conflict），设备再重连，形成噪声循环。处置：
+     *   ① 读超时放宽到 15 s；
+     *   ② 打开**协议层 ping**（组件自动收发，服务端 gorilla 自动回 pong）作为持续活跃信号；
+     *   ③ 应用层契约帧 `ping` 周期放在 20 s（服务端只用它刷新"会话活跃/陈旧"判据）。
+     */
+    cfg.network_timeout_ms = 15000;
+    cfg.ping_interval_sec = 10;
+    cfg.pingpong_timeout_sec = 0;
     /*
      * 重连交给组件自动重连（`disable_auto_reconnect = false`）：
      *   真机取证 2026-09-17：自管重连（关掉它 + 自己 start）在**首次连接**阶段即稳定触发

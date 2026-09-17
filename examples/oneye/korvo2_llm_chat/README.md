@@ -671,7 +671,10 @@ python tools/lan_link_e2e.py --target 192.168.110.80   # 广播被 AP 隔离时�
 `LinkContract.Lan` 常量与同一帧面），**手机真机上的 lan 链路仍未上机**；② **带令牌**的帧面路径未覆盖
 （令牌由 BLE 配对协商，本轮未取；属手机侧真机项）；③ 限流（≤20 帧/s）与 60 s 幂等窗口未测。
 
-### 7.1.15 ❌ 未闭环：lan 帧面 `link.ping` 会**偶发把设备打重启**（2026-09-17，根因待续）
+### 7.1.15 ✅ 已闭环：lan 帧面 `link.ping` 会把设备打重启（真根因＝例程 httpd 栈 6 KB 不够）（2026-09-17）
+
+**结论先说**：根因是 `lan_link.c` 里 `hcfg.stack_size = 6144` 对"HTTP 帧面 → SDK 组帧"这条链**不够**；
+改为 **8192** 后 **20 轮回归全 PASS、0 次重启**。修复提交见本仓 `lan_link.c` 注释（含取值依据）。
 
 **现象**（PC 侧 `lan_link_e2e.py` 暴露）：单次探测**通常 PASS**，但**重复请求**下设备重启，标记
 `LAN_PING=FAIL`（HTTP 0 / 超时），串口出现：
@@ -691,11 +694,20 @@ oneye_link_frame_build_simple → oneye_dev_link_send → link_dispatch →
 oneye_dev_link_inject_frame → frame_post_handler (lan_link.c:181) → httpd_uri → … → httpd_thread
 ```
 
-**已排除 / 已确认**：
-1. **不是"httpd 栈只是偏小"**：把 `CONFIG_HTTPD_STACK_SIZE` 依次设成 **4096（IDF 默认）/8192/16384/32768**
-   压测（每档 8~20 轮、每轮 发现+ping+守卫），**四档都能复现**；32 KB 反而更频繁（15 轮全崩）⇒ 指向
-   **内存越界破坏 httpd 栈金丝雀 / 布局敏感**，而非单纯深度不够。⇒ 已把该配置从 `sdkconfig.defaults`
-   **移除**（不写死未经证实的值）。
+**根因与**订正（重要，含一轮**被自己推翻的错误结论**）：
+1. **第一轮的错误结论**：曾按"httpd 栈偏小"去调 `CONFIG_HTTPD_STACK_SIZE`（4096/8192/16384/32768），
+   见"四档都能复现、32 KB 更频繁"，据此推测是内存越界破坏栈金丝雀，并把这个配置从 `sdkconfig.defaults`
+   移除。**该实验全部无效** —— IDF v5.5 的 `HTTPD_DEFAULT_CONFIG()` 里 `.stack_size` 是**写死的 4096**
+   （根本不读该 Kconfig），而 `lan_link.c` 又显式 `hcfg.stack_size = 6144` 覆盖了宏值 ⇒ 那四档从未生效，
+   "越调越糟"只是同一缺陷在不同编译产物上的**随机复现**。
+2. **真正生效的旋钮**是例程里的 `hcfg.stack_size`：`6144 → 8192` 后压测 **20/20 PASS、0 次
+   `stack overflow in task httpd`、0 次 `Guru`/`rst:0xc`**（同一命令：`python tools/lan_link_e2e.py --rounds 20`
+   ⇒ `LAN_STRESS=PASS`）；设备全程在线未重启。
+3. 该链为什么这么重：`httpd → frame_post_handler` → `oneye_dev_link_inject_frame` → `link_dispatch`
+   → `oneye_dev_link_send` → `oneye_link_frame_build_simple` → `jsonw_fmt(vsnprintf)`，
+   其中 SDK 的帧结构 **≈2.3 KB/帧**（历史上已在 SDK 内把两处 8 KB 栈缓冲改堆分配），叠加 newlib `vsnprintf`
+   的 alloca。⇒ **若日后内部 RAM 更紧，正确做法是"降需求"**（把 SDK 组帧路径的大对象继续下移堆分配，
+   或把帧面处理移到独立任务），**不要**压回 6144。
 2. **不是发送端组帧的 8 KB 栈缓冲**：`oneye_dev_link_send` 早已改堆分配（SDK 内注释记录了同类历史修复）；
    文件里仅剩的 8 KB 栈缓冲在 **WAN 收线程**（`link_wan_thread` 的 `acc[]`），不在本次调用链上。
 3. **崩溃只发生在"帧面 POST"这条链**：同一设备的 UDP **发现**路径在压测中 47 次应答全部正常
@@ -711,8 +723,18 @@ oneye_dev_link_inject_frame → frame_post_handler (lan_link.c:181) → httpd_ur
 3. 结构上更稳的改法：让 **LAN 帧面不在 httpd 任务上做 SDK 注入** —— 例程侧用一条**专用任务（大栈）**
    处理 `POST /api/link/frame`，httpd 只搬运请求/应答（这也是把 SDK 的栈需求与 httpd 解耦）。
 
-**当前口径（不要误用）**：lan 信道**只有"发现"路径可用于验收**；帧面（`POST /api/link/frame`）在缺陷
-闭环前**不要**作为验收依据 —— 契约 `contracts/local/lan-link.md` §2 的"取证"注解已同步标注该限制。
+**回归口径（可复跑，一条命令）**：
+
+```bash
+python tools/lan_link_e2e.py --rounds 20     # 期望：LAN_STRESS=PASS（含发现/无凭据/ping/无令牌守卫 4 项）
+```
+
+> 为什么要 20 轮：本缺陷**单次往往通过、重复才崩** —— 单轮 PASS **不构成**"已修"的证据。
+> 若日后回归出现 `LAN_STRESS=FAIL` 且串口伴随 `stack overflow in task httpd` / `Guru`，
+> 先看 `lan_link.c` 的 `hcfg.stack_size`，再看 SDK 组帧路径的栈需求变化。
+
+**遗留（仍属待验收，与本缺陷无关）**：带令牌的帧面路径（令牌由 BLE 配对协商，本轮未取）、
+限流 ≤20 帧/s 与 60 s 幂等窗口未测、**手机真机上机**未做。
 
 ## 8. 合规
 

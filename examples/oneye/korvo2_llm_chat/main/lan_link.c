@@ -232,10 +232,21 @@ esp_err_t lan_link_init(const lan_link_config_t *cfg)
     httpd_config_t hcfg = HTTPD_DEFAULT_CONFIG();
     hcfg.server_port = cfg->http_port;
     hcfg.max_uri_handlers = 4;
-    /* 6 KB：本处理函数经 `oneye_dev_link_inject_frame()` 进 SDK 的组帧/发送路径；
-     * **不要**再按"组帧要 8 KB 栈"来放大（该缺陷已于 oneye-dev-sdk 53c337c 改为堆分配）——
-     * 真机取证 2026-09-17：BLE(NimBLE) 起来后内部 RAM 紧张，12 KB 级任务栈会创建失败。 */
-    hcfg.stack_size = 6144;
+    /* HTTP 帧面任务栈：本处理函数经 `oneye_dev_link_inject_frame()` 进 SDK 的组帧/发送路径
+     * （`link_dispatch` → `oneye_dev_link_send` → `oneye_link_frame_build_simple` → `jsonw_fmt`
+     *  → `vsnprintf`），实测**这条链比看上去重**。
+     *
+     * 真机取证（2026-09-17，两轮）：
+     *   ① 6144（上一版值）**不够** —— 重复 `POST /api/link/frame`（`link.ping`）会把 httpd 栈撞穿：
+     *      `***ERROR*** A stack overflow in task httpd has been detected.` / 无金丝雀时
+     *      `Guru Meditation … (Double exception)` + 回溯含 `_xt_alloca_exc` ⇒ 设备重启；
+     *   ② **调 `CONFIG_HTTPD_STACK_SIZE` 无效**：IDF v5.5 的 `HTTPD_DEFAULT_CONFIG()` 里
+     *      `.stack_size` 是**写死的 4096**（不读该 Kconfig），而下面这行又覆盖了宏值 ⇒
+     *      配置项与该任务栈无关（上一轮据此做的四档实验是无效的，已在 README §7.1.15 订正）。
+     *
+     * 取值依据：+2 KB 内部 RAM 换掉"偶发打重启"。若日后内部 RAM 更紧，正确做法是**降需求**
+     * （把 SDK 组帧路径的 ≈2.3 KB/帧 结构下移堆分配，或把帧面处理移到独立任务），而不是压回 6144。 */
+    hcfg.stack_size = 8192;
     hcfg.lru_purge_enable = true;
     if (httpd_start(&s_httpd, &hcfg) != ESP_OK) {
         ESP_LOGE(TAG, "HTTP 服务启动失败（端口 %u）", (unsigned)cfg->http_port);

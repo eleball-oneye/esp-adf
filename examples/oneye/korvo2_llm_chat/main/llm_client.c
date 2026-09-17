@@ -509,15 +509,18 @@ esp_err_t llm_client_start(void)
     /*
      * 栈与缓冲都**必须落在内部 RAM**（真机取证 2026-09-17）：
      *   本工程开了 `CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY` 且
-     *   `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096`（>阈值才走 PSRAM），
-     *   若把 WebSocket 任务栈设成 6144、缓冲 4096，二者都会被分配到 PSRAM，
+     *   `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096`（**小于**阈值才走内部 RAM），
+     *   若把 WebSocket 任务栈设成 6144/8192、缓冲 4096，二者都会被分配到 PSRAM，
      *   而 Wi-Fi 中断/关 cache 期间跑在 PSRAM 栈上的任务会让中断看门狗超时：
      *     `Guru Meditation Error: Core 0 panic'ed (Interrupt wdt timeout on CPU0)`
-     *   （实测：连上 Wi-Fi、开始 connect 到服务端时立即复现）。
-     *   ⇒ 栈取 3584（<阈值）、缓冲取 2048，两者都在内部 RAM。
+     *   另外 BLE 配网打开后内部 RAM 更紧（BLE controller + NimBLE host 约占数十 KB），
+     *   8192 栈会直接创建失败（真机取证 2026-09-17，BLE 打开时）：
+     *     `E websocket_client: Error create websocket task` → `WebSocket 启动失败：ESP_FAIL`
+     *   ⇒ 栈取 **3584**（< 4096 阈值，落内部 RAM）、缓冲取 **2048**，两者都在内部 RAM；
+     *     这也是 BLE 关闭档下实测可用的组合（关闭档曾短暂用过 8192/4096，BLE 打开后不再可行）。
      */
-    cfg.task_stack = 8192;
-    cfg.buffer_size = 4096;
+    cfg.task_stack = 3584;
+    cfg.buffer_size = 2048;
     cfg.reconnect_timeout_ms = 3000;
     /*
      * 空闲与保活（真机取证 2026-09-17，重要）：

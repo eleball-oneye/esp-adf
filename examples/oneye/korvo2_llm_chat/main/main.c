@@ -63,6 +63,13 @@ static void selftest_task(void *arg)
     vTaskDelay(pdMS_TO_TICKS(3000));
     panel_min_note("[selftest] 自动收音 %d ms（台面自检，非按键路径）",
                    CONFIG_ONEYE_LLM_SELFTEST_TURN_MS);
+    /* 内存取证（BLE 配网打开后内部 RAM 明显变紧，音频管线会被挤掉）：
+     * 打开 BLE 后实测过 `E voice_io: I2S 读元素创建失败` → 采集启动失败，
+     * 因此每次采集前把"内部 RAM / PSRAM 余量"打出来，便于判定要腾哪一侧。 */
+    panel_min_note("[selftest] 采集前内存：内部余 %u B / 总余 %u B / 最大块 %u B",
+                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                   (unsigned)esp_get_free_heap_size(),
+                   (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     if (voice_io_capture_start(pcm_uplink_cb, NULL) != ESP_OK) {
         panel_min_note("[selftest] 采集启动失败");
         vTaskDelete(NULL);

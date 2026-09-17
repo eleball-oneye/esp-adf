@@ -62,7 +62,22 @@ CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
 CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=517
 CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
 CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=4096
-CONFIG_BT_NIMBLE_MSYS1_BLOCK_COUNT=24
+# NimBLE MSYS 内存池是**内部 RAM 里的静态数组**，默认 24/24 会在 BLE 打开后把内部 RAM 吃紧，
+# 进而挤掉音频管线（真机取证 2026-09-17：BLE 打开时出现 `E voice_io: I2S 读元素创建失败`
+# → `采集任务创建失败` → 自检轮无法收音）。本工程 BLE 只跑配网（帧 ≤600 B 分片），12/12 足够。
+CONFIG_BT_NIMBLE_MSYS1_BLOCK_COUNT=12
+CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=12
+CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=12
+# NimBLE **主机侧**分配改走 PSRAM，给音频管线腾内部 RAM（控制器侧仍在内部 RAM）。
+# 真机取证 2026-09-17：改这一项后，采集前内部余量 42,655 B（最大块 25,600 B）
+# → 56,051 B（最大块 31,744 B），音频管线随即恢复正常。
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
+
+# ------------------------------------------------------------------ Wi-Fi 内部 RAM 预算（与 BLE + AFE 共存）
+# 静态/动态接收缓冲都是连续的内部 RAM（1600 B/块）：16+32 块 ≈ 77 KB。
+# 本工程的语音上行只有 64 KB/s，8+16 块足够；腾出的连续内部块留给 I2S/AFE。
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
 
 # ------------------------------------------------------------------ 文件系统（凭据文件兜底）
 CONFIG_FATFS_CODEPAGE_936=y

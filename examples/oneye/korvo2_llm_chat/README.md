@@ -176,7 +176,65 @@ panel: [panel] 本轮结束：turn_seq=2 rtt=531 ms
 > （差一个 ADC 扫描周期 + 事件投递延迟），所以该打印值可能略小于阈值 —— 属正常误差，不代表阈值失效。
 > 已把这条口径写进 `key_talk.c` 的日志与注释（日志文案改动，未重新烧写）。
 
-### 7.1.3 根因：`link_report_task` 栈溢出踩坏自旋锁 → CPU1 中断看门狗（第 8 轮定位并修复）
+### 7.1.3 ✅ BLE 配网在真机上初始化成功（第 9 轮：GATT 注册 + 广播 + POP）
+
+第 2 轮只是"让预编译库带上 NimBLE 符号"，设备侧仍停在 `oneye_dev_ble_init=-4`。第 9 轮定位到真正根因并修复：
+
+**根因（两层，缺一不可）**
+
+1. **`access_cb = NULL` 违反 NimBLE 的 GATT 定义校验**（真机日志 `E NimBLE: ble_gatts_count_resources rc=3`）：
+   `rc=3` 是 **`BLE_HS_EINVAL`**，不是 ENOMEM —— NimBLE 用类 errno 编号
+   （`EAGAIN=1 / EALREADY=2 / **EINVAL=3** / EMSGSIZE=4 / ENOENT=5 / ENOMEM=6`，见 `host/ble_hs.h`），
+   而 `ble_gatts_chr_is_sane()` 明确要求 `chr->access_cb != NULL`。自研 GATT 里 Dev→App 的
+   **notify 特征**（只发不收）留了 `access_cb = NULL` ⇒ 计数阶段就失败。
+   处置：给该特征一个显式回调 `gatt_tx_access()`（回 `BLE_ATT_ERR_UNLIKELY`；因为 flags 只有 NOTIFY，
+   ATT 层不会把读/写路由到这里，回调实际不可达）。
+   ⚠️ 早期把 `rc=3` 当 ENOMEM 排查（资源上限/内存不足）方向全错。
+2. **例程链接的是预编译库**（`components/oneye-dev-sdk/CMakeLists.txt`：`if(EXISTS lib/<toolchain>/*.a)`），
+   所以改源码后必须**重新生成库**才生效：
+   `IDF_ROOT=$HOME/esp ./build-all.sh --toolchains esp32s3@5.5.5`（`lib/**` 是 gitignore，不入库）。
+
+**随之修掉的两个 BLE 侧问题**
+
+| 现象 | 根因 | 处置 |
+| --- | --- | --- |
+| `W oneye_ble: adv fields rc=4` | 广播载荷 33 B > 传统广播 31 B 上限（flags 3 + 128 bit UUID 18 + 设备名 12） | 广播数据只放 flags + 128 bit 服务 UUID；**设备名改放扫描响应**（`ble_gap_adv_rsp_set_fields`） |
+| `E websocket_client: Error create websocket task` → `WebSocket 启动失败` | BLE 打开后内部 RAM 变紧，WS 任务栈 8192 创建失败 | WS 任务栈 **3584** / 缓冲 **2048**（都 < `SPIRAM_MALLOC_ALWAYSINTERNAL=4096`，落内部 RAM） |
+
+**BLE + 语音闭环共存的内存预算（本轮关键取舍）**
+
+打开 BLE 后音频管线被挤掉（`E voice_io: I2S 读元素创建失败` → `采集任务创建失败` → 自检轮无法收音）。
+按"采集前内存取证"逐项腾内部 RAM：
+
+| 阶段 | 内部余量 | 最大连续块 | 结果 |
+| --- | --- | --- | --- |
+| 仅改 WS 栈/广播拆分 | 42,655 B | 25,600 B | ❌ 采集任务创建失败 |
+| ＋NimBLE 主机侧分配改 PSRAM | 56,051 B（PSRAM 8.4 MB） | 31,744 B | ✅ 采集/播放/AFE 全通 |
+
+配套默认值（已进 `sdkconfig.defaults`）：`BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y`、
+`MSYS1/MSYS_1/MSYS_2_BLOCK_COUNT=12`（原 24）、`ESP_WIFI_STATIC_RX_BUFFER_NUM=8`（原 16）、
+`ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16`（原 32）。
+
+**真机实录（BLE 配网与语音闭环同时开启）**
+
+```
+I (1355) oneye_ble: GATT 服务已注册（RX 句柄=0 TX 句柄=0，MTU 期望 247）
+I (1376) NimBLE: GAP procedure initiated: advertise;
+[oneye][ble] 配网配对码 POP=187078（300 s 内有效）
+I (1389) prov_service: BLE 配网已就绪（未配网时会以 ONEYE-<id 后 4 位> 广播；POP 在 start 时打印）
+I (3568) llm_client: 状态 → SESSION_START：已连接，发 session.start
+I (3748) llm_client: 状态 → READY：会话就绪
+I (6750) panel: [selftest] 采集前内存：内部余 56051 B / 总余 8403271 B / 最大块 31744 B
+I (6977) voice_io: 采集开始（每帧 1920 B = 60 ms @16 kHz/16 bit/单声道）
+I (10325) voice_io: 采集任务退出（累计 78720 B）
+I (10807) llm_client: 状态 → SPEAKING
+I (13382) panel: [panel] 本轮结束：turn_seq=1 rtt=438 ms
+```
+
+**仍未做**：手机侧（`mobile/Android`）真机连这个 GATT 服务走完 POP 配对 + 下发 Wi-Fi 凭据的端到端流程
+（本机缺 JDK/Gradle/Android SDK，见 `mobile/README.md` 的"待验收（缺工具链）"清单）。
+
+### 7.1.4 根因：`link_report_task` 栈溢出踩坏自旋锁 → CPU1 中断看门狗（第 8 轮定位并修复）
 
 第 7 轮及以前把周期性复位判成"平台级关中断停顿、与例程逻辑无关"，**是错的**。第 8 轮用
 `xtensa-esp32s3-elf-addr2line` 解码 panic 的两核 dump 后定位到明确的应用侧根因：
@@ -214,13 +272,13 @@ Backtrace: 0x4037ae8c 0x4037f3f9 0x4037eddf 0x4200f831 0x4037f1ad
 
 1. `xTaskCreate(prov_boot, 16 KB)` 直接失败 → 设备停在 BOOT。BLE(NimBLE) 真起来后内部 RAM 紧张，
    12/16 KB 任务栈创建失败；且 SDK 组帧已改堆分配（不再需要大栈）⇒ 配网任务降到 6 KB、
-   httpd 6 KB。⚠️ **当时把上报任务一起压到 4 KB 是错误的**（见 §7.1.3 根因），现已回到 12 KB。
+   httpd 6 KB。⚠️ **当时把上报任务一起压到 4 KB 是错误的**（见 §7.1.4 根因），现已回到 12 KB。
 2. `esp_wifi_start()` 与 `set_config/disconnect/connect` 挤在同一任务里连调 → 触发
    `Interrupt wdt timeout`（串口先报 `E wifi:sta is connecting, return error`）；
    改为**初始化阶段就 start**，配网只做 set_config + connect；另把
    `CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP` 置 n（Wi-Fi/lwIP 缓冲留内部 RAM）。
 
-### 7.1.4 第 7 轮已修：保活/读超时导致的"重复连接"噪声
+### 7.1.5 第 7 轮已修：保活/读超时导致的"重复连接"噪声
 
 `esp_websocket_client` 的 `network_timeout_ms` 被当作 **socket 读超时**：会话就绪后若一段时间没有下行数据，
 组件判"读失败"并重连 ⇒ 服务端按契约（每设备并发 1）把第二条连接拒为 `conflict` 并关闭 ⇒ 设备再重连，
@@ -230,7 +288,7 @@ Backtrace: 0x4037ae8c 0x4037f3f9 0x4037eddf 0x4200f831 0x4037f1ad
 服务端同步收敛（`StaleSessionWindow` 25→12 s、WS ping 5 s、读超时 20 s、**收到 pong 也算活跃**）。
 修复后该轮已能稳定走到 `LISTENING`。
 
-### 7.1.5 第 7 轮的其他结论（部分已被 §7.1.3 取代，保留作排查记录）
+### 7.1.6 第 7 轮的其他结论（部分已被 §7.1.4 取代，保留作排查记录）
 
 1. **联调环境侧真相：Windows 防火墙按"程序完整路径"放行**。本机入站规则只对**历史出现过的
    chatd.exe 路径**放行（如 `%LOCALAPPDATA%\go-build\<hash>\chatd.exe`）；用 `go run`（每次新临时路径）
@@ -238,11 +296,11 @@ Backtrace: 0x4037ae8c 0x4037f3f9 0x4037eddf 0x4200f831 0x4037f1ad
    HTTP 探针 `ESP_ERR_HTTP_CONNECT`。把 chatd 构建到已放行路径后，设备**立刻**连通：
    `[diag] HTTP GET …/healthz → ESP_OK（status=200）` + WS `session.ready`。
    ⇒ 台面联调请固定用**同一个二进制路径**跑 chatd（见 backend `scripts/e2e/`）。
-2. ~~`Interrupt wdt timeout` 是周期性平台停顿、与例程逻辑无关~~ —— **此结论已被 §7.1.3 推翻**：
+2. ~~`Interrupt wdt timeout` 是周期性平台停顿、与例程逻辑无关~~ —— **此结论已被 §7.1.4 推翻**：
    是 `link_report_task` 栈溢出踩坏队列自旋锁。注意台面验证档**不要**再用 `CONFIG_ESP_INT_WDT=n`
    掩盖问题（那只会把 panic 变成静默 `rst:0x7 (TG0WDT_SYS_RST)`，丢失唯一的现场）。
 3. "一次启动内开两条 WS 连接"（同 device_id 第二条在 14–18 s 后到达被 `conflict` 拒绝）已随之消失：
-   起因是组件读超时判死重连，已由 §7.1.4 的保活参数 + 服务端更快回收共同修掉；
+   起因是组件读超时判死重连，已由 §7.1.5 的保活参数 + 服务端更快回收共同修掉；
    另加了两处防重（`on_net_ready` 幂等、`llm_client_start()` 防并发重入）与 Wi-Fi 连接次序修正
    （已连上时才 disconnect，避免两次 `GOT_IP`）。
 
@@ -251,7 +309,7 @@ HTTP `GET /healthz` 探同一 host:port，用来判定"是 socket/lwIP 层面"�
 该开关同时把 `llm_client` 的运行期日志级别提到 DEBUG（**要看 `ESP_LOGD` 还需
 `CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y`**，默认 INFO 档下 DEBUG 语句被编译掉）。
 
-### 7.1.6 构建与镜像
+### 7.1.7 构建与镜像
 
 **构建（已通过）**：ESP-IDF v5.5.5 + ESP-ADF v2.8，`idf.py build` 成功，
 应用镜像 ≈1.60 MB（`0x186350`），落在 `factory` 3 MB 分区内（余量 49%）；
@@ -266,7 +324,7 @@ HTTP `GET /healthz` 探同一 host:port，用来判定"是 socket/lwIP 层面"�
 | REC 键长按服务 | ✅ | `key_talk: REC 键就绪：长按 ≥ 600 ms 开始收音`（`press_judge_time` 覆写生效）；ADC 校准成功 |
 | 凭据文件配网（本板 SD 卡 `/sdcard/oneye-wifi.txt`） | ✅ | `prov_service: 凭据文件命中 … ssid=wanya` → `已联网：ssid=wanya ip=192.168.110.83 source=file` |
 | 局域网链路 | ✅ 启动 | `lan_link: UDP 发现已就绪（57321）` + `POST http://<ip>:80/api/link/frame` 已注册 |
-| BLE 配网 | ⚠️ 未通 | 预编译库缺陷已修（见下），设备侧仍卡在 `ble_gatts_count_resources rc=3` → `oneye_dev_ble_init=-4`；台面用 `ONEYE_LLM_ENABLE_BLE_PROV=n` 规避 |
+| BLE 配网 | ✅ 已通（第 9 轮） | `GATT 服务已注册` + `POP=xxxxxx` + `BLE 配网已就绪`；与语音闭环同跑（见 §7.1.3） |
 | 语音面一轮闭环 | ✅ 已闭环 | 见 §7.1.1：上行 82,560 B / 下行 88,320 B / 首帧 369–412 ms，无复位、无 `conflict` |
 
 **开机即复位的缺陷 → 第 2 轮已修（关键根因在 SDK 侧）**：
@@ -281,7 +339,7 @@ HTTP `GET /healthz` 探同一 host:port，用来判定"是 socket/lwIP 层面"�
   `oneye_link_frame_build()` 去掉 2 KB 栈拷贝（改为直接校验 `frame->p[0]`）。
   回归：宿主单测 **20 组 / 235 用例 / 3261 断言、0 失败**；ESP 六库重发。
 - **应用侧加固**：所有 link 上报走独立 **12 KB** 任务（`link_report_task` + 队列；⚠️ 曾误压到 4 KB，
-  反而引入 §7.1.3 的栈溢出根因）、配网启动走 6 KB 任务、httpd 栈 6 KB、
+  反而引入 §7.1.4 的栈溢出根因）、配网启动走 6 KB 任务、httpd 栈 6 KB、
   `CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192`、`CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096`。
 
 **BLE 预编译库缺陷 → 第 2 轮已修（两处，缺一不可）**：
@@ -294,25 +352,20 @@ HTTP `GET /healthz` 探同一 host:port，用来判定"是 socket/lwIP 层面"�
    **取证**：`liboneye_dev_ble.a` 41,192 B（只有宿主桩）→ **54,100 B 且含 `nimble_port_init`/`ble_gatts` 引用**；
    设备侧日志由 `oneye_dev_ble_init 失败：-5（UNSUPPORTED）` 变为真正跑 NimBLE 初始化。
 
-**仍待办：BLE 配网（台面已用 `ENABLE_BLE_PROV=n` 规避）**
+**BLE 配网（第 9 轮已通，见 §7.1.3）**
 
-1. `E NimBLE: ble_gatts_count_resources rc=3` → `oneye_dev_ble_init 失败：-4`：
-   NimBLE 资源计数失败（rc=3 = `BLE_HS_ENOMEM`）。当前 Kconfig 已给
-   `BT_NIMBLE_MSYS1_BLOCK_COUNT=24 / GATT_MAX_PROCS=4 / MTU=517 / HOST_TASK_STACK=4096`；
-   下一步排查 GATT 服务/特征注册顺序与 `ble_gatts_count_resources` 的资源上限（含 GAP/GATT 预注册服务）。
-2. **配网流程在 BLE 真正初始化后停住**：设备停在 `BOOT`（`net.connected=false`、无 `凭据文件命中` 日志），
-   即 `prov_service_start()` 未走到读凭据文件那一步；已加 `配网启动：…` 入口日志以便下次区分
-   「未被调用」与「卡在读文件」；怀疑与 NimBLE 起来后的内存/任务状态有关
-   （缓解方向：把凭据文件读取提前到 BLE 初始化之前，或先在 Kconfig 关掉 BLE 验证）。
+设备侧已能：`GATT 服务已注册` → 广播（设备名走扫描响应）→ `POP` 打印 → `BLE 配网已就绪`，
+并与语音闭环同跑。**仍未做**的是手机侧真机走完 POP 配对 + 下发 Wi-Fi 凭据的端到端流程
+（`mobile/Android` 工程已就位，但本机缺 JDK/Gradle/Android SDK，构建与单测登记"待验收（缺工具链）"）。
 
 **其余待真机取证项**：
 
-1. **人手长按 REC 键**的实际时延与阈值行为；短按/播放中长按的打断路径
-   （自检开关 `ONEYE_LLM_SELFTEST_TURN_MS` 已把同一条代码路径跑通，只剩"按键触发"这一环未被真人触发取证）；
+1. **人手长按 REC 键** —— 已取证（见 §7.1.2，`turn_seq=2` 闭环）；短按 / 播放中长按的**打断时延**尚未实测；
 2. 单声道→立体声回放（本工程自行复制声道，S3 上 ADF 的 `i2s_mono_fix()` 不参与编译）—— 已完成一轮，
    听感/音量待人工确认；
 3. 打断时延（`input.cancel` → 停止回播）是否 ≤200 ms；`down_drops` 丢帧率；
-4. BLE(NimBLE)+Wi-Fi+AFE 同跑时的内部 RAM 余量（当前 BLE 关闭，`link_report_task` 峰值取证为栈余 7028 B/12 KB）。
+4. BLE(NimBLE)+Wi-Fi+AFE 同跑时的内部 RAM 余量 —— 已有取证：采集前内部余 **56,051 B**
+   （最大连续块 31,744 B，见 §7.1.3）；`link_report_task` 上报路径栈余 6,884~7,028 B / 12 KB。
 
 **实现层面的已知取舍**：
 

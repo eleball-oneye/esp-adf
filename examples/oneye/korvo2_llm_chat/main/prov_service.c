@@ -245,7 +245,11 @@ static void sc_timeout_task(void *arg)
 
 /* ------------------------------------------------------------------ BLE 配网处理器（应用侧 Wi-Fi 实现） */
 
-#if CONFIG_ONEYE_LLM_ENABLE_BLE_PROV
+/*
+ * link 的配网 provider（AP 扫描 / 连接 / 清凭据）：只用到 Wi-Fi 与本模块函数，
+ * 故**不**受 CONFIG_ONEYE_LLM_ENABLE_BLE_PROV 保护 —— 局域网通道与 BLE 通道共用同一套实现
+ * （真机取证 2026-09-17：此前定义在 BLE 开关内，关掉 BLE 后这条注册调用就编不过）。
+ */
 static int ble_prov_scan(char *json_out, size_t cap, void *ctx)
 {
     (void)ctx;
@@ -266,7 +270,6 @@ static int ble_prov_reset(void *ctx)
     (void)ctx;
     return prov_service_forget() == ESP_OK ? 0 : -1;
 }
-#endif
 
 /* ------------------------------------------------------------------ 初始化 */
 
@@ -284,7 +287,7 @@ esp_err_t prov_service_init(esp_periph_set_handle_t periph_set, prov_ready_cb_t 
             ESP_LOGE(TAG, "上报队列创建失败");
             return ESP_ERR_NO_MEM;
         }
-        if (xTaskCreate(link_report_task, "link_report", 12288, NULL, 4, NULL) != pdPASS) {
+        if (xTaskCreate(link_report_task, "link_report", 4096, NULL, 4, NULL) != pdPASS) {
             vQueueDelete(s_report_q);
             s_report_q = NULL;
             ESP_LOGE(TAG, "上报任务创建失败");
@@ -316,6 +319,16 @@ esp_err_t prov_service_init(esp_periph_set_handle_t periph_set, prov_ready_cb_t 
 #endif
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    /* Wi-Fi **在初始化阶段就 start**（真机取证 2026-09-17）：
+     * 原实现把 `esp_wifi_start()` 放在配网任务里、与 set_config/disconnect/connect 连在一起调用，
+     * 串口会先报 `E wifi:sta is connecting, return error`，随后在 Wi-Fi 起来的过程中触发
+     * `Interrupt wdt timeout on CPU1`（两核寄存器都在正常等待，属典型的"关中断期过长"）。
+     * 改为初始化即 start（此时 main 任务上下文最干净），配网只做 set_config + connect。 */
+    esp_err_t werr = esp_wifi_start();
+    if (werr != ESP_OK && werr != ESP_ERR_WIFI_STATE) {
+        ESP_LOGE(TAG, "esp_wifi_start 失败：%s", esp_err_to_name(werr));
+        return werr;
+    }
 
     /* SPIFFS（storage 分区）：凭据文件兜底存储 */
 #if CONFIG_ONEYE_LLM_ENABLE_WIFI_FILE
@@ -434,7 +447,8 @@ esp_err_t prov_service_connect(const char *ssid, const char *pass, uint32_t time
     }
     s_st.attempts++;
     xEventGroupClearBits(s_wifi_eg, WIFI_BIT_CONNECTED | WIFI_BIT_FAIL);
-    prov_report(ONEYE_DEV_LINK_PROV_CONNECTING, NULL);
+    /* 注意：此处**不**上报 CONNECTING（真机取证 2026-09-17）：该上报会让 SDK 在配网关键路径上
+     * 组帧/发帧（历史上还伴随 watch dog 问题）；连接结果只在拿到 IP / 失败时上报，语义足够。 */
 
     wifi_config_t wc = { 0 };
     snprintf((char *)wc.sta.ssid, sizeof(wc.sta.ssid), "%s", ssid);
@@ -447,11 +461,6 @@ esp_err_t prov_service_connect(const char *ssid, const char *pass, uint32_t time
         return err;
     }
     snprintf(s_st.ssid, sizeof(s_st.ssid), "%s", ssid);
-    err = esp_wifi_start();
-    if (err != ESP_OK && err != ESP_ERR_WIFI_STATE) { /* 已启动时忽略 */
-        s_st.last_err = err;
-        return err;
-    }
     esp_wifi_disconnect();
     err = esp_wifi_connect();
     if (err != ESP_OK) {
@@ -499,8 +508,7 @@ esp_err_t prov_service_start(void)
                                     WIFI_CONNECT_TIMEOUT_MS);
     }
 
-    /* 无凭据 → 开启配网通道（BLE + SmartConfig 并行）；Wi-Fi 需先 start 供扫描用 */
-    (void)esp_wifi_start();
+    /* 无凭据 → 开启配网通道（BLE + SmartConfig 并行）；Wi-Fi 已在 init 阶段 start（供扫描用） */
     prov_report(ONEYE_DEV_LINK_PROV_PAIRING, NULL);
     ESP_LOGI(TAG, "未配网：等待手机经 BLE（POP 配对）或 SmartConfig 下发凭据");
 

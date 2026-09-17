@@ -232,9 +232,10 @@ esp_err_t lan_link_init(const lan_link_config_t *cfg)
     httpd_config_t hcfg = HTTPD_DEFAULT_CONFIG();
     hcfg.server_port = cfg->http_port;
     hcfg.max_uri_handlers = 4;
-    /* 12 KB：本处理函数会经 `oneye_dev_link_inject_frame()` 进入 SDK 的组帧/发送路径，
-     * 其栈峰值 ≈11 KB（8 KB frame + 2 KB payload）；缺省 4 KB 会踩穿栈（真机取证 2026-09-17）。 */
-    hcfg.stack_size = 12288;
+    /* 6 KB：本处理函数经 `oneye_dev_link_inject_frame()` 进 SDK 的组帧/发送路径；
+     * **不要**再按"组帧要 8 KB 栈"来放大（该缺陷已于 oneye-dev-sdk 53c337c 改为堆分配）——
+     * 真机取证 2026-09-17：BLE(NimBLE) 起来后内部 RAM 紧张，12 KB 级任务栈会创建失败。 */
+    hcfg.stack_size = 6144;
     hcfg.lru_purge_enable = true;
     if (httpd_start(&s_httpd, &hcfg) != ESP_OK) {
         ESP_LOGE(TAG, "HTTP 服务启动失败（端口 %u）", (unsigned)cfg->http_port);

@@ -101,7 +101,42 @@ go run ./scripts/e2e/voice_client.go -addr 127.0.0.1:9091 -device korvo2-e2e
 | `ONEYE_LLM_LOG_TEXT` | n | 是否把 ASR/LLM 文本打串口（PIPL：正文不落盘） |
 | `ONEYE_LLM_SELFTEST_TURN_MS` | 0 | 台面自检：非 0 时语音面就绪后自动收音该时长并提交一轮（无人值守验证整条链路；量产必须 0） |
 
-## 7. 已验证 / 未验证（真机取证记录，2026-09-17）
+## 7.1 第 3 轮真机取证（2026-09-17）
+
+**已打通到语音面会话就绪**（串口实录）：
+
+```
+prov_service: 凭据文件命中：/sdcard/oneye-wifi.txt（ssid=wanya）
+wifi:connected with wanya, ...            ← Wi-Fi 连接成功
+prov_service: 已联网：ssid=wanya ip=192.168.110.80 source=file
+llm_client: 语音面客户端：ws://192.168.110.208:9091/v1/voice/ws（子协议 oneye.voice.v1）
+websocket_client: Started
+llm_client: 状态 → SESSION_START：已连接，发 session.start
+llm_client: 发送 session.start（device_id=korvo2-llm-0001）
+llm_client: 状态 → READY：会话就绪          ← 服务端 session.ready 收到
+```
+
+**本轮修掉的两个真机问题**（都在应用侧）：
+
+1. `xTaskCreate(prov_boot, 16 KB)` 直接失败 → 设备停在 BOOT。BLE(NimBLE) 真起来后内部 RAM 紧张，
+   12/16 KB 任务栈创建失败；且 SDK 组帧已改堆分配（不再需要大栈）⇒ 配网任务降到 6 KB、上报任务 4 KB、httpd 6 KB。
+2. `esp_wifi_start()` 与 `set_config/disconnect/connect` 挤在同一任务里连调 → 触发
+   `Interrupt wdt timeout`（串口先报 `E wifi:sta is connecting, return error`）；
+   改为**初始化阶段就 start**，配网只做 set_config + connect，另把
+   `CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP` 置 n（Wi-Fi/lwIP 缓冲留内部 RAM），并把
+   `CONFIG_ESP_INT_WDT_TIMEOUT_MS` 提到 1000 ms（PSRAM 工程上关 cache 窗口更宽）。
+
+**仍未闭环（下一轮）**：
+
+1. **服务端 `conflict` + 重连期 WDT**：设备拿到 `session.ready` 后立刻收到
+   `error{code:"conflict", msg:"another session is active for this device"}`，随后服务端关闭连接、
+   客户端重连；重连路径上仍会 `Interrupt wdt timeout on CPU1`。
+   原因方向：① 设备**硬复位**（RTS）不产生 TCP FIN ⇒ chatd 侧注册表里的旧会话要等 TCP 超时才释放，
+   下一轮建议给 chatd 加"会话空闲/接管"策略（契约 §6 已有 conflict 语义，属于健壮性增强）；
+   ② 重连时序需要再收敛（例如在 `WEBSOCKET_EVENT_DISCONNECTED` 后显式延迟再让组件重连）。
+2. 台面自检轮（`ONEYE_LLM_SELFTEST_TURN_MS`）尚未实跑到 `asr.final/tts/turn.end` —— 被上面的重连问题挡住。
+
+
 
 **构建（已通过）**：ESP-IDF v5.5.5 + ESP-ADF v2.8，`idf.py set-target esp32s3 && idf.py build` 成功，
 应用镜像 `0x1d2510`（≈1.82 MB），落在 `factory` 3 MB 分区内（余量 39%）；

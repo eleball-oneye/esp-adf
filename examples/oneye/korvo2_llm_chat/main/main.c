@@ -223,6 +223,9 @@ static void net_ready_task(void *arg)
 {
     (void)arg;
     char uri[192];
+    /* 等 Wi-Fi/lwIP 在拿到 IP 后稳定下来再起 WebSocket 客户端（真机取证 2026-09-17：
+     * 在 IP 事件链上立即建客户端会触发 `Interrupt wdt timeout`）。 */
+    vTaskDelay(pdMS_TO_TICKS(500));
     snprintf(uri, sizeof(uri), "%s://%s:%d%s", LLM_CLIENT_URI_SCHEME,
              CONFIG_ONEYE_LLM_SERVER_HOST, CONFIG_ONEYE_LLM_SERVER_PORT,
              CONFIG_ONEYE_LLM_WS_PATH);
@@ -253,7 +256,7 @@ static void net_ready_task(void *arg)
 static void on_net_ready(void)
 {
     /* 事件任务上下文：只投递任务 */
-    (void)xTaskCreate(net_ready_task, "net_ready", 4096, NULL, 5, NULL);
+    (void)xTaskCreate(net_ready_task, "net_ready", 6144, NULL, 5, NULL);
 }
 
 /* ------------------------------------------------------------------ 单轮兜底 */
@@ -279,10 +282,12 @@ static void turn_watchdog_task(void *arg)
 /* ------------------------------------------------------------------ 启动配网任务 */
 
 /*
- * 配网启动放在**独立 8 KB 任务**里执行，而不是直接在 app_main 调：
- *   `prov_service_start()` → `prov_service_connect()` → `prov_report()` →
- *   `oneye_dev_link_send()` → `oneye_link_frame_build()` 会在**栈上**开 ≈2 KB 的 payload 缓冲，
- *   真机取证（2026-09-17）在 main 任务里直接调用会压穿缺省 3.5 KB 栈并崩溃在 heap 分配处。
+ * 配网启动放在独立任务里执行（不在 app_main 里直接调）：
+ *   ① 启动早期 main 任务栈只有 3.5 KB（本工程已抬到 8 KB，但仍有其他大栈调用方）；
+ *   ② 组网/配网涉及 Wi-Fi/BLE/帧组包等多层调用，用独立任务更易定位与限流。
+ * ⚠️ 栈大小必须**克制**（真机取证 2026-09-17）：BLE(NimBLE) 真正初始化后内部 RAM 紧张，
+ *   曾用 16 KB → `xTaskCreate` 直接失败（串口 `[panel] 配网任务创建失败`，设备停在 BOOT）。
+ *   注意：SDK 组帧已改为**堆分配**（见 oneye-dev-sdk 53c337c），调用方不再需要 8 KB 级栈。
  */
 static void prov_boot_task(void *arg)
 {
@@ -326,8 +331,8 @@ void app_main(void)
     ESP_ERROR_CHECK(key_talk_init(s_periph_set, &kcbs));
 
     /* 4) 配网启动：文件 → Kconfig → (BLE + SmartConfig)；联网后会回调 on_net_ready 连语音面 */
-    if (xTaskCreate(prov_boot_task, "prov_boot", 16384, NULL, 5, NULL) != pdPASS) {
-        panel_min_note("配网任务创建失败");
+    if (xTaskCreate(prov_boot_task, "prov_boot", 6144, NULL, 5, NULL) != pdPASS) {
+        panel_min_note("配网任务创建失败（内部 RAM 不足？检查 Ble/WiFi/AFE 同时占用）");
     }
 
     (void)xTaskCreate(turn_watchdog_task, "turn_wd", 3072, NULL, 3, NULL);

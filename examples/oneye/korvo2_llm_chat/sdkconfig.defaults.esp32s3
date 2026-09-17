@@ -1,0 +1,33 @@
+#
+# korvo2_llm_chat —— ESP32-S3 目标板级缺省
+#
+# 目标与板卡（Audio HAL）：ESP32-S3-Korvo-2 v3
+#   板卡标识来源：components/audio_board/Kconfig.projbuild
+#   板级参数来源：components/audio_board/esp32_s3_korvo2_v3/board_def.h
+#
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_IDF_TARGET_ESP32S3=y
+CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240=y
+CONFIG_ESP32S3_DEFAULT_CPU_FREQ_MHZ=240
+
+# 模组 ESP32-S3-WROOM-1：8 MB flash（分区表按 8 MB 规划）
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="8MB"
+
+# Audio HAL：本板
+CONFIG_ESP32_S3_KORVO2_V3_BOARD=y
+
+# 注：系统事件任务栈 4096 与 main 任务栈 8192 在 sdkconfig.defaults 中设置
+#（原因：SDK 组帧在栈上开 ≈2 KB 缓冲；ADF 例程口径的 3072 不够）。
+
+#
+# ESP-SR / AFE（长按说话时的 AEC + 降噪）
+#   采集走 AFE_TYPE_VC（语音通信型前端），与唤醒词/命令词无关 ⇒ 不选任何 WakeNet/MultiNet 模型，
+#   只保留降噪（NSNET2）与 VAD（WebRTC）；模型由 esp-sr 编入名为 `model` 的分区（见 partitions.csv）。
+#
+CONFIG_MODEL_IN_FLASH=y
+CONFIG_AFE_INTERFACE_V1=y
+CONFIG_SR_NSN_NSNET2=y
+CONFIG_SR_VADN_WEBRTC=y
+CONFIG_SR_MN_CN_NONE=y
+CONFIG_SR_MN_EN_NONE=y

@@ -81,7 +81,7 @@ WITH_FIRMWARE=0
 TRANSPORT="mqtt-tcp,mqtt-tls,mqtt-ws,mqtt-wss"
 
 VENDOR_CJSON_PREFIX="oev_cjson_"
-LIBS=(oneye_dev_base oneye_dev_mpp oneye_dev_event oneye_dev_log)
+LIBS=(oneye_dev_base oneye_dev_mpp oneye_dev_event oneye_dev_log oneye_dev_link oneye_dev_ble)
 
 C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_RED=$'\033[31m'
 info()  { printf '%s==> %s%s\n' "$C_BOLD" "$*" "$C_RESET"; }
@@ -169,6 +169,19 @@ BASE_SRCS=(
 MPP_SRCS=( "$SDK_DIR/src/oneye_dev_mpp.c" "$SRC_INTERNAL/oneye_media.c" )
 EVENT_SRCS=( "$SDK_DIR/src/oneye_dev_event.c" )
 LOG_SRCS=( "$SDK_DIR/src/oneye_dev_log.c" )
+# link：设备节点/组域/多信道（本地面）；ble：BLE 配网（自研 GATT）。
+# 两者宿主与 ESP 均可编译：ble 的平台实现按 ESP_PLATFORM 在文件内裁剪（nimble 版/桩版）。
+LINK_SRCS=(
+    "$SDK_DIR/src/oneye_dev_link.c"
+    "$SRC_INTERNAL/oneye_link_frame.c"
+    "$SRC_INTERNAL/oneye_link_node.c"
+)
+BLE_SRCS=(
+    "$SDK_DIR/src/oneye_dev_ble.c"
+    "$SRC_INTERNAL/oneye_ble_pair.c"
+    "$SRC_INTERNAL/oneye_ble_plat_nimble.c"
+    "$SRC_INTERNAL/oneye_ble_plat_host.c"
+)
 VENDOR_SRCS=( "$SDK_DIR/vendor/cjson/cJSON.c" )
 
 lib_srcs() {
@@ -178,6 +191,8 @@ lib_srcs() {
         oneye_dev_mpp)   out="$(printf '%s\n' "${MPP_SRCS[@]}")" ;;
         oneye_dev_event) out="$(printf '%s\n' "${EVENT_SRCS[@]}")" ;;
         oneye_dev_log)   out="$(printf '%s\n' "${LOG_SRCS[@]}")" ;;
+        oneye_dev_link)  out="$(printf '%s\n' "${LINK_SRCS[@]}")" ;;
+        oneye_dev_ble)   out="$(printf '%s\n' "${BLE_SRCS[@]}")" ;;
         *) return 0 ;;
     esac
     # 平台适配按目标取舍：宿主用 POSIX（pthread/socket/netdb），ESP 目标用 IDF（FreeRTOS/lwip）。
@@ -199,7 +214,7 @@ list_idf_versions() {
 }
 
 if [ "$DO_LIST" = "1" ]; then
-    echo "SDK: $SDK_DIR (version $SDK_VERSION, 4 库：${LIBS[*]})"
+    echo "SDK: $SDK_DIR (version $SDK_VERSION, ${#LIBS[@]} 库：${LIBS[*]})"
     echo "输出根: $OUT_ROOT"
     echo "可用工具链规格："
     printf '  %-18s %s\n' host "宿主编译器（$(cc -dumpmachine 2>/dev/null || echo 'cc 不可用')）"
@@ -451,7 +466,7 @@ build_host() {
     fi
     ok "lib/liboneye_dev_base.a（含内嵌 cJSON，符号已隔离） $(stat -c%s "$out/lib/liboneye_dev_base.a") B"
 
-    for lib in oneye_dev_mpp oneye_dev_event oneye_dev_log; do
+    for lib in oneye_dev_mpp oneye_dev_event oneye_dev_log oneye_dev_link oneye_dev_ble; do
         cp -f "${LIB_BODY[$lib]}" "$out/lib/lib${lib}.a"
         ok "lib/lib${lib}.a $(stat -c%s "$out/lib/lib${lib}.a") B"
     done
@@ -476,7 +491,7 @@ MAP
         -o "$out/lib/liboneye_dev_base.so.$SDK_VERSION_NUM" \
         ${LIB_OBJS[oneye_dev_base]} "$vendor_priv_o" $dep_libs -lpthread -lm \
         || { err "链接 liboneye_dev_base.so 失败"; return 1; }
-    for lib in oneye_dev_mpp oneye_dev_event oneye_dev_log; do
+    for lib in oneye_dev_mpp oneye_dev_event oneye_dev_log oneye_dev_link oneye_dev_ble; do
         "$c" -shared -Wl,-soname,lib${lib}.so.0 -Wl,--version-script="$vermap" \
             -o "$out/lib/lib${lib}.so.$SDK_VERSION_NUM" \
             ${LIB_OBJS[$lib]} -L"$out/lib" -loneye_dev_base -Wl,-rpath,'$ORIGIN' \
@@ -498,7 +513,7 @@ includedir=$SDK_DIR/include
 Name: oneye-dev-sdk
 Description: oneye 设备侧通信协议 SDK（base/mpp/event/log 四库；EMQX MQTT + WS 承载）
 Version: $SDK_VERSION_NUM
-Libs: -L\${libdir} -Wl,--start-group -loneye_dev_mpp -loneye_dev_event -loneye_dev_log -loneye_dev_base -Wl,--end-group
+Libs: -L\${libdir} -Wl,--start-group -loneye_dev_ble -loneye_dev_link -loneye_dev_mpp -loneye_dev_event -loneye_dev_log -loneye_dev_base -Wl,--end-group
 Libs.private: $dep_libs
 Cflags: -I\${includedir}
 EOF
@@ -691,7 +706,7 @@ build_esp() {
         echo "END"
     } | "$ar_bin" -M >/dev/null 2>&1 || { err "合并内嵌件失败（$tcid）"; return 1; }
     ok "lib/liboneye_dev_base.a $(stat -c%s "$out/lib/liboneye_dev_base.a") B"
-    for lib in oneye_dev_mpp oneye_dev_event oneye_dev_log; do
+    for lib in oneye_dev_mpp oneye_dev_event oneye_dev_log oneye_dev_link oneye_dev_ble; do
         cp -f "${LIB_BODY[$lib]}" "$out/lib/lib${lib}.a"
         ok "lib/lib${lib}.a $(stat -c%s "$out/lib/lib${lib}.a") B"
     done
@@ -787,7 +802,7 @@ build_demo_host() { # $1=out dir
 
     # 静态归档需要用 --start-group 包住：分域库引用 base 的内部实现（如 oneye_http_*），
     # GNU ld 对归档是单向扫描，顺序写反或跨库互引都会漏符号。
-    local libs="-Wl,--start-group $out/lib/liboneye_dev_mpp.a $out/lib/liboneye_dev_event.a $out/lib/liboneye_dev_log.a $out/lib/liboneye_dev_base.a -Wl,--end-group"
+    local libs="-Wl,--start-group $out/lib/liboneye_dev_ble.a $out/lib/liboneye_dev_link.a $out/lib/liboneye_dev_mpp.a $out/lib/liboneye_dev_event.a $out/lib/liboneye_dev_log.a $out/lib/liboneye_dev_base.a -Wl,--end-group"
     local deplibs; deplibs="$(pkg-config --libs mbedtls mbedx509 mbedcrypto 2>/dev/null || echo '-lmbedtls -lmbedx509 -lmbedcrypto')"
     local name
     for name in base event log mpp all; do
@@ -795,7 +810,7 @@ build_demo_host() { # $1=out dir
             -o "$demo/demo_${name}" || { err "demo_${name} 编译失败"; continue; }
     done
     "$c" $cflags -I"$out/include" "$SDK_DIR/examples/linux/demo_all.c" \
-        -L"$out/lib" -Wl,--start-group -loneye_dev_mpp -loneye_dev_event -loneye_dev_log -loneye_dev_base -Wl,--end-group \
+        -L"$out/lib" -Wl,--start-group -loneye_dev_ble -loneye_dev_link -loneye_dev_mpp -loneye_dev_event -loneye_dev_log -loneye_dev_base -Wl,--end-group \
         -Wl,-rpath,"$out/lib" $deplibs -o "$demo/demo_all_shared" || warn "demo_all_shared 编译失败"
     "$c" $cflags -I"$out/include" "$SDK_DIR/examples/linux/demo_dlopen.c" -ldl \
         -o "$demo/demo_dlopen" || warn "demo_dlopen 编译失败"
@@ -824,11 +839,12 @@ build_tests_host() { # $1=out dir
     local srcs=("$SDK_DIR/tests/oneye_test_main.c")
     local f
     for f in "$SDK_DIR"/tests/test_*.c; do [ -f "$f" ] && srcs+=("$f"); done
-    local libs="-Wl,--start-group $out/lib/liboneye_dev_mpp.a $out/lib/liboneye_dev_event.a $out/lib/liboneye_dev_log.a $out/lib/liboneye_dev_base.a -Wl,--end-group"
+    local libs="-Wl,--start-group $out/lib/liboneye_dev_ble.a $out/lib/liboneye_dev_link.a $out/lib/liboneye_dev_mpp.a $out/lib/liboneye_dev_event.a $out/lib/liboneye_dev_log.a $out/lib/liboneye_dev_base.a -Wl,--end-group"
     local deplibs; deplibs="$(pkg-config --libs mbedtls mbedx509 mbedcrypto 2>/dev/null || echo '-lmbedtls -lmbedx509 -lmbedcrypto')"
     info "构建并运行宿主单测（tests/）"
     if "$c" -O1 -g -Wall -Wextra -std=c99 -I"$out/include" -I"$SRC_INTERNAL" -I"$SDK_DIR/tests" \
-        -I"$SDK_DIR/vendor/cjson" "${srcs[@]}" $libs $deplibs -lpthread -lm -o "$demo/oneye_dev_tests" 2>"$demo/oneye_dev_tests.build.log"; then
+        -I"$SDK_DIR/vendor/cjson" -DONEYE_TEST_VECTORS_DIR="\"$SDK_DIR/tests/vectors\"" \
+        "${srcs[@]}" $libs $deplibs -lpthread -lm -o "$demo/oneye_dev_tests" 2>"$demo/oneye_dev_tests.build.log"; then
         if "$demo/oneye_dev_tests" > "$demo/oneye_dev_tests.log" 2>&1; then
             ok "oneye_dev_tests 全部通过 → demo/oneye_dev_tests.log"
         else

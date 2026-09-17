@@ -1,0 +1,5 @@
+dependencies:
+  # 语音面客户端（oneye.voice.v1 over WebSocket）。
+  # 该组件由 ESP 组件注册表提供（与 ADF 的 esp_coze 组件同一依赖，版本口径一致）；
+  # 本工程仅用其 WebSocket 客户端能力，不使用任何扣子/GMF 相关组件。
+  espressif/esp_websocket_client: "^1.8.0"

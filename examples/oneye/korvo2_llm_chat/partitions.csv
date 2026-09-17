@@ -1,0 +1,19 @@
+# =============================================================================
+# korvo2_llm_chat 分区表（8 MB flash）
+#
+# 为什么需要自定义分区表：
+#   ① 采集走 esp-sr AFE（AEC + 降噪），**esp-sr 要求存在名为 `model` 的分区**
+#      （components/esp-sr/CMakeLists.txt 只在 CONFIG_PARTITION_TABLE_CUSTOM=y 且查到
+#       名为 model 的分区时才把 srmodels.bin 编入镜像；缺了它构建仍成功、模型却从未投放）；
+#   ② 应用镜像（ADF + esp-sr + oneye-dev-sdk + Wi-Fi + WebSocket + 播放链）> 2 MB，
+#      IDF 缺省 factory 仅 1 MB；
+#   ③ 无 SD 卡时凭据文件需要本地兜底存储 → storage(SPIFFS) 1 MB（/spiffs/oneye-wifi.txt）。
+#
+# 布局：nvs 24 KB / phy_init 4 KB / factory 3 MB / model 2 MB / storage 1 MB
+# =============================================================================
+# Name,   Type, SubType, Offset,   Size, Flags
+nvs,      data, nvs,     0x9000,   0x6000,
+phy_init, data, phy,     0xf000,   0x1000,
+factory,  app,  factory, 0x10000,  3M,
+model,    data, spiffs,  0x310000, 2M,
+storage,  data, spiffs,  0x510000, 1M,

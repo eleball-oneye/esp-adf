@@ -1,0 +1,86 @@
+#
+# korvo2_llm_chat 通用缺省（板级参数见 sdkconfig.defaults.esp32s3）
+#
+# 口径来源：examples/oneye/korvo2_oneye 的 sdkconfig.defaults（同板真机取证过的
+# 内存/PSRAM/AFE 组合），本工程在其基础上增加「BLE 配网 + WebSocket 语音面」所需项。
+#
+
+# ------------------------------------------------------------------ 启动器 / 分区
+CONFIG_BOOTLOADER_OFFSET_IN_FLASH=0x1000
+CONFIG_BOOTLOADER_COMPILER_OPTIMIZATION_SIZE=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ------------------------------------------------------------------ ESP-ADF + IDF 5.5 共栈
+CONFIG_FREERTOS_ENABLE_BACKWARD_COMPATIBILITY=y
+CONFIG_FREERTOS_HZ=1000
+CONFIG_ESPTOOLPY_HEADER_FLASHSIZE_UPDATE=y
+CONFIG_ESPTOOLPY_BEFORE_RESET=y
+
+# ------------------------------------------------------------------ 任务栈
+# 真机取证（2026-09-17，两轮排查后的结论）：
+#   `oneye_dev_link_send()` 的组帧路径在**栈上**开 `char frame[ONEYE_DEV_LINK_FRAME_MAX_BYTES]`
+#   （8 KB，SDK oneye_dev_link.c:558）＋ `oneye_link_frame_build()` 的 `payload[2049]`
+#   （oneye_link_frame.c:152）⇒ 单次 `oneye_dev_link_prov_report_status()` 峰值栈 ≈11 KB。
+#   若从系统事件任务（缺省 3 KB）或 main 任务（缺省 3.5 KB）调用，会踩穿栈并**破坏堆**，
+#   表现为启动/联网后 `Guru Meditation … LoadProhibited`（PC 落在 multi_heap_internal_lock /
+#   tlsf_malloc，回溯源到 on_got_ip → on_net_ready → xTaskCreate）。
+# 应用侧对策（见 prov_service.c / main.c）：所有 link/配网上报走**独立 12 KB 任务**，
+# 事件任务里只入队；此处同时抬高 main 与事件任务栈作为双保险。
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
+
+# ------------------------------------------------------------------ 日志
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_MAXIMUM_LEVEL_INFO=y
+
+# ------------------------------------------------------------------ PSRAM（AFE/音频任务 ext-stack）
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_BOOT_INIT=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_TYPE_AUTO=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+# 内部/DMA 内存保留（同 korvo2_oneye：Wi-Fi + SDK + AFE 同跑时留足内部 DMA 缓冲）
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
+# 小于 4 KB 的分配才放内部 RAM，其余走 PSRAM（否则 AFE 任务创建失败）
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+
+# ------------------------------------------------------------------ Wi-Fi + BLE 共存
+# BLE 配网与 Wi-Fi 同时工作，必须打开共存（否则 BLE 广播期间 Wi-Fi 吞吐/连接不稳定）
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
+
+# ------------------------------------------------------------------ BLE（NimBLE，自研 GATT 服务）
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=517
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=4096
+CONFIG_BT_NIMBLE_MSYS1_BLOCK_COUNT=24
+
+# ------------------------------------------------------------------ 文件系统（凭据文件兜底）
+CONFIG_FATFS_CODEPAGE_936=y
+CONFIG_FATFS_LFN_HEAP=y
+CONFIG_FATFS_MAX_LFN=255
+CONFIG_FATFS_FS_LOCK=5
+CONFIG_SPIFFS_MAX_PARTITIONS=3
+
+# ------------------------------------------------------------------ 例程功能开关
+# 凭据文件配网（SD /sdcard/oneye-wifi.txt → SPIFFS /spiffs/oneye-wifi.txt）——**台面/研发用**，量产置 n
+CONFIG_ONEYE_LLM_ENABLE_WIFI_FILE=y
+CONFIG_ONEYE_LLM_ENABLE_SDCARD=y
+# BLE 配网（自研 GATT + POP）与 SmartConfig（ESPTouch v2）并行，先成功者胜出
+CONFIG_ONEYE_LLM_ENABLE_BLE_PROV=y
+CONFIG_ONEYE_LLM_ENABLE_SMARTCONFIG=y
+# 转写/模型文本是否打到串口（PIPL：正文**不落盘**；量产建议 n，避免日志外泄）
+CONFIG_ONEYE_LLM_LOG_TEXT=n
+
+# ------------------------------------------------------------------ oneye-dev-sdk（本地面：link/ble）
+CONFIG_ONEYE_DEV_SDK_ENABLE_LINK=y
+CONFIG_ONEYE_DEV_SDK_ENABLE_BLE=y

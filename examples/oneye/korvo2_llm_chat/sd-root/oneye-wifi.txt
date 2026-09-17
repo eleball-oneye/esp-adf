@@ -1,0 +1,16 @@
+# =============================================================================
+# 台面/研发 Wi-Fi 凭据文件（样例）
+#
+# 用法：把本文件复制到 microSD 卡根目录并改名为 `oneye-wifi.txt`（或放进 SPIFFS 的
+#       `/spiffs/oneye-wifi.txt`），开机后固件会优先用它配网：
+#         /sdcard/oneye-wifi.txt  →  /spiffs/oneye-wifi.txt  →  Kconfig 兜底
+#
+# 格式：逐行 `key=value`；`#` 开头为注释；行首行尾空白与 CR 自动去除。
+#       可用键：ssid / password（pass、psk 亦可）。
+#
+# ⚠️ 安全口径：本文件是**明文** Wi-Fi 密码，**仅用于台面/研发配网**。
+#    量产固件必须把它关掉（CONFIG_ONEYE_LLM_ENABLE_WIFI_FILE=n），
+#    改走 claim + 一机一密凭据（见总控 ADR-0007 / docs/adr/）。
+# =============================================================================
+ssid=YourWiFiName
+password=YourWiFiPassword

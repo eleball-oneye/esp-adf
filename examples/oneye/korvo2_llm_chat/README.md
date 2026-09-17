@@ -449,6 +449,42 @@ SET 键单击 → `conv.new` → `conv.state{reason:"new"}`（新段不继承旧
 3. **音频不落库、正文加密落库**：正文密钥由设备 SN 派生（服务端 `VOICE_STORE_PEPPER` 叠加），
    设备侧只发不收——本工程不做任何正文持久化。
 
+### 7.1.10 BLE 配网崩溃：三层根因链（2026-09-17 续，逐层修）
+
+> 背景：BLE 配网长期卡在"手机侧一发帧设备就崩/不响应"。本轮用**串口 panic 现场 + `addr2line` 反解 +
+> 逐层实验**把这条链拆开，修掉两层、第三层已定位到具体函数并落修复。**崩溃与配网协议无关**，全是内存问题。
+
+**第 1 层：NimBLE 主机任务栈 4096 B 太小 → 崩板**
+
+| 项 | 内容 |
+| --- | --- |
+| 现象 | 手机侧（PC bleak 脚本）发 `prov.hello` 后立刻：`Guru Meditation Error: Core 0 panic'ed (Unhandled debug exception)` / `Debug exception reason: BREAK instr`，`A15=0xa5a5a5a5`（FreeRTOS 栈填充字），backtrace 标记 `CORRUPTED`，随后 `rst:0xc (RTC_SW_CPU_RST)` |
+| 反解 | `PC 0x4037c688=_xt_kernel_exc`、`A0 0x40374306=_KernelExceptionVector`、`A9=_frxt_int_enter`、`A4=_frxt_dispatch` ⇒ **执行流跑飞到异常向量/分发代码**，不是应用逻辑错 |
+| 机制 | GATT RX 回调跑在 **NimBLE 主机任务**上，而 SDK 在**该回调里**处理 `prov.pair` 并**直接回帧**（`oneye_dev_ble.c` 的 prov.pair 分支 → `oneye_dev_ble_send_frame`）；这条路径栈需求远超 4096 |
+| 修复 | `CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=4096 → **12288**`（写进 `sdkconfig.defaults` 并附注释；取 12 KB 与例程 `link_report_task` 同口径） |
+| 效果 | 同样操作 **0 断言**；`RX 写入 135 B（头 00 03 00 83）→ RX 回调返回 0`（`prov.hello` 真正被处理） |
+
+**第 2 层：PC 侧脚本 `seq` 语义错 → `prov.pair` 被重组器拒收**
+
+| 项 | 内容 |
+| --- | --- |
+| 现象 | 第 1 层修完后：`RX 写入 121 B（头 **01** 03 00 75）→ RX 回调返回 **-1**`（同时 `RX 写入 135 B（头 00 03 00 83）→ 0` 正常） |
+| 机制 | `seq` 是**帧内分片序号，首片必须 0**（设备侧 `oneye_ble_frag_split`：`dst[written++] = seq++;` 每帧从 0 重新计数）；而脚本传的是**跨帧全局计数器**（hello=0 / pair=1 / connect.req=2）⇒ 设备把 `seq=1` 判为"帧内非首片却带 FIRST 标志" |
+| 修复 | `tools/ble_prov_e2e.py` 的 `wrap()` 默认 `seq=0`（并把"别再传全局计数器"写进 docstring） |
+| 效果 | 两个写都返回 0；设备**发出 notify**（`NimBLE: GATT procedure initiated: notify`）⇒ `prov.pair.ok` 真的回了 |
+
+**第 3 层：SDK 发送路径在栈上开 ~24.7 KB（已定位；修复已落代码，待重建库后验收）**
+
+| 项 | 内容 |
+| --- | --- |
+| 现象 | 第 2 层修完后、`prov.pair.ok` 发出后约 7 ms：`Interrupt wdt timeout on CPU0`；反解调用栈 = `esp_websocket_client_task → ws_poll_read → esp_transport_poll_read → lwip_select → sys_arch_sem_wait → xQueueSemaphoreTake → spinlock_acquire → esp_cpu_compare_and_set` ⇒ **WS 任务的信号量自旋锁被占死/踩坏**，关中断自旋触发中断看门狗 |
+| 机制 | `oneye_dev_ble.c:124 ble_tx_frame()` 里两个局部数组：`framed[12288+64]` + `out[12288+128]` ⇒ **单次调用栈需求 ≈24.7 KB**，而它在主机任务里被调用（第 1 层已把该栈提到 12 KB，仍差 ~12 KB）⇒ 溢出砸向相邻堆对象（正是 WS 客户端的 socket 信号量）——**与"`link_report_task` 4 KB 栈溢出踩坏自旋锁"同一形态**，只是这次在 SDK 发送路径 |
+| 修复 | 两缓冲改为**堆分配**（单一出口释放；`len` 超限先挡再分配）。不走 `static` 是因为静态化 = 24 KB `.bss`（内部 RAM 紧张，会挤掉音频管线）。大分配按 `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096` 落 PSRAM；发送是低频操作 |
+| 验收 | 待跑：重建 SDK 预编译库（`build-all.sh`）→ 重编例程 → 重跑 `_tmp-ble-e2e.ps1`，期望**无断言**且收到 `prov.status` |
+
+**复现与取证脚本**：`E:\workspace\_tmp-ble-e2e.ps1`（纯 ASCII：复位抓 POP → 无复位抓串口 → bleak 驱动配网 → 按 ASCII 关键字 grep 现场）。
+**注意**：早期版本的同类脚本用中文 grep 模式，在 PS 5.1（GBK 解码）下全部变成乱码、**静默匹配不到任何行** —— 这也是本轮之前"看不出线索"的原因之一。
+
 ### 7.1.9 设备 SN 对齐（`esp32s3korvo2`）+ 10 段上限实测（2026-09-17 续）
 
 **背景（这是需求缺口，不是改名）**：开发人员拍板「当前开发板 SN 定为 **esp32s3korvo2**，对话正文按该 SN 派生密钥、

@@ -61,7 +61,15 @@ CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
 CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
 CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=517
 CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
-CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=4096
+# **主机任务栈必须 ≥ 12 KB**（默认 4096 会在 BLE 配网时崩板）：
+# GATT 的 RX 回调跑在 NimBLE 主机任务上，而 SDK 在**该回调里**处理 `prov.pair` 并**直接回帧**
+# （`oneye_dev_ble.c` 的 prov.pair 分支 → `oneye_dev_ble_send_frame` → 分片+加密+notify），
+# 这条组帧路径的栈峰值 ≈11 KB（8 KB frame + 2 KB payload，与例程里 link_report_task 取 12 KB 同因）。
+# 真机取证（2026-09-17）：4096 时手机侧一发 `prov.hello`/`prov.pair` 即崩——
+# `Guru Meditation … Debug exception reason: BREAK instr`，寄存器 A15=0xa5a5a5a5（FreeRTOS 栈填充字），
+# 反解地址全部落在 IDF 异常向量/FreeRTOS 分发代码（`_xt_kernel_exc`/`_frxt_dispatch`）⇒ 执行流跑飞；
+# 提到 12288 后同样操作 0 断言、RX 回调返回 0（正常处理）。
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=12288
 # NimBLE MSYS 内存池是**内部 RAM 里的静态数组**，默认 24/24 会在 BLE 打开后把内部 RAM 吃紧，
 # 进而挤掉音频管线（真机取证 2026-09-17：BLE 打开时出现 `E voice_io: I2S 读元素创建失败`
 # → `采集任务创建失败` → 自检轮无法收音）。本工程 BLE 只跑配网（帧 ≤600 B 分片），12/12 足够。

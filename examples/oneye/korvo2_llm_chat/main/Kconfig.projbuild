@@ -70,6 +70,15 @@ menu "korvo2_llm_chat —— 云端 LLM 实时语音对话例程"
                 用于无人值守验证「上行采集 → 服务端 ASR/LLM/TTS → 下行 PCM → 喇叭回放」整条链路。
                 ⚠️ 这是**台面/研发自检**开关（会不经按键就占用麦克风），量产必须为 0。
 
+        config ONEYE_LLM_DIAG_HTTP_PROBE
+            bool "台面诊断：建 WebSocket 前先做一次 HTTP GET /healthz"
+            default n
+            help
+                打开后，语音面客户端启动前会对同一 host:port 发一次普通 HTTP 请求并打印结果，
+                用于把「socket/lwIP 层面是否可用」与「WebSocket 组件是否有问题」分开定位
+                （真机取证 2026-09-17：建 WS 客户端时出现 `Interrupt wdt timeout on CPU1`）。
+                诊断用，量产保持 n。
+
     endmenu
 
     menu "配网（本地面：BLE 自研 GATT + ESPTouch v2 + 凭据文件）"

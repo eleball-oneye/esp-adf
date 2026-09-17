@@ -26,6 +26,7 @@
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_http_client.h"
 
 #include "board.h"
 #include "audio_hal.h"
@@ -226,6 +227,28 @@ static void net_ready_task(void *arg)
     /* 等 Wi-Fi/lwIP 在拿到 IP 后稳定下来再起 WebSocket 客户端（真机取证 2026-09-17：
      * 在 IP 事件链上立即建客户端会触发 `Interrupt wdt timeout`）。 */
     vTaskDelay(pdMS_TO_TICKS(500));
+
+    /* 诊断（台面，Kconfig 开关）：先用**普通 HTTP** 探一次同一个 host:port 的 /healthz。
+     * 目的：把"socket/lwIP 层面通不通"与"WebSocket 组件是否有问题"分开
+     * （真机取证 2026-09-17：建 WS 客户端即 `Interrupt wdt timeout on CPU1`）。 */
+#if CONFIG_ONEYE_LLM_DIAG_HTTP_PROBE
+    {
+        char url[160];
+        snprintf(url, sizeof(url), "http://%s:%d/healthz", CONFIG_ONEYE_LLM_SERVER_HOST,
+                 CONFIG_ONEYE_LLM_SERVER_PORT);
+        esp_http_client_config_t hc = { .url = url, .timeout_ms = 5000 };
+        esp_http_client_handle_t h = esp_http_client_init(&hc);
+        if (h != NULL) {
+            esp_err_t e = esp_http_client_perform(h);
+            int code = esp_http_client_get_status_code(h);
+            panel_min_note("[diag] HTTP GET %s → %s（status=%d）", url, esp_err_to_name(e), code);
+            esp_http_client_cleanup(h);
+        } else {
+            panel_min_note("[diag] HTTP 客户端创建失败");
+        }
+    }
+#endif
+
     snprintf(uri, sizeof(uri), "%s://%s:%d%s", LLM_CLIENT_URI_SCHEME,
              CONFIG_ONEYE_LLM_SERVER_HOST, CONFIG_ONEYE_LLM_SERVER_PORT,
              CONFIG_ONEYE_LLM_WS_PATH);

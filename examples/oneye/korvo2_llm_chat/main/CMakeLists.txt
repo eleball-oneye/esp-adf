@@ -7,6 +7,7 @@ idf_component_register(SRCS "main.c"
                             "panel_min.c"
                        INCLUDE_DIRS "."
                        REQUIRES oneye-dev-sdk
+                                esp_http_client
                                 audio_board
                                 audio_hal
                                 audio_pipeline

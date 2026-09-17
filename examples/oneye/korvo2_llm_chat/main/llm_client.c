@@ -501,8 +501,8 @@ esp_err_t llm_client_start(void)
      *   （实测：连上 Wi-Fi、开始 connect 到服务端时立即复现）。
      *   ⇒ 栈取 3584（<阈值）、缓冲取 2048，两者都在内部 RAM。
      */
-    cfg.task_stack = 3584;
-    cfg.buffer_size = 2048;
+    cfg.task_stack = 8192;
+    cfg.buffer_size = 4096;
     cfg.reconnect_timeout_ms = 3000;
     cfg.network_timeout_ms = 8000;
     /*

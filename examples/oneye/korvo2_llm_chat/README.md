@@ -141,6 +141,21 @@ llm_client: 状态 → READY：会话就绪          ← 服务端 session.ready
 2. chatd 侧 `conflict` 已修好并单测覆盖（见 backend `Registry` 陈旧会话接管 + WS 层 ping/读超时），
    待上面 WDT 解决后再验一次"设备端到端一轮"（`ONEYE_LLM_SELFTEST_TURN_MS` 自动收音已在固件里就绪）。
 
+**第 5 轮补充：进一步排除项与诊断工具**
+
+已排除（逐项实测仍复现）：SD 卡/FATFS（关 SD、凭据改走 Kconfig 仍复现）、
+Wi-Fi/LWIP 缓冲 PSRAM（`SPIRAM_TRY_ALLOCATE_WIFI_LWIP=n`）、
+中断看门狗阈值（300 → 1000 ms）、Wi-Fi 省电（`WIFI_PS_NONE`）、
+WebSocket 任务栈与缓冲（3584/2048 与 8192/4096 都试过）、
+发起连接任务的栈归属（6144 → 4096 内部 RAM）、组件自动重连（开/关都试过）、
+以及移除我们自己的保活/重连任务。
+**关键观察**：panic 出现的位置会漂移（有时在 `websocket_client: Started` 后 ~5 ms、
+有时在 Wi-Fi 取到 IP 前后），而两核 dump 始终显示"正常阻塞态" ⇒ 更像**周期性关中断**型
+平台问题，而非某条我们的代码路径。
+
+新增台面诊断开关 `ONEYE_LLM_DIAG_HTTP_PROBE`（缺省 n）：建 WebSocket 之前先用普通
+HTTP `GET /healthz` 探同一 host:port，用来判定"是 socket/lwIP 层面"还是"WebSocket 组件"。
+
 
 
 **构建（已通过）**：ESP-IDF v5.5.5 + ESP-ADF v2.8，`idf.py set-target esp32s3 && idf.py build` 成功，

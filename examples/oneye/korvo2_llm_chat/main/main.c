@@ -47,6 +47,35 @@ static bool                    s_gate_ready; /* 语音面就绪（可开始新�
 /* 采集回调（前置声明：定义在文件后部） */
 static void pcm_uplink_cb(const void *pcm, size_t len, void *ctx);
 
+/* ------------------------------------------------------------------ 台面自检（可选） */
+
+/*
+ * `ONEYE_LLM_SELFTEST_TURN_MS > 0` 时，语音面就绪后自动走一轮完整话轮
+ * （等价于「按住 REC 该时长后松开」），用于无人值守验证整条链路：
+ *   上行采集 → 服务端 ASR/LLM/TTS → 下行 PCM → 喇叭回放 → turn.end。
+ * 走的是与按键**完全相同**的代码路径（voice_io + llm_client），不新增任何协议/端点。
+ */
+#if CONFIG_ONEYE_LLM_SELFTEST_TURN_MS > 0
+static void selftest_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    panel_min_note("[selftest] 自动收音 %d ms（台面自检，非按键路径）",
+                   CONFIG_ONEYE_LLM_SELFTEST_TURN_MS);
+    if (voice_io_capture_start(pcm_uplink_cb, NULL) != ESP_OK) {
+        panel_min_note("[selftest] 采集启动失败");
+        vTaskDelete(NULL);
+        return;
+    }
+    s_turn_start_us = esp_timer_get_time();
+    vTaskDelay(pdMS_TO_TICKS(CONFIG_ONEYE_LLM_SELFTEST_TURN_MS));
+    (void)voice_io_capture_stop();
+    panel_min_note("[selftest] 自动提交本轮（上行 %u B）", (unsigned)voice_io_captured_bytes());
+    (void)llm_client_commit();
+    vTaskDelete(NULL);
+}
+#endif
+
 /* ------------------------------------------------------------------ 语音面回调 */
 
 static void on_llm_state(llm_client_state_t st, const char *detail, void *ctx)
@@ -65,6 +94,13 @@ static void on_llm_state(llm_client_state_t st, const char *detail, void *ctx)
     }
     s_gate_ready = (st == LLM_CLIENT_READY);
     panel_min_state(name, detail);
+#if CONFIG_ONEYE_LLM_SELFTEST_TURN_MS > 0
+    static bool selftest_done;
+    if (st == LLM_CLIENT_READY && !selftest_done) {
+        selftest_done = true;
+        (void)xTaskCreate(selftest_task, "selftest", 6144, NULL, 4, NULL);
+    }
+#endif
 }
 
 static void on_llm_text(const char *frame_t, const char *text, void *ctx)

@@ -99,6 +99,7 @@ go run ./scripts/e2e/voice_client.go -addr 127.0.0.1:9091 -device korvo2-e2e
 | `ONEYE_LLM_ENABLE_SMARTCONFIG` | y | ESPTouch v2（备用通道） |
 | `ONEYE_LLM_ENABLE_LAN_LINK` | y | 本地面 `lan` 信道（**明文，量产置 n**） |
 | `ONEYE_LLM_LOG_TEXT` | n | 是否把 ASR/LLM 文本打串口（PIPL：正文不落盘） |
+| `ONEYE_LLM_SELFTEST_TURN_MS` | 0 | 台面自检：非 0 时语音面就绪后自动收音该时长并提交一轮（无人值守验证整条链路；量产必须 0） |
 
 ## 7. 已验证 / 未验证（真机取证记录，2026-09-17）
 
@@ -118,30 +119,46 @@ go run ./scripts/e2e/voice_client.go -addr 127.0.0.1:9091 -device korvo2-e2e
 | BLE 配网 | ❌ 不可用 | `oneye_dev_ble_init` 返回 `-5`（UNSUPPORTED）——**预编译库缺陷**，见下 |
 | 语音面连接 | ⚠️ 已发起、未完成 | `llm_client: ws://…:9091/v1/voice/ws（子协议 oneye.voice.v1）` → `状态=CONNECTING` → `websocket_client: Started`，随后设备复位 |
 
-**开机即复位的缺陷（未解决，已定位到根因方向）**：
+**开机即复位的缺陷 → 第 2 轮已修（关键根因在 SDK 侧）**：
 
-- 现象：连上 Wi-Fi 后创建 WebSocket 客户端时复位重启（`Guru Meditation … LoadProhibited` 或 `Interrupt wdt timeout on CPU0`，两者都落在 heap 侧）；
-- 根因（已用 `xtensa-esp32s3-elf-addr2line` 解码回溯源确认）：
-  `prov_report()` → `oneye_dev_link_prov_report_status()` → `oneye_dev_link_send()` 的组帧路径
-  **在栈上开 8 KB**（`oneye_dev_link.c:558 char frame[ONEYE_DEV_LINK_FRAME_MAX_BYTES]`）
-  ＋ `oneye_link_frame_build()` 的 `payload[2049]`（`oneye_link_frame.c:152`）⇒ 单次调用栈峰值 ≈**11 KB**；
-  最初从**系统事件任务**（3 KB 栈）调用，栈被踩穿并破坏堆，随后任意一次 malloc（如 `xTaskCreate`）即崩；
-- 已做的缓解：所有 link 上报改为**独立 12 KB 任务**（`prov_service.c` 的 `link_report_task` + 队列投递）、
-  httpd 栈 12 KB、`CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192`、`CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096`；
-  复位现象**仍在**（已排除 Wi-Fi/Wi-Fi-LWIP PSRAM 分配这一项），需下一轮继续：建议下一步先在
-  `llm_client_start()` 前加内存水位打印、并复核 12 KB/16 KB 任务栈是否真的分配到内部 RAM；
-  **同时应向 SDK（P1 交付）提出**：`oneye_dev_link_send()` 不应把 8 KB 缓冲放在栈上（应改堆分配或降低上限），
-  否则任何调用方都可能踩栈。
+- 现象（第 1 轮）：连上 Wi-Fi 后创建 WebSocket 客户端时复位（`Guru Meditation … LoadProhibited` 或
+  `Interrupt wdt timeout on CPU0`，两者都落在 heap 侧）；
+- 根因（`xtensa-esp32s3-elf-addr2line` 解码回溯源 + 代码复核）：`oneye_dev_link_send()` 的组帧路径
+  **在栈上开 8 KB**（`oneye_dev_link.c:558 char frame[ONEYE_DEV_LINK_FRAME_MAX_BYTES]`），
+  叠加 `oneye_link_frame_build()` 里那份**本不需要**的 `payload[2049]` 拷贝 ⇒ 公共 API 单次调用栈峰值 ≈11 KB；
+  而它会被系统事件任务（3 KB）、httpd 任务（4 KB）等小栈任务调用 ⇒ 踩穿栈 → 破坏堆 → 之后任意 malloc 崩。
+- **已修（SDK 侧，第 2 轮）**：组帧缓冲改**堆分配**（每次调用申请/释放，失败返回 `ERR_NO_MEM`）；
+  `oneye_link_frame_build()` 去掉 2 KB 栈拷贝（改为直接校验 `frame->p[0]`）。
+  回归：宿主单测 **20 组 / 235 用例 / 3261 断言、0 失败**；ESP 六库重发。
+- **应用侧加固**：所有 link 上报走独立 12 KB 任务（`link_report_task` + 队列）、配网启动走 16 KB 任务、
+  httpd 栈 12 KB、`CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192`、`CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096`。
 
-**BLE 预编译库缺陷（已定位）**：`oneye_ble_plat_nimble.c` 的实现体受
-`#if defined(ESP_PLATFORM) && defined(CONFIG_BT_ENABLED) && defined(CONFIG_BT_NIMBLE_ENABLED)` 保护，
-而 P1 交叉编译产出的 `lib/xtensa-esp32s3-elf-gcc-14.2.0/liboneye_dev_ble.a` 是在**未定义这两个 CONFIG** 的
-配置下构建的 ⇒ 库里只有宿主桩（`oneye_ble_plat_supported() == false`），设备上 `oneye_dev_ble_init()` 恒返回
-`ERR_UNSUPPORTED`。修法（下一轮）：用开启了 BT/NimBLE 的配置重发该预编译库，并加一条 ABI/自检断言防回归。
+**BLE 预编译库缺陷 → 第 2 轮已修（两处，缺一不可）**：
 
-**其余待真机取证项**（依赖上述缺陷修好后才有意义）：
+1. `build-all.sh` 的 IDF 探针 `IDF_PROBE_REQUIRES` 缺 `bt esp_wifi`（且探针 sdkconfig 未开 BLE）
+   ⇒ 生成的编译参数里没有 `CONFIG_BT_ENABLED/CONFIG_BT_NIMBLE_ENABLED`；
+   已补齐 REQUIRES、给探针加 `sdkconfig.defaults`（开 BT + NimBLE）、并加 `IDF_PROBE_REV` 使缓存失效；
+2. `oneye_ble_plat_nimble.c` / `oneye_dev_ble.c` 用 `#if defined(CONFIG_*)` 判定能力，却**没包含 sdkconfig.h**
+   ⇒ 条件恒假、实现体被整段裁掉。已显式 `#include "sdkconfig.h"`（ESP 平台）。
+   **取证**：`liboneye_dev_ble.a` 41,192 B（只有宿主桩）→ **54,100 B 且含 `nimble_port_init`/`ble_gatts` 引用**；
+   设备侧日志由 `oneye_dev_ble_init 失败：-5（UNSUPPORTED）` 变为真正跑 NimBLE 初始化。
 
-1. 长按 600 ms 触发收音的实际时延与阈值行为；短按/播放中长按的打断路径；
+**下一轮待办（本轮末尾新出现的两个问题）**：
+
+1. `E NimBLE: ble_gatts_count_resources rc=3` → `oneye_dev_ble_init 失败：-4`：
+   NimBLE 资源计数失败（rc=3 = `BLE_HS_ENOMEM`）。当前 Kconfig 已给
+   `BT_NIMBLE_MSYS1_BLOCK_COUNT=24 / GATT_MAX_PROCS=4 / MTU=517 / HOST_TASK_STACK=4096`；
+   下一步排查 GATT 服务/特征注册顺序与 `ble_gatts_count_resources` 的资源上限（含 GAP/GATT 预注册服务）。
+2. **配网流程在 BLE 真正初始化后停住**：设备停在 `BOOT`（`net.connected=false`、无 `凭据文件命中` 日志），
+   即 `prov_service_start()` 未走到读凭据文件那一步；已加 `配网启动：…` 入口日志以便下次区分
+   「未被调用」与「卡在读文件」；怀疑与 NimBLE 起来后的内存/任务状态有关
+   （缓解方向：把凭据文件读取提前到 BLE 初始化之前，或先在 Kconfig 关掉 BLE 验证）。
+
+**其余待真机取证项**：
+
+1. 长按 600 ms 触发收音的实际时延与阈值行为；短按/播放中长按的打断路径
+   （已加台面自检开关 `ONEYE_LLM_SELFTEST_TURN_MS`：置 3000 时语音面就绪后自动收音 3 s 并提交，
+   无需人手按键即可验证整条链路，见下）；
 2. 单声道→立体声回放（本工程自行复制声道，S3 上 ADF 的 `i2s_mono_fix()` 不参与编译）；
 3. 打断时延（`input.cancel` → 停止回播）是否 ≤200 ms；`down_drops` 丢帧率；
 4. BLE(NimBLE)+Wi-Fi+AFE 同跑时的内部 RAM 余量。

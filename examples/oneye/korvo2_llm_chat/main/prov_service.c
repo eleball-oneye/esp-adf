@@ -399,6 +399,7 @@ esp_err_t prov_service_init(esp_periph_set_handle_t periph_set, prov_ready_cb_t 
         }
         (void)oneye_dev_ble_start();
         (void)oneye_dev_ble_bind_to_link(); /* 把 BLE 注册为 link 的 ble 信道发送器 */
+        ESP_LOGI(TAG, "BLE 配网已就绪（未配网时会以 ONEYE-<id 后 4 位> 广播；POP 在 start 时打印）");
     }
 #endif
 
@@ -475,8 +476,10 @@ esp_err_t prov_service_start(void)
     char pass[65] = { 0 };
 
     if (!s_inited) {
+        ESP_LOGE(TAG, "prov_service_start()：服务未初始化（先调 prov_service_init）");
         return ESP_ERR_INVALID_STATE;
     }
+    ESP_LOGI(TAG, "配网启动：先查凭据文件（/sdcard → /spiffs），无则回落 Kconfig，再开 BLE + SmartConfig");
 
 #if CONFIG_ONEYE_LLM_ENABLE_WIFI_FILE
     const char *paths[] = { "/sdcard/oneye-wifi.txt", "/spiffs/oneye-wifi.txt" };

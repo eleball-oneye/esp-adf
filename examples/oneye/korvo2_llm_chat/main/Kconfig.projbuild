@@ -61,6 +61,15 @@ menu "korvo2_llm_chat —— 云端 LLM 实时语音对话例程"
             range 0 100
             default 80
 
+        config ONEYE_LLM_SELFTEST_TURN_MS
+            int "台面自检：自动走一轮（收音时长 ms；0 = 关闭）"
+            range 0 10000
+            default 0
+            help
+                置为非 0 时，语音面就绪后**自动**收音该时长并提交本轮（等价于「按住 REC 该时长后松开」），
+                用于无人值守验证「上行采集 → 服务端 ASR/LLM/TTS → 下行 PCM → 喇叭回放」整条链路。
+                ⚠️ 这是**台面/研发自检**开关（会不经按键就占用麦克风），量产必须为 0。
+
     endmenu
 
     menu "配网（本地面：BLE 自研 GATT + ESPTouch v2 + 凭据文件）"

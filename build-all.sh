@@ -546,14 +546,25 @@ EOF
 #   从它产出的 compile_commands.json 汇总 -I/-D/-std/-m*，按工具链缓存复用。
 #   探针组件的 REQUIRES 与 components/oneye-dev-sdk/CMakeLists.txt 的 ESP 组件模式一致，
 #   因此拿到的 include 集合就是 SDK 在真实消费工程里的待遇（含 sdkconfig.h 所在目录）。
-IDF_PROBE_REQUIRES="esp_netif mbedtls esp_event nvs_flash esp_timer"
+#
+# ⚠️ 已修复的真实缺陷（2026-09-17，勿再漏项）：本清单此前缺 `bt esp_wifi`，于是探针的
+#   sdkconfig.h **不含 CONFIG_BT_ENABLED / CONFIG_BT_NIMBLE_ENABLED**，而 oneye_ble_plat_nimble.c
+#   整个实现被 `#if defined(ESP_PLATFORM) && defined(CONFIG_BT_ENABLED) && defined(CONFIG_BT_NIMBLE_ENABLED)`
+#   包裹 ⇒ 预编译 liboneye_dev_ble.a 里只有宿主桩（oneye_ble_plat_supported() == false），
+#   设备上 oneye_dev_ble_init() 恒返回 ERR_UNSUPPORTED（真机取证：korvo2_llm_chat 例程串口 -5）。
+#   教训：本清单**必须**与 SDK 组件模式 PRIV_REQUIRES 逐项一致，改一处要改两处。
+IDF_PROBE_REQUIRES="esp_netif mbedtls esp_event nvs_flash esp_timer bt esp_wifi"
+
+# 探针口径版本：**改 REQUIRES 或 probe/sdkconfig.defaults 时 +1**，否则旧的 flags 缓存会继续命中，
+# 表现为"改了脚本却没生效"（2026-09-17 实测踩到：加了 bt 仍拿到不含 CONFIG_BT_ENABLED 的旧参数）。
+IDF_PROBE_REV=2
 
 idf_probe_flags() { # $1=idf 路径 $2=target $3=tcid → 回显 flags 文件路径；失败返回 1
     local idf="$1" target="$2" tcid="$3"
     local cache="$OUT_ROOT/.build/idfflags-$tcid.txt"
     local meta="$cache.meta"
     local probe="$OUT_ROOT/.build/idfprobe-$tcid"
-    local want="idf=$idf target=$target"
+    local want="idf=$idf target=$target probe_rev=$IDF_PROBE_REV"
 
     # 缓存有效判据：flags 在、stamp 与本次一致、且 sdkconfig.h 仍在（探针目录未被清理）。
     if [ -s "$cache" ] && [ -f "$meta" ] && [ "$(cat "$meta" 2>/dev/null)" = "$want" ] \
@@ -562,6 +573,16 @@ idf_probe_flags() { # $1=idf 路径 $2=target $3=tcid → 回显 flags 文件路
     fi
 
     mkdir -p "$probe/main"
+    cat > "$probe/sdkconfig.defaults" <<'PROBE_EOF'
+# 探针必须**开启 BLE（NimBLE）**：oneye_ble_plat_nimble.c 的实现体受
+#   #if defined(ESP_PLATFORM) && defined(CONFIG_BT_ENABLED) && defined(CONFIG_BT_NIMBLE_ENABLED)
+# 保护，IDF 缺省 BT 是关的 ⇒ 关掉时预编译 liboneye_dev_ble.a 只编出宿主桩
+# （oneye_ble_plat_supported() == false），设备上 oneye_dev_ble_init() 恒返回 -5 UNSUPPORTED。
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+PROBE_EOF
+    # 重要：删掉旧 sdkconfig，否则 `idf.py set-target` 会沿用旧配置、忽略 defaults 的改动。
+    rm -f "$probe/sdkconfig"
     cat > "$probe/CMakeLists.txt" <<'PROBE_EOF'
 cmake_minimum_required(VERSION 3.16)
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
@@ -599,6 +620,15 @@ PROBE_EOF
 #include "mbedtls/ssl.h"
 #include "mbedtls/x509_crt.h"
 #include "nvs_flash.h"
+
+/* BLE（oneye_ble_plat_nimble.c 的平台头）：列在这里可让"探针未开 BT/NimBLE"当场暴露，
+ * 而不是等到设备上 oneye_dev_ble_init() 返回 -5 才发现（见 IDF_PROBE_REQUIRES 的注释）。 */
+#include "nimble/nimble_port.h"
+#include "nimble/nimble_port_freertos.h"
+#include "host/ble_hs.h"
+#include "host/util/util.h"
+#include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
 
 void oneye_idf_flagprobe_touch(void);
 void oneye_idf_flagprobe_touch(void) { }

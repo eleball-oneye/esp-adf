@@ -100,6 +100,32 @@ go run ./scripts/e2e/voice_client.go -addr 127.0.0.1:9091 -device korvo2-e2e
 | `ONEYE_LLM_ENABLE_LAN_LINK` | y | 本地面 `lan` 信道（**明文，量产置 n**） |
 | `ONEYE_LLM_LOG_TEXT` | n | 是否把 ASR/LLM 文本打串口（PIPL：正文不落盘） |
 | `ONEYE_LLM_SELFTEST_TURN_MS` | 0 | 台面自检：非 0 时语音面就绪后自动收音该时长并提交一轮（无人值守验证整条链路；量产必须 0） |
+| `ONEYE_LLM_SELFTEST_NEW_CONV` | n | 台面自检：第 1 轮结束后自动发 `conv.new`（等价 SET 键单击），验证"起新对话 + 新对话里从零开始"；量产必须 n |
+
+## 6.1 按键语义（第二轮新增 SET 键）
+
+| 键 | 动作 | 效果 |
+| --- | --- | --- |
+| **REC** | 长按 ≥ `ONEYE_LLM_TALK_MIN_PRESS_MS`（缺省 600 ms）后按住 | 开始收音；松开即 `input.audio.commit` |
+| REC | 短按（未达阈值） | 忽略误触；若正在回放则打断 |
+| REC | 回放中按下 | 立刻 `input.cancel`（打断 ≤200 ms，契约 §4） |
+| **SET** | **单击**（短按松开） | 发 `conv.new` → 服务端建**新对话段**并回 `conv.state{reason:"new"}`；此后轮次计入新段，**新段不继承旧上下文** |
+| SET | 长按（≥ 阈值） | 当前**不绑定动作**（保留给将来，如清空对话/恢复出厂） |
+
+要点（排查时最容易困惑的两点）：
+
+1. **重连不会自动开新对话**：服务端按设备 SN 记住最近活动的段，上电/重连后**接着那段继续**。
+   若每次连接都建新段，10 段上限几次重连就被垃圾段占满 —— 所以"开新话题"必须由 SET 键显式触发。
+2. **本轮进行中按 SET**：服务端对 `conv.new` 回 `error{code:"conflict"}`；本工程先在本地 `input.cancel` 收尾、
+   再发 `conv.new`（见 `main.c` 的 `on_new_conversation`），避免"正在生成的回答该写进哪一段"没有确定答案。
+
+对话组回执（`conv.state`）的串口日志形如：
+
+```
+I (12345) llm_client: 对话组：ready —— #1（已有 0 轮，模型档位 stub）
+I (23456) llm_client: 对话组：new —— #2（已有 0 轮，模型档位 stub）
+I (34567) llm_chat: 新对话已建立：#2（已有 0 轮，模型 stub）
+```
 
 ## 7.1 真机取证（2026-09-17，逐轮累计）
 
@@ -372,6 +398,55 @@ HTTP `GET /healthz` 探同一 host:port，用来判定"是 socket/lwIP 层面"�
 - 本工程**不启用** link 的 `wan` 信道（`wan_uri = NULL`）：语音面走独立的 voice WS；link 广域信道需要服务端 `/v1/link/ws` 支持，尚未落地；
 - 局域网信道设备→手机方向采用「HTTP 响应携带」（`lan_link.c` 头注）：`contracts/local/lan-link.md` 只定义了请求方向，异步推送口径待 R-L1 会签后定稿；
 - 未配对（无令牌）时局域网只放行 `prov.hello` / `link.ping` / `node.announce`（契约 §2 口径）；令牌协商（BLE 配对成功后下发）尚未实现。
+
+### 7.1.8 第二轮：对话组（SET 键起新对话）+ 采集任务栈改 PSRAM（2026-09-17 第 39~41 轮）
+
+**本轮新增能力**（契约 §12）：`session.start` → `conv.state{reason:"ready"}`（接着最近活动的那段继续）、
+SET 键单击 → `conv.new` → `conv.state{reason:"new"}`（新段不继承旧上下文）、控制台改档位 → `conv.state{reason:"switched"}`。
+见 §6.1 按键语义与 §6 Kconfig 速查。
+
+**真机取证（串口 + 服务端控制台双向核对）**：
+
+| 环节 | 结果 | 证据 |
+| --- | --- | --- |
+| 会话就绪绑定对话组 | ✅ | `llm_client: 对话组：ready —— #1（已有 0 轮，模型档位 stub）` + `llm_chat: 对话组回执：reason=ready conv_id=1 turns=0 profile=stub` |
+| **人工长按 REC 走完整回合** | ✅ | `REC 按下` → `长按达标（自按下事件起算 581 ms，阈值 600 ms）→ 开始收音` → `REC 松开（按住 2254 ms）→ 提交本轮` → `本轮结束：turn_seq=1 rtt=2808 ms`；THINKING→SPEAKING→下行 96,000 B 回放 |
+| **人工 SET 单击 → 起新对话** | ✅ **已闭环** | ① 会话就绪前按下（t=3.4 s < `session.ready` 4.26 s）：`key_talk: SET 单击 → 请求开新对话（第 1 次）`（事件路径通）→ 旧实现直接拒绝 ⇒ 促成"待生效补发"修正（见下）；② 会话就绪后按下（t=14.9 s）：`SET 单击` → `已请求新对话段（conv.new，reason=key_set）` → `对话组：new —— #5（已有 0 轮）` → `新对话已建立：#5` |
+| 服务端侧段隔离（控制台按 SN 查） | ✅ | `GET /v1/voice/devices/korvo2-llm-0001/conversations`：段 #1/#2/#3/#4 各 `turns=1`（标题=首句，解密正常）、段 #5 `turns=0` 且 `current=true`（旧段全部保留） |
+| 打断语义（服务端已按播放速率发送） | ✅ | 下行字节 96,000 → 105,600（第 2 轮 cancel 停在半途），`turn.end{cancelled:true}` 且无 `tts.end` |
+| 复位/断言 | ✅ 0 | 五次 70~180 s 抓取：仅烧写/抓取时的 RTS 复位，**0 `assert failed` / 0 `Guru Meditation`**；BLE 配网、局域网链路、语音面同时在线 |
+
+**本轮修掉的真缺陷：采集任务栈改放 PSRAM（`采集任务创建失败` → 长按 REC 收不到音）**
+
+- 现象：新一轮取证中自检轮报 `E voice_io: 采集任务创建失败`，且**延后到 20 s 再跑同样失败**
+  （排除"AFE 模型加载瞬时峰值"）——意味着长按 REC 也收不到音；
+- 现场数字：`内部余 43,431 B / 最大连续块 25,600 B`（PSRAM 余 ~8 MB）；`xTaskCreate` 申请 4 KB
+  **内部**栈被拒。注意此刻 `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096` —— 小分配一律优先内部 RAM，
+  BLE 配网 + Wi-Fi + AFE 三者叠加后内部 RAM 已接近枯竭（采集成功时实测内部余 **3,403 B**）；
+- 修复：`voice_io_capture_start()` 改用 `xTaskCreateWithCaps(..., MALLOC_CAP_SPIRAM)` 建采集任务
+  （PSRAM 余量充足；采集任务只从 raw 流环形缓冲读数据、不碰 ISR/DMA 描述符），
+  PSRAM 不可用或配置不允许外部栈时**回退内部栈**并打印两侧余量；用 `vTaskDeleteWithCaps` 回收（否则 PSRAM 栈泄漏）。
+  这与 `key_talk` 的按键任务 `ext_stack` 和 ADF 的 `audio_mem_spiram_stack_is_enabled()` 口径一致；
+- 证据：`voice_io: 采集任务已创建（栈 4096 B 在 PSRAM；内部余 3403 B）` → 人工长按 REC 收音 80,640 B 成功。
+
+**本轮第二个修正：会话就绪前按 SET 不再"没反应"**
+
+- 现象（真机取证）：开机 3.4 s 按下 SET，而 `session.ready` 在 4.26 s ⇒ 原实现直接拒绝
+  （`panel: SET：语音面未就绪…未起新对话`）。设备无屏，用户侧表现就是**按了没反应**；
+- 修复：未就绪时把这次意图记为待生效（`s_new_conv_pending`），会话就绪后立刻补发 `conv.new`
+  （`on_llm_state` 的 READY 分支）；只记一次（连按多次仍只开一段）。
+  该分支本身尚**未在真机上被人工触发**（要卡在开机 4 s 内按键，人手上不好复现）——
+  已实现 + 编译通过，与"就绪后直发"共用同一条发送路径（后者已闭环），登记为**待验收（人工时序）**。
+
+**本章节的口径提醒（排查时最容易踩）**：
+
+1. **重连不会自动开新段**：服务端按设备 SN 记住最近活动的段，上电/重连后接着那段继续；
+   若每次连接都建新段，10 段上限几次重连就被垃圾段占满 —— 新话题必须由 SET 键显式触发；
+2. **自检开关会自己开新段**：`ONEYE_LLM_SELFTEST_TURN_MS>0` 时自检轮会在 `turn.end` 后 2 s 自动 `conv.new`；
+   做人工按键取证时请把 `ONEYE_LLM_SELFTEST_TURN_MS=0`、`ONEYE_LLM_SELFTEST_NEW_CONV=n`，
+   否则日志里会混入自检产生的段（本次取证就先后出现 #3、#4）；
+3. **音频不落库、正文加密落库**：正文密钥由设备 SN 派生（服务端 `VOICE_STORE_PEPPER` 叠加），
+   设备侧只发不收——本工程不做任何正文持久化。
 
 ## 8. 合规
 

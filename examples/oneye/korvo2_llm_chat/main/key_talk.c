@@ -1,5 +1,5 @@
 /*
- * key_talk.c —— REC 键长按说话（ADC 按键 + input_key_service）
+ * key_talk.c —— REC 键长按说话 + SET 键单击起新对话（ADC 按键 + input_key_service）
  *
  * 见 key_talk.h 头注：本模块用**自定义 press_judge_time** 的 ADC 按键外设，
  * 因此**不得**再调用 `audio_board_key_init()`（会在同一 ADC 通道上装第二份按键外设）。
@@ -50,8 +50,23 @@ static esp_err_t key_cb(periph_service_handle_t handle, periph_service_event_t *
     }
     int user_id = (int)(intptr_t)evt->data;
     int action = (int)evt->type;
+
+    /* SET 键：单击 = 起新对话（契约 §12.1 `conv.new`）。
+     * 用 CLICK_RELEASE（短按松开）而不是 CLICK（按下）：否则用户想长按 SET 时会先误触发一次新对话，
+     * 而"新对话"是有副作用的动作（此后轮次计入新段）。长按 SET 当前不绑定动作。 */
+    if (user_id == INPUT_KEY_USER_ID_SET) {
+        if (action == KEY_EV_CLICK_RELEASE) {
+            s_st.new_conv_count++;
+            ESP_LOGI(TAG, "SET 单击 → 请求开新对话（第 %u 次）", (unsigned)s_st.new_conv_count);
+            if (s_cbs.on_new_conversation) {
+                s_cbs.on_new_conversation(s_cbs.ctx);
+            }
+        }
+        return ESP_OK;
+    }
+
     if (user_id != INPUT_KEY_USER_ID_REC) {
-        return ESP_OK; /* 其他键（VOL/MUTE/PLAY/SET）本工程暂不处理 */
+        return ESP_OK; /* 其他键（VOL/MUTE/PLAY）本工程暂不处理 */
     }
 
     switch (action) {
@@ -166,7 +181,7 @@ esp_err_t key_talk_init(esp_periph_set_handle_t set, const key_talk_cbs_t *cbs)
     (void)input_key_service_add_key(s_key_srv, key_info, INPUT_KEY_NUM);
     (void)periph_service_set_callback(s_key_srv, key_cb, NULL);
 
-    ESP_LOGI(TAG, "REC 键就绪：长按 ≥ %d ms 开始收音，松开提交（短按 = 打断/忽略）",
+    ESP_LOGI(TAG, "按键就绪：REC 长按 ≥ %d ms 开始收音、松开提交（短按 = 打断/忽略）；SET 单击 = 起新对话",
              CONFIG_ONEYE_LLM_TALK_MIN_PRESS_MS);
     return ESP_OK;
 #else

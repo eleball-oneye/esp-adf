@@ -225,6 +225,28 @@ esp_err_t llm_client_ping(void)
     return send_frame("ping", NULL);
 }
 
+esp_err_t llm_client_new_conversation(void)
+{
+    if (s_ws == NULL || !esp_websocket_client_is_connected(s_ws) || !s_st.session_ready) {
+        /* 不排队：设备无屏，静默排队会让"按了没反应"变成一个查不出的问题。
+         * 未就绪时上层（main.c）会打面板提示。 */
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* 本轮进行中服务端会回 conflict —— 先本地收尾：丢掉未发出的上行尾包，
+     * 让"这一轮"在本地就结束，避免用户在长按说话中按 SET 时状态错乱。 */
+    if (s_st.state == LLM_CLIENT_LISTENING) {
+        s_up_fill = 0;
+    } else if (s_st.state == LLM_CLIENT_THINKING || s_st.state == LLM_CLIENT_SPEAKING) {
+        return ESP_ERR_INVALID_STATE; /* 由上层先 cancel 再重试 */
+    }
+    esp_err_t err = send_frame("conv.new", "{\"reason\":\"key_set\"}");
+    if (err == ESP_OK) {
+        s_st.new_convs++;
+        ESP_LOGI(TAG, "已请求新对话段（conv.new，reason=key_set）——等待 conv.state 回执");
+    }
+    return err;
+}
+
 /* ------------------------------------------------------------------ 入站处理 */
 
 static void handle_text(const char *json, size_t len)
@@ -247,6 +269,40 @@ static void handle_text(const char *json, size_t len)
         }
         s_st.session_ready = true;
         set_state(LLM_CLIENT_READY, "会话就绪");
+    } else if (strcmp(t, "conv.state") == 0) {
+        /* 契约 §12.1：当前对话组（会话就绪 / conv.new / 控制台换档位时各回一次）。
+         * 设备无屏，这里是"在接着哪段聊、用的哪个模型、这段聊了多少轮"的唯一可见入口。 */
+        const char *reason = "";
+        const char *profile = "";
+        int64_t conv_id = 0;
+        int turns = 0;
+        if (cJSON_IsObject(jp)) {
+            const cJSON *jr = cJSON_GetObjectItemCaseSensitive(jp, "reason");
+            const cJSON *ji = cJSON_GetObjectItemCaseSensitive(jp, "conv_id");
+            const cJSON *jt2 = cJSON_GetObjectItemCaseSensitive(jp, "turns");
+            const cJSON *jpr = cJSON_GetObjectItemCaseSensitive(jp, "profile_id");
+            if (cJSON_IsString(jr) && jr->valuestring) {
+                reason = jr->valuestring;
+            }
+            if (cJSON_IsNumber(ji)) {
+                conv_id = (int64_t)ji->valuedouble;
+            }
+            if (cJSON_IsNumber(jt2)) {
+                turns = jt2->valueint;
+            }
+            if (cJSON_IsString(jpr) && jpr->valuestring) {
+                profile = jpr->valuestring;
+            }
+        }
+        s_st.conv_id = conv_id;
+        s_st.conv_turns = turns;
+        snprintf(s_st.conv_profile, sizeof(s_st.conv_profile), "%s", profile);
+        ESP_LOGI(TAG, "对话组：%s —— #%lld（已有 %d 轮，模型档位 %s）",
+                 reason[0] ? reason : "?", (long long)conv_id, turns,
+                 profile[0] ? profile : "服务端默认");
+        if (s_cbs.on_conv_state) {
+            s_cbs.on_conv_state(reason, conv_id, turns, profile, s_cbs.ctx);
+        }
     } else if (strcmp(t, "asr.partial") == 0 || strcmp(t, "asr.final") == 0 ||
                strcmp(t, "llm.delta") == 0) {
         if (text) {

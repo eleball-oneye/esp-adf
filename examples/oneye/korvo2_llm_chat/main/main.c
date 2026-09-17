@@ -44,6 +44,8 @@ static esp_periph_set_handle_t s_periph_set;
 static audio_board_handle_t    s_board;
 static int64_t                 s_turn_start_us;
 static bool                    s_gate_ready; /* 语音面就绪（可开始新一轮） */
+/* SET 键在"会话未就绪"时被按下的待生效标记（见 on_new_conversation 与 on_llm_state）。 */
+static volatile bool           s_new_conv_pending;
 
 /* 采集回调（前置声明：定义在文件后部） */
 static void pcm_uplink_cb(const void *pcm, size_t len, void *ctx);
@@ -60,7 +62,12 @@ static void pcm_uplink_cb(const void *pcm, size_t len, void *ctx);
 static void selftest_task(void *arg)
 {
     (void)arg;
-    vTaskDelay(pdMS_TO_TICKS(3000));
+    /* 等 20 s 再自检（原先 3 s）：真机取证 2026-09-17 发现 3 s 时正撞上
+     * "AFE 模型加载 + BLE 广播 + WS 建连"三者叠加的内存峰值，
+     * `voice_io` 的 4 KB 采集任务栈申请被拒（`采集任务创建失败`，当时内部余 44,111 B / 最大块 23,552 B），
+     * 自检直接失败且不重试。延后到配网与模型都稳定后再跑，采集可正常创建。
+     * 这只影响**台面自检**的时间点，不影响按键路径。 */
+    vTaskDelay(pdMS_TO_TICKS(20000));
     panel_min_note("[selftest] 自动收音 %d ms（台面自检，非按键路径）",
                    CONFIG_ONEYE_LLM_SELFTEST_TURN_MS);
     /* 内存取证（BLE 配网打开后内部 RAM 明显变紧，音频管线会被挤掉）：
@@ -82,6 +89,25 @@ static void selftest_task(void *arg)
     (void)llm_client_commit();
     vTaskDelete(NULL);
 }
+
+/*
+ * `ONEYE_LLM_SELFTEST_NEW_CONV=1` 时，第 1 轮结束后自动发一次 `conv.new`
+ * （等价 SET 键单击），用于无人值守验证"起新对话 + 在新对话里继续"：
+ * 服务端应回 `conv.state{reason:"new"}` 且 conv_id 变化、turns 归零。
+ */
+#if CONFIG_ONEYE_LLM_SELFTEST_NEW_CONV
+static void selftest_newconv_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(2000)); /* 等第 1 轮彻底收尾（turn.end 之后） */
+    panel_min_note("[selftest] 模拟 SET 单击：请求开新对话");
+    esp_err_t err = llm_client_new_conversation();
+    if (err != ESP_OK) {
+        panel_min_note("[selftest] 起新对话失败：%s", esp_err_to_name(err));
+    }
+    vTaskDelete(NULL);
+}
+#endif
 #endif
 
 /* ------------------------------------------------------------------ 语音面回调 */
@@ -102,6 +128,12 @@ static void on_llm_state(llm_client_state_t st, const char *detail, void *ctx)
     }
     s_gate_ready = (st == LLM_CLIENT_READY);
     panel_min_state(name, detail);
+    /* 会话就绪后补发"就绪前按下的 SET"（见 on_new_conversation 的说明）。 */
+    if (st == LLM_CLIENT_READY && s_new_conv_pending) {
+        s_new_conv_pending = false;
+        ESP_LOGI(TAG, "会话已就绪 → 补发先前按下的 SET（conv.new）");
+        (void)llm_client_new_conversation();
+    }
 #if CONFIG_ONEYE_LLM_SELFTEST_TURN_MS > 0
     static bool selftest_done;
     if (st == LLM_CLIENT_READY && !selftest_done) {
@@ -151,6 +183,14 @@ static void on_llm_turn_end(int turn_seq, bool cancelled, int rtt_ms, void *ctx)
     (void)voice_io_playback_close();
     panel_min_note("本轮结束：turn_seq=%d rtt=%d ms%s", turn_seq, rtt_ms,
                    cancelled ? "（已打断）" : "");
+#if CONFIG_ONEYE_LLM_SELFTEST_TURN_MS > 0 && CONFIG_ONEYE_LLM_SELFTEST_NEW_CONV
+    /* 第 1 轮结束后自动模拟一次 SET 单击（无人值守验证新对话语义） */
+    static bool newconv_fired;
+    if (turn_seq == 1 && !newconv_fired) {
+        newconv_fired = true;
+        (void)xTaskCreate(selftest_newconv_task, "selftest_conv", 4096, NULL, 4, NULL);
+    }
+#endif
 }
 
 static void on_llm_error(const char *code, const char *msg, bool retryable, void *ctx)
@@ -213,6 +253,61 @@ static void on_short_press(void *ctx)
     }
 }
 
+/*
+ * SET 键单击 → 起新对话（契约 §12.1 `conv.new`）。
+ *
+ * 口径（为什么这么处理，真机排查时最容易被问到）：
+ *   - 服务端**不会**因为重连就自动开新段（否则 10 段上限几次重连就被垃圾段占满）；
+ *     "开新话题"必须由用户显式触发 —— 这就是 SET 键；
+ *   - 本轮进行中（THINKING/SPEAKING）不允许切段（服务端回 conflict）：先在本地取消本轮，
+ *     再发 conv.new，避免"正在生成的回答该写进哪一段"没有确定答案；
+ *   - 结果以服务端 `conv.state{reason:"new"}` 为准（本回调只负责发起，不假定成功）。
+ */
+static void on_new_conversation(void *ctx)
+{
+    (void)ctx;
+    if (!llm_client_is_session_ready()) {
+        /* 真机取证 2026-09-17：开机后 3.4 s 就按 SET（会话在 4.26 s 才就绪）⇒ 原先直接拒绝，
+         * 用户侧表现就是"按了没反应"（设备无屏，连提示都看不到）。
+         * 现在记住这次意图，待会话就绪后立刻补发（见 on_llm_state 的 READY 分支）。
+         * 只记一次（连按多次仍只开一段：一次新对话就是一次新对话）。 */
+        s_new_conv_pending = true;
+        panel_min_note("SET：语音面尚未就绪，已记住该动作，连上后自动开新对话");
+        ESP_LOGI(TAG, "SET 在会话就绪前按下 → 记为待生效（READY 后补发 conv.new）");
+        return;
+    }
+    llm_client_state_t st = llm_client_get_state();
+    if (st == LLM_CLIENT_THINKING || st == LLM_CLIENT_SPEAKING) {
+        panel_min_note("SET：本轮进行中，先打断再起新对话");
+        (void)llm_client_cancel("new_conversation");
+        (void)voice_io_playback_close();
+        vTaskDelay(pdMS_TO_TICKS(200)); /* 给服务端收尾 turn.end 留一口气 */
+    }
+    esp_err_t err = llm_client_new_conversation();
+    if (err != ESP_OK) {
+        panel_min_note("SET：起新对话失败（%s）", esp_err_to_name(err));
+        return;
+    }
+    panel_min_note("SET：已起新对话（等待服务端回执）");
+}
+
+/* conv.state：服务端告知"当前在接着哪一段聊、用的哪个模型"（设备无屏，只能靠日志/面板） */
+static void on_llm_conv_state(const char *reason, int64_t conv_id, int turns,
+                              const char *profile_id, void *ctx)
+{
+    (void)ctx;
+    const char *what = "当前对话";
+    if (reason && strcmp(reason, "new") == 0) {
+        what = "新对话已建立";
+    } else if (reason && strcmp(reason, "switched") == 0) {
+        what = "模型已切换";
+    }
+    panel_min_note("%s：#%lld（已有 %d 轮，模型 %s）", what, (long long)conv_id, turns,
+                   (profile_id && profile_id[0]) ? profile_id : "默认");
+    ESP_LOGI(TAG, "对话组回执：reason=%s conv_id=%lld turns=%d profile=%s", reason ? reason : "?",
+             (long long)conv_id, turns, (profile_id && profile_id[0]) ? profile_id : "(默认)");
+}
+
 /* ------------------------------------------------------------------ 采集回调（上行） */
 
 /** voice_io → llm_client：采集到的 60 ms PCM 直接进语音面成帧缓冲；未就绪时丢帧并降噪日志 */
@@ -268,6 +363,7 @@ static void net_ready_task(void *arg)
         .on_text = on_llm_text,
         .on_turn_end = on_llm_turn_end,
         .on_error = on_llm_error,
+        .on_conv_state = on_llm_conv_state,
         .ctx = NULL,
     };
     if (llm_client_init(&cbs, uri, CONFIG_ONEYE_LLM_DEVICE_ID, CONFIG_ONEYE_LLM_TOKEN) != ESP_OK) {
@@ -368,6 +464,7 @@ void app_main(void)
         .on_talk_start = on_talk_start,
         .on_talk_stop = on_talk_stop,
         .on_short_press = on_short_press,
+        .on_new_conversation = on_new_conversation,
         .ctx = NULL,
     };
     ESP_ERROR_CHECK(key_talk_init(s_periph_set, &kcbs));

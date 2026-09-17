@@ -16,6 +16,7 @@
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 
 #include "board.h"
 #include "audio_hal.h"
@@ -39,6 +40,8 @@ static const char *TAG = "voice_io";
 #define VOICE_STEREO_BYTES    (VOICE_IO_FRAME_BYTES * 2)
 #define VOICE_READ_TIMEOUT_MS 200
 #define VOICE_WRITE_TIMEOUT_MS 100
+/* 采集任务栈（字节）。放 PSRAM 的判据见 voice_io_capture_start() 的注释。 */
+#define VOICE_CAP_TASK_STACK  4096
 
 static SemaphoreHandle_t s_lock;
 static audio_hal_handle_t s_codec;
@@ -49,6 +52,8 @@ static audio_element_handle_t s_cap_algo;
 static audio_element_handle_t s_cap_raw;   /* 属管线：由 pipeline_deinit 统一销毁 */
 static audio_pipeline_handle_t s_cap_pipe;
 static TaskHandle_t s_cap_task;
+/* 采集任务栈是否来自 PSRAM（用 xTaskCreateWithCaps 建的必须用 vTaskDeleteWithCaps 删）。 */
+static bool s_cap_task_ext;
 static volatile bool s_capturing;
 static voice_io_pcm_cb_t s_cap_cb;
 static void *s_cap_ctx;
@@ -112,12 +117,18 @@ static int vio_i2s_read_cb(audio_element_handle_t el, char *buf, int len, TickTy
 static void vio_cap_task(void *arg)
 {
     (void)arg;
+    /* 自删口径：用 xTaskCreateWithCaps 建的栈必须用 vTaskDeleteWithCaps 回收（否则 PSRAM 栈泄漏）。 */
+    const bool ext = s_cap_task_ext;
     char *buf = audio_malloc(VOICE_IO_FRAME_BYTES);
     if (buf == NULL) {
         ESP_LOGE(TAG, "采集缓冲分配失败");
         s_capturing = false;
         s_cap_task = NULL;
-        vTaskDelete(NULL);
+        if (ext) {
+            vTaskDeleteWithCaps(NULL);
+        } else {
+            vTaskDelete(NULL);
+        }
         return;
     }
     ESP_LOGI(TAG, "采集开始（每帧 %d B = 60 ms @16 kHz/16 bit/单声道）", VOICE_IO_FRAME_BYTES);
@@ -139,7 +150,11 @@ static void vio_cap_task(void *arg)
     audio_free(buf);
     ESP_LOGI(TAG, "采集任务退出（累计 %u B）", (unsigned)s_cap_bytes);
     s_cap_task = NULL;
-    vTaskDelete(NULL);
+    if (ext) {
+        vTaskDeleteWithCaps(NULL);
+    } else {
+        vTaskDelete(NULL);
+    }
 }
 
 /* ------------------------------------------------------------------ 初始化 / 状态 */
@@ -279,10 +294,40 @@ esp_err_t voice_io_capture_start(voice_io_pcm_cb_t cb, void *ctx)
         s_capturing = false;
         goto fail;
     }
-    if (xTaskCreate(vio_cap_task, "vio_cap", 4096, NULL, 5, &s_cap_task) != pdPASS) {
-        s_capturing = false;
-        ESP_LOGE(TAG, "采集任务创建失败");
-        goto fail;
+    /*
+     * 采集任务栈：**优先放 PSRAM**（真机取证 2026-09-17 后的口径变更）。
+     *
+     * 为什么必须这样（不是"优化"，是"不然按不了键"）：
+     *   BLE 配网 + Wi-Fi + AFE 语音模型都起来后，内部 RAM 只剩 ~43 KB（最大连续块 ~25 KB），
+     *   `xTaskCreate` 申请 4 KB **内部**栈会被拒 —— 现场日志：`E voice_io: 采集任务创建失败`，
+     *   结果长按 REC 完全收不到音（自检轮同样失败，且延后到 20 s 也一样，说明不是瞬时峰值）。
+     *   PSRAM 余量有 ~8 MB，采集任务只从 raw 流环形缓冲读数据、不碰 ISR/DMA 描述符，
+     *   栈放 PSRAM 是安全的；这与 `key_talk`（按键任务 `ext_stack`）和 ADF 的
+     *   `audio_mem_spiram_stack_is_enabled()` 口径一致。
+     * 兜底：PSRAM 不可用或配置不允许外部栈时，仍回退内部栈（并打印两侧余量便于定位）。
+     */
+    bool started = false;
+#if CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY && CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM
+    if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) > 128 * 1024) {
+        s_cap_task_ext = true;
+        if (xTaskCreateWithCaps(vio_cap_task, "vio_cap", VOICE_CAP_TASK_STACK, NULL, 5, &s_cap_task,
+                                MALLOC_CAP_SPIRAM) == pdPASS) {
+            started = true;
+            ESP_LOGI(TAG, "采集任务已创建（栈 %d B 在 PSRAM；内部余 %u B）", VOICE_CAP_TASK_STACK,
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+        }
+    }
+#endif
+    if (!started) {
+        s_cap_task_ext = false;
+        if (xTaskCreate(vio_cap_task, "vio_cap", VOICE_CAP_TASK_STACK, NULL, 5, &s_cap_task) != pdPASS) {
+            s_capturing = false;
+            ESP_LOGE(TAG, "采集任务创建失败（内部余 %u B/最大块 %u B，PSRAM 余 %u B）——长按 REC 将收不到音",
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+            goto fail;
+        }
     }
     vio_lock();
     s_st.last_err = ESP_OK;

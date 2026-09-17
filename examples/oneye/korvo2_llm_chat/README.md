@@ -88,7 +88,7 @@ go run ./scripts/e2e/voice_client.go -addr 127.0.0.1:9091 -device korvo2-e2e
 
 | 项 | 缺省 | 说明 |
 | --- | --- | --- |
-| `ONEYE_LLM_DEVICE_ID` | `korvo2-llm-0001` | `session.start.device_id`（每设备并发 1） |
+| `ONEYE_LLM_DEVICE_ID` | **`esp32s3korvo2`** | 设备 SN（= `session.start.device_id`）。**不只是名字**：服务端按它做「每设备并发 1 会话」隔离、**按它派生对话组正文的加密密钥**（HKDF-SHA256）、并只按它回执/查询对话段；Web 控制台也按 SN 查。**改它 = 换设备身份 = 换一套密钥与对话历史**（旧 SN 的历史仍在库里但解不开）。SN 不是秘密 ⇒ 只靠 SN 派生只防"库被直接翻看"；要更强须在服务端配 `VOICE_STORE_PEPPER`（backend 契约 §12.3） |
 | `ONEYE_LLM_SERVER_HOST/_PORT/_WS_PATH` | `192.168.1.100` / `9091` / `/v1/voice/ws` | chatd 地址 |
 | `ONEYE_LLM_USE_TLS` / `_TLS_INSECURE` | n / n | 生产必须 `wss` + 受信 CA |
 | `ONEYE_LLM_TALK_MIN_PRESS_MS` | 600 | 长按阈值（同时写入板级 ADC 按键 `press_judge_time`） |
@@ -448,6 +448,26 @@ SET 键单击 → `conv.new` → `conv.state{reason:"new"}`（新段不继承旧
    否则日志里会混入自检产生的段（本次取证就先后出现 #3、#4）；
 3. **音频不落库、正文加密落库**：正文密钥由设备 SN 派生（服务端 `VOICE_STORE_PEPPER` 叠加），
    设备侧只发不收——本工程不做任何正文持久化。
+
+### 7.1.9 设备 SN 对齐（`esp32s3korvo2`）+ 10 段上限实测（2026-09-17 续）
+
+**背景（这是需求缺口，不是改名）**：开发人员拍板「当前开发板 SN 定为 **esp32s3korvo2**，对话正文按该 SN 派生密钥、
+Web 控制台按该 SN 查设备与对话组」，但固件此前默认 `device_id = korvo2-llm-0001`
+⇒ 控制台里看到的 SN 与拍板口径不一致，密钥也是按 `korvo2-llm-0001` 派生的。本轮把
+`ONEYE_LLM_DEVICE_ID` / `ONEYE_LLM_NODE_ID` 默认值改为 **`esp32s3korvo2`** 并在 Kconfig help 里写清
+"改它 = 换身份 = 换密钥与历史"（见 §6 Kconfig 速查）。
+
+| 项 | 证据 |
+| --- | --- |
+| 固件上报新 SN | 串口：`llm_client: 发送 session.start（device_id=esp32s3korvo2）` → `对话组：ready —— #18（已有 0 轮，模型档位 stub）` |
+| 服务端按新 SN 建组 | `GET /v1/voice/devices` → `esp32s3korvo2 online=true conv=18` |
+| **按 SN 隔离可见**（同库三台设备互不影响） | 设备列表：`esp32s3korvo2`（在线，段 #18）、`esp32s3korvo2-probe`（离线）、`korvo2-llm-0001`（离线，旧 SN 的 5 段历史仍在库里但已不在线） |
+| 复位/断言 | 0 `assert failed` / 仅烧写时 RTS 复位 |
+
+**10 段上限（需求③）实测**：用**独立探针 SN**（`esp32s3korvo2-probe`，不碰开发板数据）连续建 12 段 →
+`GET …/conversations` 只剩 **10 段**（id 8…17，最旧两段 id 6/7 被淘汰），访问已删段返回 **404**。
+即"最多保留 10 段、满则删最旧、消息一并删"在**真实服务 + 真实库**上成立（单测另见 `store_test.go` 的
+`TestStoreMaxTenConversations`，含"被淘汰段不残留孤儿消息"断言）。
 
 ## 8. 合规
 

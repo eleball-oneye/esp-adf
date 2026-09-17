@@ -3,8 +3,18 @@ menu "korvo2_llm_chat —— 云端 LLM 实时语音对话例程"
     menu "语音小服务（chatd，oneye.voice.v1）"
 
         config ONEYE_LLM_DEVICE_ID
-            string "设备 id（session.start.device_id；每设备并发 1 个会话）"
-            default "korvo2-llm-0001"
+            string "设备 SN（= session.start.device_id；**也是对话组密钥的派生输入**）"
+            default "esp32s3korvo2"
+            help
+                设备标识。注意它不只是个名字（开发人员 2026-09-17 拍板：当前开发板 SN = esp32s3korvo2）：
+                  ① 服务端按它做「每设备并发 1 会话」的隔离；
+                  ② **服务端按它派生对话组正文的加密密钥**（HKDF-SHA256(ikm="sn:"+SN, salt=服务端 pepper)
+                     → AES-256-GCM），并只按它回执/查询对话段；
+                  ③ 控制台（Web）也是按 SN 查设备信息与对话组。
+                因此**改这个值 = 换设备身份 = 换一套密钥与对话历史**：改完后旧 SN 下的历史仍在库里，
+                但用新 SN 的密钥解不开（控制台仍能看到旧 SN 的设备条目，属预期）。
+                密钥强度说明：SN 不是秘密（设备名/日志里都有），只靠 SN 派生只能防"库文件被直接翻看"；
+                要做到"库泄露也解不开"，服务端必须另配 VOICE_STORE_PEPPER（见 backend 契约 §12.3）。
 
         config ONEYE_LLM_SERVER_HOST
             string "语音小服务主机（host 或 IP）"
@@ -101,7 +111,7 @@ menu "korvo2_llm_chat —— 云端 LLM 实时语音对话例程"
 
         config ONEYE_LLM_NODE_ID
             string "本地面节点 id（link 帧 from/node.announce.node_id）"
-            default "korvo2-llm-0001"
+            default "esp32s3korvo2"
 
         config ONEYE_LLM_ENABLE_WIFI_FILE
             bool "启用凭据文件配网（/sdcard/oneye-wifi.txt → /spiffs/oneye-wifi.txt）"

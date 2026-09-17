@@ -278,7 +278,16 @@ static void net_ready_task(void *arg)
 
 static void on_net_ready(void)
 {
-    /* 事件任务上下文：只投递任务 */
+    /* 幂等（真机取证 2026-09-17，关键）：
+     * Wi-Fi 在启动早期可能产生**两次 GOT_IP**（STA 自动连接 + 我们显式 connect），
+     * 若每次都建任务，就会在 `llm_client_start()` 的 `s_ws == NULL` 竞态下**起两个 WS 客户端**，
+     * 结果是服务端看到"同一 device_id 两个会话" → `error{code:"conflict"}` 并关连接。 */
+    static bool started;
+    if (started) {
+        ESP_LOGI(TAG, "网络就绪回调重复触发：忽略（语音面已在启动中）");
+        return;
+    }
+    started = true;
     /* 栈 4096（**保持 ≤ `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL`**）：该任务会调用
      * `esp_websocket_client_start()`；若栈落在 PSRAM，遇到关 cache 的窗口会触发
      * `Interrupt wdt timeout`（真机取证 2026-09-17）。 */

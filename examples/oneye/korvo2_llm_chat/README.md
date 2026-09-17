@@ -141,7 +141,24 @@ llm_client: 状态 → READY：会话就绪          ← 服务端 session.ready
 2. chatd 侧 `conflict` 已修好并单测覆盖（见 backend `Registry` 陈旧会话接管 + WS 层 ping/读超时），
    待上面 WDT 解决后再验一次"设备端到端一轮"（`ONEYE_LLM_SELFTEST_TURN_MS` 自动收音已在固件里就绪）。
 
-**第 5 轮补充：进一步排除项与诊断工具**
+**第 6 轮结论（关键，含环境侧真相）**
+
+1. **联调环境侧真相：Windows 防火墙按"程序完整路径"放行**。本机入站规则只对**历史出现过的
+   chatd.exe 路径**放行（如 `%LOCALAPPDATA%\go-build\<hash>\chatd.exe`）；用 `go run`（每次新临时路径）
+   起的 chatd **不被放行**，表现为设备侧 `esp_transport_connect … CONNECTION_TIMEOUT`、
+   HTTP 探针 `ESP_ERR_HTTP_CONNECT`。把 chatd 构建到已放行路径后，设备**立刻**连通：
+   `[diag] HTTP GET …/healthz → ESP_OK（status=200）` + WS `session.ready`。
+   ⇒ 台面联调请固定用**同一个二进制路径**跑 chatd（见 backend `scripts/e2e/`）。
+2. **`Interrupt wdt timeout` 是周期性平台停顿**：关掉 CPU1 检查后仍会（周期性）在 CPU0 触发；
+   两核 dump 始终是正常阻塞态。已定位为"平台级瞬时停顿"，与例程逻辑无关；
+   台面验证档可临时 `CONFIG_ESP_INT_WDT=n`（示例默认保持生产口径）。
+3. **设备侧仍存在"一次启动内开两条 WS 连接"的现象**（chatd 侧日志：同 device_id 的第二条连接
+   在首条之后 14–18 s 到达并被 `conflict` 拒绝），本轮已加两处防重（`on_net_ready` 幂等、
+   `llm_client_start()` 防并发重入）并修正 Wi-Fi 连接次序（已连上时才 disconnect，避免两次 GOT_IP），
+   现象仍在 ⇒ 下一轮应从 `esp_websocket_client` 的"读超时→判死→重连"行为入手
+   （例如显式设置 `ping_interval_sec`/`pingpong_timeout_sec`，或改用 SDK 自带 WS 客户端）。
+
+
 
 已排除（逐项实测仍复现）：SD 卡/FATFS（关 SD、凭据改走 Kconfig 仍复现）、
 Wi-Fi/LWIP 缓冲 PSRAM（`SPIRAM_TRY_ALLOCATE_WIFI_LWIP=n`）、

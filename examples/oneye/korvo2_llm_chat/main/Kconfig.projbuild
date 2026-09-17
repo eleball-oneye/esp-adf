@@ -79,6 +79,11 @@ menu "korvo2_llm_chat —— 云端 LLM 实时语音对话例程"
                 （真机取证 2026-09-17：建 WS 客户端时出现 `Interrupt wdt timeout on CPU1`）。
                 诊断用，量产保持 n。
 
+        config ONEYE_LLM_PANEL_HEARTBEAT_S
+            int "状态心跳周期（秒；0 附近取值可近似关闭）"
+            range 5 600
+            default 30
+
     endmenu
 
     menu "配网（本地面：BLE 自研 GATT + ESPTouch v2 + 凭据文件）"

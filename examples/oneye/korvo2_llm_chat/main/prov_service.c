@@ -465,7 +465,12 @@ esp_err_t prov_service_connect(const char *ssid, const char *pass, uint32_t time
         return err;
     }
     snprintf(s_st.ssid, sizeof(s_st.ssid), "%s", ssid);
-    esp_wifi_disconnect();
+    /* 仅在**当前已连上某个 AP** 时才先断开：否则会与 STA 自动连接打架，
+     * 产生两次 GOT_IP（真机取证 2026-09-17：会导致语音面起两个 WS 客户端 → 服务端 conflict）。 */
+    wifi_ap_record_t cur;
+    if (esp_wifi_sta_get_ap_info(&cur) == ESP_OK) {
+        esp_wifi_disconnect();
+    }
     err = esp_wifi_connect();
     if (err != ESP_OK) {
         s_st.last_err = err;

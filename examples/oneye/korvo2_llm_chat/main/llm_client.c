@@ -485,9 +485,11 @@ esp_err_t llm_client_init(const llm_client_cbs_t *cbs, const char *uri, const ch
 
 esp_err_t llm_client_start(void)
 {
-    if (s_ws != NULL) {
+    static bool s_starting; /* 防并发重入：两个调用者都可能在 s_ws 赋值前通过 s_ws==NULL 检查 */
+    if (s_ws != NULL || s_starting) {
         return ESP_OK;
     }
+    s_starting = true;
     esp_websocket_client_config_t cfg = { 0 };
     cfg.uri = s_uri;
     cfg.subprotocol = LLM_SUBPROTOCOL; /* 服务端强校验该头（wsserver.go: hasSubprotocol） */

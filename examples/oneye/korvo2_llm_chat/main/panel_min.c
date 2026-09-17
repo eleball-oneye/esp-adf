@@ -28,8 +28,9 @@ static void heartbeat_task(void *arg)
 {
     (void)arg;
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(30000));
-        char json[384];
+        /* 30 s 心跳：只打印状态 JSON（PIPL：不含音频与转写正文） */
+        vTaskDelay(pdMS_TO_TICKS(CONFIG_ONEYE_LLM_PANEL_HEARTBEAT_S * 1000));
+        char json[512];
         panel_min_status_json(json, sizeof(json));
         ESP_LOGI(TAG, "[panel] %s", json);
     }

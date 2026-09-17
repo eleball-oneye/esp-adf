@@ -69,8 +69,13 @@ static esp_err_t key_cb(periph_service_handle_t handle, periph_service_event_t *
         s_st.talking = true;
         s_st.talk_count++;
         s_press_us = esp_timer_get_time(); /* 以达标时刻为本次说话起点计时 */
-        ESP_LOGI(TAG, "长按达标（%u ms ≥ %d ms）→ 开始收音", (unsigned)held,
-                 CONFIG_ONEYE_LLM_TALK_MIN_PRESS_MS);
+        /* 注意取值口径（真机取证 2026-09-17）：`held` 是**自本模块收到"按下"事件起算**的时间，
+         * 而"长按达标"由 `input_key_service` 按其**自身计时**判定。我们的起点晚于真实按下时刻
+         * （差一个 ADC 扫描周期 + 事件投递延迟），故这里打印的值可能**略小于**阈值
+         * （实测 579 ms vs 阈值 600 ms），属正常误差，不代表阈值失效。 */
+        ESP_LOGI(TAG, "长按达标（自按下事件起算 %u ms，阈值 %d ms；差值 = ADC 扫描/事件投递延迟）"
+                      "→ 开始收音",
+                 (unsigned)held, CONFIG_ONEYE_LLM_TALK_MIN_PRESS_MS);
         if (s_cbs.on_talk_start) {
             s_cbs.on_talk_start(s_cbs.ctx);
         }

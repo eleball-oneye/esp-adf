@@ -147,7 +147,36 @@ voice: 连接结束 err="…:53151: i/o timeout"                    （设备被
 服务端那条 20 s 超时是**人工烧写导致设备静默**造成的，同时也**反证了设备保活帧确实在刷新服务端读超时**
 （否则会话早在 20 s 就断）。
 
-### 7.1.2 根因：`link_report_task` 栈溢出踩坏自旋锁 → CPU1 中断看门狗（第 8 轮定位并修复）
+### 7.1.2 ✅ 人手长按 REC 键的真实按键取证（第 8 轮）
+
+按住 REC 键 4.9 s 后松开，串口实录（`turn_seq=2`，即同一启动内的第二轮）：
+
+```
+key_talk: REC 按下
+key_talk: 长按达标（579 ms ≥ 600 ms）→ 开始收音        ← 见下方口径说明
+AUDIO_HAL: Codec mode is 1, Ctrl:1
+MODEL_LOADER: Successfully load srmodels
+AFE: AFE Pipeline: [input] -> |AEC(VOIP_LOW_COST)| -> |NS(nsnet2)| -> [output]
+voice_io: 采集开始（每帧 1920 B = 60 ms @16 kHz/16 bit/单声道）
+llm_client: 状态 → LISTENING
+key_talk: REC 松开（按住 4948 ms）→ 提交本轮
+voice_io: 采集已停止（本次 126720 B）                   ← 66 帧 × 1920 B
+llm_client: 状态 → THINKING
+llm_client: 状态 → SPEAKING                             ← rtt 531 ms
+voice_io: 回放打开（16 kHz/16 bit → 立体声 → ES8311）
+llm_client: 状态 → READY：本轮结束
+voice_io: 回放已关闭（本轮下行 179200 B）
+panel: [panel] 本轮结束：turn_seq=2 rtt=531 ms
+```
+
+⇒ **长按触发 → 收音 → 松手提交 → 服务端返回 → 喇叭回放** 这条人手路径与自检轮完全一致地闭环。
+
+> **口径说明（579 ms vs 阈值 600 ms）**：`key_talk` 打印的 held 是**自本模块收到"按下"事件起算**的时间，
+> 而"长按达标"由 ADF `input_key_service` 按**其自身计时**判定；我们的起点晚于真实按下时刻
+> （差一个 ADC 扫描周期 + 事件投递延迟），所以该打印值可能略小于阈值 —— 属正常误差，不代表阈值失效。
+> 已把这条口径写进 `key_talk.c` 的日志与注释（日志文案改动，未重新烧写）。
+
+### 7.1.3 根因：`link_report_task` 栈溢出踩坏自旋锁 → CPU1 中断看门狗（第 8 轮定位并修复）
 
 第 7 轮及以前把周期性复位判成"平台级关中断停顿、与例程逻辑无关"，**是错的**。第 8 轮用
 `xtensa-esp32s3-elf-addr2line` 解码 panic 的两核 dump 后定位到明确的应用侧根因：
@@ -185,13 +214,13 @@ Backtrace: 0x4037ae8c 0x4037f3f9 0x4037eddf 0x4200f831 0x4037f1ad
 
 1. `xTaskCreate(prov_boot, 16 KB)` 直接失败 → 设备停在 BOOT。BLE(NimBLE) 真起来后内部 RAM 紧张，
    12/16 KB 任务栈创建失败；且 SDK 组帧已改堆分配（不再需要大栈）⇒ 配网任务降到 6 KB、
-   httpd 6 KB。⚠️ **当时把上报任务一起压到 4 KB 是错误的**（见 §7.1.2 根因），现已回到 12 KB。
+   httpd 6 KB。⚠️ **当时把上报任务一起压到 4 KB 是错误的**（见 §7.1.3 根因），现已回到 12 KB。
 2. `esp_wifi_start()` 与 `set_config/disconnect/connect` 挤在同一任务里连调 → 触发
    `Interrupt wdt timeout`（串口先报 `E wifi:sta is connecting, return error`）；
    改为**初始化阶段就 start**，配网只做 set_config + connect；另把
    `CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP` 置 n（Wi-Fi/lwIP 缓冲留内部 RAM）。
 
-### 7.1.3 第 7 轮已修：保活/读超时导致的"重复连接"噪声
+### 7.1.4 第 7 轮已修：保活/读超时导致的"重复连接"噪声
 
 `esp_websocket_client` 的 `network_timeout_ms` 被当作 **socket 读超时**：会话就绪后若一段时间没有下行数据，
 组件判"读失败"并重连 ⇒ 服务端按契约（每设备并发 1）把第二条连接拒为 `conflict` 并关闭 ⇒ 设备再重连，
@@ -201,7 +230,7 @@ Backtrace: 0x4037ae8c 0x4037f3f9 0x4037eddf 0x4200f831 0x4037f1ad
 服务端同步收敛（`StaleSessionWindow` 25→12 s、WS ping 5 s、读超时 20 s、**收到 pong 也算活跃**）。
 修复后该轮已能稳定走到 `LISTENING`。
 
-### 7.1.4 第 7 轮的其他结论（部分已被 §7.1.2 取代，保留作排查记录）
+### 7.1.5 第 7 轮的其他结论（部分已被 §7.1.3 取代，保留作排查记录）
 
 1. **联调环境侧真相：Windows 防火墙按"程序完整路径"放行**。本机入站规则只对**历史出现过的
    chatd.exe 路径**放行（如 `%LOCALAPPDATA%\go-build\<hash>\chatd.exe`）；用 `go run`（每次新临时路径）
@@ -209,11 +238,11 @@ Backtrace: 0x4037ae8c 0x4037f3f9 0x4037eddf 0x4200f831 0x4037f1ad
    HTTP 探针 `ESP_ERR_HTTP_CONNECT`。把 chatd 构建到已放行路径后，设备**立刻**连通：
    `[diag] HTTP GET …/healthz → ESP_OK（status=200）` + WS `session.ready`。
    ⇒ 台面联调请固定用**同一个二进制路径**跑 chatd（见 backend `scripts/e2e/`）。
-2. ~~`Interrupt wdt timeout` 是周期性平台停顿、与例程逻辑无关~~ —— **此结论已被 §7.1.2 推翻**：
+2. ~~`Interrupt wdt timeout` 是周期性平台停顿、与例程逻辑无关~~ —— **此结论已被 §7.1.3 推翻**：
    是 `link_report_task` 栈溢出踩坏队列自旋锁。注意台面验证档**不要**再用 `CONFIG_ESP_INT_WDT=n`
    掩盖问题（那只会把 panic 变成静默 `rst:0x7 (TG0WDT_SYS_RST)`，丢失唯一的现场）。
 3. "一次启动内开两条 WS 连接"（同 device_id 第二条在 14–18 s 后到达被 `conflict` 拒绝）已随之消失：
-   起因是组件读超时判死重连，已由 §7.1.3 的保活参数 + 服务端更快回收共同修掉；
+   起因是组件读超时判死重连，已由 §7.1.4 的保活参数 + 服务端更快回收共同修掉；
    另加了两处防重（`on_net_ready` 幂等、`llm_client_start()` 防并发重入）与 Wi-Fi 连接次序修正
    （已连上时才 disconnect，避免两次 `GOT_IP`）。
 
@@ -222,7 +251,7 @@ HTTP `GET /healthz` 探同一 host:port，用来判定"是 socket/lwIP 层面"�
 该开关同时把 `llm_client` 的运行期日志级别提到 DEBUG（**要看 `ESP_LOGD` 还需
 `CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y`**，默认 INFO 档下 DEBUG 语句被编译掉）。
 
-### 7.1.5 构建与镜像
+### 7.1.6 构建与镜像
 
 **构建（已通过）**：ESP-IDF v5.5.5 + ESP-ADF v2.8，`idf.py build` 成功，
 应用镜像 ≈1.60 MB（`0x186350`），落在 `factory` 3 MB 分区内（余量 49%）；
@@ -252,7 +281,7 @@ HTTP `GET /healthz` 探同一 host:port，用来判定"是 socket/lwIP 层面"�
   `oneye_link_frame_build()` 去掉 2 KB 栈拷贝（改为直接校验 `frame->p[0]`）。
   回归：宿主单测 **20 组 / 235 用例 / 3261 断言、0 失败**；ESP 六库重发。
 - **应用侧加固**：所有 link 上报走独立 **12 KB** 任务（`link_report_task` + 队列；⚠️ 曾误压到 4 KB，
-  反而引入 §7.1.2 的栈溢出根因）、配网启动走 6 KB 任务、httpd 栈 6 KB、
+  反而引入 §7.1.3 的栈溢出根因）、配网启动走 6 KB 任务、httpd 栈 6 KB、
   `CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192`、`CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096`。
 
 **BLE 预编译库缺陷 → 第 2 轮已修（两处，缺一不可）**：

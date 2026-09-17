@@ -522,9 +522,8 @@ SET 键单击 → `conv.new` → `conv.state{reason:"new"}`（新段不继承旧
 - 脚本自检：上机前先做**原始向量自检**（HKDF = RFC 5869 TC1、AES-128-GCM = NIST TC1/TC2），原语不真就拒绝上机。
 - 判定纪律：**外部脚本不得按帧名正则判成功**——失败文案里也含帧名（如 `未收到 link.pong`），现场脚本曾把 FAIL 读成 PASS。
 
-**尚未取证（诚实登记）**：Android 真机（`:sdk-android` 的 `BleLinkClient`）走同一条链路未上机；iOS 未建；设备侧"连续 3 次
-解密失败 → 解除配对"规则未做故障注入实测；`--assume-paired`（设备**未复位**仍是已配对态的重连路径）未实测；
-`prov.status` 的 `connected` 终态只有设备侧 `配网上报完成 state=5` 佐证（脚本按首个 `prov.status` 即返回）。
+**尚未取证（诚实登记）**：Android 真机（`:sdk-android` 的 `BleLinkClient`）走同一条链路未上机；iOS 未建。
+（原列的「连续 3 次解密失败 → 解除配对未做故障注入」已由 §7.1.13 关闭；`--assume-paired` 实测结论见同节④。）
 
 ### 7.1.9 设备 SN 对齐（`esp32s3korvo2`）+ 10 段上限实测（2026-09-17 续）
 
@@ -603,6 +602,44 @@ python tools/check-sdkconfig-drift.py --memory   # 只看内存/网络/BLE/AFE
 
 **⑤ 台面口径**：自检开关（三项）只写进**被忽略的 `sdkconfig`**，量产必须为 `0/n`；
 本轮取证后已复位并重烧（复查：30 s 串口内 `selftest` 命中 0 次、仍正常 `READY` 并绑段）。
+
+### 7.1.13 ✅ 「连续 3 次解密失败 → 退回未配对态」实现 + 真机故障注入双向取证（2026-09-17 续）
+
+**背景（补的是契约缺口）**：契约 `contracts/local/ble-gatt.md` §4.3 写着「解密失败**不**回退明文；
+**连续 3 次失败 → 退回未配对态（需重新 `prov.pair`）」—— 真机跑通 BLE 配网（§7.1.11）时发现实现里
+**只有计数、没有任何一层做回退动作**，代码里还留着一句"由应用决定"。后果：手机侧密钥错（换机/清数据/被篡改）时，
+设备一直"收得到但解不开"，既不回退也不提示，只能人工重启或重新配网。
+
+**① 实现（在 SDK 层，`oneye-dev-sdk` c78d0d6）**：把"连续计数 + 阈值判定"做成**纯函数守卫**
+（`oneye_ble_pair_guard_*`，宿主可单测），达阈值时由 BLE 层执行回退：清会话密钥/nonce、清配对态、
+按 TTL 轮换 POP、恢复广播；**有意不断链、不删 BLE bond**（契约要的是应用层重新 `prov.pair`；
+断链动作在收帧回调里做会与 NimBLE 主机任务重入）。解密**成功**即清零 —— 契约要的是"连续"。
+统计新增 `crypt_fail_count` / `unpair_by_crypt`（`oneye_dev_ble_get_status()` 可取）。
+
+**② 真机取证（COM12，POP=153902；正/负双向）**：
+
+| 注入 | 判据（都是**正面证据**，不用超时判成功） | 结果 |
+| --- | --- | --- |
+| 用**错误密钥**连发 **3** 帧 | 设备回到未配对态 ⇒ **明文** `prov.pair{pop}` 应被重新受理并回明文 `prov.pair.ok` | ✅ `CRYPT_UNPAIR_AFTER_3=PASS` |
+| 用**错误密钥**连发 **2** 帧 | 设备**不应**回退 ⇒ 用正确密钥再发一帧必须仍能密文往返（`link.pong` nonce 一致） | ✅ `CRYPT_NO_UNPAIR_UNDER_3=PASS` |
+
+命令（`oneye-dev-sdk/tools/ble_prov_e2e.py`，新增 `--crypt-fault N`）：
+
+```bash
+python tools/ble_prov_e2e.py --pop <串口 POP> --crypt-fault 3   # 正例：应回退
+python tools/ble_prov_e2e.py --pop <串口 POP> --crypt-fault 2   # 负向对照：不应回退
+```
+
+**③ 踩坑（重要流程教训）**：第一次真机注入 **FAIL**，根因不在逻辑而在构建：
+例程 CMake **优先链接 `components/oneye-dev-sdk/lib/<toolchain>/` 下的预编译归档库**，
+只改 SDK 源码不重建归档 ⇒ 固件里跑的仍是旧逻辑（归档时间 19:47 早于源码改动 21:0x）。
+⇒ **改 SDK 源码后必须重跑** `./build-all.sh --toolchains esp32s3@5.5.5 --no-gates --no-demo --no-tests`
+再 `idf.py build`。（宿主单测按框架自跑方式单编该用例：**6/6 用例、256 断言、0 失败**。）
+
+**④ 顺带测出的一处口径边界**：`--assume-paired`（"设备仍处已配对态，直接派生密钥"）在当前实现下
+**只在同一次 BLE 连接内有效** —— 因为设备侧**断链即清配对态**（API-ble.md §6）。断开重连后再用该开关，
+设备已回到未配对态、按明文处理，表现为密文 `link.ping` 无 `link.pong`（不是链路故障）。
+手机侧要"断线续配"就得重新 `prov.pair`，或日后按契约评审把"配对态跨连接保留"写进 §4.3。
 
 ## 8. 合规
 

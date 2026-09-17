@@ -413,6 +413,7 @@ SET 键单击 → `conv.new` → `conv.state{reason:"new"}`（新段不继承旧
 | **人工长按 REC 走完整回合** | ✅ | `REC 按下` → `长按达标（自按下事件起算 581 ms，阈值 600 ms）→ 开始收音` → `REC 松开（按住 2254 ms）→ 提交本轮` → `本轮结束：turn_seq=1 rtt=2808 ms`；THINKING→SPEAKING→下行 96,000 B 回放 |
 | **人工 SET 单击 → 起新对话** | ✅ **已闭环** | ① 会话就绪前按下（t=3.4 s < `session.ready` 4.26 s）：`key_talk: SET 单击 → 请求开新对话（第 1 次）`（事件路径通）→ 旧实现直接拒绝 ⇒ 促成"待生效补发"修正（见下）；② 会话就绪后按下（t=14.9 s）：`SET 单击` → `已请求新对话段（conv.new，reason=key_set）` → `对话组：new —— #5（已有 0 轮）` → `新对话已建立：#5` |
 | 服务端侧段隔离（控制台按 SN 查） | ✅ | `GET /v1/voice/devices/korvo2-llm-0001/conversations`：段 #1/#2/#3/#4 各 `turns=1`（标题=首句，解密正常）、段 #5 `turns=0` 且 `current=true`（旧段全部保留） |
+| 服务端重启后重连 → **接回原段** | ✅ | chatd 重启（换镜像/换密钥场景）后设备自动重连，服务端快照 `online=true live.state=READY live.conv_id=5`（**没有**因为重连而新建段 —— 这正是"新话题只能由 SET 键触发"的设计意图） |
 | 打断语义（服务端已按播放速率发送） | ✅ | 下行字节 96,000 → 105,600（第 2 轮 cancel 停在半途），`turn.end{cancelled:true}` 且无 `tts.end` |
 | 复位/断言 | ✅ 0 | 五次 70~180 s 抓取：仅烧写/抓取时的 RTS 复位，**0 `assert failed` / 0 `Guru Meditation`**；BLE 配网、局域网链路、语音面同时在线 |
 

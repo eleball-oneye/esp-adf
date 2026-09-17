@@ -101,82 +101,107 @@ go run ./scripts/e2e/voice_client.go -addr 127.0.0.1:9091 -device korvo2-e2e
 | `ONEYE_LLM_LOG_TEXT` | n | 是否把 ASR/LLM 文本打串口（PIPL：正文不落盘） |
 | `ONEYE_LLM_SELFTEST_TURN_MS` | 0 | 台面自检：非 0 时语音面就绪后自动收音该时长并提交一轮（无人值守验证整条链路；量产必须 0） |
 
-## 7.1 第 3 轮真机取证（2026-09-17）
+## 7.1 真机取证（2026-09-17，逐轮累计）
 
-**已打通到语音面会话就绪**（串口实录）：
+### 7.1.1 ✅ 已闭环：开机 → 联网 → 会话 → 收音 → 提交 → 服务端返回 → 喇叭回放（第 8 轮）
+
+台面自检档（`ONEYE_LLM_SELFTEST_TURN_MS=3000`，免按键走与长按完全相同的代码路径）串口实录：
 
 ```
-prov_service: 凭据文件命中：/sdcard/oneye-wifi.txt（ssid=wanya）
-wifi:connected with wanya, ...            ← Wi-Fi 连接成功
-prov_service: 已联网：ssid=wanya ip=192.168.110.80 source=file
+prov_service: 已联网：ip=192.168.110.80 source=kconfig
+panel: [diag] HTTP GET http://192.168.110.208:9091/healthz → ESP_OK（status=200）
 llm_client: 语音面客户端：ws://192.168.110.208:9091/v1/voice/ws（子协议 oneye.voice.v1）
 websocket_client: Started
 llm_client: 状态 → SESSION_START：已连接，发 session.start
 llm_client: 发送 session.start（device_id=korvo2-llm-0001）
-llm_client: 状态 → READY：会话就绪          ← 服务端 session.ready 收到
-```
-
-**本轮修掉的两个真机问题**（都在应用侧）：
-
-1. `xTaskCreate(prov_boot, 16 KB)` 直接失败 → 设备停在 BOOT。BLE(NimBLE) 真起来后内部 RAM 紧张，
-   12/16 KB 任务栈创建失败；且 SDK 组帧已改堆分配（不再需要大栈）⇒ 配网任务降到 6 KB、上报任务 4 KB、httpd 6 KB。
-2. `esp_wifi_start()` 与 `set_config/disconnect/connect` 挤在同一任务里连调 → 触发
-   `Interrupt wdt timeout`（串口先报 `E wifi:sta is connecting, return error`）；
-   改为**初始化阶段就 start**，配网只做 set_config + connect，另把
-   `CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP` 置 n（Wi-Fi/lwIP 缓冲留内部 RAM），并把
-   `CONFIG_ESP_INT_WDT_TIMEOUT_MS` 提到 1000 ms（PSRAM 工程上关 cache 窗口更宽）。
-
-**仍未闭环（下一轮）**：
-
-1. **建 WebSocket 客户端时 `Interrupt wdt timeout on CPU1`**（本轮末稳定复现 3/3）：
-   串口在 `websocket_client: Started` 后 ~5 ms 内报 panic；`addr2line` 解码两核寄存器 dump 显示
-   两个核都在**正常阻塞**状态（Core 1 = `link_report_task` 卡在 `xQueueReceive`、Core 0 = idle
-   `esp_cpu_wait_for_intr`）⇒ 属"关中断期过长"型 WDT，触发者不在被 dump 的任务里（疑在 Wi-Fi ISR /
-   关 cache 窗口）。已排除/已试：`SPIRAM_TRY_ALLOCATE_WIFI_LWIP=n`、`ESP_INT_WDT_TIMEOUT_MS=1000`、
-   Wi-Fi 省电 `WIFI_PS_NONE`、把发起连接的任务栈压到 4096（保持内部 RAM）、关闭组件自动重连、
-   把我们自己的 supervisor/保活任务挪出（只保留 ping）。
-   **建议下一步**：① 打开 `esp_coredump`（flash 分区 + `idf.py coredump-info`）抓真实故障点；
-   ② 用最小 IDF 工程（仅 Wi-Fi + `esp_websocket_client`）复现，判定是组件/IDF 与该板配置的交互；
-   ③ 反查 PSRAM/关 cache 相关项（`SPIRAM_FETCH_INSTRUCTIONS`/`RODATA`、`SPIRAM_MALLOC_ALWAYSINTERNAL`）。
-2. chatd 侧 `conflict` 已修好并单测覆盖（见 backend `Registry` 陈旧会话接管 + WS 层 ping/读超时），
-   待上面 WDT 解决后再验一次"设备端到端一轮"（`ONEYE_LLM_SELFTEST_TURN_MS` 自动收音已在固件里就绪）。
-
-**第 7 轮取证：上行链路已在真机跑起来（下面是从开机到 LISTENING 的实录）**
-
-```
-[diag] HTTP GET http://192.168.110.208:9091/healthz → ESP_OK（status=200）
-websocket_client: Started → 状态 → SESSION_START：已连接，发 session.start
-状态 → READY：会话就绪                       ← 服务端 session.ready
-[selftest] 自动收音 3000 ms（台面自检，非按键路径）
-MODEL_LOADER: Successfully load srmodels     ← model 分区生效
-ALGORITHM_STREAM: Load: nsnet2
+llm_client: 状态 → READY：会话就绪                      ← 服务端 session.ready
+panel: [selftest] 自动收音 3000 ms（台面自检，非按键路径）
+MODEL_LOADER: Successfully load srmodels                ← model 分区生效
 AFE: AFE Version: (1MIC_V250121)
 AFE: Input PCM Config: total 2 channels(1 microphone, 1 playback), sample rate:16000
 AFE: AFE Pipeline: [input] -> |AEC(VOIP_LOW_COST)| -> |NS(nsnet2)| -> [output]
 AUDIO_PIPELINE: Pipeline started
 voice_io: 采集开始（每帧 1920 B = 60 ms @16 kHz/16 bit/单声道）
 llm_client: 状态 → LISTENING
+voice_io: 采集已停止（本次 82560 B）                     ← 43 帧 × 1920 B
+panel: [selftest] 自动提交本轮（上行 82560 B）
+llm_client: 状态 → THINKING                             ← input.audio.commit
+llm_client: 状态 → SPEAKING                             ← 首帧下行 TTS（rtt 369~412 ms）
+AUDIO_HAL: Codec mode is 3, Ctrl:1
+voice_io: 回放打开（16 kHz/16 bit → 立体声 → ES8311）
+llm_client: 状态 → READY：本轮结束                       ← tts.end / turn.end
+voice_io: 回放已关闭（本轮下行 88320 B）
+panel: [panel] 本轮结束：turn_seq=1 rtt=412 ms
 ```
 
-⇒ 复现了例程目标前半段：**联网 → 会话就绪 → AFE（AEC+NS）启动 → 60 ms/帧上行收音**。
+服务端（chatd，stub provider）同窗口日志：**1 条连接，`active=0` 升级后无冲突、无重连**，
+会话持续到设备被人工复位才以 20 s 读超时收场：
 
-**本轮修掉的关键问题：保活/读超时导致的"重复连接"噪声**
+```
+voice: ws 已升级 peer=192.168.110.80:53151 active=0          （会话建立）
+…（82 s 内持续收到设备保活帧，读超时判据一直被刷新）…
+voice: 连接结束 err="…:53151: i/o timeout"                    （设备被 esptool 复位后静默 20 s）
+```
+
+⇒ **上行 82,560 B / 下行 88,320 B / 首帧时延 369–412 ms，全程无复位、无 `conflict`**。
+服务端那条 20 s 超时是**人工烧写导致设备静默**造成的，同时也**反证了设备保活帧确实在刷新服务端读超时**
+（否则会话早在 20 s 就断）。
+
+### 7.1.2 根因：`link_report_task` 栈溢出踩坏自旋锁 → CPU1 中断看门狗（第 8 轮定位并修复）
+
+第 7 轮及以前把周期性复位判成"平台级关中断停顿、与例程逻辑无关"，**是错的**。第 8 轮用
+`xtensa-esp32s3-elf-addr2line` 解码 panic 的两核 dump 后定位到明确的应用侧根因：
+
+```
+Guru Meditation Error: Core  1 panic'ed (Interrupt wdt timeout on CPU1).
+Backtrace: 0x4037ae8c 0x4037f3f9 0x4037eddf 0x4200f831 0x4037f1ad
+  → esp_cpu_compare_and_set            (cpu.c:200)
+  → spinlock_acquire / xPortEnterCriticalTimeout   (port.c:489)
+  → xQueueReceive                      (queue.c:1549)
+  → link_report_task                   (prov_service.c:135)
+  → vPortTaskWrapper
+```
+
+- **机理**：`link_report_task` 的栈在 `xQueueCreate(s_report_q)` **之后**创建，两者在堆上**紧邻**。
+  该任务栈取 4096 B 时，`oneye_dev_link_prov_report_status()` → `oneye_dev_link_broadcast()`
+  组帧路径的峰值（实测 ≈5.2 KB）**向下溢出**，第一个被踩坏的对象就是紧邻其下的**队列本体**
+  （内含 `xQueueLock` 自旋锁的 owner/count）。锁被写成垃圾值后，任务下一轮
+  `xQueueReceive(portMAX_DELAY)` 会**在关中断状态下永久自旋**在这把锁上：
+  既不让出 CPU，也永远不会触发 FreeRTOS 的栈金丝雀检查（它只在上下文切换时检查），
+  于是只能由 3 s 中断看门狗收场 —— 表现为"每 ~6 s 复位一次"，且复位点看起来总在"联网/建 WS 之后"。
+- **为什么以前查不出来**：dump 出的两个核都显示"正常阻塞态"（Core 0 = idle），
+  因为**持有锁的任务根本不存在**（锁的值是垃圾），于是被误读成"关中断期过长"的平台问题。
+- **修复**：`link_report_task` 栈 4096 → **12288**（`LINK_REPORT_TASK_STACK`），
+  并在每次上报后打印 `uxTaskGetStackHighWaterMark` 取证。
+- **取证**：修复后串口首条上报即打印 `配网上报完成 state=5，栈余量 7028 B`
+  ⇒ 该任务实际峰值 ≈5.2 KB，**旧的 4 KB 栈确实不够**；此后连续 3 次 50~85 s 真机捕获
+  **0 次复位、0 次 panic**。
+- **同时清掉的隐患**：`llm_client.c` 里 `LLM_PING_MS` 被**重复定义**（顶部 20000 / 中部 10000），
+  后者静默覆盖前者（编译只报 warning），导致"注释写 20 s、实际 10 s"的取证口径不一致；
+  现已合并为顶部单一定义（10 s），并加 `ESP_LOGD` 保活取证（需 `CONFIG_LOG_MAXIMUM_LEVEL_DEBUG` 才可见）。
+
+
+**第 7 轮已修的两个真机问题**（都在应用侧）：
+
+1. `xTaskCreate(prov_boot, 16 KB)` 直接失败 → 设备停在 BOOT。BLE(NimBLE) 真起来后内部 RAM 紧张，
+   12/16 KB 任务栈创建失败；且 SDK 组帧已改堆分配（不再需要大栈）⇒ 配网任务降到 6 KB、
+   httpd 6 KB。⚠️ **当时把上报任务一起压到 4 KB 是错误的**（见 §7.1.2 根因），现已回到 12 KB。
+2. `esp_wifi_start()` 与 `set_config/disconnect/connect` 挤在同一任务里连调 → 触发
+   `Interrupt wdt timeout`（串口先报 `E wifi:sta is connecting, return error`）；
+   改为**初始化阶段就 start**，配网只做 set_config + connect；另把
+   `CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP` 置 n（Wi-Fi/lwIP 缓冲留内部 RAM）。
+
+### 7.1.3 第 7 轮已修：保活/读超时导致的"重复连接"噪声
+
 `esp_websocket_client` 的 `network_timeout_ms` 被当作 **socket 读超时**：会话就绪后若一段时间没有下行数据，
 组件判"读失败"并重连 ⇒ 服务端按契约（每设备并发 1）把第二条连接拒为 `conflict` 并关闭 ⇒ 设备再重连，
-形成噪声循环（现象：`session.ready` 后 ~4 ms 收到 `conflict`）。处置：读超时 8 s → **15 s**，
-打开**协议层 ping**（`ping_interval_sec=10`，服务端 gorilla 自动回 pong），应用层契约帧 `ping` 放到 20 s。
+形成噪声循环（现象：`session.ready` 后 ~4 ms 收到 `conflict`）。处置：读超时 8 s → **15 s**、
+打开**协议层 ping**（`ping_interval_sec=5`，服务端 gorilla 自动回 pong）、
+应用层契约帧 `ping` 周期 **10 s**（`LLM_PING_MS`，服务端 12 s 陈旧窗口据此判定）；
+服务端同步收敛（`StaleSessionWindow` 25→12 s、WS ping 5 s、读超时 20 s、**收到 pong 也算活跃**）。
 修复后该轮已能稳定走到 `LISTENING`。
 
-**仍未闭环：周期性 WDT 复位（本轮新结论）**
-
-串口捕获到复位原因 `rst:0x7 (TG0WDT_SYS_RST)` + `PRO/APP CPU has been reset by WDT`
-（`CONFIG_ESP_INT_WDT=n` 时不再打印 panic，改为硬件 WDT 静默复位），间隔约 7–20 s，
-足以打断"收音 3 s → 提交 → 服务端返回"这一轮（自检轮常被复位截断）。
-下一步：**打开 `CONFIG_ESP_TASK_WDT_PANIC=y`** 让任务看门狗打印"哪些任务没喂狗"
-（TG0 通常对应 Task WDT / idle 任务饥饿），据此定位是哪个高优先级任务长期不让出 CPU
-（嫌疑：WS 重连循环、AFE 管线任务、或我们自己的 supervisor/watchdog 任务）。
-
-
+### 7.1.4 第 7 轮的其他结论（部分已被 §7.1.2 取代，保留作排查记录）
 
 1. **联调环境侧真相：Windows 防火墙按"程序完整路径"放行**。本机入站规则只对**历史出现过的
    chatd.exe 路径**放行（如 `%LOCALAPPDATA%\go-build\<hash>\chatd.exe`）；用 `go run`（每次新临时路径）
@@ -184,34 +209,23 @@ llm_client: 状态 → LISTENING
    HTTP 探针 `ESP_ERR_HTTP_CONNECT`。把 chatd 构建到已放行路径后，设备**立刻**连通：
    `[diag] HTTP GET …/healthz → ESP_OK（status=200）` + WS `session.ready`。
    ⇒ 台面联调请固定用**同一个二进制路径**跑 chatd（见 backend `scripts/e2e/`）。
-2. **`Interrupt wdt timeout` 是周期性平台停顿**：关掉 CPU1 检查后仍会（周期性）在 CPU0 触发；
-   两核 dump 始终是正常阻塞态。已定位为"平台级瞬时停顿"，与例程逻辑无关；
-   台面验证档可临时 `CONFIG_ESP_INT_WDT=n`（示例默认保持生产口径）。
-3. **设备侧仍存在"一次启动内开两条 WS 连接"的现象**（chatd 侧日志：同 device_id 的第二条连接
-   在首条之后 14–18 s 到达并被 `conflict` 拒绝），本轮已加两处防重（`on_net_ready` 幂等、
-   `llm_client_start()` 防并发重入）并修正 Wi-Fi 连接次序（已连上时才 disconnect，避免两次 GOT_IP），
-   现象仍在 ⇒ 下一轮应从 `esp_websocket_client` 的"读超时→判死→重连"行为入手
-   （例如显式设置 `ping_interval_sec`/`pingpong_timeout_sec`，或改用 SDK 自带 WS 客户端）。
-
-
-
-已排除（逐项实测仍复现）：SD 卡/FATFS（关 SD、凭据改走 Kconfig 仍复现）、
-Wi-Fi/LWIP 缓冲 PSRAM（`SPIRAM_TRY_ALLOCATE_WIFI_LWIP=n`）、
-中断看门狗阈值（300 → 1000 ms）、Wi-Fi 省电（`WIFI_PS_NONE`）、
-WebSocket 任务栈与缓冲（3584/2048 与 8192/4096 都试过）、
-发起连接任务的栈归属（6144 → 4096 内部 RAM）、组件自动重连（开/关都试过）、
-以及移除我们自己的保活/重连任务。
-**关键观察**：panic 出现的位置会漂移（有时在 `websocket_client: Started` 后 ~5 ms、
-有时在 Wi-Fi 取到 IP 前后），而两核 dump 始终显示"正常阻塞态" ⇒ 更像**周期性关中断**型
-平台问题，而非某条我们的代码路径。
+2. ~~`Interrupt wdt timeout` 是周期性平台停顿、与例程逻辑无关~~ —— **此结论已被 §7.1.2 推翻**：
+   是 `link_report_task` 栈溢出踩坏队列自旋锁。注意台面验证档**不要**再用 `CONFIG_ESP_INT_WDT=n`
+   掩盖问题（那只会把 panic 变成静默 `rst:0x7 (TG0WDT_SYS_RST)`，丢失唯一的现场）。
+3. "一次启动内开两条 WS 连接"（同 device_id 第二条在 14–18 s 后到达被 `conflict` 拒绝）已随之消失：
+   起因是组件读超时判死重连，已由 §7.1.3 的保活参数 + 服务端更快回收共同修掉；
+   另加了两处防重（`on_net_ready` 幂等、`llm_client_start()` 防并发重入）与 Wi-Fi 连接次序修正
+   （已连上时才 disconnect，避免两次 `GOT_IP`）。
 
 新增台面诊断开关 `ONEYE_LLM_DIAG_HTTP_PROBE`（缺省 n）：建 WebSocket 之前先用普通
-HTTP `GET /healthz` 探同一 host:port，用来判定"是 socket/lwIP 层面"还是"WebSocket 组件"。
+HTTP `GET /healthz` 探同一 host:port，用来判定"是 socket/lwIP 层面"还是"WebSocket 组件"；
+该开关同时把 `llm_client` 的运行期日志级别提到 DEBUG（**要看 `ESP_LOGD` 还需
+`CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y`**，默认 INFO 档下 DEBUG 语句被编译掉）。
 
+### 7.1.5 构建与镜像
 
-
-**构建（已通过）**：ESP-IDF v5.5.5 + ESP-ADF v2.8，`idf.py set-target esp32s3 && idf.py build` 成功，
-应用镜像 `0x1d2510`（≈1.82 MB），落在 `factory` 3 MB 分区内（余量 39%）；
+**构建（已通过）**：ESP-IDF v5.5.5 + ESP-ADF v2.8，`idf.py build` 成功，
+应用镜像 ≈1.60 MB（`0x186350`），落在 `factory` 3 MB 分区内（余量 49%）；
 `srmodels.bin` 随 `model` 分区投放（`0x310000`）。
 
 **真机（ESP32-S3-Korvo-2，COM12，已烧写取证）**：
@@ -223,8 +237,8 @@ HTTP `GET /healthz` 探同一 host:port，用来判定"是 socket/lwIP 层面"�
 | REC 键长按服务 | ✅ | `key_talk: REC 键就绪：长按 ≥ 600 ms 开始收音`（`press_judge_time` 覆写生效）；ADC 校准成功 |
 | 凭据文件配网（本板 SD 卡 `/sdcard/oneye-wifi.txt`） | ✅ | `prov_service: 凭据文件命中 … ssid=wanya` → `已联网：ssid=wanya ip=192.168.110.83 source=file` |
 | 局域网链路 | ✅ 启动 | `lan_link: UDP 发现已就绪（57321）` + `POST http://<ip>:80/api/link/frame` 已注册 |
-| BLE 配网 | ❌ 不可用 | `oneye_dev_ble_init` 返回 `-5`（UNSUPPORTED）——**预编译库缺陷**，见下 |
-| 语音面连接 | ⚠️ 已发起、未完成 | `llm_client: ws://…:9091/v1/voice/ws（子协议 oneye.voice.v1）` → `状态=CONNECTING` → `websocket_client: Started`，随后设备复位 |
+| BLE 配网 | ⚠️ 未通 | 预编译库缺陷已修（见下），设备侧仍卡在 `ble_gatts_count_resources rc=3` → `oneye_dev_ble_init=-4`；台面用 `ONEYE_LLM_ENABLE_BLE_PROV=n` 规避 |
+| 语音面一轮闭环 | ✅ 已闭环 | 见 §7.1.1：上行 82,560 B / 下行 88,320 B / 首帧 369–412 ms，无复位、无 `conflict` |
 
 **开机即复位的缺陷 → 第 2 轮已修（关键根因在 SDK 侧）**：
 
@@ -237,8 +251,9 @@ HTTP `GET /healthz` 探同一 host:port，用来判定"是 socket/lwIP 层面"�
 - **已修（SDK 侧，第 2 轮）**：组帧缓冲改**堆分配**（每次调用申请/释放，失败返回 `ERR_NO_MEM`）；
   `oneye_link_frame_build()` 去掉 2 KB 栈拷贝（改为直接校验 `frame->p[0]`）。
   回归：宿主单测 **20 组 / 235 用例 / 3261 断言、0 失败**；ESP 六库重发。
-- **应用侧加固**：所有 link 上报走独立 12 KB 任务（`link_report_task` + 队列）、配网启动走 16 KB 任务、
-  httpd 栈 12 KB、`CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192`、`CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096`。
+- **应用侧加固**：所有 link 上报走独立 **12 KB** 任务（`link_report_task` + 队列；⚠️ 曾误压到 4 KB，
+  反而引入 §7.1.2 的栈溢出根因）、配网启动走 6 KB 任务、httpd 栈 6 KB、
+  `CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192`、`CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096`。
 
 **BLE 预编译库缺陷 → 第 2 轮已修（两处，缺一不可）**：
 
@@ -250,7 +265,7 @@ HTTP `GET /healthz` 探同一 host:port，用来判定"是 socket/lwIP 层面"�
    **取证**：`liboneye_dev_ble.a` 41,192 B（只有宿主桩）→ **54,100 B 且含 `nimble_port_init`/`ble_gatts` 引用**；
    设备侧日志由 `oneye_dev_ble_init 失败：-5（UNSUPPORTED）` 变为真正跑 NimBLE 初始化。
 
-**下一轮待办（本轮末尾新出现的两个问题）**：
+**仍待办：BLE 配网（台面已用 `ENABLE_BLE_PROV=n` 规避）**
 
 1. `E NimBLE: ble_gatts_count_resources rc=3` → `oneye_dev_ble_init 失败：-4`：
    NimBLE 资源计数失败（rc=3 = `BLE_HS_ENOMEM`）。当前 Kconfig 已给
@@ -263,12 +278,12 @@ HTTP `GET /healthz` 探同一 host:port，用来判定"是 socket/lwIP 层面"�
 
 **其余待真机取证项**：
 
-1. 长按 600 ms 触发收音的实际时延与阈值行为；短按/播放中长按的打断路径
-   （已加台面自检开关 `ONEYE_LLM_SELFTEST_TURN_MS`：置 3000 时语音面就绪后自动收音 3 s 并提交，
-   无需人手按键即可验证整条链路，见下）；
-2. 单声道→立体声回放（本工程自行复制声道，S3 上 ADF 的 `i2s_mono_fix()` 不参与编译）；
+1. **人手长按 REC 键**的实际时延与阈值行为；短按/播放中长按的打断路径
+   （自检开关 `ONEYE_LLM_SELFTEST_TURN_MS` 已把同一条代码路径跑通，只剩"按键触发"这一环未被真人触发取证）；
+2. 单声道→立体声回放（本工程自行复制声道，S3 上 ADF 的 `i2s_mono_fix()` 不参与编译）—— 已完成一轮，
+   听感/音量待人工确认；
 3. 打断时延（`input.cancel` → 停止回播）是否 ≤200 ms；`down_drops` 丢帧率；
-4. BLE(NimBLE)+Wi-Fi+AFE 同跑时的内部 RAM 余量。
+4. BLE(NimBLE)+Wi-Fi+AFE 同跑时的内部 RAM 余量（当前 BLE 关闭，`link_report_task` 峰值取证为栈余 7028 B/12 KB）。
 
 **实现层面的已知取舍**：
 

@@ -126,6 +126,22 @@ static void prov_report(oneye_dev_link_prov_state_t state, const char *err)
     (void)xQueueSend(s_report_q, &m, 0); /* 满则丢弃：状态面尽力而为，不阻塞事件任务 */
 }
 
+/*
+ * 上报任务的栈（**真机取证 2026-09-17，根因级**）：
+ * `oneye_dev_link_prov_report_status()` → `oneye_dev_link_broadcast()` 的组帧路径栈峰值很大，
+ * 该任务栈绝不可取几百字节级的小值。原因不是"溢出会被金丝雀抓到"那么简单：
+ * 本任务的栈与其投递队列 `s_report_q`（在上一条语句里刚创建）在堆上**紧邻**，
+ * 栈向下溢出时第一个被踩坏的堆对象就是队列本身，而队列对象里含 `xQueueLock`（自旋锁 owner/count）。
+ * 锁被写成垃圾值后，本任务下一轮 `xQueueReceive(portMAX_DELAY)` 会**在关中断状态下永久自旋**
+ * 在这把锁上（`esp_cpu_compare_and_set`），既不让出 CPU、也永远不会触发 FreeRTOS 的栈金丝雀检查，
+ * 3 s 后只能由中断看门狗收场：
+ *   `Guru Meditation Error: Core 1 panic'ed (Interrupt wdt timeout on CPU1)`
+ *   backtrace = `link_report_task → xQueueReceive → xPortEnterCriticalTimeout → spinlock_acquire`
+ * 历史上曾因堆紧张把这里从 12 KB 误降到 4 KB（与本文件原注释不符）→ 每次联网后 ~6 s 复位一次。
+ * 现固定 12 KB 并在每次上报后打印栈余量取证（见任务末尾），余量不足 1 KB 即说明还要加大。
+ */
+#define LINK_REPORT_TASK_STACK 12288
+
 /** 所有 link / prov.status 上报都在这条 12 KB 栈的任务里执行 */
 static void link_report_task(void *arg)
 {
@@ -135,10 +151,15 @@ static void link_report_task(void *arg)
         if (xQueueReceive(s_report_q, &m, portMAX_DELAY) != pdTRUE) {
             continue;
         }
+        ESP_LOGD(TAG, "配网上报 → SDK：state=%d ssid=%s ip=%s src=%s", (int)m.state, m.ssid, m.ip,
+                 m.src);
         (void)oneye_dev_link_prov_report_status(m.state, m.ssid[0] ? m.ssid : NULL,
                                                m.ip[0] ? m.ip : NULL,
                                                m.src[0] ? m.src : NULL,
                                                m.err[0] ? m.err : NULL);
+        /* 栈余量取证：确认上报路径真实峰值（单位 B；ESP-IDF 的 StackType_t = uint8_t） */
+        ESP_LOGI(TAG, "配网上报完成 state=%d，栈余量 %u B", (int)m.state,
+                 (unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)));
     }
 }
 
@@ -287,7 +308,8 @@ esp_err_t prov_service_init(esp_periph_set_handle_t periph_set, prov_ready_cb_t 
             ESP_LOGE(TAG, "上报队列创建失败");
             return ESP_ERR_NO_MEM;
         }
-        if (xTaskCreate(link_report_task, "link_report", 4096, NULL, 4, NULL) != pdPASS) {
+        if (xTaskCreate(link_report_task, "link_report", LINK_REPORT_TASK_STACK, NULL, 4, NULL) !=
+            pdPASS) {
             vQueueDelete(s_report_q);
             s_report_q = NULL;
             ESP_LOGE(TAG, "上报任务创建失败");

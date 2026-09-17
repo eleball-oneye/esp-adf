@@ -65,8 +65,8 @@ static TaskHandle_t s_ka_task;
 static bool s_ka_run;
 
 /* 连接守护（重连退避 + 保活）用的状态：事件回调里也要用，故声明在文件前部 */
-#define LLM_PING_MS      20000 /* 应用层契约帧 ping（服务端据此刷新"会话活跃/陈旧"判据）；
-                                * 协议层 ping 由组件按 ping_interval_sec=10 s 负责 */
+#define LLM_PING_MS      10000 /* 应用层契约帧 ping（服务端据此刷新"会话活跃/陈旧"判据）；
+                                * 协议层 ping 由组件按 ping_interval_sec=5 s 负责 */
 #define LLM_BACKOFF_MS   5000  /* 普通断开后的重连退避 */
 #define LLM_CONFLICT_MS  30000 /* 并发冲突后的重连退避（等服务端接管陈旧会话） */
 static volatile int64_t s_reconnect_at_ms;
@@ -422,15 +422,15 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t event_id,
 
 /*
  * supervisor_task：同时承担两件事（取代原来的 keepalive_task）
- *   ① 保活：已连接时每 10 s 发一帧 `ping`（契约帧，服务端回 `pong`）；
- *      服务端据此刷新"陈旧会话"判据（>25 s 静默即允许被接管）。
+ *   ① 保活：已连接时每 `LLM_PING_MS`（10 s）发一帧 `ping`（契约帧，服务端回 `pong`）；
+ *      服务端据此刷新"会话活跃/陈旧"与读超时判据。
  *   ② 重连：断开后按退避重连 —— 普通断开 5 s，**并发冲突（conflict）30 s**
  *      （服务端还需时间关闭上一个死会话并释放槽位，抢跑只会再次 conflict）。
+ *
+ * ⚠️ 三个周期的取值只能在本文件顶部定义（`LLM_PING_MS`/`LLM_BACKOFF_MS`/`LLM_CONFLICT_MS`）：
+ *    这里曾重复定义 `LLM_PING_MS`，后一处静默覆盖前一处（编译只报 warning），
+ *    导致"注释写 20 s、实际 10 s"的取证口径不一致 —— 现已合并为顶部单一定义。
  */
-#define LLM_PING_MS      10000
-#define LLM_BACKOFF_MS   5000
-#define LLM_CONFLICT_MS  30000
-
 static int64_t now_ms(void)
 {
     return esp_timer_get_time() / 1000;
@@ -440,6 +440,7 @@ static void supervisor_task(void *arg)
 {
     (void)arg;
     int64_t last_ping = 0;
+    uint32_t pings = 0;
     while (s_ka_run) {
         vTaskDelay(pdMS_TO_TICKS(1000));
         if (!s_ka_run) {
@@ -448,13 +449,17 @@ static void supervisor_task(void *arg)
         if (esp_websocket_client_is_connected(s_ws)) {
             if (now_ms() - last_ping >= LLM_PING_MS) {
                 last_ping = now_ms();
-                (void)llm_client_ping();
+                esp_err_t perr = llm_client_ping();
+                pings++;
+                /* 保活取证（台面诊断档开 DEBUG 日志即见）：ping 是否真的出去、服务端是否回 pong */
+                ESP_LOGD(TAG, "保活 ping 已发（第 %u 次）：%s", (unsigned)pings,
+                         esp_err_to_name(perr));
             }
             continue;
         }
         if (s_need_reconnect && now_ms() >= s_reconnect_at_ms) {
-            /* 仅记录（重连由组件自动重连负责，见 llm_client_start 的注释） */
-            ESP_LOGD(TAG, "等待组件自动重连（%s）", s_uri);
+            /* 重连由组件自动重连负责（见 llm_client_start 注释）；这里只记录退避已到点 */
+            ESP_LOGD(TAG, "退避结束，交由组件重连（%s）", s_uri);
             s_need_reconnect = false;
         }
     }
@@ -480,6 +485,13 @@ esp_err_t llm_client_init(const llm_client_cbs_t *cbs, const char *uri, const ch
     snprintf(s_device_id, sizeof(s_device_id), "%s", device_id);
     snprintf(s_token, sizeof(s_token), "%s", token ? token : "");
     s_st.state = LLM_CLIENT_IDLE;
+#if CONFIG_ONEYE_LLM_DIAG_HTTP_PROBE
+    /* 台面诊断档：把本模块的运行期日志级别提到 DEBUG（保活 ping、被忽略的帧等）。
+     * ⚠️ 运行期 `esp_log_level_set` 只能放开**已编译进来**的等级：要看 `ESP_LOGD`，
+     *    还需 `CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y`（或本文件 `LOG_LOCAL_LEVEL=ESP_LOG_DEBUG`）；
+     *    默认 INFO 档下这些 DEBUG 语句被编译掉，这里不产生任何日志。 */
+    esp_log_level_set(TAG, ESP_LOG_DEBUG);
+#endif
     ESP_LOGI(TAG, "语音面客户端：%s（子协议 %s，设备 %s）", s_uri, LLM_SUBPROTOCOL, s_device_id);
     return ESP_OK;
 }
@@ -517,14 +529,14 @@ esp_err_t llm_client_start(void)
      *   ③ 应用层契约帧 `ping` 周期放在 20 s（服务端只用它刷新"会话活跃/陈旧"判据）。
      */
     cfg.network_timeout_ms = 15000;
-    cfg.ping_interval_sec = 10;
+    cfg.ping_interval_sec = 5;
     cfg.pingpong_timeout_sec = 0;
     /*
-     * 重连交给组件自动重连（`disable_auto_reconnect = false`）：
-     *   真机取证 2026-09-17：自管重连（关掉它 + 自己 start）在**首次连接**阶段即稳定触发
-     *   `Interrupt wdt timeout on CPU1`（3/3 复现），而放开让组件重连时能正常连上并拿到
-     *   `session.ready`。故这里只用 supervisor_task 做**保活 ping**，不接管重连。
-     *   并发冲突（`error{code:"conflict"}`）由服务端"陈旧会话接管"（Registry，25 s 窗口）收敛。
+     * 重连交给组件（`disable_auto_reconnect = false`）。真机取证 2026-09-17：
+     * 设备侧"被服务端关闭后立即重连"这条路径会触发 `Interrupt wdt timeout`，
+     * 而**只要服务端不再误判冲突**（陈旧槽位 25→12 s 回收 + pong 也算活跃 + 服务端 ping 5 s），
+     * 这条路径就不会被走到 ⇒ 保持组件默认重连、把根因修在服务端与保活周期上。
+     * 协议层 ping 取 **5 s**（服务端 12 s 陈旧窗口据此判定会话是否还活着）。
      */
     cfg.disable_auto_reconnect = false;
 #if CONFIG_ONEYE_LLM_USE_TLS

@@ -91,6 +91,18 @@ menu "korvo2_llm_chat —— 云端 LLM 实时语音对话例程"
                 （SET 键的物理单击仍可人工验证；本开关只是让自动化跑得住）。
                 ⚠️ 台面/研发自检开关，量产必须为 n。
 
+        config ONEYE_LLM_SELFTEST_TURN_AFTER_NEWCONV
+            bool "台面自检：新对话建立后再自动走一轮（验证「在新对话里继续」）"
+            default n
+            depends on ONEYE_LLM_SELFTEST_NEW_CONV
+            help
+                打开后，收到 `conv.state{reason:"new"}` 时在**新段内**再自动走一轮：
+                新段应 turns 由 0 变 1、且**不继承**旧段上下文（服务端只送最近 N 轮，
+                新段历史为空 → `stub` 档位下首轮回显「历史0条」）。
+                与 `SELFTEST_NEW_CONV` 合用时，一次上电即可无人值守覆盖 P3 的
+                「SET 键单击起新对话 + 在新对话中继续」两项。
+                ⚠️ 台面/研发自检开关，量产必须为 n。
+
         config ONEYE_LLM_DIAG_HTTP_PROBE
             bool "台面诊断：建 WebSocket 前先做一次 HTTP GET /healthz"
             default n

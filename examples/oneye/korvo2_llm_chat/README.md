@@ -546,6 +546,64 @@ Web 控制台按该 SN 查设备与对话组」，但固件此前默认 `device_
 即"最多保留 10 段、满则删最旧、消息一并删"在**真实服务 + 真实库**上成立（单测另见 `store_test.go` 的
 `TestStoreMaxTenConversations`，含"被淘汰段不残留孤儿消息"断言）。
 
+### 7.1.12 ✅ 云端路径无人值守双轮取证 + 「AFE 起不来」的内存根因（配置漂移）（2026-09-17 第 53 轮）
+
+**背景**：设备已连上 CVM 云端小服务（§7.1.11 同类链路的云端版，见 backend spec-0086 第 17 轮条目），
+但"完整一轮"此前依赖人工长按。本轮用**自检开关**把它变成无人值守，并因此挖出一个**会让长按也失效**的
+内存问题。
+
+**① 自检扩展（新增 Kconfig `ONEYE_LLM_SELFTEST_TURN_AFTER_NEWCONV`）**：原自检只"走一轮 + 发一次
+`conv.new`"，覆盖不到 P3 的「**在新对话中继续**」。现改为：收到 `conv.state{reason:"new"}` 后**在新段内再走一轮**
+（走的是与按键**完全相同**的采集/提交路径，只是触发源不同）。
+
+**② 真机取证（COM12，CVM 云端路径，全程无人工按键）**：
+
+| 阶段 | 串口证据 |
+| --- | --- |
+| 连上云端 | `状态 → SESSION_START：已连接，发 session.start` → `状态 → READY` → `对话组：ready —— #5（0 轮，stub）` |
+| 第 1 轮（段 #5） | `采集开始（每帧 1920 B）` → `采集任务已创建（栈 4096 B 在 PSRAM；内部余 35039 B）` → 采集 76,800 B → `自动提交本轮（上行 76800 B）` → `THINKING` → `SPEAKING` → `本轮结束：turn_seq=1 rtt=2796 ms` |
+| **SET 单击等效** | `对话组回执：reason=new conv_id=6 turns=0` |
+| **新对话内继续（段 #6）** | `自动收音 …：新对话内的第二轮` → 采集 80,640 B → `turn_seq=2 rtt=2795 ms`、`本轮下行 192000 B` |
+| 云端落库 | `GET /v1/voice/devices/esp32s3korvo2/conversations` → **#6 turns=1 current=true**、**#5 turns=1**（两段各自 1 轮） |
+
+**③ 挖出的内存根因（重要，会表现成"长按没反应"）**：首跑自检时音频根本没起来：
+
+```
+I (23987) AUDIO_THREAD: The algo_fetch task allocate stack on external memory
+E (23994) AUDIO_THREAD: Error creating RestrictedPinnedToCore algo_fetch
+E (24001) ALGORITHM_STREAM: Failed to create algo_fetch task
+E (24010) voice_io: 采集任务创建失败（内部余 263 B/最大块 136 B，PSRAM 余 7794708 B）——长按 REC 将收不到音
+```
+
+内部 RAM 被吃到只剩 263 B / 最大块 136 B，连 TCB 都分不出来。根因是**配置漂移**：
+
+> `sdkconfig.defaults`（**跟踪文件**）写 `CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y`，
+> 而生成出来的 `sdkconfig`（**被 .gitignore 忽略**）里是 `# CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP is not set`
+> ⇒ WiFi/lwIP 的收发缓冲全落**内部 RAM**。ESP-IDF 只在 `sdkconfig` **缺少**该符号时才用 defaults，
+> 一旦生成过就不再跟随 —— 而 `sdkconfig` 不入库，**git 里完全看不见这个漂移**。
+
+修掉后（把该项置 `y` 重编重烧）内部 RAM 立刻宽松：
+
+| 指标 | 漂移时 | 修复后 |
+| --- | --- | --- |
+| 采集前内部余量 | 35,259 B | **42,391 B** |
+| 采集前内部最大块 | 21,504 B | **25,600 B** |
+| 采集任务 | ❌ 创建失败（AFE 线程先失败） | ✅ `采集任务已创建（栈 4096 B 在 PSRAM；内部余 35039 B）` |
+
+**④ 防止复发：新增工具 `tools/check-sdkconfig-drift.py`**（对照 defaults 与生成的 sdkconfig，列出漂移）：
+
+```bash
+python tools/check-sdkconfig-drift.py            # 全量；有漂移退出码 1（可进门禁）
+python tools/check-sdkconfig-drift.py --memory   # 只看内存/网络/BLE/AFE
+```
+
+⚠️ **看到漂移不要直接删 `sdkconfig` 重生成**：本机有几项是**有意覆盖且与已烧录 flash 布局绑定**的
+（`CONFIG_BOOTLOADER_OFFSET_IN_FLASH`：defaults 0x1000 vs 实际 0x0 —— 重生成会让启动区错位；
+`ESP_MAIN_TASK_STACK_SIZE`、`ONEYE_LLM_ENABLE_SDCARD` 等同理）。逐项判断后再对齐。
+
+**⑤ 台面口径**：自检开关（三项）只写进**被忽略的 `sdkconfig`**，量产必须为 `0/n`；
+本轮取证后已复位并重烧（复查：30 s 串口内 `selftest` 命中 0 次、仍正常 `READY` 并绑段）。
+
 ## 8. 合规
 
 - 会话音频与转写正文**不落库、不落盘**；本工程亦不写 SD（仅读凭据文件）；

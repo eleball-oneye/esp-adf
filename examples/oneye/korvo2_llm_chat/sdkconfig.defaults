@@ -4,6 +4,12 @@
 # 口径来源：examples/oneye/korvo2_oneye 的 sdkconfig.defaults（同板真机取证过的
 # 内存/PSRAM/AFE 组合），本工程在其基础上增加「BLE 配网 + WebSocket 语音面」所需项。
 #
+# ⚠️ 改了本文件**不一定生效**：ESP-IDF 只在 sdkconfig 里缺少该符号时才采用 defaults，
+#    而 sdkconfig 被本目录 .gitignore 忽略（不入库）⇒ 漂移在 git 里看不见。
+#    真机取证 2026-09-17：本文件写 SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y，实际 sdkconfig 是 not set，
+#    WiFi/lwIP 缓冲落内部 RAM → AFE 音频线程创建失败（长按 REC 收不到音）。
+#    改完请跑：python tools/check-sdkconfig-drift.py（见 README §7.1.12）。
+#
 
 # ------------------------------------------------------------------ 启动器 / 分区
 CONFIG_BOOTLOADER_OFFSET_IN_FLASH=0x1000

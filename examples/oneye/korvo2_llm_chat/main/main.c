@@ -59,17 +59,12 @@ static void pcm_uplink_cb(const void *pcm, size_t len, void *ctx);
  * 走的是与按键**完全相同**的代码路径（voice_io + llm_client），不新增任何协议/端点。
  */
 #if CONFIG_ONEYE_LLM_SELFTEST_TURN_MS > 0
-static void selftest_task(void *arg)
+/* selftest_run_turn 走一轮：采集固定时长 → 提交（与按键路径**完全相同**的代码，只是触发源不同）。
+ * 抽成函数是因为 `SELFTEST_TURN_AFTER_NEWCONV` 要在新对话里再走一轮。 */
+static void selftest_run_turn(const char *why)
 {
-    (void)arg;
-    /* 等 20 s 再自检（原先 3 s）：真机取证 2026-09-17 发现 3 s 时正撞上
-     * "AFE 模型加载 + BLE 广播 + WS 建连"三者叠加的内存峰值，
-     * `voice_io` 的 4 KB 采集任务栈申请被拒（`采集任务创建失败`，当时内部余 44,111 B / 最大块 23,552 B），
-     * 自检直接失败且不重试。延后到配网与模型都稳定后再跑，采集可正常创建。
-     * 这只影响**台面自检**的时间点，不影响按键路径。 */
-    vTaskDelay(pdMS_TO_TICKS(20000));
-    panel_min_note("[selftest] 自动收音 %d ms（台面自检，非按键路径）",
-                   CONFIG_ONEYE_LLM_SELFTEST_TURN_MS);
+    panel_min_note("[selftest] 自动收音 %d ms（台面自检，非按键路径）：%s",
+                   CONFIG_ONEYE_LLM_SELFTEST_TURN_MS, why);
     /* 内存取证（BLE 配网打开后内部 RAM 明显变紧，音频管线会被挤掉）：
      * 打开 BLE 后实测过 `E voice_io: I2S 读元素创建失败` → 采集启动失败，
      * 因此每次采集前把"内部 RAM / PSRAM 余量"打出来，便于判定要腾哪一侧。 */
@@ -79,7 +74,6 @@ static void selftest_task(void *arg)
                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     if (voice_io_capture_start(pcm_uplink_cb, NULL) != ESP_OK) {
         panel_min_note("[selftest] 采集启动失败");
-        vTaskDelete(NULL);
         return;
     }
     s_turn_start_us = esp_timer_get_time();
@@ -87,8 +81,35 @@ static void selftest_task(void *arg)
     (void)voice_io_capture_stop();
     panel_min_note("[selftest] 自动提交本轮（上行 %u B）", (unsigned)voice_io_captured_bytes());
     (void)llm_client_commit();
+}
+
+static void selftest_task(void *arg)
+{
+    (void)arg;
+    /* 等 20 s 再自检（原先 3 s）：真机取证 2026-09-17 发现 3 s 时正撞上
+     * "AFE 模型加载 + BLE 广播 + WS 建连"三者叠加的内存峰值，
+     * `voice_io` 的 4 KB 采集任务栈申请被拒（`采集任务创建失败`，当时内部余 44,111 B / 最大块 23,552 B），
+     * 自检直接失败且不重试。延后到配网与模型都稳定后再跑，采集可正常创建。
+     * 这只影响**台面自检**的时间点，不影响按键路径。 */
+    vTaskDelay(pdMS_TO_TICKS(20000));
+    selftest_run_turn("开机首轮");
     vTaskDelete(NULL);
 }
+
+/*
+ * `ONEYE_LLM_SELFTEST_TURN_AFTER_NEWCONV=1`：新对话建立后再自动走一轮，
+ * 用于**无人值守**验证"起新对话后在新对话里继续"（P3 验收项之一：
+ * 新段应 turns 从 0 变 1、且**不继承**旧段上下文）。
+ */
+#if CONFIG_ONEYE_LLM_SELFTEST_TURN_AFTER_NEWCONV
+static void selftest_turn_in_newconv_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(1500)); /* 等服务端把新段落定 */
+    selftest_run_turn("新对话内的第二轮");
+    vTaskDelete(NULL);
+}
+#endif
 
 /*
  * `ONEYE_LLM_SELFTEST_NEW_CONV=1` 时，第 1 轮结束后自动发一次 `conv.new`
@@ -306,6 +327,17 @@ static void on_llm_conv_state(const char *reason, int64_t conv_id, int turns,
                    (profile_id && profile_id[0]) ? profile_id : "默认");
     ESP_LOGI(TAG, "对话组回执：reason=%s conv_id=%lld turns=%d profile=%s", reason ? reason : "?",
              (long long)conv_id, turns, (profile_id && profile_id[0]) ? profile_id : "(默认)");
+#if CONFIG_ONEYE_LLM_SELFTEST_TURN_MS > 0 && CONFIG_ONEYE_LLM_SELFTEST_TURN_AFTER_NEWCONV
+    /* 新对话一建立就在**新段内**再走一轮 ⇒ 无人值守验证"起新对话后在新对话里继续"。
+     * 只认 reason=="new"（`conv.new` 的回执），不认 ready/switched —— 那两种不是"新话题"。 */
+    if (reason != NULL && strcmp(reason, "new") == 0) {
+        static bool in_newconv_fired;
+        if (!in_newconv_fired) {
+            in_newconv_fired = true;
+            (void)xTaskCreate(selftest_turn_in_newconv_task, "selftest_t2", 4096, NULL, 4, NULL);
+        }
+    }
+#endif
 }
 
 /* ------------------------------------------------------------------ 采集回调（上行） */

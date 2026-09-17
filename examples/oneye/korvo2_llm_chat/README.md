@@ -641,6 +641,36 @@ python tools/ble_prov_e2e.py --pop <串口 POP> --crypt-fault 2   # 负向对照
 设备已回到未配对态、按明文处理，表现为密文 `link.ping` 无 `link.pong`（不是链路故障）。
 手机侧要"断线续配"就得重新 `prov.pair`，或日后按契约评审把"配对态跨连接保留"写进 §4.3。
 
+### 7.1.14 ✅ 局域网（lan）信道端到端首次取证：PC ⇄ 设备，**不需要手机**（2026-09-17 续）
+
+**背景**：本地面三条信道里，`ble` 已真机跑通（§7.1.11/§7.1.13），而 **`lan` 从未端到端验证过**
+（原计划要等手机真机；但它其实**不需要手机** —— PC 与设备同网段即可：发现走 UDP、帧面走 HTTP）。
+
+**前置**：本机（设备侧）`sdkconfig` 已含 `CONFIG_ONEYE_LLM_ENABLE_LAN_LINK=y` 与
+`CONFIG_ONEYE_LLM_LAN_HTTP_PORT=80`（⚠️ 明文信道，量产必须 `n`；`sdkconfig` 被 gitignore，跟踪文件未动）。
+
+**工具（新增，已进仓）**：`embedded/esp-adf/components/oneye-dev-sdk/tools/lan_link_e2e.py`
+（只读探测：UDP `57321` 发现 + `POST /api/link/frame` 的 `link.ping`；含"无令牌只允许 `prov.hello`/`link.ping`"
+的负向断言；机器可读标记 `LAN_*`；**只发不写**，不下发凭据）。用法：
+
+```bash
+python tools/lan_link_e2e.py                       # 广播发现 + link.ping（PC 与设备同网段）
+python tools/lan_link_e2e.py --target 192.168.110.80   # 广播被 AP 隔离时改单播
+```
+
+**实跑结果（PC `192.168.110.208` → 设备 `192.168.110.80`，2026-09-17）**：
+
+| 断言 | 证据 |
+| --- | --- |
+| `LAN_DISCOVER` | ✅ 广播 `{"t":"oneye.discover","v":1}` ⇒ 设备**单播**回 `node.announce`：`node_id=esp32s3korvo2`、`kind=device`、`channels=ble,lan`、`caps=prov.ble,prov.smartconfig,link.lan,voice.ws`、`http_port=80` |
+| `LAN_ANNOUNCE_CLEAN` | ✅ 应答里**无** Wi-Fi 密码 / POP / 令牌（契约 §1 明文限域口径） |
+| `LAN_PING` / `LAN_E2E` | ✅ `POST http://192.168.110.80:80/api/link/frame` 发 `link.ping{nonce}` ⇒ HTTP 200 回 `link.pong`，`nonce` 逐字一致（`from=esp32s3korvo2`、`ch=lan`） |
+| `LAN_TOKEN_GUARD`（负向） | ✅ 无令牌发**不在白名单**的 `prov.scan.req` ⇒ 被拒：`{"t":"error","p":{"code":"unauthorized","msg":"pair first (BLE) to get token"}}`（契约 §2：无令牌**只**接受 `prov.hello` 与 `link.ping`） |
+
+**口径与未覆盖**：① 这是**PC 侧等价验证**（协议与实现一致：手机侧 `:sdk-android` 的 `LanLinkClient` 用同一
+`LinkContract.Lan` 常量与同一帧面），**手机真机上的 lan 链路仍未上机**；② **带令牌**的帧面路径未覆盖
+（令牌由 BLE 配对协商，本轮未取；属手机侧真机项）；③ 限流（≤20 帧/s）与 60 s 幂等窗口未测。
+
 ## 8. 合规
 
 - 会话音频与转写正文**不落库、不落盘**；本工程亦不写 SD（仅读凭据文件）；

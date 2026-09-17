@@ -671,6 +671,49 @@ python tools/lan_link_e2e.py --target 192.168.110.80   # 广播被 AP 隔离时�
 `LinkContract.Lan` 常量与同一帧面），**手机真机上的 lan 链路仍未上机**；② **带令牌**的帧面路径未覆盖
 （令牌由 BLE 配对协商，本轮未取；属手机侧真机项）；③ 限流（≤20 帧/s）与 60 s 幂等窗口未测。
 
+### 7.1.15 ❌ 未闭环：lan 帧面 `link.ping` 会**偶发把设备打重启**（2026-09-17，根因待续）
+
+**现象**（PC 侧 `lan_link_e2e.py` 暴露）：单次探测**通常 PASS**，但**重复请求**下设备重启，标记
+`LAN_PING=FAIL`（HTTP 0 / 超时），串口出现：
+
+```
+I (9000) lan_link: 收到 lan 帧（167 B）→ inject=0
+***ERROR*** A stack overflow in task httpd has been detected.
+Backtrace: … |<-CORRUPTED
+rst:0xc (RTC_SW_CPU_RST)
+```
+
+无金丝雀的构建里表现为 `Guru Meditation Error: Core 1 panic'ed (Double exception)`，回溯解出（`addr2line`）：
+
+```
+_xt_context_save → vsnprintf → _xt_alloca_exc → oneye_jsonw_fmt → frame_write →
+oneye_link_frame_build_simple → oneye_dev_link_send → link_dispatch →
+oneye_dev_link_inject_frame → frame_post_handler (lan_link.c:181) → httpd_uri → … → httpd_thread
+```
+
+**已排除 / 已确认**：
+1. **不是"httpd 栈只是偏小"**：把 `CONFIG_HTTPD_STACK_SIZE` 依次设成 **4096（IDF 默认）/8192/16384/32768**
+   压测（每档 8~20 轮、每轮 发现+ping+守卫），**四档都能复现**；32 KB 反而更频繁（15 轮全崩）⇒ 指向
+   **内存越界破坏 httpd 栈金丝雀 / 布局敏感**，而非单纯深度不够。⇒ 已把该配置从 `sdkconfig.defaults`
+   **移除**（不写死未经证实的值）。
+2. **不是发送端组帧的 8 KB 栈缓冲**：`oneye_dev_link_send` 早已改堆分配（SDK 内注释记录了同类历史修复）；
+   文件里仅剩的 8 KB 栈缓冲在 **WAN 收线程**（`link_wan_thread` 的 `acc[]`），不在本次调用链上。
+3. **崩溃只发生在"帧面 POST"这条链**：同一设备的 UDP **发现**路径在压测中 47 次应答全部正常
+   （`已应答发现请求（第 N 次）`），无一次崩溃。
+4. 与该缺陷无关的旁证：`link.ping` 的**语义**正确（单次成功时 HTTP 200 + `link.pong`，nonce 逐字一致；
+   无令牌的 `prov.scan.req` 也正确被拒 `unauthorized`）。
+
+**下一步（按性价比排序）**：
+1. 在 `frame_post_handler` 里打印/记录 `uxTaskGetStackHighWaterMark(httpd_task)` 与
+   `heap_caps_check_integrity_all(true)`，判定"真栈不够"还是"堆越界已发生"；
+2. 查 `oneye_link_frame.c` 的 `frame_write`/`oneye_jsonw_fmt` 是否有越界写（小 `cap` + 未校验返回值）；
+   用 `-fsanitize=address` 的宿主单测（`tests/`）先复现同类路径；
+3. 结构上更稳的改法：让 **LAN 帧面不在 httpd 任务上做 SDK 注入** —— 例程侧用一条**专用任务（大栈）**
+   处理 `POST /api/link/frame`，httpd 只搬运请求/应答（这也是把 SDK 的栈需求与 httpd 解耦）。
+
+**当前口径（不要误用）**：lan 信道**只有"发现"路径可用于验收**；帧面（`POST /api/link/frame`）在缺陷
+闭环前**不要**作为验收依据 —— 契约 `contracts/local/lan-link.md` §2 的"取证"注解已同步标注该限制。
+
 ## 8. 合规
 
 - 会话音频与转写正文**不落库、不落盘**；本工程亦不写 SD（仅读凭据文件）；

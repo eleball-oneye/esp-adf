@@ -113,3 +113,15 @@ CONFIG_ONEYE_LLM_LOG_TEXT=n
 # ------------------------------------------------------------------ oneye-dev-sdk（本地面：link/ble）
 CONFIG_ONEYE_DEV_SDK_ENABLE_LINK=y
 CONFIG_ONEYE_DEV_SDK_ENABLE_BLE=y
+
+# ------------------------------------------------------------------ HTTP 帧面（本地面 lan）
+# ⚠️ 已知未闭环缺陷（2026-09-17，详见 README §7.1.15）：`POST /api/link/frame` 的
+# `link.ping` 会**偶发**把设备打重启 —— 现象是 IDF 打印
+#   `***ERROR*** A stack overflow in task httpd has been detected.`
+# （无金丝雀时表现为 `Guru Meditation … (Double exception)`，回溯含 `_xt_alloca_exc`，
+#   链为 httpd → frame_post_handler → oneye_dev_link_inject_frame → link_dispatch →
+#    oneye_dev_link_send → oneye_link_frame_build_simple → jsonw_fmt → vsnprintf）。
+# **实测：仅调大 httpd 栈不是修复** —— 4096（默认）/8192/16384/32768 四档都能复现
+# （32 KB 反而更频繁，指向"内存越界破坏 httpd 栈金丝雀"或布局敏感问题，而非单纯不够用）。
+# 因此这里**不再**写死一个未经证实的 `CONFIG_HTTPD_STACK_SIZE`；根因待续（README §7.1.15 有
+# 已排除项与下一步）。lan 信道当前只可信任「发现」路径，帧面**不要**用于验收。

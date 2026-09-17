@@ -45,6 +45,170 @@ static void set_reply(const char *json, size_t len)
     s_reply_len = len;
 }
 
+/* ------------------------------------------------- 契约 §2：限流与幂等（帧面） */
+
+/*
+ * 契约 [C4] §2 两条**硬要求**，此前两侧都没实现（2026-09-17 补齐，真机取证见 README §7.1.16）：
+ *   · 限流：≤20 帧/s/对端；超限回 `error{code:"busy"}`
+ *   · 幂等：以帧 `id` 去重（窗口 60 s），重复 `id` 返回**最后一次结果**（不重复执行副作用）
+ *
+ * 为什么必须做：`id` 幂等是"手机重试"的安全网（LAN 明文信道更容易丢/重发）；限流是防止
+ * 一个坏对端把设备拖死（帧面处理链本身不便宜 —— 见 §7.1.15 的栈取证）。
+ * 实现留在数据面（本模块）：这是"承载层"的保护，不改变 SDK 的帧语义。
+ */
+#define LAN_RATE_LIMIT_PER_S 20u     /* 契约值：20 帧/s/对端 */
+#define LAN_RATE_PEERS       4u      /* 同时跟踪的对端数（台面足够；满了就轮转最旧） */
+#define LAN_RATE_WINDOW_MS   1000u
+#define LAN_IDEM_ENTRIES     4u      /* 幂等窗口内保留的最近帧数 */
+#define LAN_IDEM_TTL_MS      60000u  /* 契约值：60 s */
+#define LAN_FRAME_ID_MAX     64u
+#define LAN_IDEM_REPLY_MAX   1024u   /* 单条缓存应答上限（超出则不缓存，退化为"不幂等"） */
+
+typedef struct {
+    uint32_t ip;            /* 对端 IPv4（主机序）；0 = 空槽 */
+    uint32_t win_start_ms;
+    uint32_t count;
+} lan_rate_t;
+
+typedef struct {
+    char    id[LAN_FRAME_ID_MAX];
+    int64_t at_ms;
+    char   *reply;          /* 堆上副本（可为 NULL = 该次无应答） */
+    size_t  reply_len;
+} lan_idem_t;
+
+static lan_rate_t s_rate[LAN_RATE_PEERS];
+static lan_idem_t s_idem[LAN_IDEM_ENTRIES];
+
+/** 取对端 IPv4（主机序）；取不到返回 0（= 不限流，避免把正常流量误判）。 */
+static uint32_t frame_peer_ip(httpd_req_t *req)
+{
+    int fd = httpd_req_to_sockfd(req);
+    if (fd < 0) {
+        return 0;
+    }
+    struct sockaddr_in sa;
+    socklen_t len = sizeof(sa);
+    if (getpeername(fd, (struct sockaddr *)&sa, &len) != 0 || sa.sin_family != AF_INET) {
+        return 0;
+    }
+    return (uint32_t)ntohl(sa.sin_addr.s_addr);
+}
+
+/** 计数并判定：true = 放行，false = 超限（契约要求回 busy）。 */
+static bool rate_allow(uint32_t ip, int64_t now_ms)
+{
+    if (ip == 0u) {
+        return true;
+    }
+    lan_rate_t *slot = NULL;
+    lan_rate_t *oldest = &s_rate[0];
+    for (size_t i = 0; i < LAN_RATE_PEERS; i++) {
+        if (s_rate[i].ip == ip) {
+            slot = &s_rate[i];
+            break;
+        }
+        if (s_rate[i].ip == 0u) {
+            slot = &s_rate[i];
+            break;
+        }
+        if (s_rate[i].win_start_ms < oldest->win_start_ms) {
+            oldest = &s_rate[i];
+        }
+    }
+    if (slot == NULL) {
+        slot = oldest; /* 表满：轮转最旧（台面口径，够用且无分配） */
+    }
+    if (slot->ip != ip || now_ms - (int64_t)slot->win_start_ms >= (int64_t)LAN_RATE_WINDOW_MS) {
+        slot->ip = ip;
+        slot->win_start_ms = (uint32_t)now_ms;
+        slot->count = 0;
+    }
+    slot->count++;
+    return slot->count <= LAN_RATE_LIMIT_PER_S;
+}
+
+/** 从帧 JSON 里取字符串字段（零依赖扫描；找不到返回 false）。 */
+static bool json_str_field(const char *body, const char *key, char *out, size_t cap)
+{
+    char pat[40];
+    snprintf(pat, sizeof(pat), "\"%s\":\"", key);
+    const char *p = strstr(body, pat);
+    if (p == NULL) {
+        return false;
+    }
+    p += strlen(pat);
+    size_t i = 0;
+    while (p[i] != '\0' && p[i] != '"' && i + 1u < cap) {
+        out[i] = p[i];
+        i++;
+    }
+    out[i] = '\0';
+    return i > 0u;
+}
+
+/** 幂等命中？命中则把上次应答写回 [s_reply] 并返回 true（**不再执行**该帧的副作用）。 */
+static bool idem_hit(const char *id, int64_t now_ms)
+{
+    if (id == NULL || id[0] == '\0') {
+        return false;
+    }
+    for (size_t i = 0; i < LAN_IDEM_ENTRIES; i++) {
+        if (s_idem[i].id[0] == '\0' || strcmp(s_idem[i].id, id) != 0) {
+            continue;
+        }
+        if (now_ms - s_idem[i].at_ms > (int64_t)LAN_IDEM_TTL_MS) {
+            s_idem[i].id[0] = '\0'; /* 过期：当未命中，槽位顺手释放 */
+            free(s_idem[i].reply);
+            s_idem[i].reply = NULL;
+            s_idem[i].reply_len = 0;
+            return false;
+        }
+        s_idem[i].at_ms = now_ms;
+        s_reply_len = 0;
+        s_reply[0] = '\0';
+        if (s_idem[i].reply != NULL && s_idem[i].reply_len > 0u) {
+            set_reply(s_idem[i].reply, s_idem[i].reply_len);
+        }
+        ESP_LOGI(TAG, "幂等命中：id=%s（返回上次结果，不重复执行）", id);
+        return true;
+    }
+    return false;
+}
+
+/** 记住本次结果（应答为空也记 —— "重复 id 返回最后一次结果" 含空结果）。 */
+static void idem_store(const char *id, const char *reply, size_t reply_len, int64_t now_ms)
+{
+    if (id == NULL || id[0] == '\0' || reply_len > LAN_IDEM_REPLY_MAX) {
+        return;
+    }
+    lan_idem_t *slot = &s_idem[0];
+    for (size_t i = 0; i < LAN_IDEM_ENTRIES; i++) {
+        if (s_idem[i].id[0] == '\0' || strcmp(s_idem[i].id, id) == 0) {
+            slot = &s_idem[i];
+            break;
+        }
+        if (s_idem[i].at_ms < slot->at_ms) {
+            slot = &s_idem[i];
+        }
+    }
+    free(slot->reply);
+    slot->reply = NULL;
+    slot->reply_len = 0;
+    if (reply_len > 0u) {
+        slot->reply = (char *)malloc(reply_len + 1u);
+        if (slot->reply == NULL) {
+            slot->id[0] = '\0';
+            return; /* 内存不足：放弃缓存（退化为不幂等），不影响本次应答 */
+        }
+        memcpy(slot->reply, reply, reply_len);
+        slot->reply[reply_len] = '\0';
+        slot->reply_len = reply_len;
+    }
+    snprintf(slot->id, sizeof(slot->id), "%s", id);
+    slot->at_ms = now_ms;
+}
+
 /** 组一条 link 帧 JSON（信封：{v,t,id,from,to,ch,ts,p}，见 contracts/local/README.md §2.1） */
 static int build_frame(char *out, size_t cap, const char *to, const char *t, const char *p_json)
 {
@@ -178,10 +342,49 @@ static esp_err_t frame_post_handler(httpd_req_t *req)
         return ESP_OK;
     }
 
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+
+    /* 契约 §2 限流：≤20 帧/s/对端，超限回 busy（**先于**任何帧处理，避免坏对端拖死设备）。 */
+    if (!rate_allow(frame_peer_ip(req), now_ms)) {
+        ESP_LOGW(TAG, "对端超限（>%u 帧/s）：回 busy", (unsigned)LAN_RATE_LIMIT_PER_S);
+        free(body);
+        s_reply_len = 0;
+        s_reply[0] = '\0';
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"v\":1,\"t\":\"error\",\"p\":{\"code\":\"busy\","
+                                "\"msg\":\"rate limit exceeded\"}}");
+        return ESP_OK;
+    }
+
+    /* 契约 §2 幂等：同 `id` 在 60 s 内重复 ⇒ 直接回上次结果，**不重复执行**副作用。 */
+    char frame_id[LAN_FRAME_ID_MAX] = { 0 };
+    (void)json_str_field(body, "id", frame_id, sizeof(frame_id));
+    s_reply_len = 0;
+    s_reply[0] = '\0';
+    if (idem_hit(frame_id, now_ms)) {
+        free(body);
+        s_rx_frames++;
+        httpd_resp_set_type(req, "application/json");
+        if (s_reply_len > 0) {
+            (void)httpd_resp_send(req, s_reply, (ssize_t)s_reply_len);
+            s_reply_len = 0;
+            s_reply[0] = '\0';
+        } else {
+            (void)httpd_resp_sendstr(req, "{}");
+        }
+        return ESP_OK;
+    }
+
     esp_err_t err = oneye_dev_link_inject_frame(body, (size_t)received, ONEYE_DEV_LINK_CHAN_LAN);
     ESP_LOGI(TAG, "收到 lan 帧（%d B）→ inject=%d", received, (int)err);
     free(body);
     s_rx_frames++;
+
+    if (s_reply_len > 0) {
+        idem_store(frame_id, s_reply, s_reply_len, now_ms);
+    } else {
+        idem_store(frame_id, NULL, 0u, now_ms);
+    }
 
     httpd_resp_set_type(req, "application/json");
     if (s_reply_len > 0) {

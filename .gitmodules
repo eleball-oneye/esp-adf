@@ -11,3 +11,7 @@
 	path = components/oneye-dev-sdk
 	url = git@github.com:eleball-oneye/oneye-dev-sdk.git
 	branch = main
+[submodule "docs/oneye-iot-index"]
+	path = docs/oneye-iot-index
+	url = git@github.com:ELEboysss/oneye-iot-index.git
+	branch = main

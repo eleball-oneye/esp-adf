@@ -42,6 +42,20 @@
 #   这解决了"未定义 ESP_PLATFORM 导致 oneye_osal_idf.o 编成空目标文件、
 #   4 个归档链不上 IDF 工程"的缺陷（详情见 idf_probe_flags 的注释）。
 #
+# 退出码口径（**失败必须传播到调用者**，勿再出现"编不过却 exit 0"）：
+#   0  所有请求的工具链都构建成功；门禁通过；required 依赖齐（若 --deps-strict）；固件轨成功（若 --firmware）。
+#      demo / 宿主单测属**辅助轨**：其失败只 warn，不影响退出码（分类口径见「门禁与 demo」一节上方注释）。
+#   1  任一工具链的库编译/归档/链接/预编译发布失败、门禁未通过、required 依赖缺失（--deps-strict）、
+#      板级固件构建失败、或工具链规格无法识别。stderr 会给出失败摘要（工具链 ID + 失败文件）。
+#   2  参数/环境错误（未知参数、SDK 目录无效/缺 src/internal）。
+# 失败时的两条硬约束（已实测的真实事故，勿回退）：
+#   * 报告照旧生成（失败诊断需要它），但 BUILD-REPORT.md 顶部与文末都显式写明"本次构建失败"与失败清单；
+#     收尾横幅不再是"完成。产物树："。
+#   * 失败的工具链**不得留下"看起来是新的"产物**：output/<tcid>/ 回滚为上一次产物并写 STALE.md 标注陈旧，
+#     本次半成品隔离到 output/.build/failed-<tcid>/；SDK 侧预编译归档 lib/<tcid>/ 同样打陈旧标记。
+# 跳过（所请求的工具链在本机不可用：缺 IDF 或交叉编译器）**不计入失败**（`--toolchains all` 会枚举未安装的
+#   版本/芯片），但会在 stderr 与报告"已请求但未构建"一节里显式列出，绝不伪装成成功行。
+#
 # 用法示例（在 esp-adf 根目录执行）：
 #   ./build-all.sh --list
 #   ./build-all.sh --toolchains host
@@ -84,12 +98,16 @@ VENDOR_CJSON_PREFIX="oev_cjson_"
 LIBS=(oneye_dev_base oneye_dev_mpp oneye_dev_event oneye_dev_log oneye_dev_link oneye_dev_ble)
 
 C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_RED=$'\033[31m'
+# LAST_ERR / LAST_WARN：记录最后一条 err/warn 文本，供工具链成败账本生成"可定位的失败摘要"
+# （含工具链 ID 与失败文件）。这些函数是纯输出函数，除记账外不改任何行为。
+LAST_ERR=""; LAST_WARN=""
 info()  { printf '%s==> %s%s\n' "$C_BOLD" "$*" "$C_RESET"; }
 ok()    { printf '    %s%s%s\n' "$C_GREEN" "$*" "$C_RESET"; }
-warn()  { printf '    %s%s%s\n' "$C_YELLOW" "$*" "$C_RESET"; }
-err()   { printf '%sERROR: %s%s\n' "$C_RED" "$*" "$C_RESET" >&2; }
+warn()  { printf '    %s%s%s\n' "$C_YELLOW" "$*" "$C_RESET"; LAST_WARN="$*"; }
+err()   { printf '%sERROR: %s%s\n' "$C_RED" "$*" "$C_RESET" >&2; LAST_ERR="$*"; }
 
-usage() { sed -n '2,60p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+# 头部注释整块即 --help 的输出（行号随注释增删自动跟随，勿写死）
+usage() { sed -n '2,/^# =====/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 # ---------------------------------------------------------------- 参数解析
 while [ $# -gt 0 ]; do
@@ -395,6 +413,88 @@ vendor_object_private() { # $1=raw.o  $2=priv.o  $3=nm  $4=objcopy
     ok "内嵌件符号隔离：$n 个符号 → ${VENDOR_CJSON_PREFIX}*"
 }
 
+# ======================================================= 失败传播：产物快照与陈旧标注
+# 背景（已实测的真实事故，勿回退）：本脚本此前即使编译失败，也照旧打印「完成。产物树：」并重写
+# BUILD-REPORT.md，报告里没有任何失败标记；同时 output/<tcid>/ 与 SDK 侧 lib/<tcid>/ 里保留的是
+# **上一次**构建的 toolchain.json / lib/*.a（sdk_version 仍是旧值），调用者、CI 和人都会把陈旧归档
+# 当成本次结果 —— 实测踩到"预编译归档静默落后于源码、设备端上报了错的 SDK 版本号"。
+# 口径：
+#   * 失败的工具链**不得产出/刷新** toolchain.json、lib/*.a：构建前把上一次产物挪到
+#     output/.build/prev-<tcid>，成功后丢弃快照（成功路径的行为与输出完全不变）；
+#     失败则把本次半成品隔离到 output/.build/failed-<tcid>/，并把旧产物原样搬回，
+#     再写 STALE.md 明确标注"陈旧、不代表本次结果"。
+#   * SDK 侧预编译归档 lib/<tcid>/ 在失败时同样打 STALE.md 陈旧标记；发布成功时自动清除
+#     （见 publish_to_repo_lib）—— 这正是堵住"归档静默落后"的那道闸。
+TC_SNAP=""
+CUR_TCID=""
+STALE_DIRS=()
+
+tc_begin() { # $1=tcid $2=out —— 构建前暂存上一次产物
+    CUR_TCID="$1"
+    TC_SNAP="$OUT_ROOT/.build/prev-$1"
+    rm -rf "$TC_SNAP"
+    if [ -d "$2" ] && ! mv "$2" "$TC_SNAP"; then
+        err "无法暂存旧产物目录：$2"
+        TC_SNAP=""
+        return 1
+    fi
+    return 0
+}
+
+tc_commit() { # 构建成功：丢弃快照（产物已就位，无需回滚）
+    [ -n "$TC_SNAP" ] && rm -rf "$TC_SNAP"
+    TC_SNAP=""
+    return 0
+}
+
+stale_note() { # $1=工具链ID $2=失败原因 —— STALE.md 正文
+    printf '# ⚠ 陈旧产物（不是本次构建的结果）\n\n- 工具链：`%s`\n- 本次构建时间：%s（UTC）\n- 失败原因：%s\n\n本目录下的 `toolchain.json` 与 `lib/*.a` 来自**上一次成功的构建**，本次构建**失败**，\n因此它们**没有**被刷新，可能落后于当前 SDK 源码（例如 `sdk_version` 仍是旧值）。\n请勿把本目录当作本次构建的交付物。该工具链重建成功后，本文件会被自动删除。\n' \
+        "$1" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2"
+}
+
+mark_repo_lib_stale() { # $1=tcid $2=原因 —— SDK 侧预编译归档打陈旧标记
+    local d="$SDK_DIR/lib/$1"
+    [ "$PUBLISH_REPO_LIB" = "1" ] || return 0
+    [ -f "$d/toolchain.json" ] || return 0
+    stale_note "$1" "$2" > "$d/STALE.md" 2>/dev/null || return 0
+    warn "预编译归档未刷新（已标注陈旧）：$d/STALE.md"
+}
+
+tc_rollback() { # $1=tcid $2=out $3=原因 —— 失败：隔离半成品 + 回滚旧产物 + 标注陈旧
+    local tcid="$1" out="$2" reason="$3" quarantined=""
+    if [ -n "$TC_SNAP" ]; then
+        if [ -d "$out" ]; then
+            rm -rf "$OUT_ROOT/.build/failed-$tcid"
+            if mv "$out" "$OUT_ROOT/.build/failed-$tcid" 2>/dev/null; then
+                quarantined="$OUT_ROOT/.build/failed-$tcid"
+            else
+                rm -rf "$out"
+            fi
+        fi
+        if [ -d "$TC_SNAP" ]; then
+            if mv "$TC_SNAP" "$out" 2>/dev/null; then
+                STALE_DIRS+=("$tcid")
+                stale_note "$tcid" "$reason" > "$out/STALE.md" 2>/dev/null || true
+                warn "已回滚为上一次产物并标注陈旧：$out/STALE.md"
+            else
+                err "回滚 $tcid 的旧产物失败（快照留在 $TC_SNAP，请人工处理）"
+            fi
+        fi
+        TC_SNAP=""
+    fi
+    [ -n "$quarantined" ] && warn "本次未完成的半成品已隔离：$quarantined（不要使用）"
+    mark_repo_lib_stale "$tcid" "$reason"
+    return 0
+}
+
+is_stale() { # $1=tcid —— 该工具链本次是否失败（产物已回滚为陈旧）
+    local x
+    for x in "${STALE_DIRS[@]:-}"; do
+        [ "$x" = "$1" ] && return 0
+    done
+    return 1
+}
+
 # ======================================================= 构建：宿主
 build_host() {
     local c tcid out scratch nm_bin objcopy_bin
@@ -405,6 +505,8 @@ build_host() {
     scratch="$OUT_ROOT/.build/host"
     nm_bin="$(command -v nm || echo nm)"
     objcopy_bin="$(command -v objcopy || echo objcopy)"
+    # 先暂存上一次产物：本次任一环节失败都会回滚（失败不留"看起来是新的"产物）
+    tc_begin "$tcid" "$out" || return 1
 
     local cflags="-O2 -Wall -Wextra -fPIC -ffunction-sections -fdata-sections -std=c99"
     # 可见性口径（宿主轨）：
@@ -425,8 +527,9 @@ build_host() {
     # ① 内嵌件（cJSON）→ 私有符号目标文件
     local vendor_priv_o="$scratch/oneye_vendor_priv.o"
     "$c" $cflags -I"$SDK_DIR/vendor/cjson" -c "${VENDOR_SRCS[0]}" -o "$scratch/oneye_vendor_raw.o" \
-        || { err "内嵌件编译失败"; return 1; }
-    vendor_object_private "$scratch/oneye_vendor_raw.o" "$vendor_priv_o" "$nm_bin" "$objcopy_bin" || return 1
+        || { err "内嵌件编译失败（$tcid）"; return 1; }
+    vendor_object_private "$scratch/oneye_vendor_raw.o" "$vendor_priv_o" "$nm_bin" "$objcopy_bin" \
+        || { err "内嵌件符号隔离失败（$tcid）"; return 1; }
 
     # ② 各领域库：编译 → 归档（base 合并内嵌件）
     #    注意：.so 必须用**目标文件**链接（用归档链 shared 时，ld 只拉取解析未定义符号的成员，
@@ -440,13 +543,14 @@ build_host() {
         [ "$lib" = "oneye_dev_base" ] && _cflags="$cflags_base"
         while IFS= read -r s; do
             [ -n "$s" ] || continue
-            [ -f "$s" ] || { err "源文件缺失：$s"; return 1; }
+            [ -f "$s" ] || { err "源文件缺失：$s（$tcid）"; return 1; }
             o="$scratch/$(basename "${s%.c}").o"
             "$c" $_cflags -I"$SDK_DIR/include" -I"$SRC_INTERNAL" -I"$SDK_DIR/vendor/cjson" \
-                 -c "$s" -o "$o" || { err "编译失败：$s"; return 1; }
+                 -c "$s" -o "$o" || { err "编译失败：$s（$tcid）"; return 1; }
             objs+=("$o")
         done < <(lib_srcs "$lib")
-        ar rcs "$scratch/lib${lib}_body.a" "${objs[@]}" || return 1
+        ar rcs "$scratch/lib${lib}_body.a" "${objs[@]}" \
+            || { err "归档失败：$scratch/lib${lib}_body.a（$tcid）"; return 1; }
         LIB_BODY[$lib]="$scratch/lib${lib}_body.a"
         LIB_OBJS[$lib]="${objs[*]}"
         ok "编译 ${lib}（${#objs[@]} 个目标文件）"
@@ -460,9 +564,9 @@ build_host() {
         echo "ADDMOD $vendor_priv_o"
         echo "SAVE"
         echo "END"
-    } | ar -M 2>&1)" || { err "合并内嵌件失败（ar -M）："; printf '%s\n' "$ar_out" | sed 's/^/    /'; return 1; }
+    } | ar -M 2>&1)" || { err "合并内嵌件失败（ar -M，$tcid）："; printf '%s\n' "$ar_out" | sed 's/^/    /'; return 1; }
     if [ ! -f "$out/lib/liboneye_dev_base.a" ]; then
-        err "合并内嵌件后未生成 liboneye_dev_base.a："; printf '%s\n' "$ar_out" | sed 's/^/    /'; return 1
+        err "合并内嵌件后未生成 liboneye_dev_base.a（$tcid）："; printf '%s\n' "$ar_out" | sed 's/^/    /'; return 1
     fi
     ok "lib/liboneye_dev_base.a（含内嵌 cJSON，符号已隔离） $(stat -c%s "$out/lib/liboneye_dev_base.a") B"
 
@@ -490,12 +594,12 @@ MAP
     "$c" -shared -Wl,-soname,liboneye_dev_base.so.0 -Wl,--version-script="$vermap" \
         -o "$out/lib/liboneye_dev_base.so.$SDK_VERSION_NUM" \
         ${LIB_OBJS[oneye_dev_base]} "$vendor_priv_o" $dep_libs -lpthread -lm \
-        || { err "链接 liboneye_dev_base.so 失败"; return 1; }
+        || { err "链接 liboneye_dev_base.so 失败（$tcid）"; return 1; }
     for lib in oneye_dev_mpp oneye_dev_event oneye_dev_log oneye_dev_link oneye_dev_ble; do
         "$c" -shared -Wl,-soname,lib${lib}.so.0 -Wl,--version-script="$vermap" \
             -o "$out/lib/lib${lib}.so.$SDK_VERSION_NUM" \
             ${LIB_OBJS[$lib]} -L"$out/lib" -loneye_dev_base -Wl,-rpath,'$ORIGIN' \
-            || { err "链接 lib${lib}.so 失败"; return 1; }
+            || { err "链接 lib${lib}.so 失败（$tcid）"; return 1; }
     done
     for lib in "${LIBS[@]}"; do
         ln -sf "lib${lib}.so.$SDK_VERSION_NUM" "$out/lib/lib${lib}.so.0"
@@ -520,8 +624,13 @@ EOF
     ok "oneye-dev-sdk.pc（pkg-config 一次展开 4 库）"
 
     bundle_deps_host "$out"
-    write_manifest "$out" "$tcid" "$c" "$(cc_full_version "$c")" "x86_64/host" "" "$cflags"
-    [ "$PUBLISH_REPO_LIB" = "1" ] && publish_to_repo_lib "$out" "$tcid"
+    write_manifest "$out" "$tcid" "$c" "$(cc_full_version "$c")" "x86_64/host" "" "$cflags" \
+        || { err "生成构建口径清单失败（$tcid：toolchain.json / SHA256SUMS）"; return 1; }
+    # 预编译归档发布：**不得吞掉失败**（否则 lib/<tcid>/ 静默落后于源码），见本文件顶部退出码口径
+    if [ "$PUBLISH_REPO_LIB" = "1" ]; then
+        publish_to_repo_lib "$out" "$tcid" \
+            || { err "预编译归档发布失败：lib/$tcid/ 未刷新（$tcid）"; return 1; }
+    fi
     LAST_HOST_OUT="$out"
     LAST_HOST_ID="$tcid"
     return 0
@@ -673,6 +782,8 @@ build_esp() {
     nm_bin="$(dirname "$cc")/$(basename "$cc" | sed 's/gcc$/nm/')"; [ -x "$nm_bin" ] || nm_bin=nm
     objcopy_bin="$(dirname "$cc")/$(basename "$cc" | sed 's/gcc$/objcopy/')"; [ -x "$objcopy_bin" ] || objcopy_bin=objcopy
     local ar_bin; ar_bin="$(dirname "$cc")/$(basename "$cc" | sed 's/gcc$/ar/')"; [ -x "$ar_bin" ] || ar_bin=ar
+    # 先暂存上一次产物：本次任一环节失败都会回滚（失败不留"看起来是新的"产物）
+    tc_begin "$tcid" "$out" || return 1
 
     local arch_flags=""
     case "$target" in esp32|esp32s2|esp32s3) arch_flags="-mlongcalls" ;; esac
@@ -708,7 +819,8 @@ build_esp() {
 
     local vendor_priv_o="$scratch/oneye_vendor_priv.o"
     "$cc" "${IDF_FLAGS[@]}" $own_flags -I"$SDK_DIR/vendor/cjson" -c "${VENDOR_SRCS[0]}" -o "$scratch/oneye_vendor_raw.o" || { err "内嵌件编译失败（$tcid）"; return 1; }
-    vendor_object_private "$scratch/oneye_vendor_raw.o" "$vendor_priv_o" "$nm_bin" "$objcopy_bin" || return 1
+    vendor_object_private "$scratch/oneye_vendor_raw.o" "$vendor_priv_o" "$nm_bin" "$objcopy_bin" \
+        || { err "内嵌件符号隔离失败（$tcid）"; return 1; }
 
     local lib s objs=() o
     declare -A LIB_BODY=()
@@ -716,7 +828,7 @@ build_esp() {
         objs=()
         while IFS= read -r s; do
             [ -n "$s" ] || continue
-            [ -f "$s" ] || { err "源文件缺失：$s"; return 1; }
+            [ -f "$s" ] || { err "源文件缺失：$s（$tcid）"; return 1; }
             o="$scratch/$(basename "${s%.c}").o"
             # 注意顺序：我们自己的头目录放在 IDF 的 include 之前，避免同名头被 IDF 抢命中
             # （vendor/cjson 的 cJSON.h 与 src/internal/cJSON.h 别名壳必须优先）。
@@ -724,7 +836,8 @@ build_esp() {
                   -c "$s" -o "$o" || { err "编译失败：$s（$tcid）"; return 1; }
             objs+=("$o")
         done < <(lib_srcs "$lib")
-        "$ar_bin" rcs "$scratch/lib${lib}_body.a" "${objs[@]}" || return 1
+        "$ar_bin" rcs "$scratch/lib${lib}_body.a" "${objs[@]}" \
+            || { err "归档失败：$scratch/lib${lib}_body.a（$tcid）"; return 1; }
         LIB_BODY[$lib]="$scratch/lib${lib}_body.a"
     done
 
@@ -747,19 +860,39 @@ build_esp() {
     n_def="$(grep -cE '^-[DU]' "$idf_flags_file" 2>/dev/null || true)"
     idf_std="$(grep -m1 '^-std=' "$idf_flags_file" 2>/dev/null || true)"
     cflags_summary="IDF 生成参数 ${idf_std:-（无 -std=）} -I×${n_inc} -D/-U×${n_def}（全文见 idf-cflags.txt） $own_flags"
-    write_manifest "$out" "$tcid" "$cc" "$("$cc" -dumpfullversion 2>/dev/null || "$cc" -dumpversion)" "$target" "v$idfv" "$cflags_summary"
-    [ "$PUBLISH_REPO_LIB" = "1" ] && publish_to_repo_lib "$out" "$tcid"
+    write_manifest "$out" "$tcid" "$cc" "$("$cc" -dumpfullversion 2>/dev/null || "$cc" -dumpversion)" "$target" "v$idfv" "$cflags_summary" \
+        || { err "生成构建口径清单失败（$tcid：toolchain.json / SHA256SUMS）"; return 1; }
+    # 预编译归档发布：**不得吞掉失败**（否则 lib/<tcid>/ 静默落后于源码），见本文件顶部退出码口径
+    if [ "$PUBLISH_REPO_LIB" = "1" ]; then
+        publish_to_repo_lib "$out" "$tcid" \
+            || { err "预编译归档发布失败：lib/$tcid/ 未刷新（$tcid）"; return 1; }
+    fi
     ESP_OUTS+=("$tcid|$target|$idfv")
     return 0
 }
 
 publish_to_repo_lib() {
-    local out="$1" tcid="$2"
-    mkdir -p "$SDK_DIR/lib/$tcid"
-    cp -f "$out/lib/"*.a "$SDK_DIR/lib/$tcid/" 2>/dev/null || true
-    cp -f "$out/lib/"*.so* "$SDK_DIR/lib/$tcid/" 2>/dev/null || true
-    cp -f "$out/toolchain.json" "$SDK_DIR/lib/$tcid/" 2>/dev/null || true
-    cp -f "$out/SHA256SUMS" "$SDK_DIR/lib/$tcid/" 2>/dev/null || true
+    local out="$1" tcid="$2" dest="$SDK_DIR/lib/$tcid" f n=0
+    # 原先这里 4 处 `cp ... 2>/dev/null || true` 会把发布失败**全部吞掉**：预编译归档没刷新、
+    # toolchain.json 仍是旧版本（sdk_version 对不上源码）却毫无声响 —— 这正是"归档静默落后"
+    # 事故的机制。改为逐个校验并返回非零（调用方会判定该工具链构建失败）。
+    mkdir -p "$dest" || { err "无法创建预编译归档目录：$dest"; return 1; }
+    for f in "$out/lib/"*.a; do
+        [ -e "$f" ] || continue
+        cp -f "$f" "$dest/" || { err "发布归档失败：$f → $dest/"; return 1; }
+        n=$((n + 1))
+    done
+    [ "$n" -gt 0 ] || { err "发布失败：$out/lib/ 下没有任何 .a 归档"; return 1; }
+    for f in "$out/lib/"*.so*; do
+        [ -e "$f" ] || continue
+        cp -f "$f" "$dest/" || { err "发布动态库失败：$f → $dest/"; return 1; }
+    done
+    for f in "$out/toolchain.json" "$out/SHA256SUMS"; do
+        [ -f "$f" ] || { err "发布失败：缺少 $f"; return 1; }
+        cp -f "$f" "$dest/" || { err "发布失败：$f → $dest/"; return 1; }
+    done
+    rm -f "$dest/STALE.md"   # 本次发布成功 → 陈旧标记自动作废
+    return 0
 }
 
 write_manifest() { # $1=out $2=tcid $3=cc $4=ccver $5=target $6=idfver $7=cflags
@@ -791,11 +924,25 @@ write_manifest() { # $1=out $2=tcid $3=cc $4=ccver $5=target $6=idfver $7=cflags
   "built_at_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 EOF
-    ( cd "$out" && find lib include -type f 2>/dev/null | sort | xargs -r sha256sum > SHA256SUMS
-      [ -f oneye-dev-sdk.pc ] && sha256sum oneye-dev-sdk.pc >> SHA256SUMS )
+    # SHA256SUMS 的生成结果要能反映失败（原实现在 ESP 轨恒返回 1，因为那里不产出 .pc，
+    # 只是没有任何调用方看返回值；这里显式返回，便于调用方判定"清单没写成"）。
+    local sums_rc=0
+    ( cd "$out" && find lib include -type f 2>/dev/null | sort | xargs -r sha256sum > SHA256SUMS ) || sums_rc=1
+    if [ -f "$out/oneye-dev-sdk.pc" ]; then
+        ( cd "$out" && sha256sum oneye-dev-sdk.pc >> SHA256SUMS ) || sums_rc=1
+    fi
+    return "$sums_rc"
 }
 
 # ======================================================= 门禁与 demo
+# 失败分类（改这里之前先读：哪些失败**有意**不影响退出码）：
+#   * 致命（→ 退出码 1）：4 个领域库 + link/ble 的编译/归档/链接、构建口径清单（toolchain.json /
+#     SHA256SUMS）、**预编译归档发布**（lib/<tcid>/，缺了就是"归档静默落后于源码"）、门禁
+#     （run_gates：契约一致性/符号白名单）、required 依赖缺失（--deps-strict）、板级固件、规格写错。
+#   * 非致命（有意为之，只 warn）：demo（宿主/板级例程）的编译与运行失败、宿主单测的编译与用例失败。
+#     理由：它们是**辅助/示例轨**，其失败不改变交付库的正确性，且单测在迭代期本就常红；
+#     把它们判为致命会让日常构建无法进行。若要让单测失败也致命，请另开开关（勿直接改成 err+return 1）。
+#   * 非致命但必须可见：所请求工具链在本机不可用（缺 IDF/交叉编译器）＝"跳过"，见主流程账本。
 run_gates() { # $1=host out dir
     local out="$1" rc=0
     [ "$DO_GATES" = "1" ] || { warn "门禁已关闭（--no-gates）"; return 0; }
@@ -984,15 +1131,34 @@ fi
 
 LASTRC=0
 GATE_RC=0
+DEPS_RC=0
 LAST_HOST_OUT=""; LAST_HOST_ID=""; ESP_OUTS=()
+# 成败账本：每个工具链的 rc 都必须落到 BUILT / SKIPPED / FAILED 之一，不允许"默默当成功"。
+# （原实现 `[ $rc -eq 1 ]` 只认 1：任何其它非零 rc，以及"规格写错"这支，都被静默丢弃。）
+FAILED_TC=(); SKIPPED_TC=(); BUILT_TC=(); STALE_DIRS=()
 IFS=',' read -ra SPECS <<< "$TOOLCHAINS"
 for spec in "${SPECS[@]}"; do
     spec="$(echo "$spec" | xargs)"
     [ -n "$spec" ] || continue
+    LAST_ERR=""; LAST_WARN=""
     case "$spec" in
-        host) build_host; rc=$?; [ $rc -ne 0 ] && LASTRC=$rc ;;
-        *@*)  build_esp "${spec#*@}" "${spec%@*}"; rc=$?; [ $rc -eq 1 ] && LASTRC=1 ;;
-        *) warn "无法识别的工具链规格：$spec（用 host 或 <target>@<idf-version>）" ;;
+        host) build_host; rc=$? ;;
+        *@*)  build_esp "${spec#*@}" "${spec%@*}"; rc=$? ;;
+        *)    warn "无法识别的工具链规格：$spec（用 host 或 <target>@<idf-version>）"; rc=3 ;;
+    esac
+    tc_id="${CUR_TCID:-$spec}"
+    case "$rc" in
+        0)  tc_commit; BUILT_TC+=("$tc_id") ;;
+        2)  # **有意保留非致命**：所请求的工具链在本机不可用（缺 IDF / 交叉编译器）＝"跳过"，
+            # 不是构建失败（`--toolchains all` 会枚举未安装的版本/芯片）。但必须在 stderr 与
+            # 报告里显式可见，绝不伪装成成功。
+            tc_commit
+            SKIPPED_TC+=("$tc_id|${LAST_WARN:-未找到 IDF 或交叉编译器}") ;;
+        *)  # rc=1（编译/归档/链接/清单/预编译发布失败）与 rc=3（规格无法识别）一律判定失败
+            reason="${LAST_ERR:-工具链 $tc_id 构建失败（rc=$rc；无更详细的错误信息）}"
+            tc_rollback "$tc_id" "$OUT_ROOT/$tc_id" "$reason"
+            FAILED_TC+=("$tc_id|$reason")
+            LASTRC=1 ;;
     esac
 done
 
@@ -1015,6 +1181,23 @@ if [ "$WITH_FIRMWARE" = "1" ]; then
     done
 fi
 
+# ------------------------------------------------ 成败判定（**先判定，再写报告**）
+# 报告与收尾横幅都必须反映真实结果：此前这里是"先打印完成、后判定失败"，于是失败运行照样以
+# 「完成。产物树：」+ 一份无失败标记的 BUILD-REPORT.md 收尾，调用者/CI/人都会以为成功。
+[ "$DEPS_FAIL" = "1" ] && { err "存在 required 依赖缺失（--deps-strict 生效），构建判定失败"; DEPS_RC=1; LASTRC=1; }
+[ "$GATE_RC" = "1" ] && { err "门禁未通过（见上）"; LASTRC=1; }
+[ "$FIRMWARE_RC" = "1" ] && { err "板级固件构建失败（见上）"; LASTRC=1; }
+if [ "${#FAILED_TC[@]}" -gt 0 ]; then
+    err "工具链构建失败摘要（${#FAILED_TC[@]} 个）："
+    for entry in "${FAILED_TC[@]}"; do
+        printf '%sERROR:   工具链 %s：%s%s\n' "$C_RED" "${entry%%|*}" "${entry#*|}" "$C_RESET" >&2
+    done
+    LASTRC=1
+fi
+if [ "$LASTRC" != "0" ]; then
+    err "本次构建失败（含工具链/门禁/依赖/固件判定），退出码 1；详见 $OUT_ROOT/BUILD-REPORT.md"
+fi
+
 # ------------------------------------------------------------ 汇总报告
 REPORT="$OUT_ROOT/BUILD-REPORT.md"
 {
@@ -1028,6 +1211,17 @@ REPORT="$OUT_ROOT/BUILD-REPORT.md"
     echo "- 输出根：\`$OUT_ROOT\`"
     echo "- 承载：\`$TRANSPORT\`"
     echo
+    if [ "$LASTRC" != "0" ]; then
+        echo "> ⚠ **本次构建失败**（脚本退出码 1）—— 失败清单见文末「## 构建失败」。"
+        [ "$DEPS_RC" = "1" ] && echo "> - 存在 required 依赖缺失（\`--deps-strict\` 生效）"
+        [ "$GATE_RC" = "1" ] && echo "> - 门禁未通过（契约一致性 / 符号白名单，见「## 门禁与 demo」）"
+        [ "$FIRMWARE_RC" = "1" ] && echo "> - 板级固件（\`--firmware\`）构建失败"
+        if [ "${#FAILED_TC[@]}" -gt 0 ]; then
+            echo "> - 工具链构建失败 ${#FAILED_TC[@]} 个：$(printf '%s ' "${FAILED_TC[@]%%|*}")"
+            echo "> - 这些工具链的 \`toolchain.json\`/\`lib/*.a\` **未被本次刷新**（下方标 \`陈旧\` 的行来自上一次构建）"
+        fi
+        echo
+    fi
     echo "## 工具链 × 库"
     echo
     echo "| 工具链目录 | 编译器 | 目标/IDF | 库产物 | 定义符号数 | 内嵌符号外泄 |"
@@ -1035,14 +1229,21 @@ REPORT="$OUT_ROOT/BUILD-REPORT.md"
     for d in "$OUT_ROOT"/*/; do
         [ -f "$d/toolchain.json" ] || continue
         tcid="$(basename "$d")"
+        row_mark=""
+        is_stale "$tcid" && row_mark=" ⚠陈旧"
         ccv="$(sed -n 's/.*"compiler_version": "\(.*\)".*/\1/p' "$d/toolchain.json")"
         tgt="$(sed -n 's/.*"target": "\(.*\)".*/\1/p' "$d/toolchain.json")"
         idfv="$(sed -n 's/.*"idf_version": "\(.*\)".*/\1/p' "$d/toolchain.json")"
         libs="$(cd "$d/lib" 2>/dev/null && ls -1 *.a 2>/dev/null | tr '\n' ' ')"
         syms="$(nm -g --defined-only "$d"/lib/*.a 2>/dev/null | awk '{print $NF}' | grep -c '^oneye_' || true)"
         leak="$(nm -g --defined-only "$d"/lib/*.a 2>/dev/null | awk '{print $NF}' | grep -c '^cJSON_' || true)"
-        echo "| \`$tcid\` | $ccv | $tgt ${idfv:-（host）} | $libs | $syms | ${leak:-0} |"
+        echo "| \`$tcid\`$row_mark | $ccv | $tgt ${idfv:-（host）} | $libs | $syms | ${leak:-0} |"
     done
+    if [ "${#STALE_DIRS[@]}" -gt 0 ]; then
+        echo
+        echo "> ⚠ 标 \`陈旧\` 的行：该工具链**本次构建失败**，行内数据来自上一次成功构建的产物（未被刷新），"
+        echo "> **不代表本次结果**；对应目录已写 \`STALE.md\`（SDK 侧 \`lib/<tcid>/STALE.md\` 同）。"
+    fi
     echo
     echo "## 依赖打包（声明见 components/oneye-dev-sdk/deps/）"
     echo
@@ -1097,12 +1298,52 @@ PY
     echo "- 契约一致性：\`tools/check-topics.py\`（SDK topic 字面量 ↔ \`backend/contracts/api/mqtt/asyncapi.yaml\`）"
     echo "- 后端侧同源对账：\`cd backend && python3 scripts/contract_check.py\`"
     echo "- 设备面规范：\`backend/contracts/api/mqtt/传输规范.md\`"
+    if [ "${#FAILED_TC[@]}" -gt 0 ]; then
+        echo
+        echo "## 构建失败（本次运行）"
+        echo
+        echo "| 工具链 | 失败原因 | 本次产物 |"
+        echo "| --- | --- | --- |"
+        for entry in "${FAILED_TC[@]}"; do
+            tcid="${entry%%|*}"
+            reason="${entry#*|}"
+            reason="${reason//|/\\|}"     # 表格转义（原因里出现竖线时不破坏表格）
+            if is_stale "$tcid"; then
+                what="已回滚为上一次产物并标注 \`STALE.md\`（陈旧）"
+            else
+                what="无（未产出新产物；半成品隔离在 \`output/.build/failed-$tcid/\`）"
+            fi
+            echo "| \`$tcid\` | $reason | $what |"
+        done
+        echo
+        echo "**本次构建失败**：以上工具链的 \`toolchain.json\`/\`lib/*.a\` 未被本次刷新，退出码非 0。"
+        echo "请勿把标 \`陈旧\` 的产物或 SDK 侧 \`lib/<工具链>/\` 的旧归档当作本次交付。"
+    fi
+    if [ "${#SKIPPED_TC[@]}" -gt 0 ]; then
+        echo
+        echo "## 已请求但未构建（跳过，不计入失败）"
+        echo
+        echo "| 工具链 | 原因 |"
+        echo "| --- | --- |"
+        for entry in "${SKIPPED_TC[@]}"; do
+            sk_reason="${entry#*|}"
+            echo "| \`${entry%%|*}\` | ${sk_reason//|/\\|} |"
+        done
+        echo
+        echo "（本机缺 IDF 或交叉编译器；这些工具链**没有**产物，也不代表成功。）"
+    fi
 } > "$REPORT"
 
-info "完成。产物树："
+if [ "$LASTRC" = "0" ]; then
+    info "完成。产物树："
+else
+    info "构建失败。产物树（⚠ 带 STALE.md 的目录是上一次的陈旧产物）："
+fi
 ( cd "$OUT_ROOT" && find . -maxdepth 2 -mindepth 1 \( -name '.build' -prune -o -print \) | sort | sed 's/^/    /' )
 info "汇总报告：$REPORT"
-[ "$DEPS_FAIL" = "1" ] && { err "存在 required 依赖缺失（--deps-strict 生效），构建判定失败"; LASTRC=1; }
-[ "$GATE_RC" = "1" ] && { err "门禁未通过（见上）"; LASTRC=1; }
-[ "$FIRMWARE_RC" = "1" ] && { err "板级固件构建失败（见上）"; LASTRC=1; }
+if [ "$LASTRC" != "0" ]; then
+    err "构建失败：见上方 ERROR 摘要与 $REPORT（退出码 1）"
+elif [ "${#SKIPPED_TC[@]}" -gt 0 ]; then
+    warn "已请求但未构建（跳过，不计入失败）：$(printf '%s ' "${SKIPPED_TC[@]%%|*}")"
+fi
 exit $LASTRC

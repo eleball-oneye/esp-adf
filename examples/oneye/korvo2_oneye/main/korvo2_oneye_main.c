@@ -693,6 +693,41 @@ static void oneye_start(void)
     base_cfg.cloud_ws_path = (CONFIG_ONEYE_FW_CLOUD_WS_PATH[0] != '\0') ? CONFIG_ONEYE_FW_CLOUD_WS_PATH : NULL;
     base_cfg.transport = fw_transport();
     base_cfg.token = (CONFIG_ONEYE_FW_CLOUD_TOKEN[0] != '\0') ? CONFIG_ONEYE_FW_CLOUD_TOKEN : NULL;
+
+#if defined(ONEYE_FW_EMBED_CERTS)
+    /*
+     * 一机一密 mTLS：设备证书/私钥/CA 由构建期嵌入（见 main/CMakeLists.txt 顶部说明；
+     * 私钥不入库，目录由 -DONEYE_FW_CERT_DIR= 指定）。objcopy 生成的 blob 末尾带一个 NUL，
+     * 这里裁掉，避免把 NUL 一并交给 mbedtls 解析。
+     */
+    {
+        extern const uint8_t oneye_cert_ca_start[]  asm("_binary_ca_crt_start");
+        extern const uint8_t oneye_cert_ca_end[]    asm("_binary_ca_crt_end");
+        extern const uint8_t oneye_cert_crt_start[] asm("_binary_client_crt_start");
+        extern const uint8_t oneye_cert_crt_end[]   asm("_binary_client_crt_end");
+        extern const uint8_t oneye_cert_key_start[] asm("_binary_client_key_start");
+        extern const uint8_t oneye_cert_key_end[]   asm("_binary_client_key_end");
+
+        size_t ca_len  = (size_t)(oneye_cert_ca_end  - oneye_cert_ca_start);
+        size_t crt_len = (size_t)(oneye_cert_crt_end - oneye_cert_crt_start);
+        size_t key_len = (size_t)(oneye_cert_key_end - oneye_cert_key_start);
+
+        if (ca_len  > 0 && oneye_cert_ca_start[ca_len - 1]   == '\0') { ca_len--; }
+        if (crt_len > 0 && oneye_cert_crt_start[crt_len - 1] == '\0') { crt_len--; }
+        if (key_len > 0 && oneye_cert_key_start[key_len - 1] == '\0') { key_len--; }
+
+        base_cfg.credential         = oneye_cert_crt_start;
+        base_cfg.credential_len     = crt_len;
+        base_cfg.credential_key     = oneye_cert_key_start;
+        base_cfg.credential_key_len = key_len;
+        base_cfg.tls_ca_pem         = oneye_cert_ca_start;
+        base_cfg.tls_ca_pem_len     = ca_len;
+
+        ESP_LOGI(TAG, "一机一密：已嵌入设备证书（client %u B / key %u B / CA %u B）",
+                 (unsigned)crt_len, (unsigned)key_len, (unsigned)ca_len);
+    }
+#endif
+
 #if CONFIG_ONEYE_FW_TLS_INSECURE
     base_cfg.tls_insecure_skip_verify = true;    /* dev/产测；生产必须 n 并投放自研 CA */
 #else

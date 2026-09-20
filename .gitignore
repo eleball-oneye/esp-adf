@@ -61,3 +61,8 @@ docs/venv/
 
 # oneye 集成：统一编译脚本的产物目录（build-all.sh 生成，不入库）
 output/
+
+# oneye 一机一密：板级固件证书材料目录（**私钥绝不入库**）
+#   证书由构建期从 -DONEYE_FW_CERT_DIR=<外部目录> 嵌入（见 examples/oneye/korvo2_oneye/main/CMakeLists.txt）；
+#   这里同时忽略默认目录，防止有人把 PEM 私钥拷进仓库后误提交。
+examples/oneye/korvo2_oneye/main/certs/

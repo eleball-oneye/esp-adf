@@ -43,6 +43,7 @@
 #include "lcd_ui.h"
 #include "camera_api.h"
 #include "wifi_prov.h"
+#include "net_probe.h"
 
 static const char *TAG = "korvo2_oneye";
 
@@ -652,6 +653,11 @@ static void wifi_prov_boot(void)
     }
 
     ESP_LOGI(TAG, "Wi-Fi 已连接：ip=%s（ssid=%s，来源 %s）", wifi_prov_ip(), ssid, src);
+
+    /* 板级网络自检（只读、带 errno）：把"没路由 / 网关不通 / 上行丢包"三种同形故障区分开。
+       放在 SDK 建链之前，日志顺序即为"联网 → 自检 → 上云"。 */
+    net_probe_report(CONFIG_ONEYE_FW_CLOUD_HOST, (unsigned)CONFIG_ONEYE_FW_CLOUD_PORT);
+
     panel_start_if_enabled();         /* 本地验证面与云端链路解耦：拿到 IP 就起 */
     /* 上云由 on_wifi_ready()（联网就绪回调）启动；此处无需重复调用 */
 }

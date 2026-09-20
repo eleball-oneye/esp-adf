@@ -44,6 +44,7 @@
 #include "camera_api.h"
 #include "wifi_prov.h"
 #include "net_probe.h"
+#include "sntp_boot.h"
 
 static const char *TAG = "korvo2_oneye";
 
@@ -657,6 +658,10 @@ static void wifi_prov_boot(void)
     /* 板级网络自检（只读、带 errno）：把"没路由 / 网关不通 / 上行丢包"三种同形故障区分开。
        放在 SDK 建链之前，日志顺序即为"联网 → 自检 → 上云"。 */
     net_probe_report(CONFIG_ONEYE_FW_CLOUD_HOST, (unsigned)CONFIG_ONEYE_FW_CLOUD_PORT);
+
+    /* 启动期授时：**严格 TLS 校验的前置条件**（设备无 RTC，未授时时系统时间为 1970，
+       服务端证书 notBefore 落在未来 ⇒ mbedtls 必然 BADCERT_FUTURE）。失败不阻塞上云。 */
+    (void)sntp_boot_sync();
 
     panel_start_if_enabled();         /* 本地验证面与云端链路解耦：拿到 IP 就起 */
     /* 上云由 on_wifi_ready()（联网就绪回调）启动；此处无需重复调用 */

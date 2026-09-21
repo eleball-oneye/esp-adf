@@ -1,0 +1,8 @@
+# 记忆库推送纪律（对齐总控仓 AGENTS.md §8）：
+# - digest.md、plan/、tickets/ 需开发人员确认后推送（不入此忽略列表）
+# - session/（各会话原始记录，如 events.jsonl 导出）当前暂不入库，统一忽略；
+#   如需入库先移除本规则并同步更新 AGENTS.md §8
+session/
+
+# memory-system-hooks 运行时指针（跨 compaction 延续 sessionId 用，机器本地状态，不入库）
+.last-session.json

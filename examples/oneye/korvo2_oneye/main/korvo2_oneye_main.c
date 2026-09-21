@@ -568,6 +568,9 @@ static void keys_start(void)
 static void oneye_start(void);
 static void panel_sync_task(void *arg);
 static void panel_start_if_enabled(void);
+#if CONFIG_ONEYE_FW_LOG_PROBE
+static void log_probe_task(void *arg);
+#endif
 
 /* 联网就绪 → 启动上云。放在独立任务里跑（oneye_start 需较大栈；事件任务只置位）。
  * 回调会随重连反复触发，故用一次性标志保证 SDK 只启动一次；面板启动本身幂等。 */
@@ -576,6 +579,10 @@ static void cloud_start_task(void *arg)
     (void)arg;
     oneye_start();
     (void)xTaskCreate(panel_sync_task, "panel_sync", 3072, NULL, 3, NULL);
+#if CONFIG_ONEYE_FW_LOG_PROBE
+    /* ★ 取证插桩（默认关）：见 log_probe_task 注释 */
+    (void)xTaskCreate(log_probe_task, "log_probe", 3072, NULL, 2, NULL);
+#endif
     vTaskDelete(NULL);
 }
 
@@ -770,6 +777,13 @@ static void oneye_start(void)
     ONEYE_DEV_STRUCT_INIT(log_cfg);
     log_cfg.level = ONEYE_DEV_LOG_LEVEL_INFO;
     log_cfg.uplink_enabled = true;
+    /* ★ 取证插桩（2026-09-21，Kconfig 默认关）：把批量间隔拉长、并关掉"条数早发"，让缓冲里的
+     *   记录**停得住** —— 否则 1 s 就发走了，`log/down dump` 的窗口语义在线上无从观测。
+     *   缺省值是 1000 ms / 8 条。取证结论见 backend/contracts/api/mqtt/传输规范.md §8.1。 */
+#if CONFIG_ONEYE_FW_LOG_PROBE
+    log_cfg.batch_interval_ms = 20000u;
+    log_cfg.min_items_per_frame = 500u;
+#endif
     log_cfg.event_cb = sdk_event_cb;
     (void)oneye_dev_log_init(&log_cfg);
 
@@ -815,6 +829,40 @@ static void oneye_start(void)
     }
 #endif
 }
+
+#if CONFIG_ONEYE_FW_LOG_PROBE
+/* ★ 取证插桩（2026-09-21，**Kconfig 默认关**；取证后可整段删除）：
+ *
+ * 为什么需要它：本固件**只有开机自检那一行**走 SDK 的 log 面（`ONEYE_LOGI`，见 oneye_start 第 6 步），
+ * 其余日志全是 ESP-IDF 的 `ESP_LOG*`（只落本地栈）；而 SDK **内部**日志按设计也只落平台输出、
+ * **不经 log 库上行**（`oneye_internal.c:oneye_int_log` 的注释自陈"经 log 库上行需增加钩子"）。
+ * ⇒ 板上 `rmng/dev/<node>/log/up` 面上行**几乎无流量**，于是 `set_uplink` / `dump` 的"效果"
+ * 在真机上**无从观测**（2026-09-21 首次复验实测到这一点：19 条下行全部投递成功、串口有日志，
+ * 但 broker 侧一帧 `log/up` 都没有）。
+ *
+ * 本任务通过**公开 API**（不是内部日志）按确定节奏写记录：每 3 s 一条；每第 5 条之后再补一簇 5 条，
+ * 用来观察 `dump` 的窗口语义（配合 20 s 的批量间隔，缓冲里的记录停得住）。 */
+static void log_probe_task(void *arg)
+{
+    uint32_t i = 0u;
+
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(5000));
+    for (;;) {
+        ONEYE_LOGI(ONEYE_DEV_LOG_TAG_BASE, "log-probe tick=%u", (unsigned)++i);
+        if ((i % 5u) == 0u) {
+            uint32_t k;
+
+            for (k = 0u; k < 5u; k++) {
+                ONEYE_LOGI(ONEYE_DEV_LOG_TAG_BASE, "log-probe burst=%u/%u", (unsigned)i,
+                           (unsigned)k);
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(3000));
+    }
+}
+
+#endif /* CONFIG_ONEYE_FW_LOG_PROBE */
 
 /* 面板用的链路快照同步（2 s 周期；面板只读，不改变设备行为） */
 static void panel_sync_task(void *arg)

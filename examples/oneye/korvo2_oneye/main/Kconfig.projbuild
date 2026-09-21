@@ -102,6 +102,18 @@ menu "korvo2_oneye 板级固件配置"
                 契约红线：未实现/未验证的能力不得声明。开启前须完成
                 backend/contracts/api/mqtt/Korvo-2设备能力与协议映射.md §6-1 真机取证。
                 audio.intercom 在 WebRTC 数据面落地前一律不得声明（本固件不提供开关）。
+
+        config ONEYE_FW_LOG_PROBE
+            bool "log 面取证插桩（周期性 INFO 记录 + 长批量间隔；仅取证用）"
+            default n
+            help
+                **默认关，不要在生产固件里开。** 本固件平时只有开机自检那一行走 SDK 的
+                log 面（其余是 ESP-IDF 本地日志，SDK 内部日志按设计也不经 log 库上行），
+                所以板上 log/up 面几乎无流量 —— `log/down` 的 set_uplink / dump 的
+                **效果**在真机上无从观测。打开本开关后：每 3 s 经公开 API 写一条 INFO
+                记录（每第 5 条再补一簇 5 条），并把批量间隔拉到 20 s、关掉"条数早发"，
+                让缓冲里的记录停得住，从而可观测 dump 的窗口语义。
+                取证结论见 backend/contracts/api/mqtt/传输规范.md §8.1。
     endmenu
 
     menu "验证面板（本地验证面，非云端契约）"

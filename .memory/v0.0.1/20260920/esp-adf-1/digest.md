@@ -1,94 +1,74 @@
 # Memory digest
 
-> generated on compaction 2026-09-21T07:49:24.985Z
+> generated on compaction 2026-09-21T08:51:22.182Z
 
-This is an automatically generated checkpoint condensing an earlier span of the conversation to free up context. Treat the captured context as established background and build on it without restating it. Continue the task directly from the messages that follow, without acknowledging this checkpoint.
-
-<compacted-summary>
 ## Primary Request and Intent
-- Original (turn 1): add git submodule `git@github.com:ELEboysss/oneye-iot-index.git` under `embedded\esp-adf\docs`, copy master `index.html` into it; then "梳理oneye-dev-sdk的物联协议实现以及嵌入式设备能力，将设备面契约更新到…oneye-iot-index的合适部分，并在index.html体现，包括mqtt topic、ws/wss、配网、一机一密、平台鉴权等，确保架构地图和实现保持一致"; "分析一下架构设计和实际实现哪些地方是需要调优的"; "缺陷进行落地修复并同步设计文档和架构index"; mirror `oneye-iot-index` into `E:\workspace\oneye-wiki-content\resource\物联云平台\API契约` with an md index page; "更新后端和嵌入式的docs，务必和实际实现对齐"; "将改动都推送".
-- Goal 2 checklist (verbatim): "①重建 C3/IDF6.0.3 归档 2. 可做 3. 做 4. 做 5.全跑 6.用SNTP 7.选b自研自托管 8. 先实现，后续重新签 9.目前域名和证书未定，以后会部署反代和生产环境 10.国内没有AWS环境，真的需要的话只考虑自研" — all of ①–⑧ closed with hardware/counter-example evidence; ⑨ deferred by user; ⑩ honored. Marked **complete**.
-- Later: `.memory` 落档进 git（并保留在库）; "我们写的example要进git"; "反代等域名确定后再落地"; "目前没有生产设备，删除所有存量证书，当前在用的开发板可以使用新证书"; "searchThings没有前置依赖项的话可以做了".
-- Then (goal `goal-b06ffb0f`, complete): 域名 `oneye.me`（服务将解析到 `prod.oneye.me`，**当前不切**）+ 钢印方案 B（单实例签名服务）。
-- Then user asked (verbatim): "接真库验证，如果需要外部支持可告知我。平台CA在正式生产环境中还需要的的条件是那些？是否还有其他需要关注和待办/" and "我不懂这么多术语，要尽量为我交代背景和必要性，然后告知我操作步骤".
-- **Latest decisions (verbatim)**: "告警不用做签名。生产环境就在同一个服务中批量生成机器码（SN、一机一密凭证等）并做签名服务。吊销设备这个功能可以给出web访问形式，支持查看吊销名单和导入。开发板的证书进入登记簿。设备证书有效期是否能为10年或永久，不需要去维护它。要写验收脚本。申领的 HTTP 入口要做自研实现"
-- User preference: plain-language explanation of background/necessity before operating steps.
+- Standing objective (originally): mirror the device-face contract into `docs/oneye-iot-index` + wiki, keep architecture map and implementation aligned, fix defects in code and docs, push everything.
+- User decisions log (verbatim where quoted):
+  - "域名为oneye.me，后面服务会解析到prod.oneye.me，但是目前还不能正式切到有域名的环境。钢印方案选B，尽量只用一个实例服务即可闭环。测试数据可以留着继续使用"
+  - "我不懂这么多术语，要尽量为我交代背景和必要性，然后告知我操作步骤"
+  - "除了域名，接下去该做的还有什么事"
+  - "告警不用做签名。生产环境就在同一个服务中批量生成机器码（SN、一机一密凭证等）并做签名服务。吊销设备这个功能可以给出web访问形式，支持查看吊销名单和导入。开发板的证书进入登记簿。设备证书有效期是否能为10年或永久，不需要去维护它。要写验收脚本。申领的 HTTP 入口要做自研实现"
+- **Current turn's task (⑤ of that list, self-contained)**: implement a self-hosted (non-AWS) replacement for the two cloud dependencies of `POST /v1/claim/verify` — ① DynamoDB 号码保留表 (`src/rmneo/db/node_id_reservation_db`) and ② SSM claiming 配置 (`ca_bootstrap` / `claim.go` `ParamConfig`) — so the HTTP claim path runs end to end. Then: unit tests, full gates, **real bed verification on CVM `master2`**, docs write-back (§7.3 in the design doc), commit **without push**, and report in the prescribed 6-part format.
 
 ## Key Technical Concepts
-- Repo topology: outer `E:\workspace\rainmaker-oneye` branch `esps3_korvo2_20260915` → `backend/` (`eleball-oneye/oneye-iot`), `embedded/esp-adf/` (`oneye_s3_korvo` → `eleball-oneye/esp-adf`) → `components/oneye-dev-sdk` (`main`), `docs/oneye-iot-index` (`main` → `ELEboysss/oneye-iot-index`); separate `E:\workspace\oneye-wiki-content` (`main`).
-- HEADs (verified clean, ahead=0 behind=0): outer `54e7a42`, backend `1b6a85a`, esp-adf `3d5ee54a`, SDK `979add1`, index `fc546ed`, wiki `b48e390`.
-- CVM `master2` = `175.178.190.187` (ins-5f3girvy), all ports now reachable (ICMP + TCP); cannot hairpin to its own public IP (so `curl` of the public CRL URL from the host fails — checks must run externally, e.g. from WSL).
-- Beds: `oneye-mtls` 18884 (CRL check off), `oneye-crl` 18885 (`ENABLE_CRL_CHECK=true`), `oneye-platca` 18886 (off), `oneye-emqx`, `oneye-storage` (PostgreSQL **16.15**, db `oneye`, user `oneye`, password `oneye_dev`, 5432 published).
-- Two CAs: dev CA `CN=oneye-dev-ca` at `/home/ubuntu/crl-dp` (board's cert serial `2000`); platform CA `CN=oneye-iot-device-ca` at `/home/ubuntu/oneye-platform-ca` (irreplaceable; do not re-mint).
-- **"钢印方案 B" implemented**: `signerd` single instance holds CA private key via read-only mount; `CA_LEAF_VALIDITY_DAYS` default in service is 3650 days; leaves clamped to CA notAfter (**2036-09-18**) — "permanent" is impossible.
-- Signature service defaults: `SIGNER_ADDR=127.0.0.1:8088`, `SIGNER_TOKEN` ≥16 chars required, ledger (`PG_DSN` or `SHADOW_STORE_MEM=1`) required, `CLAIM_ISSUER=selfhosted` required; five fail-closed startup checks verified.
-- Two signing endpoints: `POST /v1/sign` (service generates device key, returns cert+key) and `POST /v1/sign-pub` (signs caller-supplied ECDSA P-256 public key, cert only, **no private key in response**).
-- Claim path: new mode `CLAIM_ISSUER=selfhosted-remote` + `SIGNER_URL`/`SIGNER_TOKEN`; `issuerbuild.SelfHosted()` covers both self-hosted modes; remote mode needs no local CA_DIR or ledger.
-- CRL model (converged): broker must hold a CRL relevant to the peer cert's issuer, else refuses; **no fail-open**. Republishing a CRL has no effect until cache expiry/restart.
-- CRL validity was changed on the bed from `nextUpdate=2036` to **1 day** (both CAs) with daily cron; alerting explicitly NOT to be built → open question about a fallback (log-only vs 7-day validity).
-- Known gaps found: **no Go-side CRL generator exists** (`x509.CreateRevocationList` absent) — needed for the revoke web UI; `certissuer.DeviceCertValidity = 100*365*24h` but `ca.IssueDeviceCert` default = 365 days.
-- `/v1/claim/verify` still cannot complete (needs AWS DynamoDB reservation table + SSM claiming config) → user decided: **do a self-hosted implementation**.
+- Repo topology: outer `E:\workspace\rainmaker-oneye` (branch `esps3_korvo2_20260915`) → `backend/` (remote `eleball-oneye/oneye-iot`) + `embedded/esp-adf/` (branch `oneye_s3_korvo`) → SDK submodule (branch `main`) + `docs/oneye-iot-index` (branch `main`); separate wiki at `E:\workspace\oneye-wiki-content`.
+- Current hashes: outer `54e7a42`, backend `1b6a85a`, esp-adf `3d5ee54a`, SDK `979add1`, index `fc546ed`, wiki `b48e390` (all clean/in-sync as of last check).
+- Issuer modes (`issuerbuild`): `CLAIM_ISSUER` ∈ {`kms` (default), `selfhosted`, `selfhosted-remote`}; `SelfHosted()` covers both self-hosted forms, `RemoteMode()` the remote one. **Do not change these three paths.**
+- Single-instance signer service: `src/tools/signerd` + `src/rmneo/ca/signer` (server+client). Routes: `GET /healthz` (no token), `GET /v1/info`, `GET /v1/ca`, `POST /v1/sign` (service generates device key), `POST /v1/sign-pub` (signs caller-supplied PKIX public key, returns cert only). Auth `Authorization: Bearer <SIGNER_TOKEN>` (min 16 chars, constant-time). Fail-closed at startup: no token / no ledger / mode≠selfhosted / keystore missing or keyless ⇒ refuse to start (5 negatives verified on bed). Requires `PG_DSN` or `SHADOW_STORE_MEM=1`; ledger write then **read-back** before returning a cert (`readBack` helper). Audit lines `signer: ISSUED …` / `signer: REFUSED …`.
+- `certissuer.Issuer` interface: `Issue(ctx, pub crypto.PublicKey, p Profile) (*Result, error)`; `Profile{CAID, CommonName, Validity, Subject}`; `Result{CertPEM, ChainPEM, CAID}`; `certissuer.DeviceCertValidity = 100 * 365 * 24 * time.Hour`; claim handler already requires ECDSA P-256 from the CSR.
+- `remoteIssuer` (in `issuerbuild_remote.go`) errors on empty CN and on non-zero `Profile.Subject` (refuses to silently drop organizational attributes).
+- fail-closed convention: `storebuild.Configured()` / `Describe()` / `Open(ctx)`; `ca.LoadFile` never mints.
+- Known real defect precedent: concurrent DDL race ⇒ `duplicate key value violates unique constraint "pg_type_typname_nsp_index"` (SQLSTATE 23505); fixed by `pg_advisory_xact_lock` inside a transaction in `devicecert/pgstore`.
+- Bed: `master2` = `175.178.190.187` (ssh alias `master2`); containers `oneye-mtls` 18884, `oneye-crl` 18885 (`ENABLE_CRL_CHECK=true`), `oneye-platca` 18886, `oneye-storage` (PG **16.15**, db `oneye`, user `oneye`, pw `oneye_dev`, port 5432 published), `oneye-emqx`. Board = ESP32-S3-Korvo-2 on Windows **COM12**. `signerd` running at `127.0.0.1:8088`, token in `/tmp/signerd.token`.
+- Go 1.26.6; module `github.com/espressif/esp-rainmaker-neo`.
 
 ## Files and Code
-- `backend/contracts/api/mqtt/传输规范.md` §8.1: main ⑤ device-face/downlink record — three-state verification, log/up-traffic deviation, batch B execution, refuted "irrelevant CRL ⇒ reject" expectation.
-- `backend/docs/architecture/设备凭据吊销与签发台账设计.md`: §3.6.1 batch-B operation sheet + execution results + real-DB ledger verification table; §3.7.2 single-instance signer (endpoints, fail-closed list, bed evidence, uncovered items, self-inflicted traps).
-- `backend/src/rmneo/ca/signer/{server.go,client.go,http.go,server_test.go,signpub_test.go}`: HTTP layer + client; routes `/healthz`, `/v1/info`, `/v1/ca`, `/v1/sign`, `/v1/sign-pub`.
-- `backend/src/tools/signerd/main.go`: service entry, env parsing, fail-closed startup, `-selfcheck`, `Server.Issuer` wired from `issuerbuild.Load(...).Issuer`.
-- `backend/src/tools/issuecert/main.go`: `-signer <url>` / `-signer-token` remote path (`runRemote`).
-- `backend/src/claim/issuerbuild/issuerbuild.go` + `issuerbuild_remote.go` + `issuerbuild_remote_test.go`: `ModeSelfHostedRemote`, `SelfHosted()`, `RemoteMode()`, `loadRemote()`, `remoteIssuer` (refuses non-empty `certissuer.Subject`; ECDSA P-256 only).
-- `backend/src/claim/handlers/claim_handler/claim_handler_main.go`: `defaultBuildIssuer` uses `issuerbuild.SelfHosted()`; `selfHostedSigner` skips local ledger in remote mode.
-- `backend/deployment/signer/{Dockerfile,signerd.service,README.md}`: host-built binary convention, non-root, read-only keystore, env table, security red lines.
-- `backend/scripts/ops/oneye-crl.sh`: subcommands `check` / `check-file` / `publish` / `revoke` / `restore`; `--out` mandatory when no `--url`; preflight fails on unreachable URL, expired CRL, or `nextUpdate` > `--max-age-days` (default 90).
-- `backend/docs/ops/域名切换与CRL运维.md`: domain cutover runbook (4 steps, rollback, failure triage table, cron sample, current values).
-- `embedded/esp-adf/examples/oneye/korvo2_oneye/main/korvo2_oneye_main.c` + `Kconfig.projbuild`: `CONFIG_ONEYE_FW_LOG_PROBE` (default **n**) log-face forensic instrumentation.
-- `embedded/esp-adf/components/oneye-dev-sdk/tests/test_log.c`: `down_ack_effect_differential` (new); header note that `down_ack_clears_pending` is a vacuous assertion; `INTEGRATION.md` counts refreshed to 20 groups / **237** cases / assertions ≈3263–3298.
-- `embedded/esp-adf/.memory/.gitignore` + `v0.0.1/20260920/esp-adf-1/digest.md`: memory archived per AGENTS §8.
-- Bed-side (outside repos): `/home/ubuntu/crl-dp/{www/oneye-ca.crl,www/oneye-iot-device-ca.crl,openssl.cnf,index.txt}`, `/home/ubuntu/oneye-platform-ca/{ca.crt,ca.key,openssl.cnf,db/}`, `/opt/oneye/oneye-crl.sh`, `/etc/cron.d/oneye-crl`, evidence in `embedded/esp-adf/output/.build/hwverify/*.log`, `/tmp/batchB-evidence/`, `/tmp/signerd.token`.
+- `backend/src/claim/claim.go`, `backend/src/claim/handlers/claim_handler/claim_handler_main.go`: claim path; `defaultBuildIssuer` now uses `issuerbuild.SelfHosted()`, `selfHostedSigner` skips the local ledger requirement in remote mode, `kmsIssuer` = SSM CA cert + KMS signer (per-request). Reservation semantics to preserve: 保留是**终身上限**、记录**永不删除**、同一 MAC 的不同写法必须落到同一条保留记录.
+- `backend/src/rmneo/db/node_id_reservation_db`: DynamoDB reservation store to be abstracted behind a new interface; `backend/src/claim/ca_bootstrap` + `ParamConfig` = SSM claiming config to be replaced by env/local file.
+- `backend/src/rmneo/ca/signer/{server.go,client.go,http.go,server_test.go,signpub_test.go}`: signer HTTP layer (do not modify).
+- `backend/src/claim/issuerbuild/issuerbuild.go`: modes/constants (`ModeSelfHostedRemote = "selfhosted-remote"`, `SignerURLEnv = "SIGNER_URL"`, `SignerTokenEnv = "SIGNER_TOKEN"`, `CADirEnv`, `CRLDPEnv`, `LeafValidityDaysEnv`, `CAIDEnv`, `DefaultCAID = "claiming-ca"`, `CADirCommonName = "oneye-iot-device-ca"`), `Signer` struct with `CA/Issuer/CADir/CRLDistributionPoint/RemoteURL/RemoteLedger`, `Load(ledger)`, `Describe()`.
+- `backend/src/claim/issuerbuild/issuerbuild_remote.go`: `remoteIssuer`, `publicKeyPEM` (ECDSA P-256 only), `daysFromValidity`, `loadRemote()` (startup `Healthy`+`Info`, refuses on missing `ca_id` or `ca_id` mismatch).
+- `backend/scripts/ops/oneye-crl.sh`: subcommands `check|check-file|publish|revoke|restore`; publish **requires** `--out` or `--url` (no default name — two CAs share one web dir); refuses when nextUpdate > `--max-age-days` (default 90) or expired.
+- `backend/docs/ops/域名切换与CRL运维.md`: domain cutover runbook + CRL ops (do not modify).
+- `backend/docs/architecture/设备凭据吊销与签发台账设计.md`: §3.6.1 batch B op sheet + results, §3.7.2 single-instance signer, §7.x review register — **add §7.3 here**.
+- `backend/contracts/api/mqtt/传输规范.md` §8.1: device-face downlink status, log/up no-traffic finding, batch B record, refuted "irrelevant CRL ⇒ reject" expectation.
+- `deployment/signer/{Dockerfile,README.md,signerd.service}`: signer deployment (host-built binary + alpine + chmod 0755; systemd hardened with `ReadOnlyPaths=/etc/oneye/ca`).
+- `backend/scripts/e2e/claim-selfca-e2e.sh`: reference for the bed E2E style (one-shot container, self-cleaning, must not touch the five named containers).
 
 ## Errors and Fixes
-- `docker restart oneye-crl` does not reliably produce a cold CRL cache → never infer "cert lacks a DP" from cold-cache rejection.
-- `PGSTORE_CONCURRENCY` / `PGSTORE_OPEN_RACE` expect a **count ≥2**, not `1`; passing `1` FAILs the gate (my usage error, not a product defect).
-- Restoring a revoked entry in `index.txt` by only flipping status to `V` keeps it revoked (`entry 1: not revoked yet, but has a revocation date`); must clear the revocation-date field (awk sets `$1="V"; $3=""`).
-- `crlnumber` is root-owned on the CVM (serial is ubuntu-owned) → non-root publish cannot reset it (harmless).
-- `signerd` was started without `Server.Issuer` wired → `/v1/sign-pub` returned 500 `signer has no issuer configured for public-key signing`; unit tests could not catch it (tests construct `Server` directly) — found on the bed.
-- `scp` onto a running `/tmp/signerd` failed (`dest open "/tmp/signerd": Failure`) so the new binary never landed and `/v1/sign-pub` 404'd; correct order: stop service → upload to `*.new` → rename → start.
-- PowerShell/mojibake traps: `Get-Content -Raw` misreads UTF-8 (use `[IO.File]::ReadAllText(path, UTF8Encoding($false))`); `Set-Content` writes BOM; `powershell -File` reads UTF-8 as ANSI; `wsl -e bash -lc "<multi-line>"` swallows output (use script files via `scp`); git `-m` with embedded newlines splits into pathspecs (use `-F`).
-- `esptool write_flash '@flash_args'` needs `workdir` = build dir.
-- `ca.Fingerprint` takes `[]byte`; `x509.Verify` defaults to ServerAuth so device certs need `KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}`.
-- `oneye-crl.sh publish` default output filename silently overwrote the other CA's CRL file → now `--out` (or `--url`) is mandatory.
-- `publish --url <own public IP>` always fails on the CRL host (no hairpin) → cron uses `check-file`; external check via `oneye-crl.sh check --url`.
-- Running pgstore/storebuild integration suites against the real ledger DB left 4 test rows (pushed `expiring_7d` from 0 to 3); cleaned by serial prefix.
-- Inline PowerShell string surgery on Chinese source text failed at parse time and wrote nothing (verified clean) — use the editor tools instead.
-- Retracted earlier claims (kept in docs): mtime-based cert inference; "no-DP escapes revocation"; "compile failure still exits 0" (tee); "220 `no_relevant_crls` unattributed"; "risk = fail-open window"; subagent's "iptables verified clean"; "⑤ only in contract" (stale).
+- `PGSTORE_CONCURRENCY` / `PGSTORE_OPEN_RACE` expect an **integer ≥2** (concurrency count), not `1` — giving `1` fails the gate; not a product defect.
+- `pgstore`/`storebuild` integration tests run against the real `oneye` DB **leave prefixed test rows** (4 rows, pushing `expiring_7d` 0→3); cleaned by prefix; destructive tests must use a throwaway DB.
+- `docker restart oneye-crl` does **not** reliably produce a cold CRL cache ⇒ never infer "cert has no DP" from cache temperature.
+- `index.txt` restore must clear the revocation-date field, not just flip status to `V` (`entry 1: not revoked yet, but has a revocation date`), else the serial stays revoked.
+- `crlnumber` on the CVM is root-owned (writable `serial` is not) ⇒ non-root publish cannot bump it (harmless).
+- CVM **cannot hairpin its own public IP** ⇒ `oneye-crl.sh check --url` on the CVM always fails; cron must use `check-file`; external checks run from WSL.
+- `signerd` was missing `Issuer:` wiring ⇒ `/v1/sign-pub` returned 500 `signer has no issuer configured for public-key signing`; unit tests did not catch it (they construct `Server` directly, bypassing startup assembly).
+- Overwriting a running `signerd` binary via `scp` fails (`dest open … Failure`) leaving the old binary running ⇒ order: stop service → upload `*.new` → rename → start.
+- PowerShell pitfalls hit repeatedly: `Set-Content -Encoding UTF8` in PS5.1 writes a BOM (`set: command not found`); `Get-Content -Raw` mangles UTF-8 (use `[IO.File]::ReadAllText(path, UTF8Encoding($false))`); multi-line `git commit -m` breaks (use `-F file` or single-line `-m`); inline Chinese string surgery via scriptblocks/PowerShell replacement breaks the parser (this last failure wrote **nothing**; tree verified clean at backend `1b6a85a`) — use the edit tool for Chinese text.
+- WSL invocation: multi-line here-strings through `wsl -e bash -lc` drop output; use a script file + `wsl -e bash /mnt/c/...`.
+- `esptool @flash_args` needs CWD = build dir (use `workdir`).
+- ② Irrelevant-CRL branch: a fetched-but-irrelevant CRL is inserted into cache and the connection is **still accepted** if a relevant CRL is already cached — the earlier "DP present + irrelevant CRL ⇒ reject" expectation is **refuted** and recorded.
 
 ## Pending Jobs
-- ① 证书有效期改为 10 年（叶子被钳到 CA 的 2036-09-18）；"永久"不可行。
-- ② 签名服务内**批量生成机器码**（SN + 一机一密密钥 + 证书 + 落台账）并导出。
-- ③ **吊销 web 界面**：查看吊销名单 + 导入（批量按序列号吊销并重发 CRL）；需**新写 Go 侧 CRL 生成**。
-- ④ 开发板证书进登记簿（平台 CA 经签名服务签发 + 平台根加入门卫信任名单 + 重烧）。
-- ⑤ **申领 HTTP 入口自研实现**（替换 DynamoDB 号码保留表 + SSM claiming 配置，让 `/v1/claim/verify` 跑到底）。
-- ⑥ **验收脚本**（吊销闭环 A/B/A、签名闭环、批量发证、申领入口，一键重跑）。
-- ⑦ 域名相关：DP 地址定稿（`crl.oneye.me` 建议 vs `prod.oneye.me/crl/...`）+ DNS 生效后按 runbook 切换。
-- 告警：**不做**（待确认确切含义）；兜底选项待用户选 (a) 仅日志 或 (b) 名单有效期放宽到 7 天。
-- Other loose ends: SDK 内部日志不上行/固件几乎不写 `log/up`（产品决定）；`searchThings` 降级=超集且响应无机读标记；`getFieldValues` 返回 `[]`；`shadowd` 到期 gauge + `GET /v1/devicecerts/expiring` 生产接线；生产库口令/端口/TLS；`rlog` 级别调 info；测试污染真库的默认隔离；取证插桩保留/删除。
+- **This turn**: self-hosted reservation store + claiming config for `/v1/claim/verify`; tests; gates; bed E2E; §7.3 docs; commit (no push); report.
+- Remaining goal items (goal `goal-b9ddb653-403d-43b2-823c-f4fd30a41956`, 14 rounds): ①10-year leaf validity (signer default; note leaves cannot outlive the CA, which expires 2036-09-18); ②batch machine-code generation (SN + 一机一密 credentials + cert + ledger) inside the signer service; ③CRL generation code (none exists in Go yet) + revocation web UI (view revocation list, import serials); ④onboard the board's cert into the ledger via platform CA + add platform root to the broker trust anchor (bed OK, production needs user approval) + reflash; ⑤claim HTTP entry (this turn); ⑥acceptance scripts (fold A/B/A revocation closure, signer closure, batch issuance, claim entry into a re-runnable gate).
+- Open user questions: confirm whether "告警不用做" means skip alerting entirely; choose CRL watchdog fallback (a) log-only or (b) widen CRL validity 1→7 days; pick CRL hostname (`crl.oneye.me` recommended vs `prod.oneye.me/crl/...`); decide where alerts go / where the signer will ultimately run / who may use the revocation UI.
 
 ## Current Work
-- Goal `goal-b9ddb653-403d-43b2-823c-f4fd30a41956` active (0/14 rounds) covering the six new items.
-- Attempted the 10-year validity change via inline PowerShell string replacement; the command failed at parse time and **nothing was written** (verified: backend clean at `1b6a85a`, `DefaultValidityDays` occurrences = 0).
-- Reconnaissance done: no `x509.CreateRevocationList` anywhere in the repo; `certissuer.DeviceCertValidity = 100 * 365 * 24 * time.Hour`; `ca.IssueDeviceCert` default `validDays = 365`.
-- Last completed, verified work: CRL republished with 1-day validity for both CAs (explicit `--out`, correct issuers), cron installed (2 tasks, exit 0), external preflight `check` passes both URLs (`✓ 0 revocations, nextUpdate +1 day`), board reconnected after broker restart; committed backend `1b6a85a`, outer `54e7a42`.
+- User asked to independently complete item ⑤ (self-hosted claim HTTP entry). Recon done: no `CreateRevocationList` usage anywhere in Go (CRL must be written later), `certissuer.DeviceCertValidity = 100 years`, `ca.IssueDeviceCert` default `validDays = 365`.
+- A first attempt to change the signer's default leaf validity to 10 years via inline PowerShell string replacement failed at parse time; **nothing was written** (backend still `1b6a85a`, `DefaultValidityDays` occurrences = 0, worktree clean).
 
 ## Next Step
-- Redo the 10-year leaf-validity change with the editor tools (add `Server.DefaultValidityDays`, wire `defaultLeafDays = 3650` / `CA_LEAF_VALIDITY_DAYS` in `signerd`, use it in both `/v1/sign` and `/v1/sign-pub`), add a unit test, run gates, then proceed to the batch machine-code issuance endpoint.
+- Implement item ⑤: add an explicit `CLAIM_STORE=pg|mem|dynamodb` (default `dynamodb`, invalid ⇒ error) storage abstraction for reservations (PG store with `pg_advisory_xact_lock` + `CREATE TABLE IF NOT EXISTS` inside a transaction, mem store mirroring `devicecert.NewMemStore`) and replace SSM claiming config with env/local-file config; keep reservation semantics (terminal cap, never deleted, MAC-form normalization); tests for round-trip, idempotency, normalization equivalence, quota cap, concurrent first-create, fail-closed-when-unconfigured; `go build ./...`/`go vet ./src/...`/`go test ./src/...` green; bed E2E on `master2` issuing a real `POST /v1/claim/verify`; §7.3 docs; `python scripts/contract_check.py` if contracts change; commit locally **without push**.
 
 ## Critical Context
-- User wants push-everything-directly (commit+push, no staging questions) and plain-language background+steps; refuses fake positives ("宁少勿假") and values recorded self-corrections (原说法保留 + 标明被推翻 + 说明为什么错).
-- Never create/replace containers `oneye-emqx`, `oneye-storage`, `oneye-mtls`, `oneye-crl`, `oneye-platca`; restarting `oneye-crl` is acceptable but it disconnects devices (they retry).
-- Adding the platform CA root to a broker's trust anchor is allowed on the test bed; in production requires user approval.
-- CRL endpoint availability is on the connection critical path: with `enable_crl_check=true`, an unreachable/expired CRL ⇒ **all devices rejected** (fail-closed) — hence the daily republish matters.
-- Do not sign any cert with a domain DP until the domain endpoint is verified reachable (both old and new URLs must pass the preflight).
-- Ledger DB currently holds real issued certs only (e.g. `korvo2-0002`, `korvo2-window`, `korvo2-e2e`, `korvo2-signpub`); the board's dev-CA cert serial `2000` is **not** in the ledger (item ④).
-- `oneye_pgstress` is a pre-existing DB not created by me; my disposable DBs (`oneye_pgtest`, `oneye_race`, `oneye_stress`) were dropped.
-- Open questions for the user: (1) does "告警不用做" mean no alert system, and if so choose fallback (a) log-only or (b) 7-day CRL validity; (2) CRL hostname choice; (3) who may use the revoke web UI; (4) when `prod.oneye.me` resolves.
-- Evidence locations: `embedded/esp-adf/output/.build/hwverify/` (`logface-serial.log`, `sdk-host-tests-final.log`, `batchB-serial.log`, `downlink-reverify-serial.log`), CVM `/tmp/batchB-evidence/01-before.txt`, `/tmp/signerd-evidence/`, `/tmp/signpub-evidence/`.
-</compacted-summary>
+- Do not modify: `src/rmneo/ca/signer/*`, `src/rmneo/ca/crl.go`, `src/rmneo/devicecert/{devicecert.go,pgstore/pgstore.go}` (the `Store` interface now has `Revoked(ctx)`), `scripts/ops/signer-acceptance.sh`, `docs/ops/域名切换与CRL运维.md`.
+- Do not restart/replace `oneye-emqx`/`oneye-storage`/`oneye-mtls`/`oneye-crl`/`oneye-platca`; `oneye-crl` restart is allowed but likely unnecessary. Do not touch `embedded/`. **Do not `git push`.**
+- Bed hygiene: `oneye` DB is real; destructive tests need a throwaway DB; leave no test rows.
+- Verification standard: no "verified" without real output; user demands 宁少勿假 — prefer marking items unverified over inventing evidence. Chinese comments must explain **why**; commit messages in Chinese with real evidence.
+- Fail-closed style: missing/invalid config ⇒ refuse to start or refuse to sign; no silent fallbacks.
+- Board state: running instrumented firmware (K186 `CONFIG_ONEYE_FW_LOG_PROBE` default off), cert = dev CA serial `0x2000` (DP `http://175.178.190.187:8080/oneye-ca.crl`), connected on 18885.
+- CRL state: both dev (`oneye-ca.crl`) and platform (`oneye-iot-device-ca.crl`) CRLs republished with **1-day validity**, cron installed (`/etc/cron.d/oneye-crl`, 17:3 and 23:3 daily, no `--url`), script at `/opt/oneye/oneye-crl.sh`; external check passes for both URLs.
+- Ledger state (real PG `oneye.device_certs`): rows for `korvo2-0002`, `korvo2-window`, `korvo2-e2e`, `korvo2-signpub`; board's cert serial 2000 is **not** in the ledger; `/v1/claim/verify` cannot complete without this turn's work.
+- Reported evidence highlights: signer E2E on bed issued `korvo2-e2e` (serial `c48f9ada09f9a5fcfbc6a3fe5f2c24bf`), `/v1/sign-pub` issued `korvo2-signpub` (serial `10a3f759c3601900f5a0930e2804b789`, cert public key byte-identical to the device's local `${"pub"}` SHA-256 `6ea99245eb6ae695bcbe0933e88717e762a665fce98cc42f5bc744b259bcd465`), RSA public key ⇒ HTTP 400; 40 concurrent `Open()` on a fresh DB ⇒ 0 failed / 40 ok; 100k rows loaded in 1.692 s (59,098 rows/s); 32 same-serial ⇒ exactly 1 row.

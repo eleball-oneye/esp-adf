@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -9,12 +10,14 @@
 #include "esp_netif.h"
 #include "esp_timer.h"
 #include "lwip/inet.h"
+#include "lwip/netdb.h"
 #include "lwip/sockets.h"
 
 static const char *TAG = "net_probe";
 
 /* 非阻塞 connect + select，把"连不上"的等待时间钉死在 timeout_ms 上。
- * 返回值：0 = 连上；-1 = 失败（*err_out 为 errno）；-2 = 超时（errno 可能是 EINPROGRESS）。 */
+ * 返回值：0 = 连上；-1 = 失败（*err_out 为 errno）；-2 = 超时（errno 可能是 EINPROGRESS）；
+ *         -3 = 域名解析失败（*err_out 为 EINVAL）。 */
 static int probe_tcp(const char *host, unsigned port, int timeout_ms, int *err_out, int *ms_out)
 {
     struct sockaddr_in dst;
@@ -28,9 +31,25 @@ static int probe_tcp(const char *host, unsigned port, int timeout_ms, int *err_o
     dst.sin_family = AF_INET;
     dst.sin_port = htons((uint16_t)port);
     if (inet_pton(AF_INET, host, &dst.sin_addr) != 1) {
-        *err_out = EINVAL;
-        *ms_out = 0;
-        return -1;
+        /* ⚠️ 这段是 2026-09-21 补的，起因是一个**会说谎的诊断**：此前的实现只认 IP 字面量
+         * （inet_pton 失败即 EINVAL ⇒ 打印"失败"）。设备云端端点从 IP 改成域名
+         * （mqtt.oneye.me）之后，探针就在串口里报 `cloud endpoint mqtt.oneye.me:18885 ->
+         * rc=-1 errno=22(Invalid argument) 0ms 失败`，**而同一次启动的 `link up` 是成功的** ——
+         * 也就是说，诊断工具在链路完全正常时给出了"失败"，这比没有诊断更容易把人带偏。
+         * 现在补一次 DNS 解析：解析不到才判失败，且用独立的 rc=-3 与"连不上"区分。
+         * 引用型实现注意：这里的解析是**同步**的，只在启动探针路径上跑一次，不在数据路径上。 */
+        struct addrinfo hints, *res = NULL;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        int gai = getaddrinfo(host, NULL, &hints, &res);
+        if (gai != 0 || res == NULL) {
+            *err_out = EINVAL;
+            *ms_out = 0;
+            return -3;
+        }
+        dst.sin_addr = ((struct sockaddr_in *)res->ai_addr)->sin_addr;
+        freeaddrinfo(res);
     }
 
     fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -85,6 +104,8 @@ static void probe_and_log(const char *label, const char *host, unsigned port)
 
     if (rc == 0) {
         verdict = "OK（TCP 已建立）";
+    } else if (rc == -3) {
+        verdict = "域名解析失败（DNS 不通或名字写错）";
     } else if (err == ENETUNREACH) {
         verdict = "无路由（默认网关缺失）";
     } else if (err == EHOSTUNREACH) {

@@ -96,3 +96,58 @@ cd examples/oneye/korvo2_oneye && idf.py -B <build> build
 （dev CA / openssl 那套库上的 `restore` 是另一条路，两者语义不同，别混用。）
 
 运维侧的完整 runbook 在 `backend/docs/ops/域名切换与CRL运维.md`。
+
+## 5. 全面改用域名（2026-09-21 已重烧验证）
+
+**背景**：CRL 分发点的域名已定稿（`http://crl.oneye.me:8080/oneye-iot-device-ca.crl`）并在服务侧切换；
+门卫（EMQX）三张床的服务端证书也补上了 `mqtt.oneye.me` 的 SAN。所以设备侧不再需要任何 IP。
+
+**做了什么**（`sdkconfig` 是 `.gitignore` 的本地构建配置，不进库）：
+
+| 项 | 改前 | 改后 |
+| --- | --- | --- |
+| 云端端点 `CONFIG_ONEYE_FW_CLOUD_HOST` | `175.178.190.187` | `mqtt.oneye.me`（端口仍 18885，`TRANSPORT_TLS=y`、`TLS_INSECURE` 未设） |
+| 设备证书的 CRL 分发点 | `http://175.178.190.187:8080/…` | `http://crl.oneye.me:8080/…`（**重签**一张：serial `a0ec864f2fbc33b7af879ccfa22a2e35`） |
+
+**构建与烧写的两条硬规则**：
+
+```bash
+# ⚠️ 不要用 build-all.sh --firmware —— 它会按 sdkconfig.defaults 重新生成 sdkconfig，
+#    把台面覆盖值（云端端点）冲掉，于是设备又去连占位值 192.168.1.100。
+#    这条警告原文就写在 output/.build/bench-sdkconfig.txt 里。
+# 只改 sdkconfig 时，直接增量编译即可：
+idf.py -B output/.build/korvo2_oneye-xtensa-esp32s3-elf-gcc-14.2.0 build
+# 换过 main/certs/ 里的证书时，先删掉旧的 *.S 再编，别赌 mtime：
+rm -f <build>/client.crt.S <build>/client.key.S <build>/ca.crt.S
+```
+
+**烧写前必须释放串口**：本机的 DSH 宿主会持有 COM12，`esptool` 会报
+`Could not open COM12, the port is busy`。先断开宿主串口会话再烧。
+
+**验收证据（都是实跑，不是推断）**：
+
+| 判据 | 结果 |
+| --- | --- |
+| 固件里还剩不剩 IP | `strings korvo2_oneye.bin` 里 `175.178.190.187` = **0 次**，`mqtt.oneye.me` = 1 次 |
+| 固件内嵌的是新证书吗 | 从 `client.crt.S` 反解出的 PEM 与 `main/certs/client.crt` **SHA-256 相同**（`a1b2e4bc…`），subject `CN=korvo2-0001`、serial `A0EC864F…`、DP = 域名 |
+| 设备侧串口 | `[oneye][base][I] link up: mqtt.oneye.me:18885 transport=mqtt-tls node=korvo2-0001` —— **按域名连上，且服务端证书是严格校验的**（`TLS_INSECURE` 未设） |
+| 门卫侧会话 | `Client(korvo2-0001, username=korvo2-0001, …, connected=true)`，无任何拒绝告警 |
+| **门卫按域名取名单**（决定性） | 门卫日志：`fetching_crl → fetched_crl → new_crl_url_inserted`，`url: http://crl.oneye.me:8080/oneye-iot-device-ca.crl`（`cache_miss: true`） |
+| 台账 | 新序号 `a0ec864f…` `revoked=f`；更早那张 `fa05d7cc…` 为 `t`（此前测试吊销的，符合预期） |
+
+### 坑 ④：`net_probe` 只认 IP，会对域名报**假失败**
+
+改用域名后，同一次启动的串口里出现：
+
+```
+W (5348) net_probe: [net-probe] cloud endpoint mqtt.oneye.me:18885 -> rc=-1 errno=22(Invalid argument) 0ms  失败
+[oneye][base][I] link up: mqtt.oneye.me:18885 transport=mqtt-tls node=korvo2-0001
+```
+
+**下一行就是链路成功** —— 也就是说探针在一切正常时给出了"失败"。原因在实现里：`probe_tcp()`
+用 `inet_pton(AF_INET, host, …)` 解析，**只接受 IP 字面量**，遇到域名直接 `EINVAL` 返回。
+
+已修（`main/net_probe.c`）：解析不到 IP 时补一次 `getaddrinfo`，并用**独立的 `rc=-3`** 与
+"连不上"区分，判定文案为"域名解析失败（DNS 不通或名字写错）"。**诊断工具在链路正常时说失败，
+比没有诊断更容易把人带偏** —— 这条和坑 ① 是同一类问题。
+

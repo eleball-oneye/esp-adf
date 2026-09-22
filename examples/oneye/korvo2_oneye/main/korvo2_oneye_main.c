@@ -45,6 +45,7 @@
 #include "wifi_prov.h"
 #include "net_probe.h"
 #include "device_creds.h"
+#include "prov_attest.h"
 #include "sntp_boot.h"
 
 static const char *TAG = "korvo2_oneye";
@@ -736,6 +737,26 @@ static void oneye_start(void)
         ESP_LOGI(TAG, "凭据来源：**creds 分区** node=%s（cert %u B / key %u B / CA %u B）%s",
                  s_creds.node_id, (unsigned)s_creds.cert_len, (unsigned)s_creds.key_len,
                  (unsigned)s_creds.ca_len, (s_creds.mac && s_creds.mac[0]) ? s_creds.mac : "");
+#if CONFIG_ONEYE_FW_PROV_ATTEST
+        /*
+         * 产测自证（契约 §6）：用**分区里那把私钥**签一段规范化文本，产线上位机用这台设备的证书验签。
+         * 为什么要这一行：伙伴产线的凭证分区在哪个**偏移**我们不确定，"回读一段 flash 再比对"这条路
+         * 走不通；而且回读只证明"flash 里有这份字节"，不证明"这台设备真的能用它上线"。
+         *
+         * ⚠️ 这一行**不带 ESP_LOG 前缀**（用 printf）：上位机要按 `ONEYE-PROV1 ` 开头的整行解析，
+         *    带时间戳前缀会逼工具去做"猜前缀"的模糊匹配 —— 那种宽松解析迟早会放过错的证据。
+         */
+        {
+            static char s_attest[PROV_ATTEST_LINE_MAX];
+            if (prov_attest_line(s_creds.node_id, s_creds.mac, s_creds.cert_pem,
+                                 s_creds.key_pem, s_attest, sizeof(s_attest)) == ESP_OK) {
+                printf("%s\n", s_attest);
+                fflush(stdout);
+            } else {
+                ESP_LOGE(TAG, "产测自证生成失败（原因见上）—— 这台设备**不得**被判为 PASS");
+            }
+        }
+#endif
     } else if (device_creds_is_corrupt(creds_rc)) {
         ESP_LOGE(TAG, "凭据不可用：%s", device_creds_strerror(creds_rc));
         ESP_LOGE(TAG, "**不联网**（不只不重试）：分区坏了却回退内嵌证书 = 拿公用凭证冒充这台设备");

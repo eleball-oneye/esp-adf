@@ -138,7 +138,8 @@ if ($rows.Count -eq 0) { FailArgs "$mfPath 里没有数据行" }
 # 清单格式体检：按**列名**取值，但列名不存在时要立刻说清"是清单格式不对"，而不是让后面报出
 # "这行没有 sha256" 这种把人引偏的话（旧版清单把证书指纹写在 `crc32` 列下，正是这种情况）。
 $cols = @($rows[0].PSObject.Properties.Name)
-foreach ($need in @('sn', 'node_id', 'status', 'offset', 'size', 'cert_fingerprint_sha256', 'image_crc32', 'image_sha256')) {
+foreach ($need in @('sn', 'node_id', 'status', 'partition_name', 'partition_subtype', 'image_bytes',
+                    'offset', 'partition_bytes', 'cert_fingerprint_sha256', 'image_crc32', 'image_sha256')) {
     if ($cols -notcontains $need) {
         FailArgs "$mfPath 缺少列 '$need'（实际列：$($cols -join ', ')）—— 这是旧格式或别的工具产出的清单，请用当前版本的 mkcreds 重新生成"
     }
@@ -157,17 +158,33 @@ if ($row.status -ne 'issued') {
     $why = if ($row.detail) { "：$($row.detail)" } else { '（清单没写原因）' }
     FailArgs "SN=$Sn 在清单里的状态是 '$($row.status)'$why —— 这台没有可烧的镜像，别拿别的台的文件顶替"
 }
+
+# ⚠️ **按名字交付的清单里没有偏移**，本脚本只按偏移烧写 —— 这时必须**停下**，而不是替它猜一个地址。
+#    伙伴线的做法是：他们的烧录器按自己的分区表把 <SN>\creds.img 写进 $($row.partition_name) 分区，
+#    出厂验收改走设备自证（src/tools/provverify）。见 backend/contracts/domain/设备凭据分区与产测自证契约.md。
+if (-not $row.offset) {
+    FailArgs ("这份清单是**按名字**交付的（分区 '$($row.partition_name)'，镜像 $($row.image_bytes) B，清单里没有偏移）——" +
+              "本脚本按偏移烧写，不适用于伙伴线。请用伙伴自己的烧录器写进该分区，再用 provverify 验设备自证。")
+}
 if ($row.offset -ne $Offset) {
     FailArgs "清单里的偏移是 $($row.offset)，脚本用的是 $Offset —— 分区布局不一致，先对齐 partitions.csv"
 }
-if ([int]$row.size -ne $Size) {
-    FailArgs "清单里的分区大小是 $($row.size)，脚本用的是 $Size —— 同上"
+if ([int]$row.partition_bytes -ne $Size) {
+    FailArgs "清单里的分区大小是 $($row.partition_bytes)，脚本用的是 $Size —— 同上"
 }
 
+# 镜像文件名按交付形态不同（creds.bin = 补满分区；creds.img = 裸镜像）。按偏移烧写这里应当只有前者，
+# 但两种名字都试一下，避免因为文件名把"镜像明明在"报成"找不到"。
 $imagePath = Join-Path $CredsDir (Join-Path $row.sn 'creds.bin')
-if (-not (Test-Path $imagePath)) { FailArgs "找不到镜像文件：$imagePath" }
+if (-not (Test-Path $imagePath)) {
+    $alt = Join-Path $CredsDir (Join-Path $row.sn 'creds.img')
+    if (Test-Path $alt) { $imagePath = $alt }
+}
+if (-not (Test-Path $imagePath)) { FailArgs "找不到镜像文件：$(Join-Path $CredsDir (Join-Path $row.sn 'creds.bin'))" }
 $img = [System.IO.File]::ReadAllBytes($imagePath)
-if ($img.Length -ne $Size) { FailArgs "镜像大小是 $($img.Length) B，应为 $Size B（未补满分区的镜像不要拿来烧）" }
+if ($img.Length -ne [int]$row.image_bytes) {
+    FailArgs "镜像实际 $($img.Length) B，清单写 $($row.image_bytes) B —— 文件被换过，停下"
+}
 $sumLocal = (Get-FileHash -Path $imagePath -Algorithm SHA256).Hash.ToLower()
 if ($sumLocal -ne $row.image_sha256.ToLower()) {
     FailArgs "镜像文件与清单对不上（清单 $($row.image_sha256)，实际 $sumLocal）—— 目录被换过/改过，停下"

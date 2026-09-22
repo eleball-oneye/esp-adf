@@ -118,6 +118,20 @@ menu "korvo2_oneye 板级固件配置"
 
     menu "验证面板（本地验证面，非云端契约）"
 
+        config ONEYE_FW_PROV_ATTEST
+            bool "开机打印产测自证串（ONEYE-PROV1 …）"
+            default n
+            help
+                用 creds 分区里的私钥签一段规范化文本并打印一行（不带日志前缀），产线上位机用
+                该设备的证书验签 ⇒ "这台机器真的持有与台账匹配的私钥"（契约
+                backend/contracts/domain/设备凭据分区与产测自证契约.md §6）。
+
+                为什么需要：伙伴产线的凭证分区在哪个**偏移**我们不确定，"回读一段 flash 再比对"
+                走不通；而且回读只证明"flash 里有这份字节"，不证明"这台设备真的能用它上线"。
+
+                为什么缺省关：它会每次开机多打一行；产线/伙伴产测固件打开即可。自证串本身不含
+                新的秘密（node_id 与证书指纹对拿到设备的人本来就可读），签名带随机 nonce 不可重放。
+
         config ONEYE_FW_ENABLE_PANEL_API
             bool "启用设备侧本地验证 HTTP API（/api/status、/api/selftest、/api/keys）"
             default y

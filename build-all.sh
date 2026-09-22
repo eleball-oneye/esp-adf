@@ -168,11 +168,15 @@ SDK_VERSION_NUM="${V_MAJOR:-0}.${V_MINOR:-0}.${V_PATCH:-0}"
 SRC_INTERNAL="$SDK_DIR/src/internal"
 BASE_SRCS=(
     "$SDK_DIR/src/oneye_dev_base.c"
+    "$SDK_DIR/src/oneye_dev_creds.c"
     "$SRC_INTERNAL/oneye_internal.c"
     "$SRC_INTERNAL/oneye_test.c"
     "$SRC_INTERNAL/oneye_osal_posix.c"
     "$SRC_INTERNAL/oneye_osal_idf.c"
     "$SRC_INTERNAL/oneye_osal_tls_mbedtls.c"
+    # 设备凭据分区平台层（宿主读文件 / ESP 读分区，各自在另一种平台下展开为空）
+    "$SDK_DIR/src/oneye_creds_plat_idf.c"
+    "$SDK_DIR/src/oneye_creds_plat_posix.c"
     "$SRC_INTERNAL/oneye_util.c"
     "$SRC_INTERNAL/oneye_sha1.c"
     "$SRC_INTERNAL/oneye_json.c"
@@ -964,6 +968,21 @@ run_gates() { # $1=host out dir
             err "符号白名单门禁失败"; rc=1
         fi
     fi
+
+    # 内嵌 cJSON 的**别名完整性**：源码回落路径（在 IDF 里从源码编 SDK）靠别名头给 cJSON 的
+    # **定义**改名；别名少一个，该符号就会与应用同时链入的 IDF 自带 `json` 组件
+    # `multiple definition of cJSON_*`。而**交付路径（预编译库 + objcopy 全量改名）完全正常**，
+    # 所以这个缺陷只在"伙伴从源码构建 SDK"那条路上翻车（2026-09-22 实测：别名表只有 22 个，
+    # 实际导出 79 个）。加这条门禁是为了让它不会悄悄退化回去。
+    if command -v python3 >/dev/null 2>&1 && [ -f "$SDK_DIR/tools/check-cjson-alias.py" ]; then
+        if python3 "$SDK_DIR/tools/check-cjson-alias.py" 2>&1 | sed 's/^/    /'; then
+            ok "内嵌 cJSON 别名完整性门禁：通过"
+        else
+            err "内嵌 cJSON 别名完整性门禁失败"; rc=1
+        fi
+    else
+        warn "缺少 python3 或 tools/check-cjson-alias.py —— 跳过内嵌 cJSON 别名门禁"
+    fi
     return $rc
 }
 
@@ -1021,6 +1040,7 @@ build_tests_host() { # $1=out dir
     info "构建并运行宿主单测（tests/）"
     if "$c" -O1 -g -Wall -Wextra -std=c99 -I"$out/include" -I"$SRC_INTERNAL" -I"$SDK_DIR/tests" \
         -I"$SDK_DIR/vendor/cjson" -DONEYE_TEST_VECTORS_DIR="\"$SDK_DIR/tests/vectors\"" \
+        -DONEYE_TEST_FIXTURES_DIR="\"$SDK_DIR/tests/fixtures\"" \
         "${srcs[@]}" $libs $deplibs -lpthread -lm -o "$demo/oneye_dev_tests" 2>"$demo/oneye_dev_tests.build.log"; then
         if "$demo/oneye_dev_tests" > "$demo/oneye_dev_tests.log" 2>&1; then
             ok "oneye_dev_tests 全部通过 → demo/oneye_dev_tests.log"

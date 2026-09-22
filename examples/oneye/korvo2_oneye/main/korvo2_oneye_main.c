@@ -44,8 +44,7 @@
 #include "camera_api.h"
 #include "wifi_prov.h"
 #include "net_probe.h"
-#include "device_creds.h"
-#include "prov_attest.h"
+#include "oneye_dev_creds.h"
 #include "sntp_boot.h"
 
 static const char *TAG = "korvo2_oneye";
@@ -714,29 +713,28 @@ static void oneye_start(void)
     base_cfg.transport = fw_transport();
     base_cfg.token = (CONFIG_ONEYE_FW_CLOUD_TOKEN[0] != '\0') ? CONFIG_ONEYE_FW_CLOUD_TOKEN : NULL;
 
-    /* 1.5) 凭据来源：**creds 分区优先**（量产口径：通用固件 + 产线写一次凭证，设计 §8.3）。
-     *      三种情形刻意分开：
-     *        · 分区有合法镜像 ⇒ 用它，且 **device_id/username/client_id 都取自分区里的 node_id**
-     *          （不再用编译期常量 —— 否则"固件通用"这一条不成立）；
-     *        · 分区**坏了** ⇒ **直接不联网**并说明原因。回退到内嵌证书等于"拿一份公用凭证
-     *          冒充这台设备上线"，比不联网更糟：平台会当成合法设备接受它；
-     *        · 分区**没写过**（空 / 全 0xFF）⇒ 回退到编译进固件的那份（开发板方便），日志说清来源。
+    /* 1.5) 凭据来源：**creds 分区优先**（量产口径：通用固件 + 产线写一次凭证）。
+     *      2026-09-22 起这段逻辑**搬进了 SDK**（`oneye_dev_creds_*`）：伙伴只集成 SDK，不该每家
+     *      自己实现一遍 —— 而各家实现最容易在"失败姿态"上走样（把"分区坏了"写成"读不到就回退"，
+     *      就会让一台错机器拿公用身份上线，平台会当合法设备接受它）。
+     *      契约：backend/contracts/domain/设备凭据分区与产测自证契约.md（§2 失败姿态冻结）。
+     *      三种情形：
+     *        · 有合法镜像 ⇒ 用分区里的 node_id/证书/私钥/CA（**不再用编译期常量**，否则"固件通用"不成立）；
+     *        · **坏了**（CORRUPT/IO）⇒ 一律不联网，且**不回退**；
+     *        · **没写过**（NOT_FOUND）⇒ 只有这一种情形允许回退（台面方便）；量产固件应让
+     *          `ONEYE_DEV_CREDS_REQUIRED=y` 把它也变成"不联网"。
      */
-    static device_creds_t s_creds;
-    esp_err_t creds_rc = device_creds_load(&s_creds);
-    if (creds_rc == ESP_OK) {
-        base_cfg.device_id = s_creds.node_id;
-        base_cfg.username  = s_creds.node_id;
-        base_cfg.client_id = s_creds.node_id;
-        base_cfg.credential         = s_creds.cert_pem;
-        base_cfg.credential_len     = (uint32_t)s_creds.cert_len;
-        base_cfg.credential_key     = s_creds.key_pem;
-        base_cfg.credential_key_len = (uint32_t)s_creds.key_len;
-        base_cfg.tls_ca_pem         = s_creds.ca_pem;
-        base_cfg.tls_ca_pem_len     = (uint32_t)s_creds.ca_len;
-        ESP_LOGI(TAG, "凭据来源：**creds 分区** node=%s（cert %u B / key %u B / CA %u B）%s",
+    static oneye_dev_creds_t s_creds;
+    oneye_dev_sdk_err_t creds_rc = oneye_dev_creds_load(&s_creds);
+    if (creds_rc == ONEYE_DEV_SDK_OK) {
+        if (oneye_dev_creds_apply(&base_cfg, &s_creds) != ONEYE_DEV_SDK_OK) {
+            ESP_LOGE(TAG, "凭据写入 base 配置失败（缺私钥/身份不合法）—— 不联网");
+            return;
+        }
+        ESP_LOGI(TAG, "凭据来源：**creds 分区** node=%s（cert %u B / key %u B / CA %u B）crc32=%08x %s",
                  s_creds.node_id, (unsigned)s_creds.cert_len, (unsigned)s_creds.key_len,
-                 (unsigned)s_creds.ca_len, (s_creds.mac && s_creds.mac[0]) ? s_creds.mac : "");
+                 (unsigned)s_creds.ca_len, (unsigned)s_creds.image_crc32,
+                 (s_creds.mac && s_creds.mac[0]) ? s_creds.mac : "");
 #if CONFIG_ONEYE_FW_PROV_ATTEST
         /*
          * 产测自证（契约 §6）：用**分区里那把私钥**签一段规范化文本，产线上位机用这台设备的证书验签。
@@ -747,23 +745,28 @@ static void oneye_start(void)
          *    带时间戳前缀会逼工具去做"猜前缀"的模糊匹配 —— 那种宽松解析迟早会放过错的证据。
          */
         {
-            static char s_attest[PROV_ATTEST_LINE_MAX];
-            if (prov_attest_line(s_creds.node_id, s_creds.mac, s_creds.cert_pem,
-                                 s_creds.key_pem, s_attest, sizeof(s_attest)) == ESP_OK) {
+            static char s_attest[ONEYE_DEV_CREDS_ATTEST_MAX];
+            if (oneye_dev_creds_attest(&s_creds, s_attest, sizeof(s_attest)) == ONEYE_DEV_SDK_OK) {
                 printf("%s\n", s_attest);
                 fflush(stdout);
             } else {
-                ESP_LOGE(TAG, "产测自证生成失败（原因见上）—— 这台设备**不得**被判为 PASS");
+                ESP_LOGE(TAG, "产测自证生成失败（分区里的证书/私钥不可用）—— 这台设备**不得**被判为 PASS");
             }
         }
 #endif
-    } else if (device_creds_is_corrupt(creds_rc)) {
-        ESP_LOGE(TAG, "凭据不可用：%s", device_creds_strerror(creds_rc));
-        ESP_LOGE(TAG, "**不联网**（不只不重试）：分区坏了却回退内嵌证书 = 拿公用凭证冒充这台设备");
+    } else if (!oneye_dev_creds_is_absent(creds_rc)) {
+        ESP_LOGE(TAG, "凭据不可用：%s", oneye_dev_strerror(creds_rc));
+        ESP_LOGE(TAG, "**不联网**（不只不重试）：分区坏了却回退内嵌证书 = 拿公用凭据冒充这台设备");
         return;
     } else {
+#if ONEYE_DEV_CREDS_REQUIRED_ACTIVE
+        /* 量产口径：这台机器没有身份，就不上线。**不许**退回一份公用凭据。 */
+        ESP_LOGE(TAG, "creds 分区没写过（%s），且本构建要求必须有分区凭据 —— 不联网，送产线重新写入",
+                 oneye_dev_strerror(creds_rc));
+        return;
+#else
         ESP_LOGW(TAG, "creds 分区为空（%s）—— 回退到编译进固件的凭据（仅开发/产测可接受）",
-                 device_creds_strerror(creds_rc));
+                 oneye_dev_strerror(creds_rc));
 #if defined(ONEYE_FW_EMBED_CERTS)
     /*
      * 一机一密 mTLS：设备证书/私钥/CA 由构建期嵌入（见 main/CMakeLists.txt 顶部说明；
@@ -800,6 +803,7 @@ static void oneye_start(void)
         ESP_LOGE(TAG, "no creds partition and no embedded certificates — this device has no identity, not connecting");
         return;
 #endif
+#endif /* ONEYE_DEV_CREDS_REQUIRED_ACTIVE */
     }
 
 #if CONFIG_ONEYE_FW_TLS_INSECURE

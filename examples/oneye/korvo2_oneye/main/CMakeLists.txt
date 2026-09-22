@@ -36,13 +36,10 @@ idf_component_register(SRCS "korvo2_oneye_main.c"
                             "camera_api.c"
                             "wifi_prov.c"
                             "net_probe.c"
-                                  "device_creds.c"
-                            "prov_attest.c"
                             "sntp_boot.c"
                        INCLUDE_DIRS "."
                        EMBED_FILES ${_oneye_cert_files}
                        REQUIRES oneye-dev-sdk
-                                mbedtls
                                 audio_board
                                 audio_hal
                                 audio_pipeline

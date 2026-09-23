@@ -78,3 +78,16 @@ CONFIG_SPIFFS_MAX_PARTITIONS=3
 CONFIG_ONEYE_FW_ENABLE_WIFI_FILE=y
 # microSD：凭据文件、AEC 录音落盘、板上回放都依赖它（未插卡仅告警，不阻塞启动）
 CONFIG_ONEYE_FW_ENABLE_SDCARD=y
+
+# ---- 承载：**必须钉死** ---------------------------------------------------------
+# 为什么钉：本工程 Kconfig 里承载 choice 的缺省是 TCP（dev/联调），而 SDK 对"承载不是 TLS 却给了
+# tls_ca_pem"是**报错**的（一对矛盾配置早报早好）。于是只要 sdkconfig 被"从 defaults 重新生成"
+# 一次，承载就会掉回 TCP ⇒ base init 失败 ⇒ **设备根本不上线**（2026-09-22 真机实测踩到）。
+# 生产主承载是 mqtt-tls（一机一密）；要联调明文请显式改这一项。
+CONFIG_ONEYE_FW_TRANSPORT_TLS=y
+# ---- 开发板的目标平台：**同样钉死** ---------------------------------------------
+# 与承载同理：本工程 Kconfig 的缺省是占位地址（192.168.1.100:0）。sdkconfig 一旦"从 defaults
+# 重新生成"，云端地址就会掉回占位值 ⇒ 设备能起来但**连不到平台**（2026-09-22 真机实测踩到）。
+# 开发/联调的目标 = 自建 EMQX 的 mTLS 监听（18885，与 CRL 检查同一条监听器）。
+CONFIG_ONEYE_FW_CLOUD_HOST="mqtt.oneye.me"
+CONFIG_ONEYE_FW_CLOUD_PORT=18885

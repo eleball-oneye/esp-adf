@@ -28,8 +28,7 @@ menu "korvo2_oneye 板级固件配置"
 
         choice ONEYE_FW_TRANSPORT
             prompt "承载（契约：tcp 1883 / tls 8883 / ws 8083 / wss 8084）"
-            default ONEYE_FW_TRANSPORT_TCP
-
+            default ONEYE_FW_TRANSPORT_TLS
             config ONEYE_FW_TRANSPORT_TCP
                 bool "MQTT over TCP（开发/联调）"
             config ONEYE_FW_TRANSPORT_WS

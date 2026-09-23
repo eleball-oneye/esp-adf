@@ -44,7 +44,7 @@
   指纹兜底默认**关闭**（空清单 = 不参与）；量产固件本轮只有**构建级 + 配置生效级**证据，**未上板**。
 
 ## 3.1 控制台批量签发入口（2026-09-23 落地，t08）
-- 页面：`dashboard` 设备管理「**量产签发**」`/home/node-management/provision`（清单录入/上传 → `POST /v1/claim/batch`
+- 页面：`dashboard` 节点管理「**量产签发**」`/home/node-management/provision`（清单录入/上传 → `POST /v1/claim/batch`
   → 逐台状态 → 下载 ZIP；**含私钥提醒**；200/207/422 分档）。
 - 通路：dashboard **直连**申领服务（`CLAIM_API_URL` / `?claim=`）+ 外壳层 CORS（`CORS_ORIGINS`，预检先于鉴权、
   `Expose-Headers` 带 `X-Oneye-Batch-*`）；422 响应体**追加** `rows`（`message` 不变）。
@@ -59,12 +59,12 @@
 - **令牌**：`src/rmneo/auth/tokenguard`（内存 + PG `access_tokens`）+ 四条控制面路由（列出/吊销单张/
   吊销主体全部/续期）+ 控制台「访问令牌」页；所有令牌带 `jti`；shadowd 与**申领服务**两侧验签后查台账，
   台账不可读 ⇒ fail-closed；**只有台账里有行的令牌可吊销**（密钥直接签出的不在台账里 ⇒ 处置手段是换密钥）。
-- **身份视图**：`GET /v1/devices/cred-identity` + 控制台「身份视图」页（embedded 红/unknown 中性，
-  含 basis/source/last_seen/remedy；未装配 ⇒ 503）。
+- **身份视图**：`GET /v1/devices/cred-identity` + 控制台「身份视图」页（侧栏名「凭据身份」，`/home/node-management/cred-identity`；
+  embedded 红/unknown 中性，含 basis/source/last_seen/remedy；未装配 ⇒ 503）。
 - **验收**：Go 全套 + claim 容器套件全绿（新增 14 条用例）；`contract_check` 102 路由一致；
   dashboard typecheck + **181 用例** + build 全绿。
 - **控制台地址与产线板块**：见作业指导 **§12**（本机 `http://localhost:5174/?backend=…&claim=…`；
-  板块 = 量产签发 / 身份视图 / 访问令牌 / 节点 / 注册节点）。
+  板块 = 节点管理 → 量产签发 / 凭据身份（= 身份视图页）/ 节点 / 注册节点，以及 用户管理 → 访问令牌）。
 
 ## 4. 证据入口
 

@@ -37,9 +37,10 @@
   **控制台登录收敛为一个固定账号** `admin`/`Oneye@hz2026`（最大权限；`ADMIN_LOGIN_ONLY` 缺省 1 ⇒ 其它账号
   暂不可登录；`ADMIN_PASSWORD` 无缺省值，未设即拒绝启动）；**申领服务不做 TLS**（安全组限制固定源 IP）；
   ✅ **令牌吊销/续期**与 ✅ **身份视图列表页**均已落地（见 §3.2）。
-- **未做/仍开放**：控制台**前端生产托管**（今天只有 dev :5174 与 `preview`/`dist`，无 nginx 配方）、
-  `CORS_ORIGINS` 从 `*` 收紧、产线工装/扫码/一拖多/PASS-FAIL 上传、存量重签迁移（排期）、
-  **shadowd 生产部署**（含 `DEVICE_CRL_*`）、EMQX **authentication**（ACL 只管授权）、台账 `node_id` 专用索引。
+- **未做/仍开放**：产线专用账号的**最小权限化**（今天仍是单账号最大权限）、
+  `CORS_ORIGINS` 从 `*` 收紧（域名部署后同源，已不依赖它）、产线工装/扫码/一拖多/PASS-FAIL 上传、存量重签迁移（排期）、
+  **shadowd 生产规模化部署**（含 `DEVICE_CRL_*`；域名形态已在 CVM 上跑起来，见 §3.3）、EMQX **authentication**（ACL 只管授权）、
+  台账 `node_id` 专用索引、**TLS**（拍板 HTTP + 安全组限源 IP）、前端产物回滚、`AUTH_SECRET` 轮换流程。
 - **口径边界**：`esp.cred_source` 是影子 `reported` 里的**普通键**（不是新 topic/能力位）⇒ 不构成契约面变更；
   指纹兜底默认**关闭**（空清单 = 不参与）；量产固件本轮只有**构建级 + 配置生效级**证据，**未上板**。
 
@@ -62,9 +63,35 @@
 - **身份视图**：`GET /v1/devices/cred-identity` + 控制台「身份视图」页（侧栏名「凭据身份」，`/home/node-management/cred-identity`；
   embedded 红/unknown 中性，含 basis/source/last_seen/remedy；未装配 ⇒ 503）。
 - **验收**：Go 全套 + claim 容器套件全绿（新增 14 条用例）；`contract_check` 102 路由一致；
-  dashboard typecheck + **181 用例** + build 全绿。
-- **控制台地址与产线板块**：见作业指导 **§12**（本机 `http://localhost:5174/?backend=…&claim=…`；
+  dashboard typecheck + **191 用例** + build 全绿。
+- **控制台地址与产线板块**：见作业指导 **§12**（产线/联调 `http://product-testing.oneye.me/`，本机 dev `http://localhost:5174/?backend=…&claim=…`；
   板块 = 节点管理 → 量产签发 / 凭据身份（= 身份视图页）/ 节点 / 注册节点，以及 用户管理 → 访问令牌）。
+
+## 3.3 控制台域名上线（2026-09-23 同日第三批）
+
+- **形态**：`http://product-testing.oneye.me/`（CVM `175.178.190.187`）**单 origin** —— nginx(`/etc/nginx/sites-available/oneye-console.conf`)
+  服 `/` 静态控制台、`/v1/…` → shadowd `127.0.0.1:9090`、`/claim/…` → 申领服务 `127.0.0.1:9091`（**前缀剥掉**，服务本身不知道有前缀）；
+  **默认站点已移除**（唯一入口）；同机 k8s 的 `kube-lb` 自带 nginx 二进制，互不干扰；80/443 空着（无 TLS，拍板 HTTP + 安全组限源 IP）。
+- **同源化**：发布 `/config.json` → `/client-outputs.json`，其中 `BackendApiUrl: "same-origin"`、`ClaimApiUrl: "same-origin/claim"`。
+  新哨兵在 `dashboard/src/lib/config.ts` 的 `resolveConfiguredBase()` 里解析（`same-origin` → 页面 origin；带 `/路径` 则拼上）
+  ⇒ **同一份发布配置在 HTTP/HTTPS/换域名下都不用重生成**，按 IP 打开也不会偷偷打另一个 origin；`?backend=`/`?claim=` 仍可覆盖（本机 dev 用）。
+  同时补上了 `CLAIM_API_URL` 从 client-outputs 的映射（此前只映射了 `BACKEND_API_URL`）⇒ 域名下不需要 `?claim=`。
+- **服务托管**：两个都进 systemd（`oneye-shadowd`/`oneye-claimd`，`Restart=always`），env 在 `/etc/oneye/*.env`(0600)，
+  共享 `/etc/oneye/auth.secret`（**重部署不重生成**，否则已发令牌全失效），CA 密钥库 `ReadOnlyPaths=-/home/ubuntu/oneye-platform-ca`。
+  启动日志已证：`console login enabled — only-this-account=true`、`access tokens: postgres`、`device_certs ledger: postgres`、
+  `ca: loaded (self-hosted keystore, scheme C); issuance ledger attached (fail-closed)`。
+- ⚠️ **踩到的坑（已修 + 写进文档）**：**两个服务的 `PORT` 不是同一种东西** —— shadowd 收完整监听地址（`PORT=:9090`），
+  申领服务 entrypoint 自己拼 `":"+PORT`，收**裸端口**（`PORT=9091`）；给它写 `:9091` ⇒ 启动即
+  `listen tcp: address ::9091: too many colons in address` 退出。另有 3 个**自测脚本自身的错**：`wait_http` 用 `curl -f`
+  把"服务正常返回 401"误判为挂（认证服务对裸探测就该回 401）、`|| echo 000` 把单次失败拼成 `000000` 让探针秒过、
+  以及"归档里必须有 client.crt"这条断言在**幂等重跑**上必错（`already_issued` 行**故意不交付**证书/私钥）。
+- **交付物**：`backend/deployment/console/`（nginx conf + 两个 systemd unit + `web/{config.json,client-outputs.json}` +
+  `install-console.sh` + `README.md`）、`backend/scripts/ops/deploy-console.sh`（构建→上传→安装→验收）、
+  `backend/scripts/ops/console-domain-acceptance.sh`（**24 条断言**）。
+- **验收证据（可复跑）**：安装段 7/7 ok；`console-domain-acceptance.sh` ⇒ **in-host PASS 24 · FAIL 0** + 本机到
+  `http://product-testing.oneye.me/` **200**（DNS + 安全组已通）。签发闭环：`device_certs` 出现
+  `console-acceptance-20260923`（serial `51219ba4cc3e8f16…`、`not_after 2036-09-17`），`access_tokens` 中对应令牌被主体 cutoff 盖上 `revoked_at`；
+  吊销后旧令牌 401、**重新登录立刻可用**（证明 cutoff 不是全局锁死）。
 
 ## 4. 证据入口
 

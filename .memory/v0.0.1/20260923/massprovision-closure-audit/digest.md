@@ -1,0 +1,43 @@
+# 量产/产线批次收口审计与补齐（2026-09-23）
+
+> **会话 id**：`massprovision-closure-audit` ｜ **仓**：`embedded/esp-adf`（本会话工作目录）｜
+> **跨仓**：`backend`（oneye-iot）、总控 `rainmaker-oneye`、其内嵌 `docs/oneye-iot-index`
+> **一句话**：对 2026-09-22/23 的"量产批量签发 + 设备凭证分区 + 伙伴/OEM 产线"整批做**闭环审计**，
+> 找出并修掉 **1 处规划内必需但未实现**、**1 处死配置**、**1 处编译级回归**，并补齐三仓的登记与指针。
+
+## 1. 审计结论（改动前）
+
+设备侧/工具链侧那一批是**真闭环**（真机证据齐全）；缺口集中在"平台侧"和"配置生效性"：
+
+| # | 缺口 | 性质 | 位置 |
+| --- | --- | --- | --- |
+| A | **P0-A「凭据来源对服务端可见」只做了设备侧** | 规划里写明"必需，属 backend 侧"（SDK `docs/API-creds.md` §5）却无消费者；只有一份**未跟踪、无调用方、注释引用不存在的 `Fingerprints`** 的草稿包 | `backend/src/rmneo/credsource/credsource.go`（当时 `??`） |
+| B | **量产预设里一处死配置** | `CONFIG_ONEYE_FW_TRANSPORT_MQTT_TLS`（真名 `..._TRANSPORT_TLS`）⇒ "显式钉住承载"是安慰剂；且未钉云端端点 | `esp-adf examples/oneye/korvo2_oneye/sdkconfig.defaults.production` |
+| C | **`go test ./src/...` 直接编不过** | 2026-09-22 给 `devicecert.Store` 加 `GetByNodeID`，4 个测试替身没跟上 ⇒ 全仓门禁当时是**红的**（批内只跑了分范围门禁） | `backend` `shadow/cmd/shadowd`、`ca/signer` |
+| D | 指针/工作区未收口 | `cloud` 远端已 `a5ebe30` 而总控仍 pin `0feebda`（工作区 `M cloud`）；backend 有 5 个未跟踪测试/构建残留 | 总控 + backend |
+| E | 登记与漂移 | 新契约页三处未登记；backend `docs/README` 无 ops 段、两处版本号过期；总控 `落地计划/仓库地图/可行性评估` 未回写（`cloud/` 未入地图、pin 表停在 09-15） | 三仓文档 |
+
+## 2. 本轮做了什么（每项都带可复跑证据）
+
+1. **平台侧可见性（A）**：新包 `backend/src/rmneo/credsource`（判决：**只有显式 `partition` 算合格**；`unknown` 不作合格；键缺失时可按登记的公用证书指纹兜底）+ shadowd 接线
+   `cred_identity.go`（`embedded` ⇒ WARN **+ `device_alarm`** + gauge `shadowd_device_identity_embedded`；恢复 ⇒ INFO；**键缺失不喊**）。
+   证据：`go test ./src/rmneo/credsource/... ./src/rmneo/shadow/cmd/shadowd/...` 全绿（含"重复上报不二次告警 / 恢复后再回退要再喊 / 键缺失静默 / 指纹兜底 basis 可区分 / 空清单不参与"）。
+2. **死配置（B）**：改对符号名 + 补钉 `CONFIG_ONEYE_FW_CLOUD_HOST/_PORT`；新增门禁 `tools/check-sdkconfig-defaults.py`（查"写了但不存在的符号"与"预设未生效"，**带负控**）。
+   证据：① 量产预设真构建 `BUILD_EXIT=0`，`korvo2_oneye.bin=0xf08f0`、**53% free**；② `--sdkconfig <产物> --require sdkconfig.defaults.production` ⇒ **11 项全部存在且已生效**（含 `TRANSPORT_TLS=y`、`CLOUD_HOST="mqtt.oneye.me"`、`CLOUD_PORT=18885`）；③ 开发用 `sdkconfig` 哈希前后一致（未被污染）；④ 红线守卫 A/B：`REQUIRED=y`+内嵌证书 ⇒ **exit 2** + 两条修法（B = 上面的 exit 0）；⑤ 负控：把 `_MQTT_TLS`/拼错的 `is not set` 塞回去 ⇒ 门禁 **exit 1** 并逐行点名。
+3. **编译级回归（C）**：给 4 个替身补 `GetByNodeID`（`shadowd.failingStore`、`ca/signer` 的 `failingStore`/`invisibleStore`/`failAfter`），全仓门禁复跑。
+4. **指针/工作区（D）**：bump `cloud` 指针；删掉 5 个未跟踪残留（`claim_handler.exe` + 4 个测试计时残留）并把两类加进 `backend/.gitignore`。
+5. **登记与漂移（E）**：契约页 #21 三处登记（`domain/README` + `contracts/README` + `评审记录` **R5 待签**）；`backend/docs/README` 新增 **E. 运维与产线作业 · ops/** 段并修两处版本号；设计文档 §8 标题/仍未做清单/§7.3⑰ 漂移回写；总控 `落地计划` 新增整批登记（含指针）、`仓库地图` 补 `cloud/` 与版本基线（ESP-ADF `3cb5613e`、SDK **v0.4.0** 6 库 `d7c665e`）、`可行性评估` 第 89 行"证书注入仍缺"改写；index 台账 `设备面契约.md` 量产块与 §12#7 补 09-23 追加。
+
+## 3. 仍然开放（不声称"量产就绪"）
+
+- **待拍板**：私钥在哪生成（服务端 vs 产线）、eFuse 防克隆、凭证分区加密、产线是否允许联网（设计 §8.6）。
+- **未做**：产线工装/扫码/一拖多/PASS-FAIL 上传、存量重签迁移（排期）、**shadowd 生产部署**（含 `DEVICE_CRL_*`）、EMQX **authentication**（ACL 只管授权）、申领服务自身 TLS/mTLS。
+- **口径边界**：`esp.cred_source` 是影子 `reported` 里的**普通键**（不是新 topic/能力位）⇒ 不构成契约面变更；指纹兜底默认**关闭**（空清单 = 不参与）。
+
+## 4. 证据入口
+
+- 平台侧：`backend/src/rmneo/credsource/`、`backend/src/rmneo/shadow/cmd/shadowd/cred_identity.go`
+- 固件侧：`examples/oneye/korvo2_oneye/{sdkconfig.defaults.production,README.md §5.9,tools/check-sdkconfig-defaults.py}`
+- 设计与作业：`backend/docs/architecture/设备凭据吊销与签发台账设计.md`（§8/§8.7.4）、`backend/docs/ops/产线凭证灌注作业指导.md`（§11）
+- 台账：`docs/oneye-iot-index/设备面契约.md`（§12 #7 与量产块）
+- 构建留档（gitignore 不入库）：`output/.build/korvo2_oneye-production/`、`output/.build/korvo2_oneye-guardA/out.txt`

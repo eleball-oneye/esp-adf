@@ -308,13 +308,50 @@ python3 tools/panel/panel.py --self-test
 
 **边界（不得越过）**：抓帧只用于**验证面**（本地 HTTP + `/media` 只读面），**不声明 `video.live`** —— 采集声明的前提是"模组装配 + 真机取帧"（已满足，见映射页 §6-1），但 `video.live` 还要求**编码 + 上行数据面**（MJPEG/`http_upload`）落地，本工程未实现（见 §7/§9）。
 
+## 5.9 量产形态：`creds` 分区 + 量产预设 + 身份自证（2026-09-22/23）
+
+> 本节的**事实源**在后端仓：[设计 §8](../../../../../backend/docs/architecture/设备凭据吊销与签发台账设计.md)、
+> [产线凭证灌注作业指导](../../../../../backend/docs/ops/产线凭证灌注作业指导.md)、
+> [设备凭据分区与产测自证契约](../../../../../backend/contracts/domain/设备凭据分区与产测自证契约.md)。
+> 这里只记"**本工程怎么配、怎么看**"。
+
+**为什么要变**：此前证书/私钥是**编译期嵌进固件**、`device_id` 是编译期常量 ⇒ ① 一台一个固件；
+② 谁拿到固件谁就有那台设备的私钥；③ 换证书要重编重烧。量产形态改为**通用固件 + 每台一份凭证分区**。
+
+| 件 | 位置 / 取值 | 说明 |
+| --- | --- | --- |
+| 凭证分区 | `partitions.csv`：`creds, data, 0x40, 0x510000, 16K` | 固件按**类型+名字**查找（`data`/`0x40`/`creds`），不看偏移；偏移只在"按偏移烧写"时用 |
+| 镜像格式 | `ONEYECR1` + 版本 + 长度 + CRC32 + JSON（含 PEM 三元组） | 唯一定义在后端 `src/utils/credsimage`；出镜像/回读校验用 `mkcreds` |
+| 读取顺序 | 先读分区 → **分区坏 ⇒ 一律不上网**（fail-closed）→ 分区**没写过**才回退内嵌证书 | 回退是台面便利；量产由 `ONEYE_DEV_CREDS_REQUIRED=y` 关掉 |
+| 身份自证 | `ONEYE_FW_PROV_ATTEST`（**缺省 y**）开机打印一行 `ONEYE-PROV1 …` | 产线用 `provverify` + 该设备证书验签；**只在分区里有合法镜像时打印**（没灌注的机器什么都不打） |
+| 身份来源上报 | 影子 `reported` 的 `esp.cred_source` = `partition` / `embedded` | 回退到固件内嵌**公用**凭据时云端必须看得见（服务端侧判决见后端 `credsource` + shadowd） |
+| 量产预设 | `sdkconfig.defaults.production` | 与台面口径**恰好相反**的那几条；必须**显式叠加** |
+
+```bash
+# 量产固件：显式叠加预设 + 用空证书目录关掉"可回退的公用凭据"
+idf.py -B output/.build/korvo2_oneye-production \
+  -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.defaults.production" \
+  -DONEYE_FW_CERT_DIR=<空目录> build
+```
+
+> ⚠️ **两条会被静默吃掉的红线**（都实测过，见设计 §8.7.2）：
+> ① `REQUIRED=y`（分区是唯一来源）与"内嵌证书"（可回退的公用凭据）语义相反，同时成立时
+> `main/CMakeLists.txt` 会**直接编不过**（不是靠人记得）；
+> ② 承载/端点这类"只写在 sdkconfig 里"的项必须**在 defaults 里钉死**，否则 `sdkconfig`
+> 一旦从 defaults 重新生成就会掉回缺省值 —— 承载掉回 TCP 时 SDK 会因"给了 `tls_ca_pem` 却不是
+> TLS"报错、设备**完全不上线**；云端地址掉回占位值则"能起来但连不到平台"。
+> 预设里的每一项都要能被"生成后的 sdkconfig"验证（本仓用 `tools/check-sdkconfig-defaults.py`）。
+
+---
+
 ## 6. 配置（`idf.py menuconfig` → `korvo2_oneye 板级固件配置`）
 
 | 配置 | 缺省 | 说明 |
 | --- | --- | --- |
-| `ONEYE_FW_DEVICE_ID` | `korvo2-0001` | 兼作 MQTT username/client_id（EMQX ACL `%u` 依赖） |
-| `ONEYE_FW_CLOUD_HOST` / `_PORT` / `_WS_PATH` | 192.168.1.100 / 0 / 空 | 端点显式配置（端口 0 = 按承载取契约缺省 1883/8883/8083/8084） |
-| `ONEYE_FW_TRANSPORT` | TCP | 承载选择（契约四承载） |
+| `ONEYE_FW_DEVICE_ID` | `korvo2-0001` | 兼作 MQTT username/client_id（EMQX ACL `%u` 依赖）；**有 creds 分区时被分区里的 `node_id` 覆盖**（§5.9） |
+| `ONEYE_FW_CLOUD_HOST` / `_PORT` / `_WS_PATH` | 192.168.1.100 / 0 / 空 | 端点显式配置（端口 0 = 按承载取契约缺省 1883/8883/8083/8084）；`sdkconfig.defaults` 已钉 `mqtt.oneye.me:18885` |
+| `ONEYE_FW_TRANSPORT` | **TLS** | 承载选择（契约四承载）。**别改成 TCP**：生产主承载是一机一密 mTLS，明文只在台面联调 |
+| `ONEYE_FW_PROV_ATTEST` | **y** | 开机打印一行产测自证串（`ONEYE-PROV1 …`）。**量产与产测共用同一份固件**，所以缺省开：靠编译期开关打开自证，等于维护"产测固件/量产固件"两个镜像，而发错固件会让整个产测环节**静默失效** |
 | `ONEYE_FW_CLOUD_TOKEN` | 空 | 设备令牌（空 = 匿名 dev 形态） |
 | `ONEYE_FW_TLS_INSECURE` | **n** | 仅 dev/产测可开；生产须投放自研 CA（`tls_ca_pem`） |
 | `ONEYE_FW_ENABLE_WIFI_FILE` | **y** | 凭据文件配网（SD/SPIFFS `oneye-wifi.txt`）+ `/api/action wifi_set`；**量产置 n** |

@@ -12,6 +12,14 @@
 #
 # 依据：backend/contracts/domain/设备凭据分区与产测自证契约.md（§1 分区、§2 失败姿态、§7 红线）
 #      与 docs/ops/产线凭证灌注作业指导.md §1.1
+#
+# ⚠️ 本文件里**每一项**都必须能被验证，而不是"写在文件里就算钉住了"：
+#   门禁 `python tools/check-sdkconfig-defaults.py --sdkconfig <构建产物>/sdkconfig \
+#          --require sdkconfig.defaults.production`
+#   2026-09-23 真构建抓到的教训：曾经这里写的是 `CONFIG_ONEYE_FW_TRANSPORT_MQTT_TLS=y`，
+#   而 Kconfig 里的符号叫 `CONFIG_ONEYE_FW_TRANSPORT_TLS`（本工程从来没有 `_MQTT_TLS`）
+#   ⇒ 这一行**什么都没做**，整条"显式钉住承载"是安慰剂；同一天真机实测到的正是承载掉回 TCP
+#   ⇒ 设备完全不上线。**"写了配置"与"配置生效"在文本上长得一模一样。**
 # =============================================================================
 
 # ---- 身份：分区凭据是唯一来源 -------------------------------------------------
@@ -23,8 +31,15 @@ CONFIG_ONEYE_DEV_CREDS_REQUIRED=y
 CONFIG_ONEYE_FW_PROV_ATTEST=y
 
 # ---- 承载与安全 ---------------------------------------------------------------
-# 一机一密 mTLS 主承载（缺省即 TLS，这里显式写出来，避免被别的 defaults 覆盖）
-CONFIG_ONEYE_FW_TRANSPORT_MQTT_TLS=y
+# 一机一密 mTLS 主承载。**符号名以 main/Kconfig.projbuild 的 `config ONEYE_FW_TRANSPORT_TLS` 为准**；
+# 显式写出来是为了"不被别的 defaults 覆盖"，改这一项 = 换承载，必须是有意的。
+CONFIG_ONEYE_FW_TRANSPORT_TLS=y
+# 云端端点同样钉死：缺省是占位地址（Kconfig `ONEYE_FW_CLOUD_HOST` = 192.168.1.100、端口 0），
+# sdkconfig 一旦从 defaults 重新生成就会掉回去 ⇒ 设备能起来但**连不到平台**
+# （2026-09-22 真机实测：日志 `cloud endpoint 192.168.1.100:0 → SYN 无应答`）。
+# 端口 18885 = 自建 EMQX 的 mTLS 监听（与 CRL 检查同一条监听器）。换环境时改这里 + 重烧。
+CONFIG_ONEYE_FW_CLOUD_HOST="mqtt.oneye.me"
+CONFIG_ONEYE_FW_CLOUD_PORT=18885
 # 绝不跳过证书校验（跳过=中间人可读可改）
 # CONFIG_ONEYE_FW_TLS_INSECURE is not set
 

@@ -33,16 +33,17 @@
 - **已拍板（2026-09-23，已回写）**：**不做** eFuse 防克隆（接受"复制 flash 即复制身份"，靠吊销兜底）、
   **不做**凭证分区加密（我们自己的量产形态不启用 flash/内容加密；伙伴开 flash 加密时"是否标 `encrypted`
   须双方确认"仍有效）、**私钥由服务端生成**（交付 ZIP 含 `client.key` ⇒ 归档按密钥介质管理）、
-  **产线联网**且**批量申领在控制台 web 上操作** —— ✅ **控制台入口已实现**（见 §3.1）。
-- **仍未做（联网产线的上线前置）**：产线专用账号与最小权限、**申领服务自身 TLS**、令牌吊销/续期、
-  `CORS_ORIGINS` 从 `*` 收紧成控制台 origin。
-- **未做**：产线工装/扫码/一拖多/PASS-FAIL 上传、`esp.cred_source` 身份视图列表页、存量重签迁移（排期）、
+  **产线联网**且**批量申领在控制台 web 上操作** —— ✅ **控制台入口已实现**（见 §3.1）；
+  **控制台登录收敛为一个固定账号** `admin`/`Oneye@hz2026`（最大权限；`ADMIN_LOGIN_ONLY` 缺省 1 ⇒ 其它账号
+  暂不可登录；`ADMIN_PASSWORD` 无缺省值，未设即拒绝启动）；**申领服务不做 TLS**（安全组限制固定源 IP）；
+  ✅ **令牌吊销/续期**与 ✅ **身份视图列表页**均已落地（见 §3.2）。
+- **未做/仍开放**：控制台**前端生产托管**（今天只有 dev :5174 与 `preview`/`dist`，无 nginx 配方）、
+  `CORS_ORIGINS` 从 `*` 收紧、产线工装/扫码/一拖多/PASS-FAIL 上传、存量重签迁移（排期）、
   **shadowd 生产部署**（含 `DEVICE_CRL_*`）、EMQX **authentication**（ACL 只管授权）、台账 `node_id` 专用索引。
 - **口径边界**：`esp.cred_source` 是影子 `reported` 里的**普通键**（不是新 topic/能力位）⇒ 不构成契约面变更；
   指纹兜底默认**关闭**（空清单 = 不参与）；量产固件本轮只有**构建级 + 配置生效级**证据，**未上板**。
 
 ## 3.1 控制台批量签发入口（2026-09-23 落地，t08）
-
 - 页面：`dashboard` 设备管理「**量产签发**」`/home/node-management/provision`（清单录入/上传 → `POST /v1/claim/batch`
   → 逐台状态 → 下载 ZIP；**含私钥提醒**；200/207/422 分档）。
 - 通路：dashboard **直连**申领服务（`CLAIM_API_URL` / `?claim=`）+ 外壳层 CORS（`CORS_ORIGINS`，预检先于鉴权、
@@ -50,6 +51,20 @@
 - 证据：`scripts/ops/claim-console-acceptance.sh --start` ⇒ **PASS 14 · FAIL 0**；dashboard `typecheck` /
   **vitest 24 文件 151 用例** / 新文件 eslint / `build` 全绿；Go `build`+`vet`（含 `-tags container`）exit 0。
 - ⚠️ 既有债（与本批无关，已实测）：仓库级 `npm run lint` 里的 `check:i18n` 在 HEAD 上就红（63 个问题，`register:*` 为主）。
+
+## 3.2 令牌吊销/续期 + 身份视图 + 控制台单一账号（2026-09-23 同日再落，t09）
+
+- **登录收敛**：`ADMIN_LOGIN_ONLY`（缺省 1）⇒ 控制台只认 `ADMIN_USERNAME`/`ADMIN_PASSWORD` 那一对
+  （产线形态 `admin`/`Oneye@hz2026`，最大权限）；用户表管理员要能登录得显式 `=0`；`ADMIN_PASSWORD` 无缺省值。
+- **令牌**：`src/rmneo/auth/tokenguard`（内存 + PG `access_tokens`）+ 四条控制面路由（列出/吊销单张/
+  吊销主体全部/续期）+ 控制台「访问令牌」页；所有令牌带 `jti`；shadowd 与**申领服务**两侧验签后查台账，
+  台账不可读 ⇒ fail-closed；**只有台账里有行的令牌可吊销**（密钥直接签出的不在台账里 ⇒ 处置手段是换密钥）。
+- **身份视图**：`GET /v1/devices/cred-identity` + 控制台「身份视图」页（embedded 红/unknown 中性，
+  含 basis/source/last_seen/remedy；未装配 ⇒ 503）。
+- **验收**：Go 全套 + claim 容器套件全绿（新增 14 条用例）；`contract_check` 102 路由一致；
+  dashboard typecheck + **181 用例** + build 全绿。
+- **控制台地址与产线板块**：见作业指导 **§12**（本机 `http://localhost:5174/?backend=…&claim=…`；
+  板块 = 量产签发 / 身份视图 / 访问令牌 / 节点 / 注册节点）。
 
 ## 4. 证据入口
 

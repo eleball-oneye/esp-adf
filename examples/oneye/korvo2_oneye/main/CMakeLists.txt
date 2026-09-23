@@ -64,3 +64,25 @@ idf_component_register(SRCS "korvo2_oneye_main.c"
 if(_oneye_cert_files)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE ONEYE_FW_EMBED_CERTS=1)
 endif()
+
+# =============================================================================
+# 量产红线守卫：`ONEYE_DEV_CREDS_REQUIRED=y` 与"内嵌证书"**不能同时成立**
+#
+# 两者语义正好相反：
+#   · REQUIRED=y ⇒ 分区凭据是**唯一**来源（分区没写过也不许回退，契约 §7 红线 1）；
+#   · 内嵌证书    ⇒ flash 里躺着一份**可回退的公用凭据**。
+# 同时成立时，真机表现是"凭证烧录失败的机器照样用公用身份上线"，而平台会把它当成合法设备接受
+# ——这是最难在产线上被发现的一类事故。所以这里把它做成**编不过**，而不是靠人记得。
+#
+# 实测背景（2026-09-22 复核）：本工程的默认组合恰好就是这个反例 —— main/certs 三件齐备
+# （自动 ONEYE_FW_EMBED_CERTS=1），而没有任何 sdkconfig 打开 REQUIRED。
+# =============================================================================
+if(CONFIG_ONEYE_DEV_CREDS_REQUIRED AND _oneye_cert_files)
+    message(FATAL_ERROR
+        "自相矛盾的量产配置：ONEYE_DEV_CREDS_REQUIRED=y（分区凭据是唯一来源）"
+        " 与内嵌证书（可回退的公用凭据）不能同时成立。\n"
+        "  内嵌证书目录：${ONEYE_FW_CERT_DIR}\n"
+        "  修法（二选一）：量产用 -DONEYE_FW_CERT_DIR=<空目录> 不嵌入证书（推荐，见 "
+        "sdkconfig.defaults.production）；或者把 ONEYE_DEV_CREDS_REQUIRED 置 n（仅台面/产测）。\n"
+        "  依据：backend/contracts/domain/设备凭据分区与产测自证契约.md §7 红线 1")
+endif()

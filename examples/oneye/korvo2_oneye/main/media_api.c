@@ -144,8 +144,20 @@ static void add_file(cJSON *arr, const char *alias, const char *root, const char
     cJSON_AddNumberToObject(o, "mtime", (double)st.st_mtime);
     cJSON_AddStringToObject(o, "kind", kind_of(name));
     cJSON *item = cJSON_AddObjectToObject(o, "item");
+    /*
+     * ⚠️ 这两处 snprintf 必须**判截断**，不能只看返回值不用：
+     *   2026-09-22 量产预设（`CONFIG_COMPILER_OPTIMIZATION_SIZE=y`，-Os）下构建直接失败 ——
+     *   -Os 会把本函数内联/常量传播，GCC 于是能**证明** `alias`/`name`（各 512 B 缓冲）拼进
+     *   `url`(193 B) / `dev_path`(94 B) 会截断，报 `-Werror=format-truncation`；开发用的 -Og
+     *   下看不出来。也就是说：**这个缺陷只在量产口径下暴露**，而静默截断出来的 URL 本身就是错的。
+     *   口径与上面 full 路径一致：放不进就**跳过这一项（不截断）**。
+     */
     char url[MEDIA_URI_MAX];
-    snprintf(url, sizeof(url), "media/%s/%s", alias, name);
+    int un = snprintf(url, sizeof(url), "media/%s/%s", alias, name);
+    if (un <= 0 || (size_t)un >= sizeof(url)) {
+        cJSON_Delete(o);
+        return;                                   /* URI 超契约上限：这一项不进清单 */
+    }
     cJSON_AddStringToObject(item, "url", url);
     /* 板上回放（本轮）：仅 SD 卡（FATFS）上的 wav/mp3 —— SPIFFS 录不上板播，只能网页播放/下载 */
     const char *dot = strrchr(name, '.');
@@ -153,7 +165,11 @@ static void add_file(cJSON *arr, const char *alias, const char *root, const char
                  (strcasecmp(dot, ".wav") == 0 || strcasecmp(dot, ".mp3") == 0);
     cJSON_AddBoolToObject(o, "playable_on_board", audio && strcmp(alias, "sdcard") == 0);
     char dev_path[PLAYER_PATH_MAX];
-    snprintf(dev_path, sizeof(dev_path), "/%s/%s", alias, name);
+    int dn = snprintf(dev_path, sizeof(dev_path), "/%s/%s", alias, name);
+    if (dn <= 0 || (size_t)dn >= sizeof(dev_path)) {
+        cJSON_Delete(o);
+        return;                                   /* 设备侧路径超上限：同样跳过，不截断 */
+    }
     cJSON_AddStringToObject(o, "device_path", dev_path);
     cJSON_AddItemToArray(arr, o);
 }

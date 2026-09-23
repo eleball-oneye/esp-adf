@@ -1,0 +1,43 @@
+# =============================================================================
+# 量产固件预设（在 sdkconfig.defaults / sdkconfig.defaults.esp32s3 之后再叠加）
+#
+# 用法（**必须显式叠加**，否则 IDF 只会读 sdkconfig.defaults*）：
+#   idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.defaults.production" \
+#          -DONEYE_FW_CERT_DIR=<空目录> build
+#
+# 为什么需要单独一份：量产口径与台面口径**恰好相反**的那几条（内嵌证书、本地调试面、SD 卡明文
+# Wi-Fi 密码、TLS 跳过校验），靠"记得改"是不可靠的 —— 忘一次就是把一台会拿公用身份上线的机器
+# 发出去。所以把它们集中成一份文件，并且与 CMakeLists 里的互斥守卫配合（见 main/CMakeLists.txt：
+# REQUIRED=y 与内嵌证书同时成立会直接编不过）。
+#
+# 依据：backend/contracts/domain/设备凭据分区与产测自证契约.md（§1 分区、§2 失败姿态、§7 红线）
+#      与 docs/ops/产线凭证灌注作业指导.md §1.1
+# =============================================================================
+
+# ---- 身份：分区凭据是唯一来源 -------------------------------------------------
+# 分区没写过/不存在 ⇒ 也**不许**回退（没有内嵌证书可退，且这条让失败姿态显式化）
+CONFIG_ONEYE_DEV_CREDS_REQUIRED=y
+
+# 产线验收：开机打印一行自证串（ONEYE-PROV1 …），供 provverify 验签。
+# ⚠️ 不开 = 产线看不到可验的证据，等于跳过验收（契约 §7 红线 3）。同一份固件用于量产与产测。
+CONFIG_ONEYE_FW_PROV_ATTEST=y
+
+# ---- 承载与安全 ---------------------------------------------------------------
+# 一机一密 mTLS 主承载（缺省即 TLS，这里显式写出来，避免被别的 defaults 覆盖）
+CONFIG_ONEYE_FW_TRANSPORT_MQTT_TLS=y
+# 绝不跳过证书校验（跳过=中间人可读可改）
+# CONFIG_ONEYE_FW_TLS_INSECURE is not set
+
+# ---- 台面能力一律关闭 ---------------------------------------------------------
+# SD 卡/SPIFFS 上的 Wi-Fi 凭据是**明文**，量产配网走 claim + 一机一密（ADR-0007）
+# CONFIG_ONEYE_FW_ENABLE_WIFI_FILE is not set
+# 设备侧本地 HTTP 验证面不是云端设备面契约
+# CONFIG_ONEYE_FW_ENABLE_PANEL_API is not set
+# 取证插桩（周期性 INFO + 长批量间隔）只用于取证
+# CONFIG_ONEYE_FW_LOG_PROBE is not set
+
+# ---- 自检与体积 ---------------------------------------------------------------
+# 板级自检失败即中止上云（量产要的是"坏的别上网"，不是"坏的也上网")
+CONFIG_ONEYE_FW_SELFTEST_STRICT=y
+# 应用分区很紧（实测只剩 ~1%）：量产用体积优先
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y

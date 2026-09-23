@@ -725,12 +725,18 @@ static void oneye_start(void)
      *          `ONEYE_DEV_CREDS_REQUIRED=y` 把它也变成"不联网"。
      */
     static oneye_dev_creds_t s_creds;
+    /* 本机实际用的是**哪一份身份**（P0-A：必须让服务端看得见）。
+     * 台面/漏写分区的机器允许回退到编译进固件的**公用**凭据，但"看不清有没有回退"不可以：
+     * 一台漏写分区的机器拿公用身份上线，平台上若与正常机器看不出区别，它会被一直当好设备用下去。
+     * 故这里记下来源，开机与其它状态一起报进影子 `reported` 的 `esp.cred_source`。 */
+    oneye_dev_creds_source_t cred_src = ONEYE_DEV_CREDS_SOURCE_UNKNOWN;
     oneye_dev_sdk_err_t creds_rc = oneye_dev_creds_load(&s_creds);
     if (creds_rc == ONEYE_DEV_SDK_OK) {
         if (oneye_dev_creds_apply(&base_cfg, &s_creds) != ONEYE_DEV_SDK_OK) {
             ESP_LOGE(TAG, "凭据写入 base 配置失败（缺私钥/身份不合法）—— 不联网");
             return;
         }
+        cred_src = ONEYE_DEV_CREDS_SOURCE_PARTITION;
         ESP_LOGI(TAG, "凭据来源：**creds 分区** node=%s（cert %u B / key %u B / CA %u B）crc32=%08x %s",
                  s_creds.node_id, (unsigned)s_creds.cert_len, (unsigned)s_creds.key_len,
                  (unsigned)s_creds.ca_len, (unsigned)s_creds.image_crc32,
@@ -768,6 +774,8 @@ static void oneye_start(void)
         ESP_LOGW(TAG, "creds 分区为空（%s）—— 回退到编译进固件的凭据（仅开发/产测可接受）",
                  oneye_dev_strerror(creds_rc));
 #if defined(ONEYE_FW_EMBED_CERTS)
+    /* 走到这里 = 用的是**公用**身份（固件里那一份），必须让云端看得见（见 cred_src 的说明）。 */
+    cred_src = ONEYE_DEV_CREDS_SOURCE_EMBEDDED;
     /*
      * 一机一密 mTLS：设备证书/私钥/CA 由构建期嵌入（见 main/CMakeLists.txt 顶部说明；
      * 私钥不入库，目录由 -DONEYE_FW_CERT_DIR= 指定）。objcopy 生成的 blob 末尾带一个 NUL，
@@ -867,15 +875,34 @@ static void oneye_start(void)
     /* 5b) 授时（契约 §7）由 CLOUD_LINK_UP 事件驱动的 `request_time_sync()` 发起（见 sdk_event_cb）：
      *     `oneye_dev_base_sync_time()` 会阻塞等待云端应答，必须跑在独立任务里，不能在 SDK 回调内调用。 */
 
-    /* 6) 自检结论 + 已登记影子键（esp.fw_version / esp.power） */
+    /* 6) 自检结论 + 已登记影子键（esp.fw_version / esp.power / esp.cred_source）
+     *
+     * `esp.cred_source`：本机身份**从哪来**（`partition` = 分区里的每台一份；`embedded` = 回退到
+     * 固件里的公用凭据）。为什么必须报：回退本身可以接受，**"看不清有没有回退"不可以** ——
+     * 一台漏写分区的机器拿公用身份上线，平台上若与正常机器看不出区别，它会被一直当好设备用下去。
+     * 键名与取值由 SDK 固定（`ONEYE_DEV_CREDS_SHADOW_KEY`），所有伙伴报的完全一致，服务端才能统一告警。
+     * `src_json` 是单个键的 JSON 片段（`{"esp.cred_source":"…"}`），这里去掉它开头的 `{` 后并入本行。 */
     ONEYE_LOGI(ONEYE_DEV_LOG_TAG_BASE,
                "korvo2_oneye 板级自检：%d 项 / 失败 %d 项；固件 %s",
                s_check_total, s_check_failed, ONEYE_FW_VERSION);
     {
-        char shadow[128];
+        char shadow[192];
+        char src_json[64];
+        bool has_src;
+
+        has_src = (oneye_dev_creds_state_json(cred_src, src_json, sizeof(src_json)) == ONEYE_DEV_SDK_OK);
+        if (!has_src) {
+            /* 来源未知（没走到凭据分支）就不报这一项：报一个含糊的值比不报更坏 —— 服务端没法据此告警。 */
+            ESP_LOGW(TAG, "凭据来源未知，不上报 %s", ONEYE_DEV_CREDS_SHADOW_KEY);
+        }
         snprintf(shadow, sizeof(shadow),
-                 "{\"esp.fw_version\":\"%s\",\"esp.power\":true}", ONEYE_FW_VERSION);
+                 "{\"esp.fw_version\":\"%s\",\"esp.power\":true%s%s}",
+                 ONEYE_FW_VERSION, has_src ? "," : "", has_src ? (src_json + 1) : "");
         (void)oneye_dev_base_report_state(shadow);
+        if (has_src) {
+            ESP_LOGI(TAG, "凭据来源已上报：%s=%s", ONEYE_DEV_CREDS_SHADOW_KEY,
+                     oneye_dev_creds_source_str(cred_src));
+        }
     }
 
 #if CONFIG_ONEYE_FW_ENABLE_MPP

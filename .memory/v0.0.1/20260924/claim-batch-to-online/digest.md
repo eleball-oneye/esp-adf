@@ -528,3 +528,68 @@ device_certs=156`，影子与台账都在）：
    "后加能力"（留档）覆盖范围不同；把覆盖窗口写成空结果里的**明确说明**，比让操作员自己猜要值钱。
 ② **后加能力要给它补一条"存量补录"入口**：留档只能覆盖上线之后的签发，存量设备否则永远查不到 ——
    补录把"历史包"接进来，是这类能力上线时的标准配套（安全校验一条都不能省：只收台账当前那张证书）。
+
+## 17. 第九轮：列表分页 + node_id/sn 两栏 + 真机复验"下载的包能不能上线"（2026-09-24）
+
+用户的三个要求：①问清"查询条件里 node 是 node_id 吧？sn 是设备序列号？"；②两个列表都要分页、
+每页 20 条，且**结果里 node_id 与 sn 各占一栏（即使取值相同）**；③把 `E:\tmp\prd-test\claim-package-KORVO2-0000`
+里的产物烧到开发板，验证能否正常上线。
+
+### 17.1 三个编号讲清楚（这轮现场最容易混的一处）
+
+| 名字 | 是什么 | 例 |
+| --- | --- | --- |
+| `node_id` | 平台侧设备身份 = **证书 CN**（来自设备 `creds` 分区） | `KORVO2-0000` |
+| `sn` | **产线标签上的设备编号** | `KORVO2-0000` |
+| `serial` | **证书自身的序列号**（x509 serial，与台账/CRL 同口径） | `4e9a27efdffba844b890c57ad066b502` |
+
+本项目量产口径 **`node_id == sn`**（设计 §8.6 #2；`claim_batch.go` 里 `batchRow{SN: sn, NodeID: sn}`）。
+所以：交付包结果表**拆成 `node_id` / `sn` 两列**（页面还写着"serial 是证书序列号，不是设备编号"）；
+身份视图只有 `node_id`（**影子文档里没有 sn 字段**，页面上写明这点，不是编一列假数据）。
+契约 §4.1 有对照表 —— 把它写进契约是因为**拿设备编号去 CRL 里核吊销**这种错用真的发生过。
+
+### 17.2 分页：服务端切页，且 `count` 与 `total` 是两件事
+
+- 交付包列表：`page` / `page_size`（缺省 20、上限 200；`limit` 是同义旧写法），
+  PG 侧 `SELECT count(*)` + `LIMIT/OFFSET`，两者**共用同一个 WHERE**（各写一遍迟早出现
+  "第 2 页有行、total 说只有 1 页"）。
+- 身份视图：内存快照切页，同一个 `page/page_size` 口径；响应多给一个 `total`（**筛选后**行数）。
+  ⚠️ 它的 `summary` 仍是**全量**口径 ⇒ 页面必须分别标注（"共 N 台 · 第 x/y 页"），
+  否则"卡片 3 台、表里 1 行"会被读成数据对不上账。
+- `Count` = 这一页的条数，`Total` = 匹配总数：只回一页不说总数，分页控件只能靠"这页满没满"猜。
+- 非法页参数（`page=0`、`page_size=0/201/x`）一律 **400**，不静默回第一页。
+- `ledger_match` 的判据从"这一页为空"改成 **`total == 0`**（翻到第 3 页时页里没行 ≠ 查不到）。
+- 前端用设计系统的 `DataTable`，但它这一版的 `pageIndex` 是**写死 0** 的（`pagination: {pageIndex: 0, pageSize}`，
+  Next 只回调 `onNextPage`）⇒ 必须走**服务端分页**那套 props（这也是仓里其它列表的既有做法）。
+- 控制台里每页 20 条只写一处（`CRED_IDENTITY_PAGE_SIZE` / `CLAIM_ARTIFACTS_PAGE_SIZE` + 服务端
+  `artifacts.DefaultPageSize`），免得"接口说 20、页面按 10 排"。
+
+### 17.3 真机复验：**从控制台下载的**交付包 → 上线
+
+真板 Korvo-2 / COM12、SN=`KORVO2-0000`（证书 serial `4e9a27ef…`、指纹 `4b58cd59…`）：
+
+1. 从控制台下载该台的交付包（不是签发时手上那份）→ 解出 `devices/KORVO2-0000/{client.crt,client.key,ca.crt}`；
+2. **先擦掉凭证分区取证**：设备打印 `magic 不是 "ONEYECR1"（ff ff ff…）→ 视为从未写入` +
+   `本构建要求必须有分区凭据 —— 不联网，送产线重新写入`（网络探测全 OK ⇒ **拒绝上云**，fail-closed）；
+3. `mkcreds -zip <下载的包>` → 16384 B、`crc32=f6ed1bb8`、`image_sha256=1801b9c1…`；
+4. `provision-device.ps1` → **exit 0 / PASS**，写 `0x510000` + 回读逐字节一致；
+5. 串口：`凭据来源：creds 分区 node=KORVO2-0000 … crc32=f6ed1bb8`（与清单一致）、
+   `ONEYE-PROV1 … cert_fp=4b58cd59…`（与清单一致）、`link up: mqtt.oneye.me:18886 transport=mqtt-tls`；
+6. `provverify` 用**包里那张证书**验自证串 → **PASS**（7 项，含 ECDSA 验签与防重放）；
+7. 平台侧新增 `scripts/ops/device-online-acceptance.sh` ⇒ **PASS=6 FAIL=0**
+   （门卫 `Client(KORVO2-0000, username=KORVO2-0000, connected=true, subscriptions=6)`；
+   影子 `esp.cred_source=partition`；身份视图 `partition`；证书不在 CRL）。
+   负例 `--sn NOPE-9999` ⇒ PASS=0 FAIL=4 / exit 1（**能失败的门才叫门**）。
+
+> **取证要点**：第 2 步不能省 —— 只"写一遍看到上线"证明不了是这份包起的作用（板子上原来可能
+> 就是同一份身份）。这和 §16 里"先看空结果再补录"是同一个道理。
+
+### 17.4 这轮踩到的两个工具坑（都不是产品缺陷）
+
+1. **`emqx ctl clients list | grep -q` 会假失败**：`set -o pipefail` 下 `grep -q` 命中即关管道，
+   左侧进程收 SIGPIPE ⇒ pipeline 状态非 0。**先落文件再 grep**（`device-online-acceptance.sh` 里注释写明了）。
+2. **PowerShell 脚本里出现空串变量做 grep 模式**：`grep -ci "$EMPTY"` 匹配**每一行**，
+   于是"证书在 CRL 里"这种假 FAIL 就出来了。**拿不到值就跳过并说明**，别拿空串去匹配。
+3. （老朋友又踩一次）**`write` 出来的 .ps1 没有 UTF-8 BOM**：Windows PowerShell 5.1 按 GBK 解码，
+   中文注释把语法读坏 —— 临时的 .ps1 一律**只写 ASCII**（仓里那些 .ps1 带 BOM 是有原因的）。
+

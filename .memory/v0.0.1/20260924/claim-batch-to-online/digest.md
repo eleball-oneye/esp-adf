@@ -248,3 +248,75 @@ CRL 未开（且证书还没有分发点）——两条都写明"放量前必须
    钉 `-tls1_2` 后 5/5 rc=1 且带 `certificate required` 告警。现在自检两者都认（rc≠0 或告警文本）。
 2. **`sed 's/},{/\n/g'` 可以切 JSON 规则，`tr '}' '\n'` 不行** —— 后者会把 topic 里的 `${username}`
    从 `}` 处切断；另外 curl 输出**没有尾换行**，`while read` 会把最后一行整行丢掉（要补一个 `echo`）。
+
+## 11. 第三轮：按"量产生产环境"把 ③ 的"产物可查询"与 ④ 的 TLS/CRL 真正落地（2026-09-24 晚）
+
+### 11.1 ③-a 的收尾：固件产物要能回答"装了哪些模块功能"
+
+`--firmware-preset` 之前只给了"哪些开关生效"的**逐项核对**（`preset-check.txt`）与全集
+（`sdkconfig.txt`，8 万字节）。量产要的是**一眼能答**，所以产物里新增两份：
+
+- **`modules.txt`（人读版清单）**：身份（preset/工具链/IDF/板卡/flash/云端端点/承载/是否强制凭证）、
+  **被链接的 6 个 SDK 预编译归档**（base/mpp/event/log/link/ble，各带 sha256）+
+  **`sdk_src_sha256`**（与 CMake 哨兵同源：源码改过没重生成归档，这里就会变）、
+  按组摘录的生效开关（应用层/无线/承载与加密/音频语音/存储/分区/内存/日志/协议栈）。
+  **"没开"也列**（`# CONFIG_X is not set`）—— 出货事实里"没开"和"开了"一样重要。
+- **`size-components.txt`**：`idf.py size-components` 原文，按组件列 flash/DRAM/IRAM 占用
+  （`liboneye_dev_base.a 92387`、`libmbedtls.a 94329`、`libfatfs.a 194965`…）
+  —— 这是"装了哪些模块"的**硬证据**，也能用来比两次构建的体积漂移。
+
+实测（production 档位真构建）：两份文件都生成（12 KB / 20 KB），`preset-check.txt` 仍 PASS。
+顺带修一个自己造的 bug：编辑时把函数的 `local` 行并进了上一行的注释里 ⇒ `target: unbound variable`
+（`bash -n` 不报，构建时才炸）——**改完 build-all.sh 必须真跑一次构建**，只做语法检查不够。
+
+### 11.2 ④ 的 TLS：控制台真的上 HTTPS 了
+
+- `deployment/console/enable-tls.sh`（新）：装 certbot → HTTP-01（webroot 就是控制台静态根）签发/复用
+  → 证书落到 `/etc/nginx/certs`（key 0600）→ **装续期钩子**（`deploy/00-oneye-reload-nginx.sh`：
+  续成功后同步证书 + reload，否则"续了但 nginx 还用旧证书"）→ 切站点 → 自检（`https 200` 且
+  `ssl_verify_result=0`、`http 301`）。
+- 实测：`https://product-testing.oneye.me/` **200 / verify=0**（外网视角也是），`http` **301**；
+  证书到期 2026-12-23，`certbot.timer` 已排。
+- `install-console.sh` 现在**记得** TLS 状态（`/etc/oneye/console-tls.enabled`）：重部署**不会**
+  把控制台悄悄降回 HTTP（要降得显式 `--no-tls`）；它的自检也改成按实际启用的站点选探针。
+- **两个坑**：① nginx 1.18 **不认** `http2 on;`（≥1.25.1 的语法）⇒ 必须 `listen 443 ssl http2;`；
+  ② 启用 TLS 后 80 只回 301，原来那套"打 `http://127.0.0.1` + `Host:` 头"的断言会**全部读成 301**
+  ⇒ 改成 `--resolve <域名>:443:127.0.0.1 https://<域名>`（**不加 `-k`**，要的就是真校验证书链）。
+
+### 11.3 ④ 的意外收获：申领链路"每请求 1.5~13 s"的停顿（已修，1.5s→0.7ms）
+
+现象：控制台申领页每次 `/claim/v1/claim/batch` 等 1.5~13 s，而 shadowd 的 `/v1/*` 只要 1~3 ms；
+验收脚本的 fresh-token 探测因此偶发 `000`（**不是**验收脚本的锅）。
+定位（`ss -tnp` 抓 socket）：请求期间 claimd 在往 **`169.254.169.254:80`（EC2 实例元数据 IMDS）**
+建连并卡在 `SYN-SENT`。链路是 `claim.CurrentVariant()` → `LoadClaimingConfig()` →
+没设 `CLAIMING_CONFIG_FILE` ⇒ 走 **AWS SSM** ⇒ SDK 解析凭据时探 IMDS；腾讯云 CVM 上那是黑洞地址。
+**而参数读失败没有任何东西可缓存** ⇒ 每个请求都重来一遍。
+修法（语义不变）：`claimd.env` 加 `CLAIMING_CONFIG_FILE=/etc/oneye/claiming-config.json`
+（本环境没有 AWS ⇒ 申领配置走本地文件；文件不存在 = "从未配置" = 与读不到 SSM **同义**）+
+**两个 env 都加** `AWS_EC2_METADATA_DISABLED=true`。
+实测：同一路径 **1.5~13 s → 0.7 ms**；整套 `console-domain-acceptance.sh` 从"偶发 FAIL"变成
+**in-host PASS 24 · FAIL 0**，全程 2.6 s。
+
+### 11.4 ④ 的 CRL：从"一句口号"到"有证据的吊销"
+
+这轮把 CRL 这条链上**四个真缺口**补掉（都是实测发现的，不是读代码猜的）：
+
+| # | 缺口 | 证据 | 修法 |
+| --- | --- | --- | --- |
+| 1 | **名单没人刷新**：平台 CA 的名单停在 2026-09-22（旧 openssl cron 2026-09-21 退役时，"改由签发服务导出"接上了、**定时发布没接**）⇒ 这期间**吊销谁都不生效** | `ls -l` 名单 mtime；`/etc/cron.d` 里只有 dev CA 那条 | `deployment/signer/publish-crl.sh`（导出→校验 issuer/nextUpdate→**原子替换**→`--check`）+ `oneye-crl-publish.timer`（每 6h） |
+| 2 | **签发服务跑在 `/tmp/signerd` 且手工起**：`/tmp` 一清或重启即没，签发与名单导出同时消失且无人知道 | `/proc/<pid>/exe -> /tmp/signerd`、无 systemd 单元 | `install-signerd.sh` → `/opt/oneye/signerd` + `oneye-signerd.service`（Restart=always、开机自起；本机因 CA 在 `/home/ubuntu` 而用 `ProtectHome=read-only`） |
+| 3 | **容器取不到 CRL 端点**：腾讯云 EIP **没有 hairpin**，容器→自己公网 IP`:8080` 必超时 ⇒ 开 `enable_crl_check` 就是**全量拒连** | 容器内 `curl` 12s 超时；`fix-hairpin.sh` 的 DNAT 只覆盖旧网段 `172.18/16` | `docker-compose.yml`：**固定网段 172.28.0.0/16 + `extra_hosts: crl.oneye.me → 172.28.0.1`**（容器内实测 `200 / 1978B / 1.8ms`） |
+| 4 | **新证书不带 DP**：`claimd.env` 的 `CA_CRL_DP_URL` 是空的 ⇒ 即便开了开关，新设备也是"无 DP 证书"（行为随缓存漂移） | `openssl x509 -ext crlDistributionPoints` 为空 | 归一为定稿值 `http://crl.oneye.me:8080/oneye-iot-device-ca.crl`，真签一张验证已带 DP |
+
+**端到端验收件** `scripts/ops/crl-enforcement-check.sh`（可复跑，**不碰生产监听器**）：
+签两张带 DP 的证书 → 吊销其中一张（`/v1/revoke` → PG 台账）→ `publish-crl.sh` 重发 →
+**重启门卫**作废名单缓存 → 临时建 `ssl:crlprobe`（:18887，`enable_crl_check=true`）→ 对照连接：
+未吊销 `ALLOWED`、已吊销 **`remote error: tls: revoked certificate`** → 删掉临时监听器。
+实测 **PASS=9 FAIL=0**。两个坑也记在里面：① **不要用 `emqx_crl_cache:evict/1` 代替重启** ——
+实测 evict 之后门卫反而**放行**被吊销的证书（缓存项清空但对端没重新取名单）；
+② 探针 SNI 必须用门卫证书里的 `mqtt.oneye.me`（控制台域名不在 SAN 里）。
+
+**仍未做（下一步，顺序不能反）**：18886 上 `enable_crl_check` 还是 `false`。
+开之前必须先把现网那台设备**重签成带 DP 的证书**并重新灌注（设计 §3.6.1 的"存量重签"），
+否则无 DP 证书在冷缓存下会被拒。回滚只需把开关改回 false —— 唯一不可逆的点（证书里印的 DP）
+已经印上了。

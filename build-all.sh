@@ -1123,6 +1123,72 @@ build_demo_esp() { # $1=idf 版本, $2=target
     fi
 }
 
+# 固件"装了哪些模块/哪些开关生效"的**人读版清单**（产物 modules.txt）。
+# 判据全部取自**这次构建的真实产物**（bdir/sdkconfig + 被链接的预编译归档 + 板级文件），
+# 不是把 defaults 里的意图复述一遍 —— 这两者在历史上长得一样，而只有前者是真的。
+firmware_modules_manifest() { # $1=产物目录 $2=档位 $3=工具链 id $4=IDF 版本
+    local out="$1" preset="$2" tcid="$3" idfv="$4"
+    local sdkcfg="$out/sdkconfig.txt" lib f first=1
+
+    # sel <标题> <符号前缀…>：把 sdkconfig 里以这些前缀开头的行原样列出，**包含**
+    # `# CONFIG_X is not set`（"关掉了"和"打开了"一样是事实，不能只列 y 的那些）。
+    sel() {
+        local title="$1"; shift
+        local args=() p
+        for p in "$@"; do args+=(-e "^CONFIG_$p" -e "^# CONFIG_$p"); done
+        echo "### $title"
+        if grep -E "${args[@]}" "$sdkcfg" 2>/dev/null | sed 's/^/  /'; then :; else echo "  (无匹配)"; fi
+        echo
+    }
+
+    {
+        echo "# korvo2_oneye 固件组成清单（$(date -u +%Y-%m-%dT%H:%M:%SZ) 生成）"
+        echo "#"
+        echo "# 这份文件回答两个问题：**这版固件装了哪些模块功能**、**哪些开关真的生效了**。"
+        echo "# 三个配套文件：sdkconfig.txt（生效开关全集）、preset-check.txt（逐项核对）、"
+        echo "#              size-components.txt（按组件列体积 = 链接进固件的模块清单）"
+        echo
+        echo "## 0. 身份"
+        echo "  preset            = $preset"
+        echo "  toolchain_id      = $tcid"
+        echo "  idf               = $idfv"
+        echo "  board             = $(grep -m1 '^CONFIG_ESP32_S3_KORVO2_V3_BOARD=' "$sdkcfg" 2>/dev/null || echo '(未确认)')"
+        echo "  flash_size        = $(grep -m1 '^CONFIG_ESPTOOLPY_FLASHSIZE=' "$sdkcfg" 2>/dev/null || echo '(未确认)')"
+        echo "  cloud_endpoint    = $(grep -m1 '^CONFIG_ONEYE_FW_CLOUD_HOST=' "$sdkcfg" 2>/dev/null | cut -d= -f2-):$(grep -m1 '^CONFIG_ONEYE_FW_CLOUD_PORT=' "$sdkcfg" 2>/dev/null | cut -d= -f2-)"
+        echo "  transport_tls     = $(grep -m1 '^CONFIG_ONEYE_FW_TRANSPORT_TLS=' "$sdkcfg" 2>/dev/null || echo '(未开)')"
+        echo "  creds_required    = $(grep -m1 '^CONFIG_ONEYE_DEV_CREDS_REQUIRED=' "$sdkcfg" 2>/dev/null || echo '(未开启)')"
+        echo
+        echo "## 1. onEye 设备 SDK 模块（预编译归档 —— 真正被链接进去的就是这几个）"
+        echo "  sdk_version       = $SDK_VERSION"
+        echo "  sdk_src_sha256    = $(sdk_src_hash 2>/dev/null || echo '(未取到)')   # 与 CMake 哨兵同源：源码改过没重生成归档，这里会变"
+        for lib in "${LIBS[@]}"; do
+            f="$SDK_DIR/lib/$tcid/lib$lib.a"
+            if [ -f "$f" ]; then
+                printf '  %-22s %9s B  sha256=%s\n' "lib$lib.a" "$(stat -c%s "$f" 2>/dev/null || echo '?')" \
+                    "$(sha256sum "$f" 2>/dev/null | cut -c1-16)"
+            else
+                printf '  %-22s %s\n' "lib$lib.a" "**(缺失 —— 该模块没进这份固件)**"
+            fi
+        done
+        echo "  说明：base=核心/凭据与配置、mpp=物模型与属性、event=事件、log=日志、link=链路与重连、ble=蓝牙配网"
+        echo
+        echo "## 2. 关键功能开关（分组摘录；全集见 sdkconfig.txt）"
+        echo
+        sel "应用层（onEye）" ONEYE_
+        sel "板卡与目标" IDF_TARGET ESP32_S3_KORVO2_V3_BOARD
+        sel "无线（Wi-Fi / 蓝牙）" ESP_WIFI_ENABLED ESP_WIFI_SOFTAP_SUPPORT BT_ENABLED BT_BLE_ENABLED BT_NIMBLE_ENABLED BT_BLUEDROID_ENABLED
+        sel "承载与加密（TLS / mbedTLS）" ONEYE_FW_TLS ESP_TLS_ MBEDTLS_CERTIFICATE_BUNDLE MBEDTLS_SSL_PROTO_TLS1_3
+        sel "音频与语音（ADF / esp-sr）" AUDIO_BOARD ESP_SR_ MODEL_IN_FLASH AFE_ ADF_
+        sel "存储与文件系统" FATFS_ SPIFFS_ SDMMC_ ESPTOOLPY_FLASHSIZE
+        sel "分区与启动" PARTITION_TABLE_ BOOTLOADER_
+        sel "内存（PSRAM / 内部保留）" SPIRAM
+        sel "日志" LOG_DEFAULT_LEVEL LOG_MAXIMUM
+        sel "协议栈与 RTOS" MQTT_ LWIP_DHCP LWIP_SNTP FREERTOS_HZ
+        echo "## 3. 各组件体积"
+        echo "  见同目录 size-components.txt（idf.py 原文，按组件列 flash/DRAM/IRAM 占用）"
+    } > "$out/modules.txt" 2>/dev/null || warn "生成 modules.txt 失败"
+}
+
 build_firmware_esp() { # $1=idf 版本, $2=target —— Korvo-2 板级固件（仅 esp32s3；--firmware 时启用）
     local idfv="$1" target="$2" idf cc tcid out ex bdir preset defs certdir emptycerts
     [ "$WITH_FIRMWARE" = "1" ] || return 0
@@ -1179,6 +1245,25 @@ build_firmware_esp() { # $1=idf 版本, $2=target —— Korvo-2 板级固件（
         echo "built_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     } > "$out/preset.txt"
     cp -f "$bdir/sdkconfig" "$out/sdkconfig.txt" 2>/dev/null || true
+
+    # ---- 模块/开关清单：一份给人看的 modules.txt，一份按组件列体积的 size-components.txt ---------
+    # 为什么要这个：sdkconfig.txt 是 8 万字节的全集，"这台固件里到底有哪些模块功能"不该靠 grep 全集回答。
+    # modules.txt 给**分组摘录 + SDK 模块与哈希**；size-components.txt 是 idf.py 的原文，按组件列
+    # flash/IRAM/DRAM 占用 ⇒ "装了哪些模块、各占多大"有硬证据，也便于对比两次构建的体积漂移。
+    firmware_modules_manifest "$out" "$preset" "$tcid" "$idfv"
+    if (
+        set +u
+        . "$idf/export.sh" >/dev/null 2>&1
+        export ADF_PATH="$SCRIPT_DIR"
+        cd "$ex" || exit 4
+        idf.py -B "$bdir" -DSDKCONFIG="$bdir/sdkconfig" -DSDKCONFIG_DEFAULTS="$defs" \
+               -DONEYE_FW_CERT_DIR="$certdir" size-components > "$out/size-components.txt" 2>&1
+    ); then
+        ok "组件体积表已生成（size-components.txt：按组件列占用，= 装了哪些模块的硬证据）"
+    else
+        warn "size-components 未生成（不影响固件本身；modules.txt 仍在）"
+    fi
+
     if [ -f "$ex/tools/check-sdkconfig-defaults.py" ]; then
         if [ "$preset" = "production" ]; then
             python3 "$ex/tools/check-sdkconfig-defaults.py" --sdkconfig "$out/sdkconfig.txt" \

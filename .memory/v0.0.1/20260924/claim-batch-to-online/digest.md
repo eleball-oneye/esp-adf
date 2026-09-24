@@ -320,3 +320,38 @@ CRL 未开（且证书还没有分发点）——两条都写明"放量前必须
 开之前必须先把现网那台设备**重签成带 DP 的证书**并重新灌注（设计 §3.6.1 的"存量重签"），
 否则无 DP 证书在冷缓存下会被拒。回滚只需把开关改回 false —— 唯一不可逆的点（证书里印的 DP）
 已经印上了。
+
+## 12. 第四轮：CRL 收口 —— 存量重签 + 打开开关（2026-09-24 晚，目标第 2 轮）
+
+上一节留的"最后一步"做完了，顺序严格按"先证书、后台账、最后开关"：
+
+1. **存量重签（私钥不出设备）**：从现网证书取公钥（`openssl x509 -pubkey`）→
+   `POST /v1/sign-pub`（signerd）⇒ 只回证书；**校验三件事**：公钥与旧证书**逐字节一致**、
+   带 DP（`URI:http://crl.oneye.me:8080/oneye-iot-device-ca.crl`）、issuer = 平台 CA，且台账多一行。
+   实测：旧序列 `af92322d…` → 新序列 `4e9a27ef…`，notAfter 仍被钳在 CA 到期日 2036-09-17。
+2. **重新灌注**：用现有私钥 + 新证书按交付物格式组一份目录（`manifest.csv` 按声明列）→
+   `mkcreds -zip` 出 `creds.bin`（16384 B、CRC32 `6d2cf73b`、指纹 `4b58cd59…`）→
+   `mkcreds -verify` 自检 → `provision-device.ps1` 写凭证分区并**回读逐字节一致**（PASS）。
+   ⚠️ 一个 Windows 坑：`Compress-Archive` 写进 ZIP 的是**反斜杠**路径（`devices\SN\client.crt`），
+   mkcreds 找不到 ⇒ 必须用 `System.IO.Compression.ZipFile.CreateEntryFromFile` 显式给
+   `devices/SN/client.crt` 这样的正斜杠条目名（WSL/宿主上都没有 `zip`）。
+3. **真机自证**：串口 `ONEYE-PROV1 node_id=KORVO2-0000 cert_fp=4b58cd59…`（= 本地新证书指纹）、
+   `link up: mqtt.oneye.me:18886 transport=mqtt-tls`、`esp.cred_source=partition`、
+   `tx progress: app_tx=5 mqtt_pub=5 … inflight=0/8`（顺带又一次证明 ① 的修复还在生效）。
+4. **吊销被替换的旧序列号**（reason `superseded_by_resign`）+ 重发名单（33 条）。
+   不吊销的话，旧凭证仍然是"有效身份"——这一步容易漏。
+5. **打开 18886 的 `enable_crl_check`** 并重建容器；对照验证（都在**生产监听器**上）：
+   - 真机 `KORVO2-0000` 照常在线（`subscriptions=6`）、平台影子 version 继续自增；
+   - 同批未吊销的带 DP 证书 `ALLOWED`；同批**已吊销**的 `remote error: tls: revoked certificate`。
+6. **`deploy-broker.sh` 新增一条自检**：开着 CRL 检查时，**容器必须取得到名单**（容器连公网 IP
+   没有 hairpin 是实测事实）—— 取不到就直接 FAIL，因为那等于"下一次重启 = 全量设备掉线"。
+
+**踩到的两个坑（都已写进文档/脚本注释）**：
+- **fixture 会过期**：开着 CRL 检查后，`mqtt-isolation-check.sh` 拿**重签前的旧证书**当 fixture
+  ⇒ 所有探针都被 `tls: revoked certificate` 拒掉，看起来像"隔离/链路坏了"，实际是**吊销正常生效**。
+  换证后必须同步更新 fixture（换成设备**当前**那份）。
+- **旧夹具导致的假 FAIL 也顺带成了证据**：`deploy-broker.sh` 第 6 组自检先红后绿，红的正是
+  "被吊销的旧证书连不上"。
+
+**最终状态**：CRL 这条链 ① 端点 ② 定时发布 ③ 签发服务受管 ④ 新证书带 DP ⑤ 容器可达
+⑥ 吊销端到端生效 ⑦ 开关已开 —— 全部有可复跑证据；回滚只需把开关改回 `false`。

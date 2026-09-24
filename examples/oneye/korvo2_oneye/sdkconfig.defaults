@@ -94,6 +94,12 @@ CONFIG_ONEYE_FW_TRANSPORT_TLS=y
 # ---- 开发板的目标平台：**同样钉死** ---------------------------------------------
 # 与承载同理：本工程 Kconfig 的缺省是占位地址（192.168.1.100:0）。sdkconfig 一旦"从 defaults
 # 重新生成"，云端地址就会掉回占位值 ⇒ 设备能起来但**连不到平台**（2026-09-22 真机实测踩到）。
-# 开发/联调的目标 = 自建 EMQX 的 mTLS 监听（18885，与 CRL 检查同一条监听器）。
+#
+# ⚠️ **端口必须与"信任签发 CA 的那台监听器"一致**（2026-09-24 更正，原值 18885）：
+#   台面固件同样要连平台 CA 那台 —— 申领服务签发的设备证书挂在平台 CA（`oneye-iot-device-ca`）下，
+#   而只有 `oneye-platca` 那台 broker 的 cacertfile 是平台 CA（宿主端口 **18886**）。
+#   原来的 18885 是另一台老 CA 的监听器：拿平台证书去连**必被拒**，现象像"证书坏了"。
+#   现在 broker 已收成稳定形态（`backend/deployment/broker/`：一台 broker、两个监听器），
+#   18886 仍然是设备面的固定端口 ⇒ 台面与产线用同一个端点，不再有两套口径。
 CONFIG_ONEYE_FW_CLOUD_HOST="mqtt.oneye.me"
-CONFIG_ONEYE_FW_CLOUD_PORT=18885
+CONFIG_ONEYE_FW_CLOUD_PORT=18886

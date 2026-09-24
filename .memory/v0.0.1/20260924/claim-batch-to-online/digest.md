@@ -380,3 +380,57 @@ CRL 未开（且证书还没有分发点）——两条都写明"放量前必须
 **教训（可复用）**：把某个开关打开，等于给它依赖的那条链**升格**；原来"能跑就行"的环节
 （手工进程、单入口、放 /home 下的 web 根）会立刻变成生产缺陷。开开关后**要按"这条链断了会怎样"
 重新过一遍**，而不是只验开关本身生效。
+
+## 14. 第六轮：交付包"按 node/SN 查回并再次下载"（2026-09-24，用户新需求）
+
+**需求**：控制台「凭据身份」页要能按设备 node 或 SN 查到它那次量产签发的交付 ZIP，并**再次下载**。
+
+**为什么本来做不到**：交付 ZIP 在申领服务里是**流式返回、服务端不留副本**；产线把文件弄丢后，
+唯一能重新拿到凭证的办法是**重签**——而重签会产出第二张同时有效的证书（吊销只能吊销一张），
+正是 `/v1/claim/batch` 一直在防的事。
+
+### 14.1 落地（后端）
+
+- 新包 `src/claim/artifacts`：`Store` 接口 + 内存实现 + `pgstore`（两张表：`claim_batches` 存整批 ZIP、
+  `claim_artifacts` 存逐台记录），与 `devicecert/pgstore` 同一套做法（事务级 advisory lock 建表）。
+- 批量签发时顺手入库：整批 ZIP 原样存一份 + 逐台一行（sn/node/serial/指纹/有效期/该台的 manifest 行/保留期）。
+  响应头新增 **`X-Oneye-Artifact-Stored: 1|0`** —— 入库失败**不影响交付**（包已在手里），但必须让调用方
+  知道"以后还能不能再下载"（否则会默认"存好了"）。控制台把它读出来渲染成提示（CORS 的
+  `Access-Control-Expose-Headers` 也加了这个头）。
+- 批号缺省时**服务端生成**（`B-YYYYMMDD-HHMMSS-xxxx`）：批号是"这一次交付"的定位符，空批号会让这个
+  单位在库里丢失。
+- 两条新路由（都走与签发同一道 `aud=admin` 门）：`GET /v1/claim/artifacts?q=&sn=&serial=&limit=`
+  （元数据，**不含密钥**；查不到=空列表而不是 404）、`GET /v1/claim/artifact?sn=|serial=[&download=1]
+  [&whole_batch=1]`（单台包 / 整批原文）。
+- 单台包 = 从整批 ZIP 里**只取这一台的条目**重打包：`manifest.csv` 只留这一行，`batch.json`/`README.md`
+  **逐字保留原批那份**（它们描述的是这一批，按单台重写会把"这批多少台/批号"改错），私钥标 0600。
+  **不重新签发** —— 验收会比对指纹与台账一致。
+- **保留期** `CLAIM_ARTIFACT_RETENTION_DAYS`（缺省 30 天；`0`=永久）：到点只清**载荷**、元数据留着 ⇒
+  页面仍能回答"这台在某批签过"，但下载给 **410 Gone**（要再拿只能重签），而不是含混的 404。
+- 每次下载：`download_count`/`last_downloaded_at` + 一行审计日志。
+
+### 14.2 落地（控制台）
+
+「凭据身份」页新增第二个卡片"量产交付包（按 node/SN 查询与再次下载）"：一个查询框（node/SN/序列号都走
+`q=`，服务端同时匹配三列）+ 结果表（SN/序列号/批次/签发时间/是否已入库/已下载次数）+「下载本台」/「下载整批」；
+`downloadable=false` 时按钮禁用并显示"已过保留期 —— 需重新签发"。API 层
+`src/api/backend/claim-artifacts.ts`（8 条 vitest 覆盖 200/404/410/503/未配置/文件名/整批）。
+
+### 14.3 实测（真平台，`scripts/ops/claim-package-acceptance.sh`）
+
+`PASS=14 FAIL=0`：签发 200 + `X-Oneye-Artifact-Stored: 1`；按 SN 查到 1 台（downloadable、保留期 30d、
+store=postgres）；再下载得到单台包（含 client.key 模式位 600、manifest 只一行、**指纹与记录一致**）；
+下载计数=1；整批下载 200；未签过 404；匿名 401；PG 两张表都有行。
+控制台验收脚本另加 3 条断言（匿名 401 / 授权可读 / **响应不含密钥材料**），in-host 从 PASS 24 变
+**PASS 28 · FAIL 0**；dashboard 单测 199 条全绿（其中新增 8 条）。
+
+### 14.4 顺带发现并修掉一个**审计缺口**（比功能本身更要紧）
+
+验收时发现 `claimd.log` 里**只有 gateway 的拒连行**：`claim batch issuance`（"谁、哪一批、出了多少张"）
+这类 rlog **Info 级审计行一条都没有** —— 因为 **rlog 的缺省等级是 ErrorLevel**。
+也就是说在这之前"我们有审计"是句空话，控制面动作**没留痕**。
+修法：`claimd.env` 显式 `RLOG={"level":"info"}`（安装脚本已写入并注释为什么这么设）。
+复核：重跑后 `grep -e 'claim batch issuance' -e 're-downloaded' /var/log/oneye/claimd.log` 两行都在。
+
+**教训**：写完"记审计"的代码后必须**去日志里把它找出来**才算数 —— 本次正是"断言审计行存在"这条
+测试把缺口抓出来的（日志既不在 journald 里，等级又不够，"有审计"就变成了想当然）。

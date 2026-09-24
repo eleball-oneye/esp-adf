@@ -888,20 +888,86 @@ static void oneye_start(void)
     {
         char shadow[192];
         char src_json[64];
+        char fields[64];
         bool has_src;
+        oneye_dev_sdk_err_t rrc;
 
-        has_src = (oneye_dev_creds_state_json(cred_src, src_json, sizeof(src_json)) == ONEYE_DEV_SDK_OK);
+        /* 取 SDK 给的 `{"esp.cred_source":"…"}` 的**内层**（去掉外层那一对花括号），
+         * 再把这段并进本行的对象里。
+         *
+         * ⚠️ 这里以前写的是 `src_json + 1`：它只去掉了开头的 `{`，**结尾的 `}` 还留着**，
+         * 于是拼出来的是 `…"partition"}}` —— **多一个花括号 ⇒ 不是合法 JSON**。
+         * 后果（2026-09-24 真机实测，查了几轮才定位）：`oneye_dev_base_report_state()`
+         * 返回 INVALID（参数非法），设备**从来没上报过影子** ⇒ 平台侧没有影子文档，
+         * 控制台的节点页与身份视图都看不到这台设备；而当时调用处是 `(void)…` 加一句
+         * 无条件的"凭据来源已上报"，所以串口上看起来一切正常。
+         * 修法：成对地去括号，并且**校验形状**（不是 `{…}` 就当作没有这一段，不硬拼）。 */
+        has_src = false;
+        if (oneye_dev_creds_state_json(cred_src, src_json, sizeof(src_json)) == ONEYE_DEV_SDK_OK) {
+            size_t n = strlen(src_json);
+            if (n >= 2u && src_json[0] == '{' && src_json[n - 1u] == '}' && (n - 2u) < sizeof(fields)) {
+                memcpy(fields, src_json + 1, n - 2u);
+                fields[n - 2u] = '\0';
+                has_src = true;
+            }
+        }
         if (!has_src) {
-            /* 来源未知（没走到凭据分支）就不报这一项：报一个含糊的值比不报更坏 —— 服务端没法据此告警。 */
+            /* 来源未知（或形状不对）就不报这一项：报一个含糊/拼坏的值比不报更坏 ——
+             * 服务端要么没法据此告警，要么整帧解不开（那正是这次踩到的坑）。 */
             ESP_LOGW(TAG, "凭据来源未知，不上报 %s", ONEYE_DEV_CREDS_SHADOW_KEY);
         }
         snprintf(shadow, sizeof(shadow),
                  "{\"esp.fw_version\":\"%s\",\"esp.power\":true%s%s}",
-                 ONEYE_FW_VERSION, has_src ? "," : "", has_src ? (src_json + 1) : "");
-        (void)oneye_dev_base_report_state(shadow);
-        if (has_src) {
-            ESP_LOGI(TAG, "凭据来源已上报：%s=%s", ONEYE_DEV_CREDS_SHADOW_KEY,
-                     oneye_dev_creds_source_str(cred_src));
+                 ONEYE_FW_VERSION, has_src ? "," : "", has_src ? fields : "");
+
+        /* ⚠️ 这个返回值**必须看**（2026-09-24 修正）。
+         *
+         * 原来是 `(void)oneye_dev_base_report_state(shadow);` —— 紧接着无条件打印了一句
+         * "凭据来源已上报"，于是**失败与成功在串口上长得一模一样**。真机实测的后果：
+         * 设备在平台侧**没有影子文档**（身份视图/节点页都看不到它），而现场日志只在说"已上报"。
+         * 上报失败常见于链路刚起（`bint_guard_link` 要求 initialized && started && connected），
+         * 所以这里失败**重试一次**并两次都把错误码打出来 —— 让"没报上去"这件事不再需要靠猜。 */
+        rrc = oneye_dev_base_report_state(shadow);
+        if (rrc != ONEYE_DEV_SDK_OK) {
+            ESP_LOGW(TAG, "影子上报失败（第 1 次）：%s —— 2 s 后重试", oneye_dev_strerror(rrc));
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            rrc = oneye_dev_base_report_state(shadow);
+        }
+        if (rrc == ONEYE_DEV_SDK_OK) {
+            ESP_LOGI(TAG, "影子上报成功（shadow/up，含 %s）：%s", ONEYE_DEV_CREDS_SHADOW_KEY, shadow);
+            if (has_src) {
+                ESP_LOGI(TAG, "凭据来源已上报：%s=%s", ONEYE_DEV_CREDS_SHADOW_KEY,
+                         oneye_dev_creds_source_str(cred_src));
+            }
+        } else {
+            ESP_LOGE(TAG, "影子上报**失败**（重试后仍为 %s）—— 平台侧将看不到 %s，"
+                          "设备在控制台的节点页/身份视图里不会出现",
+                     oneye_dev_strerror(rrc), ONEYE_DEV_CREDS_SHADOW_KEY);
+        }
+
+        /* 上报返回 OK 只代表"已入发送队列"，**不代表已经发到线上**。
+         * 2026-09-24 真机就撞上了这个区别：串口说上报成功、broker 上却一帧都没有。
+         * 所以这里把 SDK 自己的收发计数与链路状态一并打出来 —— 让"入队了但没发出去"这件事
+         * 在串口上就能分辨（tx_frames 不涨 = 发送路径没走通；dropped_frames 涨 = 被丢弃）。 */
+        {
+            oneye_dev_base_stats_t st;
+            oneye_dev_link_status_t ls;
+            oneye_dev_sdk_err_t src, lrc;
+            /* ⚠️ 这两个结构体带 struct_size/api_version ABI 守卫（所有 SDK 结构体都带）：
+             * 不初始化就调用，getter 会直接返回 INVALID 而**什么都不写** —— 第一版诊断就这么
+             * 静默失效了（串口一行都没多）。`ONEYE_DEV_STRUCT_INIT` 就是干这个的。 */
+            memset(&st, 0, sizeof(st));
+            ONEYE_DEV_STRUCT_INIT(st);
+            memset(&ls, 0, sizeof(ls));
+            ONEYE_DEV_STRUCT_INIT(ls);
+            src = oneye_dev_base_get_stats(&st);
+            lrc = oneye_dev_base_get_link_status(&ls);
+            ESP_LOGI(TAG, "[cloud-stats] stats_rc=%d link_rc=%d tx_frames=%u rx_frames=%u dropped=%u retries=%u cloud_link_up=%d transport=%s",
+                     (int)src, (int)lrc,
+                     (unsigned)st.tx_frames, (unsigned)st.rx_frames,
+                     (unsigned)st.dropped_frames, (unsigned)st.publish_retries,
+                     (int)ls.cloud_link_up,
+                     oneye_dev_transport_str(ls.transport));
         }
     }
 

@@ -68,6 +68,13 @@
 #   ./build-all.sh --toolchains esp32s3@5.5.5 --firmware     # 额外构建 Korvo-2 板级固件
 #
 # 固件轨（--firmware，可选；仅对 esp32s3 生效）：
+#   ./build-all.sh --toolchains esp32s3@5.5.5 --firmware                        # 缺省 = 量产档位
+#   ./build-all.sh --toolchains esp32s3@5.5.5 --firmware --firmware-preset bench # 台面验证档位
+#   档位决定叠加哪些 defaults 与是否嵌证书：production 叠加 sdkconfig.defaults.production
+#   且不嵌证书（分区凭据是唯一来源，构建期红线守卫会拦下"同时嵌证书"）；bench 只到 esp32s3
+#   （台面形态：SD 卡 Wi-Fi 文件、本地验证面），并按需嵌 main/certs 做一机一密自测。
+#   产物含 **sdkconfig.txt（这份固件真正生效的全部开关）** 与 **preset-check.txt（逐项核对）**，
+#   即"这份固件到底装了什么"可以从产物本身回答，不必靠记忆。
 #   构建 examples/oneye/korvo2_oneye（ESP32-S3-Korvo-2 板级固件：板级参数自检 + oneye-dev-sdk 接入），
 #   产物落 output/firmware/<toolchain-id>/korvo2_oneye/{.bin,.elf,bootloader,partition-table,build.log,SHA256SUMS}。
 #   前置：ADF v2.8 官方仅支持 IDF v5.1–v5.5 ⇒ 请用 esp32s3@5.5.5（6.0.x 会因 esp-sr 依赖 json 而失败）。
@@ -92,6 +99,8 @@ DEPS_STRICT=0
 VENDOR_IDF_HEADERS=0
 DEPS_LIST_ONLY=0
 WITH_FIRMWARE=0
+# 固件档位（见 --firmware-preset 的解析处说明）：production = 出货形态（缺省），bench = 台面验证形态
+FIRMWARE_PRESET="production"
 TRANSPORT="mqtt-tcp,mqtt-tls,mqtt-ws,mqtt-wss"
 
 VENDOR_CJSON_PREFIX="oev_cjson_"
@@ -126,6 +135,7 @@ while [ $# -gt 0 ]; do
         --deps-list)     DEPS_LIST_ONLY=1; shift ;;
         --vendor-idf-headers) VENDOR_IDF_HEADERS=1; shift ;;
         --firmware)      WITH_FIRMWARE=1; shift ;;
+        --firmware-preset) FIRMWARE_PRESET="${2:-}"; shift 2 ;;
         --no-deps)       DEPS_MODE="none"; shift ;;
         --clean)         DO_CLEAN=1; shift ;;
         --list)          DO_LIST=1; shift ;;
@@ -133,6 +143,18 @@ while [ $# -gt 0 ]; do
         *) err "未知参数：$1"; usage; exit 2 ;;
     esac
 done
+
+# 固件档位：production（**缺省**，出货用）/ bench（台面验证用）。
+# 缺省选 production 是刻意的：量产固件必须是"默认就能拿到"的那一份，而台面形态要显式要 ——
+# 否则"忘了叠加量产预设"就会把台面固件发出去（那正是 2026-09-23 之前的状态）。
+case "$FIRMWARE_PRESET" in
+    production|bench) ;;
+    "") FIRMWARE_PRESET="production" ;;
+    *) err "未知 --firmware-preset：$FIRMWARE_PRESET（可选 production | bench）"; exit 2 ;;
+esac
+if [ "$WITH_FIRMWARE" = "0" ] && [ "$FIRMWARE_PRESET" != "production" ]; then
+    warn "--firmware-preset $FIRMWARE_PRESET 只在 --firmware 时生效（本次未构建固件）"
+fi
 
 # ------------------------------------------------- SDK 与输出目录自动探测
 if [ -z "$SDK_DIR" ]; then
@@ -1102,7 +1124,7 @@ build_demo_esp() { # $1=idf 版本, $2=target
 }
 
 build_firmware_esp() { # $1=idf 版本, $2=target —— Korvo-2 板级固件（仅 esp32s3；--firmware 时启用）
-    local idfv="$1" target="$2" idf cc tcid out ex bdir
+    local idfv="$1" target="$2" idf cc tcid out ex bdir preset defs certdir emptycerts
     [ "$WITH_FIRMWARE" = "1" ] || return 0
     if [ "$target" != "esp32s3" ]; then
         warn "固件轨仅支持 esp32s3（ESP32-S3-Korvo-2），跳过：$target"
@@ -1113,9 +1135,24 @@ build_firmware_esp() { # $1=idf 版本, $2=target —— Korvo-2 板级固件（
     tcid="$(basename "$cc" | sed 's/-gcc$//')-gcc-$("$cc" -dumpversion)"
     ex="$SCRIPT_DIR/examples/oneye/korvo2_oneye"
     [ -d "$ex" ] || { warn "固件工程不存在：examples/oneye/korvo2_oneye"; return 2; }
-    out="$OUT_ROOT/firmware/$tcid/korvo2_oneye"; mkdir -p "$out"
-    bdir="$OUT_ROOT/.build/korvo2_oneye-$tcid"
-    info "构建 Korvo-2 板级固件 korvo2_oneye（$target @ IDF v$idfv）→ output/firmware/$tcid/korvo2_oneye/"
+
+    # ---- 档位决定"用哪些 defaults + 嵌不嵌证书"------------------------------------------------
+    # production：叠加 sdkconfig.defaults.production，且 **不嵌证书**（`ONEYE_DEV_CREDS_REQUIRED=y`
+    #   与内嵌证书同时成立时 CMakeLists 会直接 FATAL —— 那是"漏写分区的机器拿公用身份上线"的红线）。
+    # bench：只叠加到 esp32s3（台面形态：SD 卡 Wi-Fi 文件、本地验证面都开着），并按需嵌 main/certs
+    #   —— 台面一机一密自测要用它。
+    preset="$FIRMWARE_PRESET"
+    defs="sdkconfig.defaults;sdkconfig.defaults.esp32s3"
+    certdir="$ex/main/certs"          # bench：目录不存在/不齐时 CMakeLists 自动视为"不嵌入"
+    if [ "$preset" = "production" ]; then
+        defs="$defs;sdkconfig.defaults.production"
+        emptycerts="$OUT_ROOT/.build/empty-certs-$tcid"; mkdir -p "$emptycerts"
+        certdir="$emptycerts"
+    fi
+
+    out="$OUT_ROOT/firmware/$tcid/korvo2_oneye-$preset"; mkdir -p "$out"
+    bdir="$OUT_ROOT/.build/korvo2_oneye-$preset-$tcid"
+    info "构建 Korvo-2 板级固件 korvo2_oneye（档位 **$preset**，$target @ IDF v$idfv）→ output/firmware/$tcid/korvo2_oneye-$preset/"
     (
         set +u
         . "$idf/export.sh" >/dev/null 2>&1
@@ -1123,21 +1160,47 @@ build_firmware_esp() { # $1=idf 版本, $2=target —— Korvo-2 板级固件（
         export CCACHE_ENABLE="${CCACHE_ENABLE:-0}"   # 并行构建时 ccache 竞争会 ICE
         cd "$ex" || exit 4
         rm -rf "$bdir" build                          # 残留 build 会让 set-target 静默回退
-        idf.py -B "$bdir" set-target "$target" > "$out/build.log" 2>&1 \
-            && idf.py -B "$bdir" build >> "$out/build.log" 2>&1
-    ) || { warn "korvo2_oneye 构建失败（见 firmware/$tcid/korvo2_oneye/build.log）"; return 2; }
+        # 独立 SDKCONFIG（不碰工程开发用 sdkconfig）+ 显式 defaults 链 + 显式证书目录
+        idf.py -B "$bdir" -DSDKCONFIG="$bdir/sdkconfig" -DSDKCONFIG_DEFAULTS="$defs" \
+               -DONEYE_FW_CERT_DIR="$certdir" \
+               set-target "$target" > "$out/build.log" 2>&1 \
+            && idf.py -B "$bdir" -DSDKCONFIG="$bdir/sdkconfig" -DSDKCONFIG_DEFAULTS="$defs" \
+                      -DONEYE_FW_CERT_DIR="$certdir" build >> "$out/build.log" 2>&1
+    ) || { warn "korvo2_oneye[$preset] 构建失败（见 firmware/$tcid/korvo2_oneye-$preset/build.log）"; return 2; }
 
-    # 板卡选择核对（sdkconfig 落在**工程目录**，不在构建目录）
+    # ---- 出货自证：这份固件**到底装了什么**（量产要能查，而不是"应该叠了"）----------------------
+    {
+        echo "preset=$preset"
+        echo "sdkconfig_defaults=$defs"
+        echo "cert_dir=$certdir"
+        echo "sdk_version=$SDK_VERSION"
+        echo "toolchain_id=$tcid"
+        echo "idf=$idfv"
+        echo "built_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "$out/preset.txt"
+    cp -f "$bdir/sdkconfig" "$out/sdkconfig.txt" 2>/dev/null || true
+    if [ -f "$ex/tools/check-sdkconfig-defaults.py" ]; then
+        if [ "$preset" = "production" ]; then
+            python3 "$ex/tools/check-sdkconfig-defaults.py" --sdkconfig "$out/sdkconfig.txt" \
+                --require sdkconfig.defaults.production > "$out/preset-check.txt" 2>&1 \
+                && ok "量产预设逐项核对通过（见 preset-check.txt）" \
+                || { warn "量产预设核对**未通过**（见 firmware/$tcid/korvo2_oneye-$preset/preset-check.txt）"; }
+        else
+            python3 "$ex/tools/check-sdkconfig-defaults.py" --sdkconfig "$out/sdkconfig.txt" \
+                > "$out/preset-check.txt" 2>&1 || true
+        fi
+    fi
+    # 板卡选择核对（用**这份构建**的 sdkconfig，不再读工程目录那个 —— 工程 sdkconfig 已不参与构建）
     grep -E '^CONFIG_IDF_TARGET=|^CONFIG_IDF_TARGET_ESP32S3=|^CONFIG_ESP32_S3_KORVO2_V3_BOARD=' \
-        "$ex/sdkconfig" > "$out/board-config.txt" 2>/dev/null || true
+        "$out/sdkconfig.txt" > "$out/board-config.txt" 2>/dev/null || true
     cp -f "$bdir"/korvo2_oneye.bin "$bdir"/korvo2_oneye.elf "$bdir"/bootloader/bootloader.bin \
-          "$bdir"/partition_table/partition-table.bin "$out/" 2>/dev/null || true
+          "$bdir"/partition_table/partition-table.bin "$bdir"/srmodels/srmodels.bin "$out/" 2>/dev/null || true
     ( cd "$out" && sha256sum ./*.bin ./*.elf > SHA256SUMS 2>/dev/null ) || true
     if grep -q '^CONFIG_IDF_TARGET_ESP32S3=y' "$out/board-config.txt" 2>/dev/null \
        && grep -q '^CONFIG_ESP32_S3_KORVO2_V3_BOARD=y' "$out/board-config.txt" 2>/dev/null; then
-        ok "korvo2_oneye 构建通过（板卡选择已核对：esp32s3 + KORVO2_V3）"
+        ok "korvo2_oneye[$preset] 构建通过（板卡选择已核对：esp32s3 + KORVO2_V3）"
     else
-        warn "korvo2_oneye 构建完成，但 board-config.txt 未确认 esp32s3 + KORVO2_V3（请人工核对）"
+        warn "korvo2_oneye[$preset] 构建完成，但 board-config.txt 未确认 esp32s3 + KORVO2_V3（请人工核对）"
     fi
 }
 

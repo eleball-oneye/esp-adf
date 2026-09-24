@@ -102,12 +102,14 @@ host 单测 **21 组 / 250 用例 / 断言 3568 次 / 失败 0**。
 不再依赖 docker 网桥 IP（上一批就是用它顶的，而它会随容器重建变化）。历史四台实验容器只 `stop` 不 `rm`。
 `deploy-broker.sh` 自检 3/3：平台 CA 证书被接受、无证书被拒、1883 只绑回环。
 
-ACL 从历史的 `{allow, all}` 收成"未认证一律拒绝"，但 ⚠️ **按设备隔离 topic 没做成**（实测）：
+ACL 从历史的 `{allow, all}` 收成"未认证一律拒绝"，但当时 ⚠️ **按设备隔离 topic 没做成**（实测）：
 EMQX 5.8.6 的**文件型 ACL 里 `%u` 与 `${username}` 占位符都不展开**（三种写法都试了；
-只有把 node 写死才有效，不可扩展）。当前强度 = "必须持 CA 签发的证书"，**不等于**"只能访问自己的面"。
+只有把 node 写死才有效，不可扩展）。当时强度 = "必须持 CA 签发的证书"，**不等于**"只能访问自己的面"。
+→ **当晚已补做，见 §10.3**（换授权源而不是继续在文件里想办法）。
 
 ⚠️ 顺带查出一个**未修的生产级缺口**：**broker 重启后 shadowd 不重新订阅**
 （`clients list` 显示 `subscriptions=0`，设备上行全部丢失且无任何告警，必须重启 shadowd 才恢复）。
+→ **当晚已修，见 §10.2**。
 
 ### 7.4 还踩到一个"更贵的坑"：预编译库与源码脱节
 
@@ -136,22 +138,113 @@ EMQX 5.8.6 的**文件型 ACL 里 `%u` 与 `${username}` 占位符都不展开**
   与 `/tmp/oneye-prodcheck/`（**纯量产预设**，门禁跑在这份上）
 - 串口：`E:\workspace\board-online.log`
 - 门禁：`check-sdkconfig-defaults.py --require sdkconfig.defaults.production` ⇒ **PASS**（11/11 + 32 + 14）
+- broker 落点（§10）：`/home/ubuntu/oneye-broker/{docker-compose.yml, acl.conf, sync-authz.sh, api-keys.txt}`
+  （`api-keys.txt` = 管理 API 密钥，0640 root:1000，**不入库**）；隔离验收探针 `/tmp/mqttprobe`（linux/amd64）
+  + 设备证书 `/tmp/probe-cr/{ca.crt,client.crt,client.key}`（取自本批交付物 `devices/KORVO2-0000/`）
 
 ## 9. 遗留（下一轮可做）
 
 1. **链路建立后那一段为什么把 drain 挡住 ~70 s**（§7.2 的间接原因，未深挖）：订阅是串行等待的
    （`oneye_mqtt_subscribe(..., 2000)` × 每面一条），实测每条约 10 s 才轮到下一条，
    怀疑 SUBACK 在 wait 期间没被消费（`mqtt_wait_for` 里有 `mqtt_pump`，但现象是每条都耗满超时）。
-   现在有 `tx progress` 的时间线，下次直接用"订阅耗时"日志定位，不必再猜。
-2. **broker 重启后 shadowd 不重新订阅**（§7.3）——生产形态下必须先修，否则任何 broker 重启都会
-   静默丢掉全部设备上行。
-3. **按设备隔离 topic 未实现**（§7.3）：EMQX 5.8.6 文件 ACL 不支持占位符；要真隔离得换
-   内置库授权 / HTTP 授权源（或加一层网关）。
-4. 台面验证固件与量产固件的差异（Wi-Fi 文件开关）应由 `build-all.sh` 的一个显式档位产出，
-   而不是每次手写 defaults；顺带把"固件里到底装了哪些模块"变成可查询的事实。
+   → **当晚定位并修掉，见 §10.1**（真因比"SUBACK 没消费"更朴素：每次 wait 都**超时**，不是没消费）。
+2. **broker 重启后 shadowd 不重新订阅** → **已修（§10.2）**。
+3. **按设备隔离 topic 未实现**：EMQX 5.8.6 文件 ACL 不支持占位符。 → **已落地（§10.3）**：
+   换 `built_in_database` 授权源，那里的 `${username}` 会展开。
+4. 台面/量产固件差异应由 `build-all.sh` 显式档位产出，并让"固件里到底装了哪些模块"可查
+   → **已做（§10.4，`--firmware-preset`）**。
+5. 仍留着的（**未做，已写进 `backend/docs/ops/量产上线前检查单.md`**）：控制台 TLS（配置已备好、未放证书）、
+   CRL 落地（`enable_crl_check=false`，先要有可用 CRL 端点，否则 https 端点失败 = 全量拒连）、
+   shadowd 单实例、eFuse 防克隆与凭证分区加密（已拍板不做，靠吊销兜底）。
 
-1. **设备侧 `shadow/up` 没发出来** —— 这是"控制台看得见设备"的唯一卡点（问题 3），要先在 SDK 里
-   把 `report_state` 的返回值暴露出来（别 `(void)`），再定位是 guard/队列/payload 哪一步失败。
-2. `caps/up` 的 `model_version` 类型漂移（问题 4）：设备发 string、服务端要 int，二选一改齐 + 加契约断言。
-3. shadowd 生产形态：一台 broker（平台 CA 的 mTLS 监听 + 内部明文监听），别再用 docker 网桥 IP 指 broker。
-4. 台面验证固件与量产固件的差异（Wi-Fi 文件开关）应当由 `build-all.sh` 的一个显式档位产出，而不是手写 defaults。
+## 10. 第二轮：把四个"量产口径"缺口逐条收口（2026-09-24 晚）
+
+口径是用户定的：**"按照量产生产环境来要求"** —— 判据不是"开发跑通了"，而是"出货后错了要能查、能收、能停"。
+
+### 10.1 ① 链路建立后 ~70 s 的 drain 停顿：真因是"订阅等待每次都超时"
+
+现象：`link-up subscribe phase took 60709 ms`，这段里发送线程被占住 ⇒ 首帧影子躺过 TTL。
+第一版怀疑"SUBACK 在等的时候没被消费"，于是把每条订阅的等待上限收到 500 ms —— **没用**（总量仍是 60 s 级），
+说明**每个 wait 都耗满了自己的超时**，而不是慢。
+真因：`bint_subscribe_mqtt_all()` 一条条**阻塞**等 SUBACK，而那时序上 SUBACK 根本没到（或没被 pump）⇒
+每条都等满 ⇒ 串起来 60 s+。
+修法：**订阅全部改成非阻塞**（`oneye_mqtt_subscribe(..., 0)`），并**去掉重复的那次 `oneye_mqtt_resubscribe`**；
+`SUBACK` 返回 `0x80` 时打日志（被拒的订阅以前**完全无声**）。
+另加：`bint_drain_tx()` 每 10 s 打一行 `tx progress`（app 计数 | MQTT 计数 | txq/slots/inflight），
+`-7`（保留重试）/其它错误（丢弃）/TTL 过期三条路径**都留话且限频**。
+**闭环证据**：真机日志不再出现 subscribe phase 警告；`app_tx=5` 在 10 s 内出现；无 `tx expired`。
+
+### 10.2 ② shadowd 重连后不恢复订阅（生产级：broker 一重启就静默丢全部上行）
+
+真因：paho 的自动重连**只重建 TCP/MQTT 会话，不重放订阅**（`clients list` 里 `subscriptions=0`，且无告警）。
+修法：`subTracker` 包一层 paho 客户端，`Subscribe/Unsubscribe` 时记账，`SetOnConnectHandler` 里重放；
+`SetConnectionLostHandler` 打 WARN（以前断了也没声）。
+单测：`subtracker_test.go` 用假 token/假客户端覆盖"无订阅不重放 / 全量重放 / 去重 / 单条失败不阻断"。
+**闭环证据**：`docker restart oneye-broker` ⇒ shadowd `WARN mqtt 连接断开：EOF` → `INFO mqtt 重连后已恢复 6 条订阅`，
+门卫侧 `subscriptions=6`。
+
+### 10.3 ③-b 按设备隔离 topic：换授权源，一条模板规则覆盖全部设备
+
+**关键判断：不要继续在文件 ACL 里想办法。** 文件源不展开占位符（实测），但
+**内置数据库授权源（`built_in_database`）的模板占位符会展开** —— 实测矩阵：
+| 规则 topic | 订自己的 | 订别人的 |
+| --- | --- | --- |
+| `rmng/dev/KORVO2-0000/#`（写死） | ALLOWED | DENIED |
+| `rmng/dev/${username}/#` | **ALLOWED** | **DENIED** |
+| `rmng/dev/%u/#` | DENIED | DENIED（`%u` 不是这个源的语法） |
+| `rmng/dev/${clientid}/#` | DENIED（探针 clientid 是随机的） | DENIED |
+于是：一条 `rmng/dev/${username}/#`（allow all）覆盖全部设备，**新增设备不需要动 broker 配置**
+（生成式 ACL 的不可扩展问题一并消失）。落地件：
+
+- `deployment/broker/acl.conf`：只留控制面 shadowd；**删掉**给设备的整体放行，**也删掉 `{deny, all}`**
+  （⚠️ 文件源里留一条"什么都拒"会让排在后面的授权源**永远轮不到被查**，隔离直接失效；兜底靠 `no_match=deny`）。
+- `deployment/broker/sync-authz.sh`：幂等注入（一致就跳过；不一致才重写）+ `emqx ctl authz cache-clean all`
+  （不清缓存会读到 1 分钟前的旧结论）+ 规则摘要打印；`--strict` = 最小权限档（publish 仅 `+/up`、
+  subscribe 仅 `+/down` 与 `ota/notify`）。
+- `docker-compose.yml`：`sources = [built_in_database, file]`；新增只绑回环的 `18083`（管理 API）
+  与 API Key 引导文件 `api-keys.txt`（`EMQX_API_KEY__BOOTSTRAP_FILE`，格式 `key:secret:administrator`）。
+- `deploy-broker.sh`：生成/沿用 API Key（**0640 root:1000** —— 0600 root:root 会让容器里 uid 1000 的 EMQX
+  读不到，日志 `failed_to_open_the_bootstrap_file`，随后所有 API 调用 401；而且引导文件**只在启动时读一次**，
+  改完要 recreate 容器 ⇒ 脚本会先实测 API Key，不通用就 `--force-recreate`）；跑 sync-authz；第 6 组自检
+  = 按设备隔离验收（给了 `ISOLATION_CREDS/ISOLATION_NODE` 才跑）。
+
+**验收件 `backend/scripts/ops/mqtt-isolation-check.sh`（含两个"不这么做就会自欺"的点）**：
+1. **订阅侧的判据是 SUBACK 返回码，不是 token error** —— paho 对 `0x80` **不设** `token.Error()`
+   （`net.go` 只写 `subResult`）⇒ 原来的探针把"被拒"读成"通过"，一度让整个实验结论反过来。必须读
+   `SubscribeToken.Result()`。
+2. **发布侧客户端看不到拒绝**（EMQX `deny_action=ignore`），且门卫**会节流同类日志**
+   （实测 `log_events_throttled_during_last_period` 把拒绝日志丢掉 ⇒ grep 日志同样会把"拒绝"读成"没拒绝"）。
+   所以发布侧判据用管理 API 的 `authorization.deny` 计数增量，并配一条"发自己的 topic 不该涨"的正向对照。
+3. 每次探测换一个 clientid / 清授权缓存：EMQX 按 client 缓存授权结果 1 分钟，复用 clientid 会串结论。
+
+**实测结论**：`PASS=6 FAIL=0`（自己订阅 ALLOWED；别人的 command/down、别人的通配、全体通配全 DENIED(0x80)；
+发布自己不计拒绝、发布别人计入拒绝）。**反向对照**：故意把规则写成 `rmng/dev/NEGCTL-0000/#` ⇒ 脚本
+`FAIL=2`、退出码 1（证明它不是"永远 PASS"）。**strict 档位**：6/6 通过、真机照常上报
+（shadow version 98→100）、且"订阅自己的 `shadow/up`"被判拒（own-prefix 档位下允许）。
+真机在隔离生效后仍然正常：门卫 `KORVO2-0000 … subscriptions=6`、平台 shadow version 连续自增、
+最近 5 分钟只有探针那次预期的拒绝。
+
+### 10.4 ③-a 固件档位（`--firmware-preset`）：把"发的是哪一版"变成产物自带的事实
+
+`sdkconfig.defaults`（台面：Wi-Fi 文件 + PANEL_API）与 `sdkconfig.defaults.production`（量产：强制凭证、
+不内嵌证书、关 Wi-Fi/面板）以前靠"记得叠加哪个"，且用哪个 defaults 只有构建命令知道。
+现在 `build-all.sh --firmware-preset production|bench`（缺省 `production`，写错即 exit 2）：
+产物目录 `output/firmware/<tcid>/korvo2_oneye-<preset>/`，并写入 `preset.txt`、`sdkconfig.txt`、
+`preset-check.txt`（逐项生效开关）、`board-config.txt`、`srmodels.bin`、`SHA256SUMS`。
+实测两份真构建：production ⇒ `WIFI_FILE is not set` / `PANEL_API is not set` / `CREDS_REQUIRED=y` /
+`CLOUD_PORT=18886`；bench ⇒ `WIFI_FILE=y` / `PANEL_API=y` / 无 `CREDS_REQUIRED`。
+
+### 10.5 ④ 控制台/账号/密钥：把"现状"和"缺口"分开写清
+
+新增 `backend/docs/ops/量产上线前检查单.md`（§0 一页结论 + 逐条可复跑验证命令 + §6 缺口与已接受风险），
+以及可直接启用的 `deployment/console/nginx/oneye-console-tls.conf`（443 + 80→301、TLS1.2/1.3、ACME 目录、
+安全头、与现有 origin 同构路由）。**没有假装收口**：控制台今天仍是 HTTP（安全组限源 IP）、
+CRL 未开（且证书还没有分发点）——两条都写明"放量前必须做"及顺序。
+
+### 10.6 这轮又踩到的两个"工具级"坑（写下来免得重犯）
+
+1. **`openssl s_client` 的 mTLS 反向自检在 TLS1.3 下不可靠**：不客户端证书时 `-brief` 形式
+   5 次里 4 次 **rc=0**（TLS1.3 的"证书缺失"拒绝发生在握手之后）⇒ 自检会报"居然放行了"。
+   钉 `-tls1_2` 后 5/5 rc=1 且带 `certificate required` 告警。现在自检两者都认（rc≠0 或告警文本）。
+2. **`sed 's/},{/\n/g'` 可以切 JSON 规则，`tr '}' '\n'` 不行** —— 后者会把 topic 里的 `${username}`
+   从 `}` 处切断；另外 curl 输出**没有尾换行**，`while read` 会把最后一行整行丢掉（要补一个 `echo`）。

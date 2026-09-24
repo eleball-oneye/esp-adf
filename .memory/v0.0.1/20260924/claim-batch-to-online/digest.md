@@ -355,3 +355,28 @@ CRL 未开（且证书还没有分发点）——两条都写明"放量前必须
 
 **最终状态**：CRL 这条链 ① 端点 ② 定时发布 ③ 签发服务受管 ④ 新证书带 DP ⑤ 容器可达
 ⑥ 吊销端到端生效 ⑦ 开关已开 —— 全部有可复跑证据；回滚只需把开关改回 `false`。
+
+## 13. 第五轮：开开关**之后**才暴露的两个坑（名单服务本身）
+
+打开 `enable_crl_check` 的那一刻，8080 这个端口就从"一个静态文件服务"变成"设备能不能连上"的
+必经环节（取不到名单 ⇒ 冷缓存时全量拒连）。于是两个原本只是"脆弱"的东西立刻成了生产缺陷：
+
+1. **名单服务是手工起的 python httpd**（`setsid nohup python3 -m http.server 8080`）——
+   没有单元在管、重启即没。已换成 **nginx**（systemd、开机自起），配置见
+   `deployment/signer/nginx-crl.conf`，由 `install-signerd.sh` 第 6 步安装（会先停掉占着 8080
+   的手工 httpd 再 reload）。
+   ⚠️ 顺带撞到 **403**：nginx worker 是 `www-data`，而 `/home/ubuntu` 0750、`/home/ubuntu/crl-dp` 0700
+   ⇒ 连目录都进不去。web 根因此搬到 **`/var/www/oneye-crl`**（老路径留软链，`publish-crl.sh`
+   与 dev CA 的 cron 同步改新根）。
+2. **证书里印着两种 DP 形态**，只留一个入口就会让另一半取不到名单：
+   - `http://crl.oneye.me:8080/oneye-iot-device-ca.crl`（2026-09-21 起的定稿形态）
+   - `http://crl.oneye.me/oneye-iot-device-ca.crl`（更早签发的证书里印的是这个，**不带端口**）
+   实测：拿 `platca-bed/client.crt`（老形态）去连时，门卫按 80 取 → nginx 返回 **301** 跳 https →
+   跟随到 443 后 `bad_cert,hostname_check_failed`（证书是 product-testing 的）⇒ `failed_to_fetch_crl`。
+   **证书里的 URL 是印死的、改不了** ⇒ 只能让这个 URL 也能取到：nginx 加一个
+   `server_name crl.oneye.me` 的 **:80 直给文件（不跳转）**。现在两条入口外网/容器内都 200，
+   老形态 DP 的证书连 18886 通过且日志**不再出现** `failed_to_fetch_crl`。
+
+**教训（可复用）**：把某个开关打开，等于给它依赖的那条链**升格**；原来"能跑就行"的环节
+（手工进程、单入口、放 /home 下的 web 根）会立刻变成生产缺陷。开开关后**要按"这条链断了会怎样"
+重新过一遍**，而不是只验开关本身生效。

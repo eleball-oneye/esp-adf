@@ -65,27 +65,34 @@ IDF 的 `LOG_MAXIMUM_LEVEL_INFO` 带 `depends on LOG_DEFAULT_LEVEL < 3`，而上
 新增 `caps_model_version_must_be_numeric`（`v2` ⇒ INVALID 且不入队；`0007` ⇒ 发 `7`）。
 host 单测 **21 组 / 250 用例 / 断言 3568 次 / 失败 0**。
 
-### 7.2 ③ 的主因已修，但还有第二层（未闭环）
+### 7.2 ③ 已闭环（两层都修了）
 
-**主因（已修）**：固件拼影子的 JSON 时只去掉了 SDK 片段**开头**的 `{`，结尾的 `}` 还留着 ⇒
-`{"esp.fw_version":"0.1.0","esp.power":true,"esp.cred_source":"partition"}}`（**多一个花括号**）
-⇒ 不是合法 JSON ⇒ `report_state` 返回 INVALID ⇒ **平台侧从来没有影子文档**。
-它藏这么久，是因为调用处是 `(void)…` + 一句无条件的"凭据来源已上报"：
-**失败与成功在串口上长得一模一样**。现已：看返回值 + 失败重试一次 + 打印错误码与**实际发出的那一串**。
+**第一层（已修）：影子 JSON 多一个花括号。** 固件拼 JSON 时只去掉了 SDK 片段**开头**的 `{`，
+结尾的 `}` 还留着 ⇒ `…"partition"}}` ⇒ 不是合法 JSON ⇒ `report_state` 返回 INVALID
+⇒ **平台侧从来没有影子文档**。它藏这么久，是因为调用处是 `(void)…` + 一句无条件的
+"凭据来源已上报"：**失败与成功在串口上长得一模一样**。
 
-**第二层（未闭环，已定位到 SDK）**：修完 JSON 后串口说"影子上报成功"，但线上仍看不到 `shadow/up`。
-用 EMQX topic trace + 固件侧 `[cloud-stats]` 拿到的事实：
-- `[cloud-stats] stats_rc=0 link_rc=0 tx_frames=0 rx_frames=0 dropped=0 retries=0 cloud_link_up=1`
-  ⇒ SDK 认为**一帧都没发出去**，也没有丢帧 ⇒ 落在"保留该帧、下一轮重试"那条路径
-  （`oneye_internal.c` 的 `bint_drain_tx`：`oneye_mqtt_publish` 返回 -7 时 `held_net` 不释放）。
-- 100 s 窗口内线上只有 `caps/up`×3、`log/up`×1、`status/up`×1，**没有 `shadow/up`**；
-  设备发过 PINGREQ（写路径活着）、20 个 PUBLISH 出去、只收回 10 个 PUBACK。
-- 怀疑点（下一步按这个查）：`oneye_mqtt.c` 的 **slot/inflight 窗口** —— `mqtt_slot_reclaim` 是
-  **严格 FIFO**，`mqtt_flush_tx` 在 `inflight >= max_inflight(=8)` 时对 QoS1 **停止写出**；
-  PUBACK 若个别没匹配上（或没被 poll 消费），未确认槽会一直占着窗口，后面的 QoS1 帧
-  （正是 shadow/up）永远写不出去，而**控制报文不受影响**（所以订阅照常、看起来"连接正常"）。
-- ⚠️ 排查期的假线索：短窗口（40 s）看不到 PUBLISH，一度以为"设备完全不发"；拉到 90–100 s 才看到
-  周期性上行。**判"发没发"要看足够长的窗口或 topic trace。**
+**第二层（已修）：影子帧在队列里过期被静默清掉。** 修完 JSON 后串口说成功、平台仍看不到。
+本轮新增的三条诊断（`[cloud-stats]` / `tx progress` / `tx expired`）给出事实：
+- `tx progress: app_tx=0 app_dropped=0 | mqtt_pub=0 … | txq=0/16384 slots=0/16 inflight=0/8`
+  ⇒ 上层一帧都没发出去，而 **MQTT 层根本没被占满** ⇒ 先前"slot/inflight 窗口被占满"的怀疑
+  **被数据否定**（这是本轮最有价值的一次纠错：差一点就去修错的地方）。
+- `tx expired: face=1 expired=1 ttl=30000` ⇒ 影子帧 7.4 s 入队，第一次真正的 drain 到 ~80 s 才发生
+  （链路建立后那段被订阅等串行动作占着），帧躺过 30 s TTL 被**静默清掉**。
+
+**两侧修法**：
+- SDK：TTL 只度量"链路可用期间的等待" —— 新增 `oneye_queue_refresh_enqueued()`，
+  链路恢复时刷新已入队帧的入队时刻（断链不是设备的错，重连后仍应上报）。
+- 固件：影子状态 **每 60 s 周期重述**（`esp.cred_source` 是**状态**不是事件，一次丢了不该永远丢）。
+
+**闭环证据（真板 Korvo-2 / COM12）**：`GET /v1/devices` 含 `KORVO2-0000`；
+`GET /v1/devices/KORVO2-0000/shadow` = **200** 且 `reported.esp.cred_source=partition`；
+身份视图 `identity=partition`（`basis=reported`）；shadowd 日志
+`device KORVO2-0000 credential identity: partition`；串口 `app_tx=6 mqtt_pub=6`。
+
+**留档的诊断（下次同类问题靠它们，不用再烧板子猜）**：`oneye_mqtt_tx_snapshot()`（txq/slots/inflight）、
+`tx progress`（app 与 MQTT 两层计数并排）、三条以前只涨计数不留话的路径（`-7` 保留重试 /
+其它错误丢弃 / **TTL 过期静默清掉**）全部打日志且限频。
 
 ### 7.3 ⑤ broker 已收成稳定生产形态
 
@@ -132,10 +139,10 @@ EMQX 5.8.6 的**文件型 ACL 里 `%u` 与 `${username}` 占位符都不展开**
 
 ## 9. 遗留（下一轮可做）
 
-1. **③ 的第二层 = 设备侧 shadow/up 上不了线**（§7.2）——这是"控制台看得见设备"的唯一卡点。
-   已定位到 SDK 的 MQTT slot/inflight 窗口（`oneye_mqtt.c`：严格 FIFO 回收 +
-   `inflight >= max_inflight` 时对 QoS1 停止写出），下一步按"PUBACK 是否个别没匹配/没被 poll 消费"
-   查，并在 `bint_drain_tx` 的 `-7` 路径上加可观测性（现在它只保留帧、不留话）。
+1. **链路建立后那一段为什么把 drain 挡住 ~70 s**（§7.2 的间接原因，未深挖）：订阅是串行等待的
+   （`oneye_mqtt_subscribe(..., 2000)` × 每面一条），实测每条约 10 s 才轮到下一条，
+   怀疑 SUBACK 在 wait 期间没被消费（`mqtt_wait_for` 里有 `mqtt_pump`，但现象是每条都耗满超时）。
+   现在有 `tx progress` 的时间线，下次直接用"订阅耗时"日志定位，不必再猜。
 2. **broker 重启后 shadowd 不重新订阅**（§7.3）——生产形态下必须先修，否则任何 broker 重启都会
    静默丢掉全部设备上行。
 3. **按设备隔离 topic 未实现**（§7.3）：EMQX 5.8.6 文件 ACL 不支持占位符；要真隔离得换

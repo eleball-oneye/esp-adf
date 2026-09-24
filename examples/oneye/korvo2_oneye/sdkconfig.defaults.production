@@ -37,9 +37,18 @@ CONFIG_ONEYE_FW_TRANSPORT_TLS=y
 # 云端端点同样钉死：缺省是占位地址（Kconfig `ONEYE_FW_CLOUD_HOST` = 192.168.1.100、端口 0），
 # sdkconfig 一旦从 defaults 重新生成就会掉回去 ⇒ 设备能起来但**连不到平台**
 # （2026-09-22 真机实测：日志 `cloud endpoint 192.168.1.100:0 → SYN 无应答`）。
-# 端口 18885 = 自建 EMQX 的 mTLS 监听（与 CRL 检查同一条监听器）。换环境时改这里 + 重烧。
+#
+# ⚠️ **端口必须与"信任签发 CA 的那台监听器"一致**（2026-09-24 真机实测更正，原值 18885）：
+#   申领服务签发的设备证书挂在**平台 CA**（`oneye-iot-device-ca`）下，而平台上只有
+#   `oneye-platca` 这台 broker 的 `cacertfile` 是平台 CA（宿主端口 **18886**）。
+#   原来的 18885 是 `oneye-crl`（另一台老 CA，`mtls-test/certs/ca.crt`）—— 必被拒。
+#   实测（拿本批真证书跑 `openssl s_client`）：
+#     18886 `Verification: OK`；18885 / 18884 / 8883 全部
+#     `self-signed certificate in certificate chain`。
+#   现象很像"证书坏了"，实际是端口选错 —— 而端口是**编译期**钉死的，选错只能重烧。
+#   换环境时改这里 + 重烧；同一批证书的端点也写在交付物的 README.md 里（§0）。
 CONFIG_ONEYE_FW_CLOUD_HOST="mqtt.oneye.me"
-CONFIG_ONEYE_FW_CLOUD_PORT=18885
+CONFIG_ONEYE_FW_CLOUD_PORT=18886
 # 绝不跳过证书校验（跳过=中间人可读可改）
 # CONFIG_ONEYE_FW_TLS_INSECURE is not set
 

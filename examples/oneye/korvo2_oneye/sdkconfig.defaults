@@ -16,7 +16,13 @@ CONFIG_ESPTOOLPY_BEFORE_RESET=y
 
 # 板级自检需要 INFO 日志完整打印（[board-check] 逐行结论）
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
-CONFIG_LOG_MAXIMUM_LEVEL_INFO=y
+# 这里原本写的是 `CONFIG_LOG_MAXIMUM_LEVEL_INFO=y` —— **它什么都做不了**（2026-09-24 门禁抓到）：
+# IDF 的 `config LOG_MAXIMUM_LEVEL_INFO` 带 `depends on LOG_DEFAULT_LEVEL < 3`，而上一行已经把
+# 缺省级别设成 INFO(=3) ⇒ `3 < 3` 为假 ⇒ 该成员不可选，写进 defaults 会被静默丢弃，
+# choice 落回 `LOG_MAXIMUM_EQUALS_DEFAULT`（即 max = 缺省 = INFO，效果恰好一致，所以一直没人发现）。
+# 显式钉 `LOG_MAXIMUM_EQUALS_DEFAULT`：它**是**一个真实符号（会出现在 sdkconfig 里、门禁看得见），
+# 语义也正是本工程要的"运行期可调到缺省级别"，且将来有人改缺省级别时这里不会被悄悄带跑。
+CONFIG_LOG_MAXIMUM_EQUALS_DEFAULT=y
 
 #
 # 分区表：自定义（factory 2M + storage 1M SPIFFS）

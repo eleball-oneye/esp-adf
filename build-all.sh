@@ -899,6 +899,24 @@ publish_to_repo_lib() {
     return 0
 }
 
+# SDK 源内容哈希 —— **必须与组件侧 `cmake/sdk_src_hash.cmake` 用同一口径**（两端比对同一个值）：
+#   · 文件集合 = BASE ∪ MPP ∪ EVENT ∪ LOG ∪ LINK ∪ BLE ∪ vendor cJSON ∪ include/oneye_dev_types.h
+#     （**平台裁剪之前**的并集）；
+#   · 每行 `<basename>:<该文件 sha256>`，按行内容字典序排序，拼成以 `\n` 结尾的文本再取 sha256。
+# 用途：ESP-IDF 组件路径在 `lib/<tcid>/` 有归档时**只链接归档、不编译 src/**，而原哨兵只比版本号
+# ⇒ 改了源码没改版本号就会静默链接旧库（2026-09-24 为此白烧三轮板子）。消费侧拿这个值比对。
+sdk_src_hash() {
+    local f base h
+    for f in "${BASE_SRCS[@]}" "${MPP_SRCS[@]}" "${EVENT_SRCS[@]}" "${LOG_SRCS[@]}" \
+             "${LINK_SRCS[@]}" "${BLE_SRCS[@]}" "${VENDOR_SRCS[@]}" \
+             "$SDK_DIR/include/oneye_dev_types.h"; do
+        [ -f "$f" ] || continue
+        base="$(basename "$f")"
+        h="$(sha256sum "$f" | cut -d' ' -f1)"
+        printf '%s:%s\n' "$base" "$h"
+    done | sort -u | sha256sum | cut -d' ' -f1
+}
+
 write_manifest() { # $1=out $2=tcid $3=cc $4=ccver $5=target $6=idfver $7=cflags
     local out="$1" tcid="$2" cc="$3" ccver="$4" target="$5" idfver="$6" cflags="$7"
     local libs_json="" l
@@ -925,6 +943,7 @@ write_manifest() { # $1=out $2=tcid $3=cc $4=ccver $5=target $6=idfver $7=cflags
   "faces": ["shadow", "command", "ota", "caps", "status", "event", "track", "log", "mpp"],
   "transport": "$TRANSPORT",
   "contract": "backend/contracts/api/mqtt/asyncapi.yaml v0.2.0 + 传输规范.md",
+  "src_sha256": "$(sdk_src_hash)",
   "built_at_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 EOF

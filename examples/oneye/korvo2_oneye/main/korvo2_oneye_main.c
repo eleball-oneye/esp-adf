@@ -603,6 +603,24 @@ static void on_wifi_ready(void)
     ESP_LOGI(TAG, "已联网 → 启动上云（oneye-dev-sdk）");
 }
 
+/** 影子状态的最近一次内容 + 周期重报任务（见 oneye_start 第 6 步的说明） */
+static char s_shadow_state[192];
+static bool s_shadow_state_valid;
+static bool s_shadow_task_started;
+
+static void shadow_reassert_task(void *arg)
+{
+    (void)arg;
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(60000));
+        if (!s_shadow_state_valid) {
+            continue;
+        }
+        oneye_dev_sdk_err_t rc = oneye_dev_base_report_state(s_shadow_state);
+        ESP_LOGI(TAG, "影子状态周期重报：%s", oneye_dev_strerror(rc));
+    }
+}
+
 /** 启动本地验证面（需已联网获得 IP；与云端链路是否可用无关） */
 static void panel_start_if_enabled(void)
 {
@@ -968,6 +986,23 @@ static void oneye_start(void)
                      (unsigned)st.dropped_frames, (unsigned)st.publish_retries,
                      (int)ls.cloud_link_up,
                      oneye_dev_transport_str(ls.transport));
+        }
+
+        /* 记住这次的内容并起一个**周期重报**任务（2026-09-24）。
+         *
+         * 为什么必须周期重述，而不是开机报一次就算完：`esp.cred_source` 是**状态**，不是事件。
+         * 真机实测：开机那次上报的帧在队列里等到第一次 drain 时已经过了影子面 30 s 的 TTL，
+         * 被静默清掉（`tx expired: face=1`）—— 平台上因此**从来没有影子文档**：控制台节点页
+         * 与身份视图都看不到这台设备，而 `report_state()` 返回的是成功。
+         * 一次丢了就永远丢了，对"这台机器用的是哪一份身份"这种状态来说不可接受。 */
+        snprintf(s_shadow_state, sizeof(s_shadow_state), "%s", shadow);
+        s_shadow_state_valid = true;
+        if (!s_shadow_task_started) {
+            s_shadow_task_started = true;
+            if (xTaskCreate(shadow_reassert_task, "shadow_reassert", 4096, NULL, 2, NULL) != pdPASS) {
+                s_shadow_task_started = false;
+                ESP_LOGW(TAG, "周期重报任务创建失败（内存不足）—— 平台侧可能看不到身份来源");
+            }
         }
     }
 

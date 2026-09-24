@@ -462,3 +462,69 @@ device_certs=156`，影子与台账都在）：
    长得一模一样 —— 破坏性校验必须显式开关 + 跑前警告。
 ② **"记录丢了"先看数据源**：这次的真相是"视图是派生且只在内存里"，数据一条没少；
    凡是**派生视图**都要问一句"重启后它会长回来吗"，长不回来就得从持久源装载。
+
+## 16. 第八轮：`KORVO2-0000` 按编号查交付包**查不到**，但身份视图里明明有这台（2026-09-24）
+
+**用户原话**："我以 KORVO2-0000 作为关键字查询并没能查到交付包，但按凭据身份列出的设备是有这个记录的。"
+
+### 16.1 为什么"两边不一致" —— 它们读的是**两个数据源**，不是同一件事
+
+| 页面 | 数据源 | 覆盖范围 |
+| --- | --- | --- |
+| 身份视图（设备表） | `shadow_docs`（设备**上报过的影子**，启动时 `Hydrate()` 装载） | 上过线的设备 |
+| 量产交付包 | `claim_artifacts`（**交付包留档**，2026-09-24 才上线） | 只有 09-24 之后经 `/v1/claim/batch` 签发的批次 |
+
+`KORVO2-0000` 的当前证书 `4e9a27ef…`（指纹 `4b58cd59…`）是 **09-24 当天走重签路径
+`POST /v1/sign-pub` 签出来的**（存量重签，见 §12）—— 时间上晚于留档上线，但**那条路径根本不落交付包**，
+所以库里没有它的包。旧证书 `af92322d…` 已吊销（09-23 签发，同样没留档）。
+
+**结论：不是数据丢失，也不是查询坏了，是"留档能力上线前/非批量路径签发的证书在平台上没有包"。**
+
+### 16.2 修法一：空结果要说清是"没签过"还是"签过但没留档"（后端 + 页面）
+
+- `GET /v1/claim/artifacts` 在**查不到**时再问一次台账，命中就给 `ledger_match`
+  （`node_id/serial/issued_at/not_after/revoked` + 一句人话 `reason`）；台账里没有 ⇒ 不给该字段（= 真没签过）。
+  留档上线的时刻写成常量 `packageStoreEpoch = 2026-09-24T00:00:00Z`，用它把两种成因分开说。
+- `reason` 按**已吊销 / 早于留档上线 / 其它（重签路径或当时没配存储）**三分支，都带上"怎么补救"。
+  ⚠️ 第三分支**不猜是哪一种**：台账里没有能区分"重签路径"与"当时没配存储"的字段
+  （正是 `recordCertIssuance` 对 `replaces_serial` 为空的那条说明），并列两种可能比猜一个诚实。
+- 控制台（`claim-package-panel.tsx`）空态分两种渲染：有 `ledger_match` 就给黄条 + 台账事实
+  （node/序列号/签发时间）+ 平台原话；没有才是"平台上没有这个 node/SN 的签发记录"。
+  i18n 新增 6 个 key（zh/en 对称，`npm run check:i18n` 把关）。
+
+### 16.3 修法二：补录（`POST /v1/claim/artifact`）—— 把手上那份包登记进来
+
+- 请求：`{sn, package_base64, serial?, batch_id?, source?, note?}`（ZIP ≤ 8 MiB）。
+- 平台侧**三条**校验：① 管理员令牌（与签发同一道门）；② 包里的证书必须是**台账里这台设备的当前那张**
+  （按 `devices/<sn>/client.crt` 的 CN 找 node、序列号与 `GetByNodeID`（not_after 最大的一张）一致）——
+  CN 不符/不是 ZIP/缺这份证书 ⇒ `400`；台账没这台、或是旧/已吊销序列号 ⇒ `409`；③ 每次留一行审计。
+- **不重新签发**、不写台账、不改证书：只是把一份已存在的交付物登记进 `claim_artifacts`/`claim_batches`，
+  之后单台下载/整批下载照常工作。
+- ops 脚本 `scripts/ops/claim-package-ingest.sh`（`--dry-run` 先本地体检：ZIP 可解 + 是哪台 + 序列号/指纹/有效期，
+  再提交 + 复查查询）。已同步到 `deployment/console` 检查单 §2.7 与契约 §4.1。
+
+### 16.4 实测（真平台）
+
+- 补录前：`?q=KORVO2-0000` ⇒ `count=0` + `ledger_match{serial=4e9a27ef…, revoked=false, reason="…没有它的交付包留档…"}`
+  （直连 9091 与控制台同源 `/claim/…` 两条路都验过）。
+- 补录 `/tmp/resign/resign-KORVO2-0000.zip`（3894 B，含 client.key）⇒ `serial=4e9a27ef… batch=INGEST-KORVO2-0000-20260924-085312`；
+  复查 `count=1 downloadable=true`，`ledger_match` 消失。**现场核对 PASS=7 FAIL=0**
+  （同源查询 / 下载 200 / 指纹一致 / manifest 单行 / 含私钥 / 审计行落盘 / 负例）。
+- 负例：把**已吊销**的旧证书塞进同一台设备的包 ⇒ `409 ... the package carries serial af92322d…,
+  but the live certificate for KORVO2-0000 is 4e9a27ef…`。
+- 回归：`claim-package-acceptance.sh` **PASS=14 FAIL=0**；`console-domain-acceptance.sh` in-host
+  **PASS 29 · FAIL 0**（含"identity view still loads for a fresh session"）；dashboard 单测 **205 条全绿**。
+
+### 16.5 顺手修掉的安装脚本坑
+
+`install-console.sh` 写 `claimd.env` 的那段注释里有**反引号**（`` `claim batch issuance` ``），
+而它在**双引号**里 ⇒ bash 把它当命令替换执行，安装时报 `line 184: claim: command not found`，
+写进 env 的注释还被吞掉两个词。改成单引号。**教训**：往文件里写的注释也会被 shell 解析，
+要在双引号字符串里放反引号，先问一句"这会不会被当成命令替换"。
+
+### 16.6 可复用的教训
+
+① **"两个页面不一致"先问数据源，再问覆盖窗口**：这次不是 bug，是"派生视图"（影子）与
+   "后加能力"（留档）覆盖范围不同；把覆盖窗口写成空结果里的**明确说明**，比让操作员自己猜要值钱。
+② **后加能力要给它补一条"存量补录"入口**：留档只能覆盖上线之后的签发，存量设备否则永远查不到 ——
+   补录把"历史包"接进来，是这类能力上线时的标准配套（安全校验一条都不能省：只收台账当前那张证书）。

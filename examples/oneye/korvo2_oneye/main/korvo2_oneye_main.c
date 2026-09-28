@@ -9,7 +9,7 @@
  *   ⑤ 按键 → `event/up`（`type=device_event`，见 backend/contracts/domain/事件与埋点上报.md §3.1）。
  *
  * 契约纪律（勿越界）：
- *   - 不发明通道/字段：自检结论走 `log/up` 文本；影子只写**已登记键**（`esp.fw_version` / `esp.power`）；
+ *   - 不发明通道/字段：自检结论走 `log/up` 文本；影子只写**已登记键**（`firmwareVersion` / `power`）；
  *   - 能力位严格：默认 `ONEYE_DEV_CAP_NONE`；`video.live` 需真机取帧取证后才可声明（Kconfig 开关）；
  *     `audio.intercom` 在 WebRTC 数据面落地前**一律不得声明**（本固件不提供开关）；
  *   - 事实源：backend/contracts/api/mqtt/Korvo-2设备能力与协议映射.md（板级能力↔协议唯一对照页）。
@@ -603,21 +603,57 @@ static void on_wifi_ready(void)
     ESP_LOGI(TAG, "已联网 → 启动上云（oneye-dev-sdk）");
 }
 
-/** 影子状态的最近一次内容 + 周期重报任务（见 oneye_start 第 6 步的说明） */
-static char s_shadow_state[192];
+/** 影子状态的**整帧**：boot 发一次，云链路上线（down → up）时再补发一次。
+ *  没有周期重报 —— 见 shadow_reassert_task() 的说明。 */
+static char s_shadow_state[192];       /* 整帧：firmwareVersion + power + credSource */
 static bool s_shadow_state_valid;
 static bool s_shadow_task_started;
 
+/* 上一轮读到的云链路在线状态，用于识别**重连**（down → up）。
+ * 初值 true：boot 那一帧就当链路当时可用 —— 链路不可用时 SDK 会自己把待发帧的入队时刻
+ * 刷新到 link up 那一刻（`internal/oneye_internal.c` 的 bint_on_link_up），开机帧不会因断链而过期。 */
+static bool s_shadow_link_was_up = true;
+
+/** 影子**补发**任务：事件驱动，**只在云链路 down → up 时补发整帧**；没有周期重报。
+ *
+ * 为什么去掉周期重报（2026-09-25，R80 选项 (iv)）：
+ *   · 量级：整帧 60 s 一次 ⇒ ≈1440 帧/天/设备，而登记的容量假设是 `fallbackPeriodSec=300`
+ *     ⇒ 288 帧/天/设备（云端 TSL `OY-SPK-01.json` 的 `defaults.reportStrategy`），相差 5×；
+ *     云端**没有任何代码读 `reportStrategy`** ⇒ 这 5× 只能在设备侧收窄。
+ *   · 只收窄**载荷**（改报身份子集）**解决不了**这 5×（2026-09-25 实测确认）：帧数一帧没少，
+ *     且子集里仍然带 `credSource` **这一列**，帧照样进 Kafka/TDengine。要真消掉它只能去掉周期。
+ *   · 为什么少掉这一遍重述也还能接受：链路恢复时 SDK 自己就把各面「已入队、还没发出去」的帧
+ *     的入队时刻刷新了一遍，断链期间不计入 TTL，随后照常 drain 出去
+ *     （`internal/oneye_internal.c:756-764`，2026-09-24 为更早那次影子丢失加的）。
+ *     所以「开机帧因断链过期被静默清掉」这一类**断链**故障本就有兜底，周期重报在它之上是冗余的。
+ *
+ * ⚠️ **已接受的代价（不是疏漏）**：一次上报丢了、而**原因不是链路掉线**时 —— 例如帧已经
+ * publish 出去、却在链路对端/broker 侧被丢掉，而链路自己从未 down 过 —— 现在**不再自愈**：
+ * 没有周期重报就没有第二次机会，只能等下一次真正的 `down → up`，或设备重启。`credSource`
+ * 这类**状态**因此可能在一段时间内对服务端不可见。这是 R80 (iv) 明确接受的权衡
+ * （拿「帧量 5×」换「这一小类丢失」），不是遗漏。若日后要重新拿回自愈能力，应当另立一条
+ * **低频**兜底，而不是退回 60 s 周期。
+ *
+ * 整帧仍在 **boot** 发（见 oneye_start 第 6 步），并在这里的**重连**时补发一次，把 `power`
+ * 这类非身份键也带回；补发放在**本任务**里而不是 `sdk_event_cb`（回调由 SDK 事件任务调用，
+ * 在回调内再回调 SDK 属重入）。 */
 static void shadow_reassert_task(void *arg)
 {
     (void)arg;
+
     while (true) {
-        vTaskDelay(pdMS_TO_TICKS(60000));
-        if (!s_shadow_state_valid) {
-            continue;
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        /* 重连（down → up）⇒ 补发整帧 */
+        oneye_dev_link_status_t ls;
+        memset(&ls, 0, sizeof(ls));
+        ONEYE_DEV_STRUCT_INIT(ls);
+        bool link_up = (oneye_dev_base_get_link_status(&ls) == ONEYE_DEV_SDK_OK) && ls.cloud_link_up;
+        if (link_up && !s_shadow_link_was_up && s_shadow_state_valid) {
+            oneye_dev_sdk_err_t frc = oneye_dev_base_report_state(s_shadow_state);
+            ESP_LOGI(TAG, "影子整帧补发（链路上线）：%s", oneye_dev_strerror(frc));
         }
-        oneye_dev_sdk_err_t rc = oneye_dev_base_report_state(s_shadow_state);
-        ESP_LOGI(TAG, "影子状态周期重报：%s", oneye_dev_strerror(rc));
+        s_shadow_link_was_up = link_up;
     }
 }
 
@@ -746,7 +782,7 @@ static void oneye_start(void)
     /* 本机实际用的是**哪一份身份**（P0-A：必须让服务端看得见）。
      * 台面/漏写分区的机器允许回退到编译进固件的**公用**凭据，但"看不清有没有回退"不可以：
      * 一台漏写分区的机器拿公用身份上线，平台上若与正常机器看不出区别，它会被一直当好设备用下去。
-     * 故这里记下来源，开机与其它状态一起报进影子 `reported` 的 `esp.cred_source`。 */
+     * 故这里记下来源，开机与其它状态一起报进影子 `reported` 的 `credSource`。 */
     oneye_dev_creds_source_t cred_src = ONEYE_DEV_CREDS_SOURCE_UNKNOWN;
     oneye_dev_sdk_err_t creds_rc = oneye_dev_creds_load(&s_creds);
     if (creds_rc == ONEYE_DEV_SDK_OK) {
@@ -893,13 +929,13 @@ static void oneye_start(void)
     /* 5b) 授时（契约 §7）由 CLOUD_LINK_UP 事件驱动的 `request_time_sync()` 发起（见 sdk_event_cb）：
      *     `oneye_dev_base_sync_time()` 会阻塞等待云端应答，必须跑在独立任务里，不能在 SDK 回调内调用。 */
 
-    /* 6) 自检结论 + 已登记影子键（esp.fw_version / esp.power / esp.cred_source）
+    /* 6) 自检结论 + 已登记影子键（firmwareVersion / power / credSource）
      *
-     * `esp.cred_source`：本机身份**从哪来**（`partition` = 分区里的每台一份；`embedded` = 回退到
+     * `credSource`：本机身份**从哪来**（`partition` = 分区里的每台一份；`embedded` = 回退到
      * 固件里的公用凭据）。为什么必须报：回退本身可以接受，**"看不清有没有回退"不可以** ——
      * 一台漏写分区的机器拿公用身份上线，平台上若与正常机器看不出区别，它会被一直当好设备用下去。
      * 键名与取值由 SDK 固定（`ONEYE_DEV_CREDS_SHADOW_KEY`），所有伙伴报的完全一致，服务端才能统一告警。
-     * `src_json` 是单个键的 JSON 片段（`{"esp.cred_source":"…"}`），这里去掉它开头的 `{` 后并入本行。 */
+     * `src_json` 是单个键的 JSON 片段（`{"credSource":"…"}`），这里去掉它开头的 `{` 后并入本行。 */
     ONEYE_LOGI(ONEYE_DEV_LOG_TAG_BASE,
                "korvo2_oneye 板级自检：%d 项 / 失败 %d 项；固件 %s",
                s_check_total, s_check_failed, ONEYE_FW_VERSION);
@@ -910,7 +946,7 @@ static void oneye_start(void)
         bool has_src;
         oneye_dev_sdk_err_t rrc;
 
-        /* 取 SDK 给的 `{"esp.cred_source":"…"}` 的**内层**（去掉外层那一对花括号），
+        /* 取 SDK 给的 `{"credSource":"…"}` 的**内层**（去掉外层那一对花括号），
          * 再把这段并进本行的对象里。
          *
          * ⚠️ 这里以前写的是 `src_json + 1`：它只去掉了开头的 `{`，**结尾的 `}` 还留着**，
@@ -935,7 +971,7 @@ static void oneye_start(void)
             ESP_LOGW(TAG, "凭据来源未知，不上报 %s", ONEYE_DEV_CREDS_SHADOW_KEY);
         }
         snprintf(shadow, sizeof(shadow),
-                 "{\"esp.fw_version\":\"%s\",\"esp.power\":true%s%s}",
+                 "{\"firmwareVersion\":\"%s\",\"power\":true%s%s}",
                  ONEYE_FW_VERSION, has_src ? "," : "", has_src ? fields : "");
 
         /* ⚠️ 这个返回值**必须看**（2026-09-24 修正）。
@@ -988,20 +1024,25 @@ static void oneye_start(void)
                      oneye_dev_transport_str(ls.transport));
         }
 
-        /* 记住这次的内容并起一个**周期重报**任务（2026-09-24）。
+        /* 记住这次的内容，并起一个**补发**任务（2026-09-24 起；2026-09-25 改为事件驱动）。
          *
-         * 为什么必须周期重述，而不是开机报一次就算完：`esp.cred_source` 是**状态**，不是事件。
-         * 真机实测：开机那次上报的帧在队列里等到第一次 drain 时已经过了影子面 30 s 的 TTL，
-         * 被静默清掉（`tx expired: face=1`）—— 平台上因此**从来没有影子文档**：控制台节点页
-         * 与身份视图都看不到这台设备，而 `report_state()` 返回的是成功。
-         * 一次丢了就永远丢了，对"这台机器用的是哪一份身份"这种状态来说不可接受。 */
+         * 为什么曾经必须周期重述，以及为什么现在不必了：`credSource` 是**状态**，不是事件 ——
+         * 开机那一帧丢了，这台机器在凭据来源视图里就永远看不见（正是要防的静默事故）。真机实测：
+         * 开机那次上报的帧在队列里等到第一次 drain 时已经过了影子面 30 s 的 TTL，被静默清掉
+         * （`tx expired: face=1`）—— 平台上因此**从来没有影子文档**：控制台节点页与身份视图都
+         * 看不到这台设备，而 `report_state()` 返回的是成功。
+         * 但这条**断链**故障现由 SDK 自己兜底（链路恢复时刷新待发帧的入队时刻，见
+         * `internal/oneye_internal.c:756-764`），周期重报在它之上是冗余的；而周期重报本身要付
+         * ≈1440 帧/天/设备（对照登记的 `fallbackPeriodSec=300` ⇒ 288 帧/天/设备，差 5×）。
+         * 故 2026-09-25 按 R80 选项 (iv) 去掉周期，只保留**事件驱动**的 `down → up` 补发；
+         * 代价（非掉线类丢失不再自愈）见 shadow_reassert_task() 的注释，是**已接受**的。 */
         snprintf(s_shadow_state, sizeof(s_shadow_state), "%s", shadow);
         s_shadow_state_valid = true;
         if (!s_shadow_task_started) {
             s_shadow_task_started = true;
             if (xTaskCreate(shadow_reassert_task, "shadow_reassert", 4096, NULL, 2, NULL) != pdPASS) {
                 s_shadow_task_started = false;
-                ESP_LOGW(TAG, "周期重报任务创建失败（内存不足）—— 平台侧可能看不到身份来源");
+                ESP_LOGW(TAG, "影子补发任务创建失败（内存不足）—— 链路上线后不会补发整帧");
             }
         }
     }

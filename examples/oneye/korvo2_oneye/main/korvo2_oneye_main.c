@@ -29,6 +29,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "cJSON.h"
 #include "board.h"
 #include "es7210.h"
 #include "esp_peripherals.h"
@@ -338,6 +339,62 @@ static void lcd_update(const char *key_line)
 static const char *key_pending_pop(void);
 static bool ack_payload_is_ok(const char *payload, size_t len);
 
+/* -------------------------------------------------------- command/down → command/up
+ *
+ * 契约（正本 = `cloud/contracts/api/mqtt/asyncapi.yaml`，设备面唯一事实源）：
+ *   `rmng/dev/{node}/command/down` → `ControlCommand`  required `[id, params]`（**RAW，不套信封**）
+ *   `rmng/dev/{node}/command/up`   → `ControlAck`      required `[id, status]`、`status ∈ {ok, error}`、
+ *                                                      可选 `error`（**RAW，不套信封**）
+ *   `id` **由服务端生成**，是回执关联的唯一依据（`backend/contracts/domain/控制通路.md` §2）。
+ *
+ * 为什么这里回的是 `error` 而不是 `ok`：本固件**没有任何命令执行面**（PTZ/命令执行属 S16，未落地），
+ * `caps/up` 的 `cmds[]` 为空 ⇒ 按契约每条命令都是**未知命令**：
+ * 《物模型与能力集.md》§5 逐字「命令可用集合 = 物模型 `cmds`；**下发未知命令应回执 `status=error`**」，
+ * 《Korvo-2设备能力与协议映射.md》§2 第 6 行同判词。⇒ 回 `error` 是**契约规定的正确行为**；
+ * 回 `ok` 才是假回执（把"没做"报成"做了"）。
+ *
+ * 这一步补的是「收到命令完全不回执」的缺口：不回执时云端 `dev_command.status` 会一直停在 `SENT`
+ * 直到超时（`控制通路.md` §4「设备离线」行：无存储转发 ⇒ 只能等超时）。
+ *
+ * `error` 是 free text（asyncapi `ControlAck.error` = `type: string`，非闭集），措辞取 SDK 自身
+ * 文档与单测里的既有字面量（`docs/API-base.md:486` / `tests/test_base.c:541`），**不新造名字**。
+ */
+static void command_ack_unknown(const void *payload, size_t len)
+{
+    cJSON *doc;
+    const cJSON *id;
+    oneye_dev_sdk_err_t rc;
+
+    /* MQTT 载荷**不保证 NUL 结尾** ⇒ 必须用带长度的解析（SDK 内部同样按 len 处理，
+     * 固件此前的打印也用 `%.*s` 而不是 `%s`）。 */
+    doc = cJSON_ParseWithLength((const char *)payload, len);
+    if (doc == NULL) {
+        ESP_LOGW(TAG, "[command] 负载不是合法 JSON（%u B）⇒ 无法回执（契约要求按 id 关联）",
+                 (unsigned)len);
+        return;
+    }
+
+    id = cJSON_GetObjectItemCaseSensitive(doc, "id");
+    if (!cJSON_IsString(id) || id->valuestring == NULL || id->valuestring[0] == '\0') {
+        /* 没有 id 就没有关联依据：不回执。云侧对 `id` 为空/非法的回执也是直接丢弃
+         *（`控制通路.md` §3「无回执丢弃」）⇒ 此处不回执与契约不冲突。 */
+        ESP_LOGW(TAG, "[command] 负载缺可用 id（非字符串或空串）⇒ 无法回执");
+        cJSON_Delete(doc);
+        return;
+    }
+
+    /* 回执很短（SDK 单帧内构造），可在 SDK 回调内直接调用，不阻塞、不起任务。 */
+    rc = oneye_dev_base_ack_command(id->valuestring, "unknown command");
+    if (rc != ONEYE_DEV_SDK_OK) {
+        /* 失败即上报不出去（未在线/队列满/超单帧）—— 只看返回值，不假装成功 */
+        ESP_LOGW(TAG, "[command] command/up 回执发送失败：%s（id=%s）",
+                 oneye_dev_strerror(rc), id->valuestring);
+    } else {
+        ESP_LOGI(TAG, "[command] 未知命令 ⇒ command/up{id=%s,status=error}", id->valuestring);
+    }
+    cJSON_Delete(doc);
+}
+
 static void sdk_event_cb(oneye_dev_event_t evt, const void *payload, size_t len, void *ctx)
 {
     (void)ctx;
@@ -374,8 +431,10 @@ static void sdk_event_cb(oneye_dev_event_t evt, const void *payload, size_t len,
     }
     if (evt == ONEYE_DEV_SDK_EVT_COMMAND_RECEIVED && payload != NULL && len > 0) {
         /* 真机产品：解析命令 → 执行 → oneye_dev_base_ack_command(id, err)
-         * 本固件仅打印（命令面/PTZ 属 S16，未落地，不做假实现）。 */
+         * 命令执行面属 S16，未落地 ⇒ 按契约对**未知命令**回 `status=error`（不是假回执）。
+         * 必须回执：不回时云端 `dev_command.status` 会停在 `SENT` 直到超时。 */
         ESP_LOGI(TAG, "[sdk-event] command payload: %.*s", (int)len, (const char *)payload);
+        command_ack_unknown(payload, len);
     }
 }
 

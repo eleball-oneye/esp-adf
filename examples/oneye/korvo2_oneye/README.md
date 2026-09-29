@@ -372,7 +372,7 @@ idf.py -B output/.build/korvo2_oneye-production \
 | `shadow/up` | 只写**已登记键**：`firmwareVersion`、`power`（不新增键） |
 | `log/up` | 板级自检结论、启动信息（`tag=oneye_base`） |
 | `event/up` | 按键事件（`type=device_event`，`data{key,action}`） |
-| `command/down` | 收到即打印（命令执行面属 S16，未落地；不做假回执） |
+| `command/down` → `command/up` | 解析载荷取 `id` ⇒ **一律回执 `{"id":…,"status":"error","error":"unknown command"}`**（两面均 `x-oneye-envelope: false`，**RAW 不套信封**）。命令执行面属 S16 未落地 ⇒ `caps/up` 的 `cmds[]` 为空 ⇒ 契约上每条命令都是**未知命令**，而契约逐字规定「下发未知命令应回执 `status=error`」（`物模型与能力集.md` §5 / `Korvo-2设备能力与协议映射.md` §2 第 6 行）⇒ **回 error 是正确行为，⛔ 不假回 `ok`**。载荷非 JSON 或缺合法 `id` 时不回执并告警（无关联依据）。**此改动消除的是「收到命令完全无回执 ⇒ 云端 `dev_command.status` 停在 `SENT` 到超时」的缺口，不是「命令闭环打通」** |
 | `mpp/*` | 缺省不启用（媒体数据面未真机验证） |
 
 ## 8. 本轮实测记录
@@ -440,6 +440,7 @@ idf.py -B output/.build/korvo2_oneye-production \
 | **摄像头探测的初始化顺序（真机，第十八轮查明）** | 把 `camera_api_init()` 放到 `board_init_peripherals()` **之前**（照抄上游 `lcd_camera` 的 "camera init in advance" 注释）⇒ `camera probe … no sensor FAIL`（ADF I2C 总线尚未建立）；放在**板级初始化之后**⇒ 探测成功。另：该失败曾因计入硬自检而触发 `SELFTEST_STRICT` 中止上云 ⇒ 设备连 IP 都拿不到（**看不到失败原因**），故摄像头改用提示级 `chk_warn`（记红行、不中止） |
 | **待续（未闭环，明确记录）** | ① **可听性**：回放链路已把 PCM 完整时钟输出（`AEL_IO_DONE` + 时长吻合），但「扬声器是否真的出声」需人耳确认（PA `GPIO48` 已在 `es8311_codec_init` 打开、音量 80）；② **麦克风灵敏度**：原始幅度随环境变化（123→390），对着板子说话的幅度取证待补；③ **`video.live` 上行数据面**（MJPEG 编码 + `http_upload`/`mqtt_frame`）未实现 ⇒ 该能力位仍不得声明 |
 | ⚠️ **镜像余量告急（第十八轮）** | `korvo2_oneye.bin` **2,045,856 B**（`0x1f37a0`），`factory 2M` 分区**仅余 2%**（0xc860）。后续增长首选 `CONFIG_COMPILER_OPTIMIZATION_SIZE=y`（-Os），或扩 `factory` 分区（16 MB flash 尚有余量） |
+| **`command/up` 回执接线（G2）** | 缺口：SDK 早有 `oneye_dev_base_ack_command()`，但固件**从未调用** ⇒ 云端下发 `command/down` 后设备不回执，`dev_command.status` 停在 `SENT` 直到超时。落码：`main/korvo2_oneye_main.c` 新增 `command_ack_unknown()`（:342-396，`cJSON_ParseWithLength` 取 `id`）+ 在 `COMMAND_RECV` 事件里调用（:437）；因 `cmds[]` 为空 ⇒ 一律回 `ControlAck{id,status:"error",error:"unknown command"}`（RAW 不套信封，与 asyncapi 逐字段一致）。**构建证据（WSL/IDF v5.5.5，复用 `/tmp/rc-net2`）**：`BUILD_RC=0`；`korvo2_oneye.bin binary size 0x1f7550 bytes. Smallest app partition is 0x200000 bytes. 0x8ab0 bytes (2%) free.` + `Project build complete.`；ninja 仅重编 `korvo2_oneye_main.c.obj`（`[4/9]`）⇒ 相对基线 `0x1f7120` 的 **+0x430（+1,072 B）就是本次改动代价**。**符号级证据**：`nm` 该 obj 有 `U oneye_dev_base_ack_command` / `U cJSON_ParseWithLength`，最终 `.elf` 里 `T oneye_dev_base_ack_command`（0x4201d114）；镜像 `strings` 含字面量 `unknown command`。**⛔ 未做**：未上真机、未端到端发 `command/down` 验回执；真实 `ok` 路径属 **S16 命令执行面**，且需**先登记**具体命令名（`cmds[]` 取值 = 物模型命令名）——本轮收尾的是「停在 `SENT` 到超时」这个缺口被消除，⛔ **不是**「命令闭环打通」 |
 
 **后续（真机）**：`idf.py -p <COM> flash monitor` → 核对自检逐行 PASS → **SD 卡放 `oneye-wifi.txt` 复位自动配网** → 观察
 `caps/up` / `status/up`（retained + LWT）/ `shadow/up` / `log/up` 与按键 `event/up`；其间可用面板「Wi-Fi 配网」卡片核对**凭据来源**；
@@ -447,7 +448,9 @@ LCD 状态屏与摄像头抓帧见 §5.7/§5.8（**已真机闭环**），`video
 
 ## 9. 边界
 
-- 本工程**不实现**：媒体数据面（webrtc/http_upload/mqtt_frame，含 `video.live` 上行）、PTZ/命令执行面、
+- 本工程**不实现**：媒体数据面（webrtc/http_upload/mqtt_frame，含 `video.live` 上行）、PTZ/命令执行面
+  （⚠️ **命令回执 `command/up` 已接线**，但**只回 `status=error`**；真实 `ok` 路径需先落 S16 命令执行面，且
+  **必须先登记**一个具体命令名 —— `cmds[]` 取值 = 物模型命令名，登记后落码，见 §7 表与 §8 本轮记录）、
   AI 端侧初筛、LED 显示服务、触摸、电池采集；
 - 板载 **LCD 状态屏**、**摄像头抓帧**与**局域网 MJPEG 预览**（:81）属**本地验证面**（`/api/*`、`:81/stream`、既有 `/media/*` 只读面），不是云端设备面契约的一部分：**不新增 topic / 影子键 / 能力位**；预览也**不构成** `video.live` 的声明依据（缺契约承载的编码+上行数据面）；
 - 抓帧与云端链路共享内部 DMA 内存：改摄像头配置后必须同时核对 `panel.heap.internal_free` 与 `cloud.link_up`（见 §5.8 的关键坑）；

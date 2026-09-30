@@ -483,7 +483,14 @@ esp_err_t aec_capture_start(uint32_t duration_s, char *out_path, size_t cap)
     }
 
     ESP_LOGI(TAG, "开始采集：%s（%u s）", path, (unsigned)duration_s);
-    (void)xTaskCreate(aec_stop_task, "aec_stop", 3072, (void *)(uintptr_t)duration_s, 4, &s_stop_task);
+    /* ⚠️ 返回值必须看（2026-09-30 同批修正：本工程里 `(void)xTaskCreate(...)` 曾把
+     *    "任务根本没起来"变成板上查无证据的静默失效）。
+     *    这里失败**不**回滚采集（用户已经明确要录），但必须留下告警：没有这个任务，
+     *    录音不会按时长自动停，只能靠手动 `aec_stop` 或写满存储。 */
+    if (xTaskCreate(aec_stop_task, "aec_stop", 3072, (void *)(uintptr_t)duration_s, 4, &s_stop_task) != pdPASS) {
+        ESP_LOGW(TAG, "自动停止任务创建失败（内存不足）⇒ 本次录音不会按时长（%u s）自动停，需手动停止",
+                 (unsigned)duration_s);
+    }
     return ESP_OK;
 
 fail:

@@ -410,8 +410,12 @@ static esp_err_t wifi_set_start(const char *ssid, const char *pass)
     if (pass) {
         snprintf(r->pass, sizeof(r->pass), "%s", pass);
     }
+    /* ⚠️ 返回值必须看（2026-09-30 同批复核：本工程要求凡创建任务都接返回值**并告警**）。
+     * 失败时 HTTP 侧会回 `cannot start (no memory)`，但那只对发起方可见 —— 串口上必须有同样的证据，
+     * 否则"运行期改配没生效"在板上与"这条路从没被调用过"完全同形。 */
     if (xTaskCreate(wifi_set_task, "wifi_set", 4096, r, 4, NULL) != pdPASS) {
         free(r);
+        ESP_LOGW(TAG, "改配 Wi-Fi 任务创建失败（内存不足）⇒ 本次运行期改配请求未生效：ssid=%s", ssid);
         return ESP_ERR_NO_MEM;
     }
     ESP_LOGW(TAG, "运行期改配 Wi-Fi（明文，仅台面/联调）→ ssid=%s", ssid);

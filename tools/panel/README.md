@@ -151,9 +151,18 @@ python3 panel.py --device korvo2-0001=http://<设备IP> \
 | 项 | 结果 |
 | --- | --- |
 | 命令 | `idf.py build`（IDF v5.5.5 / esp32s3 / `CONFIG_ESP32_S3_KORVO2_V3_BOARD=y`） |
-| 分区 | 自定义 `partitions.csv`：`factory 2M` + **`model 2M`** + `storage(spiffs) 1M` |
-| 产物 | `korvo2_oneye.bin` **390,656 B**（分区余量 81%）；**`srmodels/srmodels.bin` 337,952 B**（esp-sr 模型，烧写偏移 `0x210000`，`flash_args` 已包含） |
+| 分区（**2026-09-15 该轮口径，历史读数**） | 该轮自定义 `partitions.csv`：`factory 2M` + **`model 2M`** + `storage(spiffs) 1M` —— ⚠️ **该布局已过期**：2026-09-30 起本工程为 `factory 4M` + **`model 1M @0x410000`** + `creds 16K @0x510000`（🔴 逐字未动）+ `storage 1M @0x514000`（**开发板台面形态**） |
+| 产物（**2026-09-15 该轮读数**） | `korvo2_oneye.bin` **390,656 B**（该轮按 `factory 2M` 计余量 81%）；**`srmodels/srmodels.bin` 337,952 B**（esp-sr 模型，该轮烧写偏移 `0x210000`，`flash_args` 已包含）—— ⚠️ **`0x210000` 已过期，现为 `0x410000`**（照旧值烧会烧错地方） |
 | 坑位（已修） | esp-sr 只在分区表存在 `model` 分区时才投放模型（上游 AEC/algorithm 例程缺该分区 ⇒ 模型从未投放）；另有 4 类编译期错误（注释内嵌 `/*`、`HTTPD_416_*` 缺失、`I2S_CHANNEL_FMT_*` 需 `driver/i2s.h`、`snprintf` 截断告警） |
+
+> ⚠️ **分区布局订正（2026-09-30，第二十轮，旧值逐字留痕于上表两行）**：上表 `factory 2M` / `model 2M` / `storage 1M` /
+> `srmodels` 偏移 `0x210000` **均已过期**，保留只为不篡改当轮记录。**当前布局 = 开发板台面形态**：
+> `factory 4M` / `model 1M @0x410000` / `creds 16K @0x510000`（🔴 逐字未动；板上 per-device 凭据按此偏移烧好）/
+> `storage 1M @0x514000`。依据：`_tmp-phase2/device-fixes-partition.md` §2.1/§2.2/§3.1，以及工程
+> [`partitions.csv`](../../examples/oneye/korvo2_oneye/partitions.csv) 与 [`README.md` §2 烧写四段偏移](../../examples/oneye/korvo2_oneye/README.md)。
+> ⇒ 手工 esptool 烧 `srmodels/srmodels.bin` **必须烧 `0x410000`**；`storage` 偏移变更后**首次挂载会自动格式化**
+> （`format_if_mount_failed=true`）⇒ 旧的 SPIFFS 兜底录音会丢。⚠️ `factory 4M` 只为开发板台面留应用余量，
+> **量产分区形态仍待单独评审**（本页不构成量产结论）。
 
 复跑：`python3 panel.py --self-test`（日志落 `output/.build/panel-selftest.log`）。
 

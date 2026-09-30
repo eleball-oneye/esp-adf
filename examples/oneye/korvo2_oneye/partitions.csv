@@ -8,20 +8,61 @@
 #      否则那句 "Please add a line(Name=model) …" 只是赋给一个未被使用的 CMake 变量（上游不会打印），
 #      **构建照常成功、模型却从未投放** ⇒ 真机 AFE 会因为找不到模型而失败。
 #      （已核实：上游 `examples/advanced_examples/{aec,algorithm}` 的 partitions.csv 同样没有 model 分区。）
-#   ② 应用镜像（ADF + esp-sr + oneye-dev-sdk 四库 + Wi-Fi/HTTP + ADF 播放链）实测 **~1.93 MB**（`-Og` 未优化；
-#      旧记录里的 ~390 KB **不含 Wi-Fi**，见 README §8），IDF 缺省 `factory` 仅 1 MB ⇒ 取 2 MB（余量约 8%）；
-#      若后续功能继续增长，首选把 `CONFIG_COMPILER_OPTIMIZATION_SIZE=y`（-Os）打开换空间；
+#   ② 应用镜像（ADF + esp-sr + oneye-dev-sdk 四库 + Wi-Fi/HTTP + ADF 播放链）实测 **~1.97 MB**
+#      ⇒ 放大到 4 MB（见下「2026-09-30 开发板台面形态」）。
 #   ③ 无 SD 卡时录音需要本地兜底存储 ⇒ `storage`(SPIFFS) 1 MB（/spiffs/rec）。
 #
-# 布局（8 MB flash，总占用约 5.1 MB）：
-#   nvs      24 KB   phy_init 4 KB   factory 2 MB   model 2 MB   storage 1 MB
+# ---------------------------------------------------------------------------------
+# 🔴 硬约束（不可逆红线）：`creds` **必须留在 0x510000**
+#   板上已按这个偏移烧好 per-device 凭据（ONEYECR1 镜像，node=KORVO2-0000，crc32=f6ed1bb8）。
+#   挪动该分区 == 把真机身份弄丢（固件按"名字+类型"找分区，但**烧写与产线灌注按偏移**：
+#   `tools/provision-device.ps1 -Offset` 缺省 0x510000、`mkcreds-manifest.csv` 的 offset 列）。
+#   ⇒ 本表任何改动都必须保持 `creds` 行 = `creds, data, 0x40, 0x510000, 16K`（逐字）。
+# ---------------------------------------------------------------------------------
+#
+# 2026-09-30 开发板台面形态（**本批放大 app 分区**；用户裁定「开发板尽量多应用空间」）：
+#
+#   nvs      24 KB   phy_init 4 KB   factory 4 MB   model 1 MB   creds 16 KB(@0x510000)   storage 1 MB
+#            0x9000           0xf000        0x10000       0x410000        0x510000                 0x514000
+#
+#   与上一版（`factory 2M + model 2M + storage 1M`，总占用 ~5.1 MB）的逐项取舍：
+#   ┌ factory 2M → 4M  ：**本批目的**。2 M 时实测只剩 1%（`korvo2_oneye.bin` 0x1f8a30 / 0x200000，
+#   │                   构建告警 `smallest app partition is nearly full`），继续加功能必炸。
+#   │                   4 M ⇒ 余量约 51%（读数见 README §8「本轮实测记录」）。理由：开发板 flash 充裕，
+#   │                   而"余量告急"已经实际拦住过功能（上一批修 track/影子/log 三个产出方时只能内联，不能新增任务）。
+#   │                   为什么不更大：**creds 钉在 0x510000**，[0x10000, 0x510000) 只有 5 MB，
+#   │                   而 `model` 至少要放得下 srmodels.bin（实测 337,952 B）⇒ 见下一项。
+#   ├ model 2M → 1M    ：这是"腾出 app 空间"的**唯一**来源（`model` 与 `storage` 都排在 creds 之前）。
+#   │                   1 MB 对当前载荷（srmodels.bin **337,952 B**，仅 NSNET2 + WebRTC VAD）是 **3.1×**
+#   │                   余量；esp-sr 只要求该分区**存在**并按名字取 offset/size 烧写
+#   │                   （`components/esp-sr/CMakeLists.txt:79-96`：`partition_table_get_partition_info`
+#   │                   + `esptool_py_flash_to_partition`），**不校验** size 是否够放 bin。
+#   │                   ⚠️ 因此有"隐性上限"：若日后打开 WakeNet/MultiNet 等更多 esp-sr 模型，
+#   │                   **必须重新核算 srmodels.bin 字节数**（构建后会打印），必要时从 factory 里割回来。
+#   │                   这一条是本布局唯一"用余量换空间"的取舍，已登记进 README。
+#   ├ storage 1M 位置  ：大小**不变**（1 M，/spiffs/rec 兜底录音），但缓冲区被 model 占走后
+#   │                   只能**移到 creds 之后**（0x514000，4 KB 对齐；SPIFFS 按**分区名**挂载，
+#   │                   偏移变了不影响挂载 —— `main/aec_capture.c:216-222` 用 `partition_label="storage"`，
+#   │                   且 `format_if_mount_failed = true` ⇒ 首次在新偏移上自动格式化，不丢启动路径）。
+#   └ nvs / phy_init   ：**不动**（与 IDF 缺省一致；bootloader 与 0x8000 的分区表偏移也都没动）。
+#
+#   flash 占用：0x614000 ≈ 6.08 MB（本板 `CONFIG_ESPTOOLPY_FLASHSIZE="8MB"`，仍在界内；
+#   真机 esptool 自报 `Auto-detected Flash size: 16MB`，但配置钉的是 8 MB ⇒ 故意不越 8 MB 线，
+#   要越必须先显式改 `CONFIG_ESPTOOLPY_FLASHSIZE_*`，属单独评审的改动）。
+#
+# ⚠️ **这是"开发板台面形态"，不是量产结论**：量产设备的 flash 更充裕（用户裁定），
+#    量产分区表需要单独评审 —— 至少要重新决定 factory 大小、是否保留 `storage`（量产无 SD 卡兜底录音
+#    是否需要）、`model` 该给多大（取决于量产启用的 esp-sr 模型集合），以及是否引入 OTA 双槽。
+#    ⛔ 不得把本表当作量产分区表的依据。
 #
 # 注意：改 phy_init/factory 偏移须同步 IDF bootloader 配置（保持 0x10000）。
+#      改 `factory`/`model`/`storage`/`creds` 任一偏移 ⇒ 必须同步 `tools/provision-device.ps1`
+#      的烧写偏移（该脚本现在会自己读本文件核对，不一致直接以退出码 2 拒绝动作）。
 # =============================================================================
 # Name,   Type, SubType, Offset,  Size, Flags
 nvs,      data, nvs,     0x9000,  0x6000,
 phy_init, data, phy,     0xf000,  0x1000,
-factory,  app,  factory, 0x10000, 2M,
-model,    data, spiffs,  0x210000, 2M,
-storage,  data, spiffs,  0x410000, 1M,
+factory,  app,  factory, 0x10000, 4M,
+model,    data, spiffs,  0x410000, 1M,
 creds,    data, 0x40,    0x510000, 16K,
+storage,  data, spiffs,  0x514000, 1M,

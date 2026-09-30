@@ -49,8 +49,12 @@ idf.py -p <COMx> flash monitor        # Windows；Linux/macOS 为 /dev/ttyUSB0 �
 - 扬声器接 **扬声器输出端口**；USB 供电建议 ≥5 V/2 A（rst「供电说明」）。
 - **首次上电前**（本仓库为 Windows 侧烧录准备，见 `output/.build/flash-korvo2.ps1`）：
   1. 把 [`sd-root/oneye-wifi.txt`](sd-root/oneye-wifi.txt) 拷到 microSD 卡**根目录**并填好 `ssid=` / `password=`，插卡；
-  2. 烧写四个镜像（**必须先 `-Erase`**：分区表已改为 `factory 2M + model 2M + storage 1M`）：
-     `0x0 bootloader.bin` / `0x8000 partition-table.bin` / `0x10000 korvo2_oneye.bin` / `0x210000 srmodels/srmodels.bin`;
+  2. 烧写四个镜像（**必须先 `-Erase`**：分区表已改为 `factory 4M + model 1M + creds 16K@0x510000 + storage 1M`
+     —— **开发板台面形态**，2026-09-30 放大 app 分区，逐项取舍见 [`partitions.csv`](partitions.csv) 顶部注释）：
+     `0x0 bootloader.bin` / `0x8000 partition-table.bin` / `0x10000 korvo2_oneye.bin` / `0x410000 srmodels/srmodels.bin`;
+     ⚠️ 本批 `model` 偏移由 `0x210000` 挪到 **`0x410000`**，`storage` 由 `0x410000` 挪到 `0x514000`；
+     **`creds` 仍钉在 `0x510000`（不变）**。用 `tools/provision-device.ps1` 烧写时它会自读 `partitions.csv`
+     核对这组偏移（对不上以退出码 2 拒绝执行）；手工 esptool 则必须按上面这组偏移逐一核对。
   3. 复位后看串口：`从凭据文件读取 Wi-Fi` → `Wi-Fi 已获取 IP：…` → `已联网 → 启动上云` → `本地验证面板：http://<IP>/api/status`。
      若没看到，按 §5.4 的排查口径逐条核对（卡未挂载 / 文件不在根目录 / 键名拼写 / 密码错误）。
 
@@ -142,14 +146,21 @@ I2S0(CODEC_ADC_I2S_PORT) 16 kHz / 32 bit / ONLY_LEFT        ← 单麦口径：i
 - **落盘位置**：SD 卡可用 → `/sdcard/rec/aec-N.wav`；否则 SPIFFS 兜底 → `/spiffs/rec/aec-N.wav`。
 - **触发方式**：`POST /api/action {"op":"aec_start","duration_s":5}`（到时自动停止）或 `{"op":"aec_stop"}`；
   验证面板上有「录 5/10/30 s」「停止录音」按钮，并在「音频」卡片里直接播放/下载 WAV（`Range` 已支持拖动）。
-- **分区口径（自定义 `partitions.csv`）**：`factory 2M` + **`model 2M`** + `storage(spiffs) 1M`。
+- **分区口径（自定义 `partitions.csv`，2026-09-30 起为「开发板台面形态」）**：`factory 4M` + **`model 1M`** +
+  `creds 16K@0x510000`（🔴 偏移不可挪） + `storage 1M`（移到 creds 之后，`0x514000`）。
+  放大 app 的**唯一代价**是从 `model` 里割 1 M（`srmodels.bin` 实测 337,952 B ⇒ 仍有 3.1× 余量），
+  以及 `storage` 换了偏移（按分区名挂载 + `format_if_mount_failed=true`，不影响启动路径）。
+  ⚠️ **量产分区形态需单独评审**（本表只为开发板台面给 app 留余量）。
 
 > **⚠️ 关键坑位（已修复，勿踩）——esp-sr 的模型分区**：`components/esp-sr/CMakeLists.txt:78-100` 只在
 > **`CONFIG_PARTITION_TABLE_CUSTOM=y` 且分区表中存在名为 `model` 的分区**时，才生成 `srmodels/srmodels.bin`
 > 并把模型烧到该分区；否则那句提示只是赋给一个未被使用的 CMake 变量（**上游不打印**）⇒ **构建成功、模型从未投放**，
 > 真机 AFE 会因找不到模型而失败。**上游 `examples/advanced_examples/{aec,algorithm}` 的 `partitions.csv` 即缺 `model` 分区**。
-> 本工程已修正：`partitions.csv` 含 `model`（2 M），构建产出 `srmodels.bin` **337,952 B**（仅 NSNET2 + WebRTC VAD；
+> 本工程已修正：`partitions.csv` 含 `model`（**2026-09-30 由 2 M 缩到 1 M** —— 让出的 1 M 全部给了 `factory`，
+> 见 [`partitions.csv`](partitions.csv) 顶部取舍说明），构建产出 `srmodels.bin` **337,952 B**（仅 NSNET2 + WebRTC VAD；
 > 不含 WakeNet/MultiNet ⇒ 与 `AFE_TYPE_VC` 口径一致，且省下约 3.8 MB flash）。
+> ⚠️ **1 M 是"够用"而不是"随便加"**：esp-sr 不校验分区够不够装（`components/esp-sr/CMakeLists.txt:79-96` 只取
+> offset/size 去烧），所以**一旦启用更多 esp-sr 模型，必须重新核对 `srmodels.bin` 字节数并从 `factory` 割回来**。
 - **前置条件**：AFE 需要 PSRAM（`CONFIG_SPIRAM*`，本板 ESP32-S3-WROOM-1 带 Octal PSRAM）。
 - **真机状态（第十四轮）**：① PSRAM 已确认 Octal 8 MB @80 MHz；② 录音链路已闭环（请求 5 s → 163,884 B = 5.12 s，
   原始 I2S 幅度 RMS 123–390 / 峰值 600–1600，安静房间量级）；③ SD 落盘与 SPIFFS 兜底两条路径均已实测；
@@ -320,7 +331,7 @@ python3 tools/panel/panel.py --self-test
 
 | 件 | 位置 / 取值 | 说明 |
 | --- | --- | --- |
-| 凭证分区 | `partitions.csv`：`creds, data, 0x40, 0x510000, 16K` | 固件按**类型+名字**查找（`data`/`0x40`/`creds`），不看偏移；偏移只在"按偏移烧写"时用 |
+| 凭证分区 | `partitions.csv`：`creds, data, 0x40, 0x510000, 16K` | 固件按**类型+名字**查找（`data`/`0x40`/`creds`），不看偏移；偏移只在"按偏移烧写"时用。🔴 **该偏移是不可挪的红线**：板上凭据已按 `0x510000` 烧好，挪了 = 丢真机身份（2026-09-30 放大 app 分区时专门保住它，见 [`partitions.csv`](partitions.csv) 顶部；`tools/provision-device.ps1` 现在会自读分区表核对） |
 | 镜像格式 | `ONEYECR1` + 版本 + 长度 + CRC32 + JSON（含 PEM 三元组） | 唯一定义在后端 `src/utils/credsimage`；出镜像/回读校验用 `mkcreds` |
 | 读取顺序 | 先读分区 → **分区坏 ⇒ 一律不上网**（fail-closed）→ 分区**没写过**才回退内嵌证书 | 回退是台面便利；量产由 `ONEYE_DEV_CREDS_REQUIRED=y` 关掉 |
 | 身份自证 | `ONEYE_FW_PROV_ATTEST`（**缺省 y**）开机打印一行 `ONEYE-PROV1 …` | 产线用 `provverify` + 该设备证书验签；**只在分区里有合法镜像时打印**（没灌注的机器什么都不打） |
@@ -440,6 +451,8 @@ idf.py -B output/.build/korvo2_oneye-production \
 | **摄像头探测的初始化顺序（真机，第十八轮查明）** | 把 `camera_api_init()` 放到 `board_init_peripherals()` **之前**（照抄上游 `lcd_camera` 的 "camera init in advance" 注释）⇒ `camera probe … no sensor FAIL`（ADF I2C 总线尚未建立）；放在**板级初始化之后**⇒ 探测成功。另：该失败曾因计入硬自检而触发 `SELFTEST_STRICT` 中止上云 ⇒ 设备连 IP 都拿不到（**看不到失败原因**），故摄像头改用提示级 `chk_warn`（记红行、不中止） |
 | **待续（未闭环，明确记录）** | ① **可听性**：回放链路已把 PCM 完整时钟输出（`AEL_IO_DONE` + 时长吻合），但「扬声器是否真的出声」需人耳确认（PA `GPIO48` 已在 `es8311_codec_init` 打开、音量 80）；② **麦克风灵敏度**：原始幅度随环境变化（123→390），对着板子说话的幅度取证待补；③ **`video.live` 上行数据面**（MJPEG 编码 + `http_upload`/`mqtt_frame`）未实现 ⇒ 该能力位仍不得声明 |
 | ⚠️ **镜像余量告急（第十八轮）** | `korvo2_oneye.bin` **2,045,856 B**（`0x1f37a0`），`factory 2M` 分区**仅余 2%**（0xc860）。后续增长首选 `CONFIG_COMPILER_OPTIMIZATION_SIZE=y`（-Os），或扩 `factory` 分区（16 MB flash 尚有余量） |
+| **app 分区放大 2M→4M（第二十轮，2026-09-30）** | 用户裁定「开发板尽量多应用空间」⇒ `partitions.csv` 改为 `factory 4M + model 1M + creds 16K@0x510000 + storage 1M@0x514000`（**开发板台面形态**；用量产预设的实测见下行）。**WSL**（`idf.py -B /tmp/korvo2-wsl-build build`，全新目录）**EXIT 0**：`korvo2_oneye.bin` **2,064,656 B（`0x1f8110`）**，`Smallest app partition is 0x400000` ⇒ **余量 `0x207ef0` = 51%**（放大前的 `nearly full` 告警**消失**）；`korvo2_oneye.elf` 17,079,880 B；`srmodels/srmodels.bin` 337,952 B（`movemodel.py` 自述 `Recommended model partition size: 331K` ⇒ 1 M 的 `model` 仍有 3.2× 余量）。**Windows**（全新目录，**不带** `-DONEYE_SDK_LIB_OUT_DIR` 绕行）**EXIT 0**：bin **2,064,448 B**、sha256 `BC2302D840C6A1EB226EC22AB08EF15274402FE8FCB63BC7D26F2D1AC9538F8`、elf 17,049,656 B；`flash_args` = `0x0 bootloader` / `0x8000 partition-table` / `0x10000 korvo2_oneye` / **`0x410000 srmodels`**；两次构建日志里解码出的分区表**逐字相同**，`creds` **仍在 `0x510000`**。同一批还把 `shadow_reassert`(4096 w) / `log_probe`(3072 w) 两个**起不来**的任务内联进常驻的 `cloud_start_task`（全程读数见 `_tmp-phase2/device-fixes-partition.md`） |
+| **量产预设下的体积读数（第二十轮 EXTRA，2026-09-30）** | `-DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.defaults.production"` + 空证书目录 ⇒ **EXIT 0**：`korvo2_oneye.bin` **993,008 B（`0xf2af0`）**（-Os）、`0x400000` 分区余量 **76%**。这条的**真正用途**是证明本批新增的 `#if CONFIG_ONEYE_FW_LOG_PROBE` 守卫在「开关关掉」（量产预设 `:61`）时**编译通过**，并给出 `tools/check-sdkconfig-defaults.py --sdkconfig <该构建>/sdkconfig --require sdkconfig.defaults.production` = **PASS（11 项全部存在且已生效）** 的读数 |
 | **`command/up` 回执接线（G2）** | 缺口：SDK 早有 `oneye_dev_base_ack_command()`，但固件**从未调用** ⇒ 云端下发 `command/down` 后设备不回执，`dev_command.status` 停在 `SENT` 直到超时。落码：`main/korvo2_oneye_main.c` 新增 `command_ack_unknown()`（:342-396，`cJSON_ParseWithLength` 取 `id`）+ 在 `COMMAND_RECV` 事件里调用（:437）；因 `cmds[]` 为空 ⇒ 一律回 `ControlAck{id,status:"error",error:"unknown command"}`（RAW 不套信封，与 asyncapi 逐字段一致）。**构建证据（WSL/IDF v5.5.5，复用 `/tmp/rc-net2`）**：`BUILD_RC=0`；`korvo2_oneye.bin binary size 0x1f7550 bytes. Smallest app partition is 0x200000 bytes. 0x8ab0 bytes (2%) free.` + `Project build complete.`；ninja 仅重编 `korvo2_oneye_main.c.obj`（`[4/9]`）⇒ 相对基线 `0x1f7120` 的 **+0x430（+1,072 B）就是本次改动代价**。**符号级证据**：`nm` 该 obj 有 `U oneye_dev_base_ack_command` / `U cJSON_ParseWithLength`，最终 `.elf` 里 `T oneye_dev_base_ack_command`（0x4201d114）；镜像 `strings` 含字面量 `unknown command`。**⛔ 未做**：未上真机、未端到端发 `command/down` 验回执；真实 `ok` 路径属 **S16 命令执行面**，且需**先登记**具体命令名（`cmds[]` 取值 = 物模型命令名）——本轮收尾的是「停在 `SENT` 到超时」这个缺口被消除，⛔ **不是**「命令闭环打通」 |
 
 **后续（真机）**：`idf.py -p <COM> flash monitor` → 核对自检逐行 PASS → **SD 卡放 `oneye-wifi.txt` 复位自动配网** → 观察

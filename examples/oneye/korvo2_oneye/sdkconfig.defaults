@@ -1,10 +1,13 @@
 #
 # korvo2_oneye 通用缺省（板级参数见 sdkconfig.defaults.esp32s3）
 #
-# Bootloader / 分区：与 ADF 例程口径一致（单 App 分区，偏移 0x1000）
+# Bootloader / 分区表：分区表放在 0x8000、**自定义分区表**（见下面的 CONFIG_PARTITION_TABLE_CUSTOM；
+# 布局与逐项取舍写在 partitions.csv 顶部的注释里）。
+# ⚠️ 这里**故意不写** `CONFIG_PARTITION_TABLE_SINGLE_APP=y`（2026-09-30 放分区时删掉）：
+#    它与 `CUSTOM=y` 是同一个 choice 的两个成员，"两行都写"只是靠"后写者胜"才成立，
+#    读起来却像两条同时生效 —— 分区表只有一处选择，就只留一处。
 CONFIG_BOOTLOADER_OFFSET_IN_FLASH=0x1000
 CONFIG_BOOTLOADER_COMPILER_OPTIMIZATION_SIZE=y
-CONFIG_PARTITION_TABLE_SINGLE_APP=y
 CONFIG_PARTITION_TABLE_MD5=y
 
 # ESP-ADF（v2.8）与 ESP-IDF 5.5 共栈需要：FreeRTOS 向后兼容
@@ -25,9 +28,18 @@ CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_LOG_MAXIMUM_EQUALS_DEFAULT=y
 
 #
-# 分区表：自定义（factory 2M + storage 1M SPIFFS）
-#   AEC 采集走 esp-sr AFE 且模型以 MODEL_IN_FLASH 编入应用 ⇒ 应用 ~1.4 MB，超出 IDF 缺省 factory(1M)；
-#   SPIFFS 作无 SD 卡时的录音兜底（/spiffs/rec）。
+# 分区表：自定义（**开发板台面形态**：factory 4M + model 1M + creds 16K@0x510000 + storage 1M）
+#   为什么必须自定义：
+#     ① esp-sr 的 AFE 要求分区表里存在名为 `model` 的分区，否则 `srmodels.bin` **从不投放**
+#        （`components/esp-sr/CMakeLists.txt:78-100`，上游不打印任何提示）；
+#     ② IDF 缺省 `factory` 只有 1 MB，而本应用（ADF 播放链 + esp-sr + oneye-dev-sdk 四库 + Wi-Fi + 本地面板）
+#        实测约 1.97 MB；
+#     ③ 无 SD 卡时录音需要 SPIFFS 兜底（`/spiffs/rec`）。
+#   2026-09-30 放大的**唯一目的**是给 app 留余量：`factory` 2M→4M（放大前实测只剩 1%，构建期告警
+#   `The smallest app partition is nearly full …`，继续加功能必炸）。
+#   🔴 `creds` 被**钉在 0x510000**（板上已按该偏移烧好 per-device 凭据；挪了 = 把真机身份弄丢）
+#      ⇒ 本表是**开发板台面形态**；**量产分区形态需单独评审**（用户裁定：实际生产设备 flash 更充裕）。
+#   逐项取舍（为什么缩 model、为什么 storage 移到 creds 之后）见 partitions.csv 顶部注释。
 #
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
@@ -84,6 +96,30 @@ CONFIG_SPIFFS_MAX_PARTITIONS=3
 CONFIG_ONEYE_FW_ENABLE_WIFI_FILE=y
 # microSD：凭据文件、AEC 录音落盘、板上回放都依赖它（未插卡仅告警，不阻塞启动）
 CONFIG_ONEYE_FW_ENABLE_SDCARD=y
+
+# ---- log/up：让板级**真的**有日志上行（2026-09-30 本轮目标之一） -------------------------
+# 为什么要显式开：本固件平时**只有开机自检那一行**走 SDK 的 log 面（`ONEYE_LOGI`，main/korvo2_oneye_main.c
+# 的 oneye_start 第 6 步），其余日志全是 ESP-IDF 的 `ESP_LOG*`（只落本地栈），而 SDK **内部**日志按设计
+# 也不经 log 库上行 ⇒ 板上 `rmng/dev/<node>/log/up` 面**几乎无流量**，于是 `log/down` 的
+# set_uplink / dump 的**效果**在真机上无从观测（2026-09-21 真机复验实测：19 条下行全部投递成功、
+# 串口逐条有日志，broker 侧一帧 `log/up` 都没有）。取证结论见
+# backend/contracts/api/mqtt/传输规范.md:251-259。
+#
+# 这个开关（main/Kconfig.projbuild:105-115）做的事：用**既有公开 API** 每 3 s 写一条 INFO 记录
+# （每第 5 条再补一簇 5 条），并把批量间隔拉到 20 s、关掉"条数早发"，让记录在缓冲里停得住
+# （`log/down dump` 的窗口语义才可观测）。实现见 main/korvo2_oneye_main.c 的 log_probe_task。
+#
+# 速率核算（对照 backend/contracts/api/mqtt/传输规范.md:149 的 log/up 限额 ≤1 帧/s、基线 ≤16 KB/s）：
+# 每 15 s 共 10 条（5 个 tick + 1 簇 5 条）× 约 60–100 B ≈ 4–7 KB/min ≈ 0.1 KB/s，且 20 s 才组一帧
+# ⇒ 离"高频"极远（帧率 0.05 帧/s、字节率约为基线的 0.6%）。SDK 另有 32 KB/帧与 16 KB/s 限速兜底。
+#
+# ⚠️ 这是**取证插桩**（Kconfig help 逐字"仅取证用"）：量产预设 sdkconfig.defaults.production:61
+# 显式写着 `# CONFIG_ONEYE_FW_LOG_PROBE is not set` 且后叠加者胜 ⇒ **量产口径不受本行影响**。
+# 为什么本轮选它而不是装 platform hook（`oneye_dev_log_install_platform_hook()`，
+# components/oneye-dev-sdk/include/oneye_dev_log.h:140，那条路能让真实 ESP_LOG 也上行）：
+# hook 会替换全局 `esp_log_set_vprintf` 调用链，属"改整机日志路径"，本轮**无真机可验**
+# （不烧写、不占串口）；而本开关只在既有任务里多写几条记录，风险面小得多。hook 路线登记为未做项。
+CONFIG_ONEYE_FW_LOG_PROBE=y
 
 # ---- 承载：**必须钉死** ---------------------------------------------------------
 # 为什么钉：本工程 Kconfig 里承载 choice 的缺省是 TCP（dev/联调），而 SDK 对"承载不是 TLS 却给了

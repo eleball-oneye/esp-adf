@@ -366,7 +366,14 @@ esp_err_t player_play(const char *path)
     set_msg_locked("播放中");
     pl_unlock();
 
-    if (audio_pipeline_run(s_pipeline) != ESP_OK || xTaskCreate(player_task, "player_evt", 4096, NULL, 4, &s_task) != pdPASS) {
+    if (audio_pipeline_run(s_pipeline) != ESP_OK) {
+        goto fail;
+    }
+    /* ⚠️ 返回值必须看（2026-09-30 同批复核）：任务建不起来与"管线跑不动"是**两种**故障，
+     * 原来两者共用一个 `goto fail`，串口上分不清是内存不足还是文件/解码问题
+     * —— 前者要减少并发占用，后者要换文件。这里把后者单独告警并保留原 fail 收敛路径。 */
+    if (xTaskCreate(player_task, "player_evt", 4096, NULL, 4, &s_task) != pdPASS) {
+        ESP_LOGW(TAG, "回放事件任务创建失败（内存不足）⇒ 本次回放未启动：%s", path);
         goto fail;
     }
     ESP_LOGI(TAG, "开始播放：%s（%s）", path, is_wav ? "wav" : "mp3");

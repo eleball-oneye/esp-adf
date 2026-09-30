@@ -25,6 +25,7 @@
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -628,9 +629,10 @@ static void keys_start(void)
 static void oneye_start(void);
 static void panel_sync_task(void *arg);
 static void panel_start_if_enabled(void);
-#if CONFIG_ONEYE_FW_LOG_PROBE
-static void log_probe_task(void *arg);
-#endif
+/* 常驻上行维护循环：**不是**独立任务 —— 就地跑在 cloud_start_task 里。
+ * 它一个循环同时驱动三条产出方：track 埋点（`track/up`）、影子整帧补发（`shadow/up`）、
+ * log 取证插桩（`log/up` 周期流量）。栈/内部 RAM 约束见「埋点 → track/up」段注释。 */
+static void uplink_maintain_run(void);
 
 /* 联网就绪 → 启动上云。放在独立任务里跑（oneye_start 需较大栈；事件任务只置位）。
  * 回调会随重连反复触发，故用一次性标志保证 SDK 只启动一次；面板启动本身幂等。 */
@@ -638,12 +640,34 @@ static void cloud_start_task(void *arg)
 {
     (void)arg;
     oneye_start();
-    (void)xTaskCreate(panel_sync_task, "panel_sync", 3072, NULL, 3, NULL);
-#if CONFIG_ONEYE_FW_LOG_PROBE
-    /* ★ 取证插桩（默认关）：见 log_probe_task 注释 */
-    (void)xTaskCreate(log_probe_task, "log_probe", 3072, NULL, 2, NULL);
-#endif
-    vTaskDelete(NULL);
+
+    /* ⚠️ 这一处原来是 `(void)xTaskCreate(...)` —— 创建失败时**零告警**，串口上"没跑"与"没写"完全同形。
+     * 2026-09-30 真机实测就是被这一点掩盖的：`log_probe_task`（3072 words）根本没起来，
+     * 而板上没有任何一行能证明它失败（`log-probe` 命中 0 行）。凡创建任务，返回值一律接出来告警。 */
+    if (xTaskCreate(panel_sync_task, "panel_sync", 3072, NULL, 3, NULL) != pdPASS) {
+        ESP_LOGW(TAG, "面板同步任务创建失败（内存不足）⇒ 面板链路快照不会刷新");
+    }
+
+    /* ★ 2026-09-30（本批）：**其余三处一律不再新建任务**。
+     * 真机实测（`_tmp-phase2/device-trackup-fix.md` §1、`_tmp-phase2/serial-trackup-proof2.txt:243-245`）：
+     * `track`（4096 words）与 `shadow_reassert`（4096 words）都 `pdPASS` 失败，`log_probe`（3072 words）同样；
+     * 同一刻板子自己量出来 `largest_internal_block=2304 B` ⇒ 内部 RAM **最大连续块**只有 2.2 KB，
+     * 而一个 4096 words 的 FreeRTOS 栈要的是 **16 KB 连续内部块**，结构上不可能成功。
+     * 所以三条产出方（track 埋点 / 影子补发 / log 取证）现在共用**本任务**这 6144 words 栈：
+     * 见 uplink_maintain_run() 与 shadow_reassert_step() / log_probe_step()。 */
+
+    /* 资源读数：把「16 KB 栈在这台板子上要不到」从**推断**变成**测量**（这正是上一版 track 任务失败的根因）。 */
+    ESP_LOGI(TAG, "[res] free_internal=%u B / largest_internal_block=%u B / free_psram=%u B",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
+    /* 上行维护（track 埋点 + 影子补发 + log 取证）：**就地跑在本任务里**，一个新任务都不建 ——
+     * 理由见上一条与「埋点 → track/up」段注释。本任务因此不再 `vTaskDelete(NULL)`：它转为这三条面的
+     * 常驻维护者（1 s 一拍，多数拍只读计数/判链路）。栈是**已经分配**的 6144 words（本函数的创建点
+     * `on_wifi_ready()`），常驻不抬高内存峰值；而"再建一个 4096 words 的任务"正是这台板子上实测失败的那一步。
+     * uplink_maintain_run() 不返回。 */
+    uplink_maintain_run();
 }
 
 static void on_wifi_ready(void)
@@ -663,17 +687,16 @@ static void on_wifi_ready(void)
 }
 
 /** 影子状态的**整帧**：boot 发一次，云链路上线（down → up）时再补发一次。
- *  没有周期重报 —— 见 shadow_reassert_task() 的说明。 */
+ *  没有周期重报 —— 见 shadow_reassert_step() 的说明。 */
 static char s_shadow_state[192];       /* 整帧：firmwareVersion + power + credSource */
 static bool s_shadow_state_valid;
-static bool s_shadow_task_started;
 
 /* 上一轮读到的云链路在线状态，用于识别**重连**（down → up）。
  * 初值 true：boot 那一帧就当链路当时可用 —— 链路不可用时 SDK 会自己把待发帧的入队时刻
  * 刷新到 link up 那一刻（`internal/oneye_internal.c` 的 bint_on_link_up），开机帧不会因断链而过期。 */
 static bool s_shadow_link_was_up = true;
 
-/** 影子**补发**任务：事件驱动，**只在云链路 down → up 时补发整帧**；没有周期重报。
+/** 影子**补发**判定：事件驱动，**只在云链路 down → up 时补发整帧**；没有周期重报。
  *
  * 为什么去掉周期重报（2026-09-25，R80 选项 (iv)）：
  *   · 量级：整帧 60 s 一次 ⇒ ≈1440 帧/天/设备，而登记的容量假设是 `fallbackPeriodSec=300`
@@ -694,26 +717,29 @@ static bool s_shadow_link_was_up = true;
  * **低频**兜底，而不是退回 60 s 周期。
  *
  * 整帧仍在 **boot** 发（见 oneye_start 第 6 步），并在这里的**重连**时补发一次，把 `power`
- * 这类非身份键也带回；补发放在**本任务**里而不是 `sdk_event_cb`（回调由 SDK 事件任务调用，
- * 在回调内再回调 SDK 属重入）。 */
-static void shadow_reassert_task(void *arg)
+ * 这类非身份键也带回；补发放在**本函数**里而不是 `sdk_event_cb`（回调由 SDK 事件任务调用，
+ * 在回调内再回调 SDK 属重入）。
+ *
+ * ★★ 2026-09-30 真机修正：本函数**不再是一个任务** ★★
+ *
+ * 第一版把它写成 `xTaskCreate(shadow_reassert_task, "shadow_reassert", 4096, …)`（4096 words = 16 KB 内部 RAM 栈）。
+ * 真机两轮串口取证（`_tmp-phase2/serial-korvo2-proof*.txt`、`_tmp-phase2/serial-trackup-proof2.txt:243`）实测
+ * `pdPASS` **失败**，只留一行 `影子补发任务创建失败（内存不足）—— 链路上线后不会补发整帧`；本批收紧前
+ * （`device-trackup-fix.md` §9-1）它一直是"仍然起不来"的欠账。
+ * 同一刻板子自报 `largest_internal_block=2304 B`（`serial-trackup-proof2.txt:245`）⇒ 16 KB **连续**内部块要不到。
+ *
+ * 修法与 `track/up` 面**同一条**：不新建任务，**就地并入**已经在跑的 `cloud_start_task`（6144 words，
+ * 创建点 `on_wifi_ready()`，真机确认成功）。这里拆成 `shadow_reassert_step()`——**每次只做一次判定、立即返回**，
+ * 由 `uplink_maintain_run()` 每秒调用。为什么能绕开内存约束：它跑在**已经分配**的 6144 words 栈上，
+ * 不申请任何新栈；判定逻辑（`down → up` + 状态有效 ⇒ 重发整帧）与原任务循环体**逐行相同**，只是换了宿主。
+ * ⚠️ 因此**不许**为了"看起来更干净"再把它变回独立任务：这台上任何 ≥16 KB 的新任务都会重现同一次失败。 */
+static void shadow_reassert_step(bool link_up)
 {
-    (void)arg;
-
-    while (true) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-
-        /* 重连（down → up）⇒ 补发整帧 */
-        oneye_dev_link_status_t ls;
-        memset(&ls, 0, sizeof(ls));
-        ONEYE_DEV_STRUCT_INIT(ls);
-        bool link_up = (oneye_dev_base_get_link_status(&ls) == ONEYE_DEV_SDK_OK) && ls.cloud_link_up;
-        if (link_up && !s_shadow_link_was_up && s_shadow_state_valid) {
-            oneye_dev_sdk_err_t frc = oneye_dev_base_report_state(s_shadow_state);
-            ESP_LOGI(TAG, "影子整帧补发（链路上线）：%s", oneye_dev_strerror(frc));
-        }
-        s_shadow_link_was_up = link_up;
+    if (link_up && !s_shadow_link_was_up && s_shadow_state_valid) {
+        oneye_dev_sdk_err_t frc = oneye_dev_base_report_state(s_shadow_state);
+        ESP_LOGI(TAG, "影子整帧补发（链路上线）：%s", oneye_dev_strerror(frc));
     }
+    s_shadow_link_was_up = link_up;
 }
 
 /** 启动本地验证面（需已联网获得 IP；与云端链路是否可用无关） */
@@ -1083,7 +1109,8 @@ static void oneye_start(void)
                      oneye_dev_transport_str(ls.transport));
         }
 
-        /* 记住这次的内容，并起一个**补发**任务（2026-09-24 起；2026-09-25 改为事件驱动）。
+        /* 记住这次的内容，交给**已在跑的** `uplink_maintain_run()`（cloud_start_task 内）在
+         * `down → up` 时补发（2026-09-24 起；2026-09-25 改为事件驱动）。
          *
          * 为什么曾经必须周期重述，以及为什么现在不必了：`credSource` 是**状态**，不是事件 ——
          * 开机那一帧丢了，这台机器在凭据来源视图里就永远看不见（正是要防的静默事故）。真机实测：
@@ -1094,16 +1121,14 @@ static void oneye_start(void)
          * `internal/oneye_internal.c:756-764`），周期重报在它之上是冗余的；而周期重报本身要付
          * ≈1440 帧/天/设备（对照登记的 `fallbackPeriodSec=300` ⇒ 288 帧/天/设备，差 5×）。
          * 故 2026-09-25 按 R80 选项 (iv) 去掉周期，只保留**事件驱动**的 `down → up` 补发；
-         * 代价（非掉线类丢失不再自愈）见 shadow_reassert_task() 的注释，是**已接受**的。 */
+         * 代价（非掉线类丢失不再自愈）见 shadow_reassert_step() 的注释，是**已接受**的。
+         *
+         * ★ 2026-09-30：这里**不再 `xTaskCreate(shadow_reassert_task, …4096 words…)`** ——
+         *   真机实测那个任务起不来（告警逐字见 shadow_reassert_step() 注释）。补发判定改为
+         *   `shadow_reassert_step()`，由常驻的 `uplink_maintain_run()` 每秒调用一次；
+         *   **不新建任务、不申请新栈**，因此不存在"起不来"这一态。 */
         snprintf(s_shadow_state, sizeof(s_shadow_state), "%s", shadow);
         s_shadow_state_valid = true;
-        if (!s_shadow_task_started) {
-            s_shadow_task_started = true;
-            if (xTaskCreate(shadow_reassert_task, "shadow_reassert", 4096, NULL, 2, NULL) != pdPASS) {
-                s_shadow_task_started = false;
-                ESP_LOGW(TAG, "影子补发任务创建失败（内存不足）—— 链路上线后不会补发整帧");
-            }
-        }
     }
 
 #if CONFIG_ONEYE_FW_ENABLE_MPP
@@ -1128,29 +1153,251 @@ static void oneye_start(void)
  * 在真机上**无从观测**（2026-09-21 首次复验实测到这一点：19 条下行全部投递成功、串口有日志，
  * 但 broker 侧一帧 `log/up` 都没有）。
  *
- * 本任务通过**公开 API**（不是内部日志）按确定节奏写记录：每 3 s 一条；每第 5 条之后再补一簇 5 条，
- * 用来观察 `dump` 的窗口语义（配合 20 s 的批量间隔，缓冲里的记录停得住）。 */
-static void log_probe_task(void *arg)
+ * 本函数通过**公开 API**（不是内部日志）按确定节奏写记录：每 3 s 一条；每第 5 条之后再补一簇 5 条，
+ * 用来观察 `dump` 的窗口语义（配合 20 s 的批量间隔，缓冲里的记录停得住）。
+ *
+ * ★★ 2026-09-30 真机修正：本函数**不再是一个任务** ★★
+ *
+ * 第一版是 `xTaskCreate(log_probe_task, "log_probe", 3072, …)`（3072 words = 12 KB 内部 RAM 栈）。
+ * 真机实测 `pdPASS` **失败**（`_tmp-phase2/serial-trackup-proof2.txt:244`），且它的返回值当时被 `(void)` 丢掉
+ * ⇒ 板上**没有一行**能证明它失败，症状与"代码没写"完全同形（`device-serial-proof.md` §7.3 只能写"高度疑似"）。
+ * 本批两件事一起做：① 返回值告警（上一批已接，本批连任务本身一起删）；② 拆成 `log_probe_step()`——
+ * **写一轮立即返回**，由已在跑的 `uplink_maintain_run()` 每 3 s 调用一次。
+ * 为什么能绕开内部 RAM 约束：它跑在 `cloud_start_task` **已经分配**的 6144 words 栈上，不再申请 12 KB 新栈；
+ * 写的记录与节奏与原任务**逐条相同**（`tick=` 每 3 s 一条、每第 5 条补 `burst=` 一簇 5 条），
+ * 只是把 `vTaskDelay` 换成了调用者的节拍。
+ * ⚠️ 因此**不许**把它变回独立任务：3072 words 在这台板子上同样要不到（同刻 `largest_internal_block=2304 B`）。
+ *
+ * 频率核算（与 sdkconfig.defaults:100-102 的登记同源，本批未改）：每 15 s 共 10 条 × 约 60–100 B
+ * ≈ 0.1 KB/s，且 20 s 才组一帧 ⇒ 帧率 0.05 帧/s、字节率约为契约基线（≤1 帧/s、≤16 KB/s）的 0.6%。 */
+static void log_probe_step(uint32_t *seq)
 {
-    uint32_t i = 0u;
+    uint32_t i = ++(*seq);
 
-    (void)arg;
-    vTaskDelay(pdMS_TO_TICKS(5000));
-    for (;;) {
-        ONEYE_LOGI(ONEYE_DEV_LOG_TAG_BASE, "log-probe tick=%u", (unsigned)++i);
-        if ((i % 5u) == 0u) {
-            uint32_t k;
+    ONEYE_LOGI(ONEYE_DEV_LOG_TAG_BASE, "log-probe tick=%u", (unsigned)i);
+    if ((i % 5u) == 0u) {
+        uint32_t k;
 
-            for (k = 0u; k < 5u; k++) {
-                ONEYE_LOGI(ONEYE_DEV_LOG_TAG_BASE, "log-probe burst=%u/%u", (unsigned)i,
-                           (unsigned)k);
-            }
+        for (k = 0u; k < 5u; k++) {
+            ONEYE_LOGI(ONEYE_DEV_LOG_TAG_BASE, "log-probe burst=%u/%u", (unsigned)i,
+                       (unsigned)k);
         }
-        vTaskDelay(pdMS_TO_TICKS(3000));
     }
 }
 
 #endif /* CONFIG_ONEYE_FW_LOG_PROBE */
+
+/* ---------------------------------------------------------------- 埋点 → track/up
+ *
+ * 契约：`rmng/dev/{node}/track/up`（QoS **0**、信封 + `type=track`、≥5 s 聚合窗口、≤16 KB/帧；
+ * 正本 = backend/contracts/api/mqtt/传输规范.md:89/:148、backend/contracts/domain/事件与埋点上报.md §2.4/§3.3）。
+ * SDK 侧的**通道、白名单、组帧、API 全都早已存在**（组帧 `components/oneye-dev-sdk/src/oneye_dev_event.c:638`、
+ * 白名单 `include/oneye_dev_event.h:47-53`、API 声明 `:135`），缺的只有**产出方**：
+ * 本文件 `oneye_start()` 第 4 步把 `ev_cfg.track_enabled` 置了 true（`:981`），
+ * 而 2026-09-30 实测**全 `examples/oneye` 对 `oneye_dev_event_track()` 零调用**
+ * ⇒ 这条面长期"开着但从不发"。下面补两个**只报真事**的产出方（不新造名字、不新造字段）：
+ *
+ *  ① `boot`（`ONEYE_DEV_TRACK_BOOT`，`oneye_dev_event.h:53`）：**每次启动必发一条**。attrs 只带白名单
+ *     允许的 `uptime_ms`（`事件与埋点上报.md:116`），取值 = `esp_timer_get_time()` 的**实测**运行毫秒。
+ *     为什么必须**等链路上线**才发：SDK 对 track 走 QoS0 且**离线不缓存**
+ *     （`src/oneye_dev_event.c:1188-1191` 逐字：`!link_up()` ⇒ 直接丢弃并计入 `track_dropped`）
+ *     ⇒ 链路没起就调用等于没发。故本任务先等到 `cloud_link_up` 再发（最多等 120 s，超时如实告警）。
+ *     为什么不带 `reason`：`boot` 的 `reason` **取值**在契约里没有登记（§3.3 只登记了键名），
+ *     这里不自行发明一套"重启原因"取值；要加须先登记。
+ *
+ *  ② `uplink.throttled`（`ONEYE_DEV_TRACK_UPLINK_THROTTLE`，`oneye_dev_event.h:51`）：**只在计数真的
+ *     涨了才发**。attrs 的 `face` 取自 SDK 自己的**面名**（`oneye_dev_face_str()`，`src/oneye_dev_base.c:103-118`，
+ *     不新造取值），`dropped` = 本次采样相对上次的**真实增量**；计数不涨就一条都不发 ——
+ *     契约要的是"上行限速/背压取证"（`事件与埋点上报.md:114`），**没有背压就不许报背压**。
+ *     取这两面：`log` 面 `dropped`（缓冲满丢弃，`oneye_dev_log.h:67`）与 `event` 面 `items_dropped`
+ *     （队列/离线缓存满丢弃，`oneye_dev_event.h:95`）；**不含** `track_dropped` —— 它把"白名单外被拒"
+ *     与"QoS0 离线按设计丢弃"也计进来，报成 throttled 会失真。
+ *
+ * 频率：10 s 采样一次（track 面聚合窗口 ≥5 s；计数器单调累计，10 s 既不高频也不漏增量）
+ * ⇒ `boot` 每次启动至多 1 条、`uplink.throttled` 每面每次采样至多 1 条，远低于契约限额。
+ *
+ * ★★ 2026-09-30 真机修正：为什么这里**不再是一个独立任务** ★★
+ *
+ * 第一版把上面这套写成独立任务 `xTaskCreate(track_task, "track", 4096, …)`（4096 words = 16 KB 内部 RAM 栈）。
+ * 真机两轮各 120 s 串口取证（`_tmp-phase2/serial-korvo2-proof*.txt`）实测：**`pdPASS` 失败**，
+ * 板上只留一行 `埋点任务创建失败（内存不足）⇒ 本轮不会发出任何 track/up`，`[track]` 命中 0 行、
+ * broker 侧 `track/up` 0 帧。同一时刻、同样 4096 words 的 `shadow_reassert` 也失败；而 `log_probe` 的返回值
+ * 当时被 `(void)` 丢掉 ⇒ 它八成也没起来，却**零告警**。
+ * 把 `CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL` 由 64K 提到 128K **实测无效**（两条失败告警逐字不变，已回滚）：
+ * 缺的不是"预留额度"，而是这块板上（ADF + esp-sr AFE + 摄像头 + Wi-Fi + 面板同时在跑）**要不到 16 KB 连续内部 RAM**。
+ *
+ * ⇒ 修法不是"再挤一个任务出来"，而是**复用已经在跑的任务**：`oneye_start()` 本来就跑在 `cloud_start_task`
+ * （6144 words，创建点 `on_wifi_ready()`，真机确认创建成功）里，而"链路上线"这一刻也正好落在它手里 ⇒ 埋点**就地**跑在它那儿。
+ * 代价：`cloud_start_task` 不再 `vTaskDelete(NULL)`，那 6144 words 栈转为常驻。它是**已分配**的栈，不抬高内存峰值；
+ * 反过来，任何"再建一个 ≥16 KB 任务"的写法都会重现同一个失败 —— 这就是不许走那条路的原因。
+ *
+ * ★★ 2026-09-30（本批）把另外两条产出方也并进同一个循环 ★★
+ *
+ * 上一批只解决了 track 面；真机同刻的另外两条**仍然失败**：`shadow_reassert_task`（4096 words，影子补发）
+ * 与 `log_probe_task`（3072 words，`log/up` 周期流量）。本批按**同一条**修法把三者并进
+ * `uplink_maintain_run()` 一个 1 s 节拍：影子补发每秒判一次（`shadow_reassert_step()`）、
+ * log 取证每 3 s 写一轮（`log_probe_step()`）、track 采样每 10 s 一次。
+ * 判据：本工程现在**只在 `on_wifi_ready()` 里创建 1 个上云任务 + 1 个面板同步任务**，
+ * 两者都接返回值；不再有任何"可能起不来的产出方任务"。
+ */
+#define ONEYE_FW_TRACK_SAMPLE_MS  10000u   /* `uplink.throttled` 采样周期（contract 聚合窗口 ≥5 s） */
+#define ONEYE_FW_MAINTAIN_TICK_MS  1000u   /* 常驻维护循环节拍：影子 down→up 判定需要这个量级 */
+#if CONFIG_ONEYE_FW_LOG_PROBE
+#define ONEYE_FW_LOG_PROBE_MS      3000u   /* log 取证插桩写入间隔（与原 log_probe_task 同值） */
+#endif
+
+/* 上报一条 `uplink.throttled`。**只由"计数真的涨了"的调用点触发**（见上），不做任何猜测性上报。 */
+static void track_emit_throttled(oneye_dev_face_t face, uint32_t dropped)
+{
+    const char *face_name = oneye_dev_face_str(face);
+    char attrs[64];
+    oneye_dev_sdk_err_t trc;
+
+    if (face_name == NULL) {
+        return;                     /* 没有面名可报：宁可少报，也不报含糊值 */
+    }
+    (void)snprintf(attrs, sizeof(attrs), "{\"face\":\"%s\",\"dropped\":%u}",
+                   face_name, (unsigned)dropped);
+    trc = oneye_dev_event_track(ONEYE_DEV_TRACK_UPLINK_THROTTLE, attrs);
+    if (trc == ONEYE_DEV_SDK_OK) {
+        ESP_LOGW(TAG, "[track] uplink.throttled 已上报（%s）", attrs);  /* 背压本身要显眼 ⇒ WARN */
+    } else {
+        ESP_LOGW(TAG, "[track] uplink.throttled 上报失败：%s（%s）",
+                 oneye_dev_strerror(trc), attrs);
+    }
+}
+
+/* 常驻上行维护循环：**由 cloud_start_task 直接调用**（不新建任务，见上）。本函数不返回。
+ *
+ * 三条产出方共用一个节拍（`ONEYE_FW_MAINTAIN_TICK_MS` = 1 s），各自按自己的周期到点才动：
+ *   ① 影子整帧补发 —— 每拍一次 `shadow_reassert_step(link_up)`（原 `shadow_reassert_task` 的判据逐行未改）
+ *   ② log 取证插桩 —— 每 3 s 一轮 `log_probe_step()`（原 `log_probe_task` 的节奏逐条未改）
+ *   ③ track 埋点     —— `boot` 只发一次（等链路上线 → 等 SDK 计数确认）；`uplink.throttled` 每 10 s 采样
+ * 三者的**入参/取值/判据全部沿用原实现**，唯一变化是"宿主任务"与"节拍从各自 `vTaskDelay` 变成统一 tick"。 */
+static void uplink_maintain_run(void)
+{
+    uint32_t prev_event_drops = 0u;
+    uint32_t prev_log_drops = 0u;
+    uint32_t ms_since_track = 0u;
+    uint32_t boot_waited_ms = 0u;
+#if CONFIG_ONEYE_FW_LOG_PROBE
+    uint32_t probe_seq = 0u;
+    uint32_t ms_since_probe = 0u;
+#endif
+    /* boot 埋点状态机：0 = 等链路上线；1 = 已入队、等 SDK 计数确认；2 = 已了结（成功/失败/超时，都不再动） */
+    int boot_state = 0;
+    char boot_attrs[48] = { 0 };
+    bool link_up = false;
+
+    for (;;) {
+        oneye_dev_link_status_t ls;
+
+        vTaskDelay(pdMS_TO_TICKS(ONEYE_FW_MAINTAIN_TICK_MS));
+        ms_since_track += ONEYE_FW_MAINTAIN_TICK_MS;
+        boot_waited_ms += ONEYE_FW_MAINTAIN_TICK_MS;
+#if CONFIG_ONEYE_FW_LOG_PROBE
+        ms_since_probe += ONEYE_FW_MAINTAIN_TICK_MS;
+#endif
+
+        /* 链路状态每拍只取一次，三处共用（`ONEYE_DEV_STRUCT_INIT` 不可省：不初始化 struct_size
+         * ⇒ getter 返回 INVALID 且**什么都不写**，上一版诊断就这么静默失效过）。 */
+        memset(&ls, 0, sizeof(ls));
+        ONEYE_DEV_STRUCT_INIT(ls);
+        link_up = (oneye_dev_base_get_link_status(&ls) == ONEYE_DEV_SDK_OK) && ls.cloud_link_up;
+
+        /* ① 影子补发：仅 `down → up` 且状态有效时补发整帧 */
+        shadow_reassert_step(link_up);
+
+        /* ② log 取证插桩：每 3 s 写一轮**真实**记录（走 SDK 公开 log API，不伪造内容、不新造 tag） */
+#if CONFIG_ONEYE_FW_LOG_PROBE
+        if (ms_since_probe >= ONEYE_FW_LOG_PROBE_MS) {
+            ms_since_probe = 0u;
+            log_probe_step(&probe_seq);
+        }
+#endif
+
+        /* ③a `boot`：等链路上线（QoS0 + 离线不缓存 ⇒ 链路没起就发等于没发），最多 120 s */
+        if (boot_state == 0) {
+            if (link_up) {
+                oneye_dev_sdk_err_t trc;
+
+                (void)snprintf(boot_attrs, sizeof(boot_attrs), "{\"uptime_ms\":%llu}",
+                               (unsigned long long)(esp_timer_get_time() / 1000));
+                trc = oneye_dev_event_track(ONEYE_DEV_TRACK_BOOT, boot_attrs);
+                if (trc == ONEYE_DEV_SDK_OK) {
+                    /* ⚠️ 返回值 OK **只代表"已入聚合缓冲"**，不代表已经发出去：track 面按 ≥5 s 的窗口组帧
+                     * （`oneye_dev_event.c:651-656`），实际冲刷由 SDK 自己的周期 tick 驱动。
+                     * 2026-09-30 真机第一版修好后就撞到了这个区别：串口打的是 `track_reported=0`（刚入队，
+                     * 还没到窗口），而 broker 上其实收到了帧 —— 只看第一行会误判成"没发出去"。
+                     * 所以这里**等计数真的动了**再打判据行（最多 30 s；实测约 20 s 与 log 面同批发出）。
+                     * 这一步是"不许静默"的关键：判据行必须由 SDK 的实测计数背书，而不是由调用返回值背书。 */
+                    ESP_LOGI(TAG, "[track] boot 已入队（%s）—— 等聚合窗口/周期冲刷后确认", boot_attrs);
+                    boot_state = 1;
+                    boot_waited_ms = 0u;
+                } else {
+                    ESP_LOGW(TAG, "[track] boot 上报失败：%s（%s）",
+                             oneye_dev_strerror(trc), boot_attrs);
+                    boot_state = 2;
+                }
+            } else if (boot_waited_ms >= 120000u) {
+                ESP_LOGW(TAG, "[track] 等云链路上线超时（120 s）⇒ 不发 boot 埋点"
+                              "（track 面 QoS0 且离线不缓存，链路没起时发了也会被丢）");
+                boot_state = 2;
+            }
+        } else if (boot_state == 1) {
+            oneye_dev_event_stats_t st;
+
+            memset(&st, 0, sizeof(st));
+            ONEYE_DEV_STRUCT_INIT(st);
+            (void)oneye_dev_event_get_stats(&st);
+            if (st.track_reported > 0u || st.track_dropped > 0u) {
+                if (st.track_reported > 0u && st.track_dropped == 0u) {
+                    ESP_LOGI(TAG, "[track] boot 已上报（%s）；track_reported=%u track_dropped=%u frames_tx=%u",
+                             boot_attrs, (unsigned)st.track_reported, (unsigned)st.track_dropped,
+                             (unsigned)st.frames_tx);
+                } else {
+                    ESP_LOGW(TAG, "[track] boot 已入队但 30 s 内未见上报确认（%s）："
+                                  "track_reported=%u track_dropped=%u frames_tx=%u",
+                             boot_attrs, (unsigned)st.track_reported, (unsigned)st.track_dropped,
+                             (unsigned)st.frames_tx);
+                }
+                boot_state = 2;
+            } else if (boot_waited_ms >= 30000u) {
+                ESP_LOGW(TAG, "[track] boot 已入队但 30 s 内未见上报确认（%s）："
+                              "track_reported=%u track_dropped=%u frames_tx=%u",
+                         boot_attrs, (unsigned)st.track_reported, (unsigned)st.track_dropped,
+                         (unsigned)st.frames_tx);
+                boot_state = 2;
+            }
+        }
+
+        /* ③b `uplink.throttled`：每 10 s 采样各面丢弃计数，**只报真实增量** */
+        if (ms_since_track >= ONEYE_FW_TRACK_SAMPLE_MS) {
+            oneye_dev_event_stats_t es;
+            oneye_dev_log_stats_t lgs;
+
+            ms_since_track = 0u;
+
+            memset(&es, 0, sizeof(es));
+            ONEYE_DEV_STRUCT_INIT(es);
+            if (oneye_dev_event_get_stats(&es) == ONEYE_DEV_SDK_OK) {
+                if (es.items_dropped > prev_event_drops) {
+                    track_emit_throttled(ONEYE_DEV_FACE_EVENT, es.items_dropped - prev_event_drops);
+                }
+                prev_event_drops = es.items_dropped;    /* 取数失败时**不**改写基准，避免造出假增量 */
+            }
+
+            memset(&lgs, 0, sizeof(lgs));
+            ONEYE_DEV_STRUCT_INIT(lgs);
+            if (oneye_dev_log_get_stats(&lgs) == ONEYE_DEV_SDK_OK) {
+                if (lgs.dropped > prev_log_drops) {
+                    track_emit_throttled(ONEYE_DEV_FACE_LOG, lgs.dropped - prev_log_drops);
+                }
+                prev_log_drops = lgs.dropped;
+            }
+        }
+    }
+}
 
 /* 面板用的链路快照同步（2 s 周期；面板只读，不改变设备行为） */
 static void panel_sync_task(void *arg)

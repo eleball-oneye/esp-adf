@@ -225,6 +225,37 @@ function Invoke-Esptool([string[]]$esptoolArgs, [string]$what) {
     }
 }
 
+# ---------------------------------------------------------------- 2b. 烧写偏移自检（与 partitions.csv 同源）
+# 本脚本里硬编码的四个烧写偏移（0x0 / 0x8000 / 0x10000 / model）必须与 partitions.csv 一致。
+# 为什么必须自动核对：分区表改了而脚本没跟着改，会**静默**产出"分区表说 model 在 X、固件把 srmodels
+# 写到 Y"的机器 —— 构建、烧写、启动都不报错，只有行为不对。2026-09-30 放大 app 分区（model 由
+# 0x210000 挪到 0x410000）正是这一类改动，而这类错误在产线上要烧掉一批机器才会被发现。
+# 读不到 partitions.csv 时**明确警告**（不假装通过）；与分区表对不上则以退出码 2 拒绝（此时尚未动 flash）。
+$partCsv = Join-Path (Split-Path -Parent $PSScriptRoot) 'partitions.csv'
+if (Test-Path $partCsv) {
+    $ptOffset = @{}
+    foreach ($line in Get-Content -Path $partCsv -Encoding UTF8) {
+        if ($line -match '^\s*([A-Za-z0-9_]+)\s*,\s*[A-Za-z0-9_]+\s*,\s*[A-Za-z0-9_]+\s*,\s*0x([0-9A-Fa-f]+)\s*,') {
+            $ptOffset[$Matches[1]] = [Convert]::ToUInt32($Matches[2], 16)
+        }
+    }
+    $expectOffset = @{ 'factory' = 0x10000; 'model' = 0x410000; 'creds' = 0x510000 }
+    foreach ($name in @('factory', 'model', 'creds')) {
+        if (-not $ptOffset.ContainsKey($name)) {
+            FailArgs "partitions.csv 里找不到分区 '$name'（$partCsv）—— 分区表与产线脚本已脱节，先对齐再烧"
+        }
+        if ($ptOffset[$name] -ne $expectOffset[$name]) {
+            FailArgs ("分区 '$name' 在 partitions.csv 里是 0x{0:X}，而本脚本按 0x{1:X} 烧写 —— 两者必须逐项一致（改一边必改另一边）" -f $ptOffset[$name], $expectOffset[$name])
+        }
+    }
+    $offsetNum = [Convert]::ToUInt32(($Offset -replace '^0[xX]', ''), 16)
+    if ($offsetNum -ne $ptOffset['creds']) {
+        Write-Host ("[provision] 注意：本台 -Offset={0} 与 partitions.csv 里的 creds 偏移 0x{1:X} 不同 —— 只有刻意覆盖时才是对的" -f $Offset, $ptOffset['creds']) -ForegroundColor Yellow
+    }
+    Write-Host ("[provision] 烧写偏移自检通过：factory=0x{0:X} model=0x{1:X} creds=0x{2:X}（与 partitions.csv 一致）" -f $ptOffset['factory'], $ptOffset['model'], $ptOffset['creds']) -ForegroundColor DarkGray
+} else {
+    Write-Host "[provision] 警告：找不到 $partCsv，无法核对烧写偏移与分区表是否一致（本脚本硬编码：factory 0x10000 / model 0x410000 / creds 0x510000）" -ForegroundColor Yellow
+}
 # ---------------------------------------------------------------- 3. 可选的固件烧写（顺序在这里保证）
 if ($Erase) {
     if (-not $BuildDir) {
@@ -244,8 +275,8 @@ if ($BuildDir) {
     Invoke-Esptool @(
         '-b', "$Baud", '--before', 'default_reset', '--after', 'hard_reset',
         'write_flash', '--flash_mode', 'dio', '--flash_freq', '80m', '--flash_size', 'detect',
-        '0x0', $boot, '0x8000', $part, '0x10000', $app, '0x210000', $sr
-    ) '写入通用固件（4 段，所有机器相同）'
+        '0x0', $boot, '0x8000', $part, '0x10000', $app, '0x410000', $sr
+    ) '写入通用固件（4 段，所有机器相同；model 偏移须与 partitions.csv 一致，见 2b 段自检）'
 }
 
 # ---------------------------------------------------------------- 4. 写这一台的凭证

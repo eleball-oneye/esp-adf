@@ -39,6 +39,10 @@ idf.py build
 构建后请核对 `sdkconfig`：`CONFIG_IDF_TARGET="esp32s3"`、`CONFIG_ESP32_S3_KORVO2_V3_BOARD=y`
 （两者缺一即视为"没按本板构建"）。
 
+> ⚠️ **上面这段是「开发板台面」口径**：它读写的是**工程目录里那份 gitignored `sdkconfig`**，与量产无关。
+> **生产固件必须按 §5.10 的受控步骤产出**（显式叠加 `sdkconfig.defaults.production`、并把生成的
+> `sdkconfig` 指到构建目录）——**不要**拿台面构建的产物当量产件。
+
 ## 2. 烧录（2026-09-15 **已实测**：Windows 侧 esptool → COM12，见 §8）
 
 ```bash
@@ -355,12 +359,76 @@ idf.py -B output/.build/korvo2_oneye-production \
 
 ---
 
+## 5.10 生产固件的受控产出步骤（`sdkconfig` 是 gitignored，**必须由 defaults 派生**）
+
+> **为什么要有这一节**（2026-10-07 固化）：本工程的 `sdkconfig` 被 `.gitignore:24`
+> （`examples/**/sdkconfig`）覆盖 ⇒ **不入库**，它是**生成物**。所以"生产口径"若只存在于某台机器上的
+> 那份 `sdkconfig` 里：换机/清目录即丢失，谁也无法在评审时看到它，而且它会被下一次"从 defaults 重建"
+> 悄悄换成台面值。**唯一受控来源 = 三份 defaults**：`sdkconfig.defaults`（通用 ＋ 端点/承载钉死）
+> ＋ `sdkconfig.defaults.esp32s3`（芯片）＋ **`sdkconfig.defaults.production`（量产口径唯一来源）**。
+
+### 步骤（WSL / Linux 口径；Windows 侧参数同名）
+
+```bash
+source ~/esp/esp-idf-5.5.5/export.sh
+export ADF_PATH=<repo>/embedded/esp-adf
+export CCACHE_ENABLE=0
+cd $ADF_PATH/examples/oneye/korvo2_oneye
+
+B=/tmp/korvo2-prod-build
+rm -rf "$B"                              # 全新目录 ⇒ sdkconfig 只可能由 defaults 派生
+mkdir -p /tmp/oneye-empty-certs          # 空证书目录：量产"无可回退的公用凭据"
+
+idf.py -B "$B" \
+  -DSDKCONFIG="$B/sdkconfig" \
+  -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.defaults.production" \
+  -DONEYE_FW_CERT_DIR=/tmp/oneye-empty-certs \
+  build
+```
+
+### 三条硬约束（少一条就不叫"生产口径"）
+
+| # | 约束 | 不这么做会怎样 |
+| --- | --- | --- |
+| ① | **显式 `-DSDKCONFIG_DEFAULTS="…;sdkconfig.defaults.production"`** | IDF 缺省只叠加 `sdkconfig.defaults`（＋ `sdkconfig.defaults.<target>`）；不列出预设 = 用**台面**口径编出一个"看起来是量产件"的固件（`PANEL_API`/`LOG_PROBE`/明文 Wi-Fi 凭据配网全开着） |
+| ② | **显式 `-DSDKCONFIG=<构建目录>/sdkconfig`** | IDF 的 `SDKCONFIG` 缺省落在**工程目录**（`<example>/sdkconfig`，gitignored）。defaults 只对"尚未存在的符号"生效 ⇒ 工作区里那份来路不明的 `sdkconfig` **盖住**预设，构建还会反过来**改写**它 —— 于是"改了 defaults 却不生效"，而文本上完全看不出来 |
+| ③ | **`-DONEYE_FW_CERT_DIR=<空目录>`**（因为预设里 `CONFIG_ONEYE_DEV_CREDS_REQUIRED=y`） | `main/CMakeLists.txt:80` 把「`REQUIRED=y` ＋ 内嵌证书」做成**编不过**：两者语义相反（前者 = 分区是唯一身份来源；后者 = flash 里躺着一份可回退的**公用**凭据）。不给空目录就直接构建失败 |
+
+### 产出后必须自证（把"写了配置"变成"配置生效"）
+
+```bash
+# ① 生成物（不是 defaults 文本）里的端点与调试残留实际取值
+grep -aE 'CONFIG_ONEYE_FW_(CLOUD_HOST|CLOUD_PORT|TLS_INSECURE|TRANSPORT_TLS|ENABLE_PANEL_API|LOG_PROBE|CLOUD_TOKEN)' "$B/sdkconfig"
+grep -aE 'ONEYE_FW_(CLOUD_HOST|CLOUD_PORT|TLS_INSECURE|ENABLE_PANEL_API|LOG_PROBE|CLOUD_TOKEN)' "$B/config/sdkconfig.h"
+
+# ② defaults/预设"每一项都存在且已生效"
+python tools/check-sdkconfig-defaults.py --sdkconfig "$B/sdkconfig" --require sdkconfig.defaults.production
+
+# ③ 字面量：生产端点在 bin 里在场；台面端点/token 反证为 0
+strings -a "$B/korvo2_oneye.bin" | grep -c 'mqtt.oneye.me'
+for s in 192.168.110.208 18830 'oneye@2026-KORVO2-0000'; do
+  printf '%s=%s\n' "$s" "$(strings -a "$B/korvo2_oneye.bin" | grep -c -- "$s")"
+done
+```
+
+2026-10-07 按上述步骤的实跑读数（`-Os` 量产件、`ENABLE_PANEL_API=n`、`LOG_PROBE=n`）见 §8 本轮实测记录。
+
+**已知边界（如实登记，⛔ 不要读成"生产件全干净"）**：
+① 编译期 `ONEYE_FW_DEVICE_ID`（缺省 `korvo2-0001`）在 `creds` 分区有合法镜像时**被分区里的 `node_id` 覆盖**（§5.9）——
+   "固件通用"成立的前提就是这份覆盖；量产身份**不**来自本预设；
+② SDK 内部源码 `components/oneye-dev-sdk/src/internal/oneye_ble_plat_nimble.c:102/:114/:126` 自述
+   「量产应降为 `ESP_LOGD`（协议正文不落串口，PIPL）」：那是**另一个仓**（SDK）的实现，且本固件未启用 BLE，
+   本预设管不到，登记为未做；
+③ 分区形态仍是**开发板台面形态**（`factory 4M`），量产分区表需单独评审（见 [`partitions.csv`](partitions.csv) 顶部）。
+
+---
+
 ## 6. 配置（`idf.py menuconfig` → `korvo2_oneye 板级固件配置`）
 
 | 配置 | 缺省 | 说明 |
 | --- | --- | --- |
 | `ONEYE_FW_DEVICE_ID` | `korvo2-0001` | 兼作 MQTT username/client_id（EMQX ACL `%u` 依赖）；**有 creds 分区时被分区里的 `node_id` 覆盖**（§5.9） |
-| `ONEYE_FW_CLOUD_HOST` / `_PORT` / `_WS_PATH` | 192.168.1.100 / 0 / 空 | 端点显式配置（端口 0 = 按承载取契约缺省 1883/8883/8083/8084）；`sdkconfig.defaults` 已钉 `mqtt.oneye.me:18885` |
+| `ONEYE_FW_CLOUD_HOST` / `_PORT` / `_WS_PATH` | 192.168.1.100 / 0 / 空 | 端点显式配置（端口 0 = 按承载取契约缺省 1883/8883/8083/8084）；`sdkconfig.defaults` 已钉 `mqtt.oneye.me:18886` |
 | `ONEYE_FW_TRANSPORT` | **TLS** | 承载选择（契约四承载）。**别改成 TCP**：生产主承载是一机一密 mTLS，明文只在台面联调 |
 | `ONEYE_FW_PROV_ATTEST` | **y** | 开机打印一行产测自证串（`ONEYE-PROV1 …`）。**量产与产测共用同一份固件**，所以缺省开：靠编译期开关打开自证，等于维护"产测固件/量产固件"两个镜像，而发错固件会让整个产测环节**静默失效** |
 | `ONEYE_FW_CLOUD_TOKEN` | 空 | 设备令牌（空 = 匿名 dev 形态） |
@@ -454,6 +522,8 @@ idf.py -B output/.build/korvo2_oneye-production \
 | **app 分区放大 2M→4M（第二十轮，2026-09-30）** | 用户裁定「开发板尽量多应用空间」⇒ `partitions.csv` 改为 `factory 4M + model 1M + creds 16K@0x510000 + storage 1M@0x514000`（**开发板台面形态**；用量产预设的实测见下行）。**WSL**（`idf.py -B /tmp/korvo2-wsl-build build`，全新目录）**EXIT 0**：`korvo2_oneye.bin` **2,064,656 B（`0x1f8110`）**，`Smallest app partition is 0x400000` ⇒ **余量 `0x207ef0` = 51%**（放大前的 `nearly full` 告警**消失**）；`korvo2_oneye.elf` 17,079,880 B；`srmodels/srmodels.bin` 337,952 B（`movemodel.py` 自述 `Recommended model partition size: 331K` ⇒ 1 M 的 `model` 仍有 3.2× 余量）。**Windows**（全新目录，**不带** `-DONEYE_SDK_LIB_OUT_DIR` 绕行）**EXIT 0**：bin **2,064,448 B**、sha256 `BC2302D840C6A1EB226EC22AB08EF15274402FE8FCB63BC7D26F2D1AC9538F8`、elf 17,049,656 B；`flash_args` = `0x0 bootloader` / `0x8000 partition-table` / `0x10000 korvo2_oneye` / **`0x410000 srmodels`**；两次构建日志里解码出的分区表**逐字相同**，`creds` **仍在 `0x510000`**。同一批还把 `shadow_reassert`(4096 w) / `log_probe`(3072 w) 两个**起不来**的任务内联进常驻的 `cloud_start_task`（全程读数见 `_tmp-phase2/device-fixes-partition.md`） |
 | **量产预设下的体积读数（第二十轮 EXTRA，2026-09-30）** | `-DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.defaults.production"` + 空证书目录 ⇒ **EXIT 0**：`korvo2_oneye.bin` **993,008 B（`0xf2af0`）**（-Os）、`0x400000` 分区余量 **76%**。这条的**真正用途**是证明本批新增的 `#if CONFIG_ONEYE_FW_LOG_PROBE` 守卫在「开关关掉」（量产预设 `:61`）时**编译通过**，并给出 `tools/check-sdkconfig-defaults.py --sdkconfig <该构建>/sdkconfig --require sdkconfig.defaults.production` = **PASS（11 项全部存在且已生效）** 的读数 |
 | **`command/up` 回执接线（G2）** | 缺口：SDK 早有 `oneye_dev_base_ack_command()`，但固件**从未调用** ⇒ 云端下发 `command/down` 后设备不回执，`dev_command.status` 停在 `SENT` 直到超时。落码：`main/korvo2_oneye_main.c` 新增 `command_ack_unknown()`（:342-396，`cJSON_ParseWithLength` 取 `id`）+ 在 `COMMAND_RECV` 事件里调用（:437）；因 `cmds[]` 为空 ⇒ 一律回 `ControlAck{id,status:"error",error:"unknown command"}`（RAW 不套信封，与 asyncapi 逐字段一致）。**构建证据（WSL/IDF v5.5.5，复用 `/tmp/rc-net2`）**：`BUILD_RC=0`；`korvo2_oneye.bin binary size 0x1f7550 bytes. Smallest app partition is 0x200000 bytes. 0x8ab0 bytes (2%) free.` + `Project build complete.`；ninja 仅重编 `korvo2_oneye_main.c.obj`（`[4/9]`）⇒ 相对基线 `0x1f7120` 的 **+0x430（+1,072 B）就是本次改动代价**。**符号级证据**：`nm` 该 obj 有 `U oneye_dev_base_ack_command` / `U cJSON_ParseWithLength`，最终 `.elf` 里 `T oneye_dev_base_ack_command`（0x4201d114）；镜像 `strings` 含字面量 `unknown command`。**⛔ 未做**：未上真机、未端到端发 `command/down` 验回执；真实 `ok` 路径属 **S16 命令执行面**，且需**先登记**具体命令名（`cmds[]` 取值 = 物模型命令名）——本轮收尾的是「停在 `SENT` 到超时」这个缺口被消除，⛔ **不是**「命令闭环打通」 |
+| **生产口径固化为受控路径（第二十一轮，2026-10-07）** | `sdkconfig` 是 gitignored 的**生成物** ⇒ 生产口径唯一来源 = 三份 defaults；受控产出步骤与三条硬约束写在本文件 **§5.10**。`sdkconfig.defaults.production` 本轮补齐 3 处：① 显式钉 `CONFIG_ONEYE_FW_CLOUD_TOKEN=""`（`:72`，台面令牌不得进量产件）；② 文末新增**「自述量产应置 X 项」逐条对齐台账**（`:84-129`，把 Kconfig/README/SDK 文档里 5 类自述项对到本文件行号，并登记 2 条**管不到**的：SDK 内部 `components/oneye-dev-sdk/src/internal/oneye_ble_plat_nimble.c:102/:114/:126` 的 PIPL 口径、另一例程 `examples/oneye/korvo2_llm_chat`）；③ `sdkconfig.defaults:116-120` 里对 `sdkconfig.defaults.production:61` 的**过期行号引用**改为按符号表述。`README.md`：新增 §5.10、§1 加"台面 ≠ 量产"分道提示、配置表里过期的 `mqtt.oneye.me:18885` 改为 `18886`。**受控构建实跑（WSL / IDF v5.5.5，全新目录）**：`idf.py -B /tmp/korvo2-wsl-prod2 -DSDKCONFIG=/tmp/korvo2-wsl-prod2/sdkconfig -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.defaults.production" -DONEYE_FW_CERT_DIR=/tmp/oneye-empty-certs build` ⇒ **EXIT 0**；生成物 `sdkconfig`（sha256 `3d4dc362f320318b3c4dcc8bbe79364f447f961e5a2d9c9fcafa2275ecde8b22`）`:606/:607/:614` = `CLOUD_HOST="mqtt.oneye.me"` / `CLOUD_PORT=18886` / `# CONFIG_ONEYE_FW_TLS_INSECURE is not set`，`:609` `CLOUD_TOKEN=""`、`:620` `# CONFIG_ONEYE_FW_ENABLE_WIFI_FILE is not set`、`:633` `# CONFIG_ONEYE_FW_LOG_PROBE is not set`、`:640` `# CONFIG_ONEYE_FW_ENABLE_PANEL_API is not set`；`korvo2_oneye.bin` **994,048 B（`0xf2b00`）**、`factory 4M` 余量 **76.30%**、`model 1M` 余量 67.77%、bootloader 36.43%；`python tools/check-sdkconfig-defaults.py --sdkconfig /tmp/korvo2-wsl-prod2/sdkconfig --require sdkconfig.defaults.production` = **PASS（预设 12 项全部存在且已生效）**；`strings` 字面量：`mqtt.oneye.me`=**1**、`192.168.110.208`/`18830`/`oneye@2026-KORVO2-0000` 均 **0**。⚠️ 同一次构建**没有触碰**工作区那份 gitignored `sdkconfig`（构建前后 sha256 均 `ED2AC1B4ADCA3E58732A04E77E7BD96EECDAEAB94DE9751D2EA89CDBE2BF99AC`、mtime 未变）——这正是 `-DSDKCONFIG` 那条约束要的效果 |
+| **生产件真机验证 ＋ 一处「生产件到不了云」的定位（第二十一轮，2026-10-07）** | 四偏移烧写（`0x0`/`0x8000`/`0x10000`/`0x410000`）四区全部 `Hash of data verified`，重叠断言四区 `overlap_creds=False`；`creds` 16 KiB 烧前/烧后**逐字节 `differing bytes = 0`**（sha256 `1801B9C1…`、`node=KORVO2-0000`、`crc32=f6ed1bb8`）。**抓包口径修正（根因）**：上一轮丢开机前缀是因为 **RTS 脉冲没有真的复位**——实测四种 DTR/RTS 组合（`DTR=0,RTS=1` / `DTR=1,RTS=1` / **按住 `RTS=1` 再释放** 均 `ROM_BANNER=YES`；不切换、`DTR=1,RTS=0` 为 no）⇒ 本轮改为"**端口已开、读循环已就位时按住 EN 500 ms 再释放**"。**生产件（量产预设原样）200 s 抓包**：`ESP-ROM:esp32s3` / `rst:0x1 (POWERON)` / `boot:  4 creds 00510000 00004000` / `app_init: Compile time` / `ELF file SHA256` **各 1 次、全部在窗口内**；`assert`/`Guru`/`Backtrace`/`WDT`/`Core dump`/`abort()`/`Panic` **全 0**；整段 `ESP-ROM` 仅 1 次 ⇒ 只有一次启动、无自发重启；固件自证 `本地验证面板已按 Kconfig 关闭（ONEYE_FW_ENABLE_PANEL_API=n）`。🔴 **但纯生产件在台面上到不了云**：`WIFI_FILE=n`（量产预设 `:64`，"SD 卡明文 Wi-Fi 密码不得进量产件"）＋ Kconfig SSID 为空 ⇒ `main/korvo2_oneye_main.c:773-793` 走 `!have` 分支，打印 `未找到 Wi-Fi 凭据 → 跳过上云` 后 `return`，**`oneye_start()` 根本没被调用**（因此连 `creds` 也没读、`ONEYE-PROV1` 也不打）。⇒ **判据「`CLOUD_LINK_UP`」在纯生产件上不可能满足，原因不是 TLS、也不是安全组，而是本固件缺少 ADR-0007 的 claim 配网路径**（`wifi_prov.c` 只有凭据文件一条路）。**诊断件（唯一 delta = `WIFI_FILE=y`，其余全生产：严格 TLS、`PANEL_API=n`、`LOG_PROBE=n`、`-Os`、`CREDS_REQUIRED=y`、生产端点）200 s 实跑**：`[sdk-event] CLOUD_LINK_UP`、`影子上报成功（shadow/up，含 credSource）{"firmwareVersion":"0.1.0","power":true,"credSource":"partition"}`（**身份来自 creds 分区**）、`cloud_link_up=1 transport=mqtt-tls`、`TIME_SYNCED`×2、`[track] boot 已上报 track_reported=1 frames_tx=1`、`[net-probe] cloud endpoint mqtt.oneye.me:18886 -> rc=0 errno=0 114ms OK（TCP 已建立）`、`[sntp] 已同步：UTC=2026-10-07 02:07:47`；崩溃模式全 0、**TLS/证书失败迹象 0**（严格校验下 mTLS 成功）。**云端只读旁证**（SSH `ubuntu@175.178.190.187`＝`wanya-prod-master2`，`emqx_ctl`）：连接前 `clients list` 只有 `oneye-shadowd`；连接后新增 `Client(KORVO2-0000, username=KORVO2-0000, peername=183.134.164.65:60796, keepalive=60, connected=true, subscriptions=6)`，6 条订阅逐条 = `rmng/dev/KORVO2-0000/{caps,command,event,log,shadow}/down` ＋ `ota/notify`（均 QoS1）；该主机**无** kafka/tdengine/mysql/redis，故"落行"无证据（如实登记）。**宿主独立复测**：`mqtt.oneye.me -> 175.178.190.187`、`tcp 18886 -> CONNECTED 104 ms`（对照 `223.5.5.5:53 -> CONNECTED 10 ms`；`1883`/`8883` 超时，符合"只有 18886 是设备面监听"）。**板子最终状态 = 生产件**（诊断件跑完已回灌生产件四区，并再次核对 `creds` `differing bytes = 0`）。⚠️ 同期发现一处**固件文案缺陷**（本轮**未改**，登记）：`main/korvo2_oneye_main.c:790` 在 `WIFI_FILE=n` 时仍提示"把 oneye-wifi.txt 放 SD 卡根目录后复位"，而该路径已被编译掉 ⇒ 量产件上这是**做不到的建议**（应改为指向 claim 流程） |
 
 **后续（真机）**：`idf.py -p <COM> flash monitor` → 核对自检逐行 PASS → **SD 卡放 `oneye-wifi.txt` 复位自动配网** → 观察
 `caps/up` / `status/up`（retained + LWT）/ `shadow/up` / `log/up` 与按键 `event/up`；其间可用面板「Wi-Fi 配网」卡片核对**凭据来源**；

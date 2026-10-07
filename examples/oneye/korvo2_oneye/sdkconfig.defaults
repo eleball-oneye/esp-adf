@@ -113,8 +113,11 @@ CONFIG_ONEYE_FW_ENABLE_SDCARD=y
 # 每 15 s 共 10 条（5 个 tick + 1 簇 5 条）× 约 60–100 B ≈ 4–7 KB/min ≈ 0.1 KB/s，且 20 s 才组一帧
 # ⇒ 离"高频"极远（帧率 0.05 帧/s、字节率约为基线的 0.6%）。SDK 另有 32 KB/帧与 16 KB/s 限速兜底。
 #
-# ⚠️ 这是**取证插桩**（Kconfig help 逐字"仅取证用"）：量产预设 sdkconfig.defaults.production:61
-# 显式写着 `# CONFIG_ONEYE_FW_LOG_PROBE is not set` 且后叠加者胜 ⇒ **量产口径不受本行影响**。
+# ⚠️ 这是**取证插桩**（Kconfig help 逐字"仅取证用"）：量产预设
+# `sdkconfig.defaults.production` 的「台面能力一律关闭」段里显式写着
+# `# CONFIG_ONEYE_FW_LOG_PROBE is not set`（2026-10-07 复核时在 `:68`；同段 `:64`/`:66`
+# 是明文 Wi-Fi 凭据文件与 PANEL_API 两条同类关闭项。行号会随该文件增补漂移，**以符号为准**），
+# 且后叠加者胜 ⇒ **量产口径不受本行影响**。
 # 为什么本轮选它而不是装 platform hook（`oneye_dev_log_install_platform_hook()`，
 # components/oneye-dev-sdk/include/oneye_dev_log.h:140，那条路能让真实 ESP_LOG 也上行）：
 # hook 会替换全局 `esp_log_set_vprintf` 调用链，属"改整机日志路径"，本轮**无真机可验**

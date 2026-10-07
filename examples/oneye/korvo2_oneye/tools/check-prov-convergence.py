@@ -30,13 +30,19 @@ check-prov-convergence.py —— 结构性门禁：证明 korvo2_oneye 的「入
          通道模块（wifi_prov_ble.c / media_api.c / wifi_prov.c / panel_api.c …）里不得出现这两个符号
   A12    收敛点下游的**顺序**：net_probe → sntp → 面板 → `xTaskCreate(cloud_start_task,…)`。
          ⚠️ sntp 必须在 cloud_start_task 之前：严格 TLS 校验需要先把时钟校好（设备无 RTC）
+  A13    资源读数（`[res]`：free_internal / largest_internal_block / free_psram）必须是**同一个** helper
+         （全工程只有 1 处日志格式串）在 3 个**未入网也必经**的点各打一行、且带 `phase=` 阶段标签：
+         `app_main()`（配网/NimBLE 之前）· `wifi_prov_boot()` 内 `wifi_prov_ble_start()` **之后**
+         （NimBLE 已起栈、尚未入网）· `cloud_start_task()`（原有的入网后那一处，⛔ 不得被删/移）。
+         旧形状只有第 3 处 ⇒ BLE 机型未入网时这一行**永远打不出来**（2026-10-07 真机实证：
+         BLE 件 120 s 抓包 `[res]` 命中 0 行），"NimBLE 12 KB 主机栈之后内部 RAM 还剩多少"因此无读数。
 
 退出码：0 = 全部断言通过；1 = 有断言失败（逐条打出）。
 **自带负向对照**：把 `main/` 与夹具复制到临时目录后逐条注入已知缺陷，同一套检查**必须逐条报红**
 （含 A1 的第二条入网后逻辑、A8b 的直连连接层、A9b 的丢掉"只入网一次"、A8e 的留痕缺失、
 A10b 的判据抄件、**A11 的"通道模块里再调一次 sntp_boot_sync()/net_probe_report()"**、
-**A12 的"把 sntp 挪到 cloud_start_task 之后"**）。任一条注入没有被对应断言抓住 ⇒ 本脚本自己的
-判据是空转的 ⇒ exit 1。
+**A12 的"把 sntp 挪到 cloud_start_task 之后"**、**A13 的"删掉 NimBLE 起栈后那一处资源读数"**）。
+任一条注入没有被对应断言抓住 ⇒ 本脚本自己的判据是空转的 ⇒ exit 1。
 """
 
 import os
@@ -69,6 +75,10 @@ RELEASE_HELD_CALL = re.compile(r"wifi_prov_release_held\s*\(")
 CALL_NET_PROBE = re.compile(r"net_probe_report\s*\(")
 CALL_SNTP_BOOT = re.compile(r"sntp_boot_sync\s*\(")
 CALL_PANEL_START = re.compile(r"panel_start_if_enabled\s*\(")
+# A13：资源读数（`[res]`）必须在**不依赖入网**的必经点各打一行、且带阶段标签（2026-10-07 第三批）
+CALL_RES_REPORT = re.compile(r"res_report\s*\(")
+RES_LOG_FORMAT = re.compile(r'ESP_LOGI\s*\(\s*TAG\s*,\s*"\[res\]\s+phase=%s')
+RES_RESERVED_KINDS = ("app_main", "wifi_prov_boot", "cloud_start_task")
 # 通道模块（判据侧只允许"交凭据"；出现上面两个符号即第二条入网后路径）
 CHANNEL_MODULES = ("wifi_prov_ble.c", "media_api.c", "wifi_prov.c", "panel_api.c",
                    "wifi_prov_file.c", "wifi_prov_sonic.c", "wifi_prov_qrcode.c")
@@ -394,6 +404,42 @@ def run_checks(sources, headers, test_lines):
                              "cloud_start_task 创建点（第 {} 行）之间"
                              .format(pn[0][1], sb_ln, cr_ln))
 
+    # ------------------------------------------- A13 资源读数（[res]）必须"未入网也可见"且带阶段标签
+    # 形状（2026-10-07 第三批）：同一 helper（全工程**只有 1 处** `[res]` 日志格式串）在 3 个必经点各打一行 ——
+    #   ① app_main 内（外设就绪、配网/NimBLE 之前 ⇒ 两机型同阶段可比）
+    #   ② wifi_prov_boot 内 wifi_prov_ble_start() **之后**（NimBLE 已起栈、尚未入网 ⇒ BLE 机型的读数；
+    #      旧版没有这一处 ⇒ BLE 机型未入网时永远读不到内部 RAM 余量）
+    #   ③ cloud_start_task 内（**原有的**那一处，入网后；⛔ 不许被移走/删掉）
+    rr = find_calls({"korvo2_oneye_main.c": main_lines}, CALL_RES_REPORT)
+    expect(rr, 3, "A13a res_report() 调用点（korvo2_oneye_main.c）",
+           "期望 3 处（配网前基线 / NimBLE 后未入网 / 入网后），实测 {} 处".format(len(rr)))
+    for fn, ln, func in rr:
+        need(func in RES_RESERVED_KINDS,
+             "A13a res_report() 出现在 {}()（第 {} 行）".format(func, ln),
+             "只允许出现在这 3 个未入网也必经的位置：{}".format("/".join(RES_RESERVED_KINDS)))
+    in_app = [h for h in rr if h[2] == "app_main"]
+    need(len(in_app) == 1, "A13c app_main() 内的 res_report()",
+         "期望恰好 1 处（配网/NimBLE 之前的基线，两机型同阶段可比），实测 {} 处".format(len(in_app)))
+    in_cloud = [h for h in rr if h[2] == "cloud_start_task"]
+    need(len(in_cloud) == 1, "A13d cloud_start_task() 内的 res_report()（原有读数）",
+         "期望恰好 1 处（入网后的量，原有读数不得被删/移），实测 {} 处".format(len(in_cloud)))
+    ble_ln = bs[0][1] if bs else None
+    if ble_ln is None:
+        fails.append("A13b 找不到 wifi_prov_ble_start() 调用点 ⇒ 「NimBLE 起栈后」的读数无从判定")
+    else:
+        in_ble = [h for h in rr if h[2] == "wifi_prov_boot" and h[1] > ble_ln]
+        need(len(in_ble) == 1,
+             "A13b wifi_prov_boot() 内 wifi_prov_ble_start()（第 {} 行）之后的 res_report()".format(ble_ln),
+             "期望恰好 1 处 —— BLE 机型必须在 NimBLE 起栈后、入网前读到内部 RAM 三个量"
+             "（旧版只有入网后那一处 ⇒ 本机型永远读不到），实测 {} 处".format(len(in_ble)))
+    fmt = [i + 1 for i, l in enumerate(main_lines) if RES_LOG_FORMAT.search(l)]
+    need(len(fmt) == 1, "A13e `[res]` 日志格式串（phase=%s + 三个量）不唯一",
+         "实测 {} 处（第 {} 行）—— 多处各写一份会让「同一组量」分叉".format(len(fmt), fmt))
+    if len(fmt) == 1:
+        for token in ("free_internal=", "largest_internal_block=", "free_psram="):
+            need(token in main_lines[fmt[0] - 1], "A13e `[res]` 读数缺少 `{}`".format(token),
+                 "三个量必须逐字保留（本批只加 phase 阶段标签，不动量本身）")
+
     return (not fails), fails
 
 
@@ -483,6 +529,9 @@ INJECTIONS = [
                             "{ net_probe_report(\"host\", 18886); }")),
     ("把 sntp_boot_sync() 挪到 cloud_start_task 之后（顺序退化）", "korvo2_oneye_main.c", "A12",
      _move_sntp_after_cloud_start),
+    # A13（2026-10-07 第三批）：把「NimBLE 起栈后、入网前」那一处资源读数删掉 ⇒ 退回"只有入网后可见"。
+    ("删掉 NimBLE 起栈后的资源读数（[res] 退回「只有入网后才可见」）", "korvo2_oneye_main.c", "A13",
+     lambda ls: _replace_in(ls, 'res_report("ble-ready', 'res_report_disabled("ble-ready')),
 ]
 
 
@@ -542,7 +591,7 @@ def main():
     ok, fails = run_checks(src, headers, test_lines)
     for f in fails:
         print("  ✗ " + f)
-    print("正向断言（A1–A12）：{}".format("PASS" if ok else "FAIL"))
+    print("正向断言（A1–A13）：{}".format("PASS" if ok else "FAIL"))
 
     status, detail = run_host_test(EXAMPLE)
     if status == "pass":
@@ -579,7 +628,7 @@ def main():
     if not ok:
         return 1
     print("RESULT=PASS 单一收敛点 + 优先级（SD>BLE>其他）+ 只入网一次 + 自检/授时全通道必经"
-          "（ADR-0017 D2/D4）")
+          "（ADR-0017 D2/D4）+ 资源读数未入网可见（A13，带阶段标签）")
     return 0
 
 

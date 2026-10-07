@@ -635,6 +635,38 @@ static void panel_start_if_enabled(void);
  * log 取证插桩（`log/up` 周期流量）。栈/内部 RAM 约束见「埋点 → track/up」段注释。 */
 static void uplink_maintain_run(void);
 
+/* ---------------------------------------------------------------- 资源读数（`[res]`）
+ *
+ * ★★ 2026-10-07（第三批）：这一读数**原来只有一处、且在入网之后才可达** ——
+ *   它写在 `cloud_start_task()` 里，而该任务由 `on_wifi_ready()`（GOT_IP 之后）创建。
+ *   后果（真机实证，不是推断）：BLE 机型**未入网**时这一行**永远打不出来** ——
+ *   上一批 BLE 件 120 s 抓包里 `[res]` 命中 0 行（同段其余启动行都在场），
+ *   于是"12 KB 的 NimBLE 主机栈起来之后内部 RAM 还剩多少"**没有读数**。
+ *
+ * 本函数把同一组量做成**带阶段标签**的一次性读数，在多个**不依赖入网**的必经点各打一行：
+ *   · `phase=pre-prov…`   —— `app_main()` 里外设/LCD/摄像头/SD/AEC/回放都已就绪、配网与 NimBLE **之前**
+ *     （两种机型都在同一位置打 ⇒ 跨机型同阶段可比）；
+ *   · `phase=ble-ready…`  —— `wifi_prov_boot()` 里 BLE 通道**已起栈并开始广播、尚未入网**
+ *     （BLE 机型的 NimBLE 后读数；与上面那行同机相减 = NimBLE 主机栈的净代价）；
+ *   · `phase=cloud-start…` —— `cloud_start_task()` 里（= **原有的**那一处，位置与三个量逐字保留，
+ *     只加了 phase 标签）⇒ 入网之后、SDK 起来之后的量，仍可读，⛔ 未被删掉。
+ *
+ * 关键量是 `largest_internal_block`（`MALLOC_CAP_INTERNAL` 的**最大连续块**）：这台板子历史实测
+ *   只有 2304 B，而任何 ≥16 KB 的新 FreeRTOS 任务栈都要"连续"内部块（见 `cloud_start_task()` 注释）。
+ *   它在**入网前**的量才决定"BLE 机型还能不能再起任务"。
+ *
+ * ⛔ 不许为此新增常驻任务/定时器：本函数就地调用（单次、只读 `heap_caps_*`、不阻塞、不分配）。
+ * ⛔ 不许把 `phase` 去掉：多处读数没有阶段标签就分不清"哪一刻的量"，等于把上一批那个缺口换个形状。
+ * ⛔ 不许把 `cloud-start（入网后）` 那一处删掉（门禁 A13d 断言三处都在）。 */
+static void res_report(const char *phase)
+{
+    ESP_LOGI(TAG, "[res] phase=%s free_internal=%u B / largest_internal_block=%u B / free_psram=%u B",
+             phase,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+}
+
 /* 联网就绪 → 启动上云。放在独立任务里跑（oneye_start 需较大栈；事件任务只置位）。
  * 回调会随重连反复触发，故用一次性标志保证 SDK 只启动一次；面板启动本身幂等。 */
 static void cloud_start_task(void *arg)
@@ -657,11 +689,11 @@ static void cloud_start_task(void *arg)
      * 所以三条产出方（track 埋点 / 影子补发 / log 取证）现在共用**本任务**这 6144 words 栈：
      * 见 uplink_maintain_run() 与 shadow_reassert_step() / log_probe_step()。 */
 
-    /* 资源读数：把「16 KB 栈在这台板子上要不到」从**推断**变成**测量**（这正是上一版 track 任务失败的根因）。 */
-    ESP_LOGI(TAG, "[res] free_internal=%u B / largest_internal_block=%u B / free_psram=%u B",
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    /* 资源读数：把「16 KB 栈在这台板子上要不到」从**推断**变成**测量**（这正是上一版 track 任务失败的根因）。
+     * ★ 2026-10-07（第三批）：**本处读数逐字保留**（同位置、同三个量），只把日志改成经 `res_report()`
+     *   打出的带阶段标签版本 `phase=cloud-start（入网后）` ⇒ 与"入网前"那几个阶段可对照。
+     *   ⛔ 不许把这一处删掉换取别处读数：入网后/未入网两个时刻要能同时看到才有对照。 */
+    res_report("cloud-start（入网后）");
 
     /* 上行维护（track 埋点 + 影子补发 + log 取证）：**就地跑在本任务里**，一个新任务都不建 ——
      * 理由见上一条与「埋点 → track/up」段注释。本任务因此不再 `vTaskDelete(NULL)`：它转为这三条面的
@@ -886,6 +918,12 @@ static void wifi_prov_boot(void)
     if (wifi_prov_ble_start() == ESP_OK) {
         ESP_LOGW(TAG, "下一步：手机 App 连接 ONEYE-<设备 id 后 4 位>，"
                       "输入串口打印的 6 位配对码（POP）后下发 Wi-Fi 凭据");
+        /* ★ 2026-10-07（第三批）：**NimBLE 主机栈已起来（12 KB，
+         *   `CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE 12288`）、已开始广播、而还没有入网**的这一刻，
+         *   把内部 RAM 的三个量打出来 —— 这正是 BLE 机型此前**没有读数**的那一个时刻
+         *   （入网后那处 `phase=cloud-start…` 本机型走不到）。与本函数上方/`app_main()` 里的
+         *   `phase=pre-prov…`（同一块板、外设已就绪、NimBLE 之前）相减即 NimBLE 的净代价。 */
+        res_report("ble-ready（NimBLE 已起栈并广播、未入网）");
         panel_start_if_enabled();     /* 无 IP ⇒ 提示并直接返回 */
         return;                       /* 等通道提交凭据；入网后由收敛点统一触发上云 */
     }
@@ -1606,6 +1644,11 @@ void app_main(void)
         }
     }
 #endif
+
+    /* ★ 2026-10-07（第三批）：配网/NimBLE **之前**的基线读数。位置选在"外设全部就绪之后、
+     *   `wifi_prov_boot()` 之前"（LCD/摄像头/SD/AEC/回放都已初始化）⇒ 两种机型都在**同一位置**
+     *   打这一行，跨机型同阶段可比；BLE 机型再与 `phase=ble-ready…` 相减即 NimBLE 主机栈的净代价。 */
+    res_report("pre-prov（外设就绪、配网与 NimBLE 之前）");
 
     /* ④ 配网（SD 卡凭据文件优先 → Kconfig 兜底）+ ⑤ oneye 上云
      * 无凭据/连不上 ⇒ 不中止：板级自检、按键、AEC 录音、板上回放、串口日志仍可用；

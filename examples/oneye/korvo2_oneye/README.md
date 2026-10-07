@@ -494,17 +494,21 @@ cd embedded/esp-adf/examples/oneye/korvo2_oneye
 python3 tools/check-prov-convergence.py          # RESULT=PASS ⇒ exit 0
 ```
 
-它机械断言 A1–A12（`oneye_start()` 调用点唯一且在 `cloud_start_task` 内、`cloud_start_task`
+它机械断言 A1–A13（`oneye_start()` 调用点唯一且在 `cloud_start_task` 内、`cloud_start_task`
 创建点唯一且在 `on_wifi_ready` 内、ready 回调注册点/触发点各唯一、BLE 通道只经唯一入口且
 自己不调 `oneye_start()`/`esp_wifi_connect()`、**SD 凭据在启动期先于 BLE 被递上去**、
 **非 `wifi_prov.c` 不得直连 `wifi_prov_connect()`/不得写 `wifi_prov_set_source()`**、
 **只入网一次**（一次性守卫 + 判据 `onboarded = s_connected && s_held_valid` + 判据顺序）、
 **夹具与判据同源**、**A11**`net_probe_report()`/`sntp_boot_sync()` 各只 1 处调用点且都在
 `on_wifi_ready()` 内（通道模块里不得出现）、**A12** 顺序 `net_probe → sntp → 面板 →
-cloud_start_task`（授时必须先于建链）…），
-并**自带 8 条注入负向对照**（第二条入网后逻辑 / 直连连接层 / 丢掉"只入网一次" / 抹掉留痕 /
+cloud_start_task`（授时必须先于建链）、**A13** 资源读数 `[res]` 由**同一个** helper 在 3 个
+**未入网也必经**的点各打一行且带 `phase=` 阶段标签：`app_main()`（配网/NimBLE 之前）·
+`wifi_prov_boot()` 内 `wifi_prov_ble_start()` **之后**（NimBLE 已起栈、尚未入网）·
+`cloud_start_task()`（原有的入网后那一处，⛔ 不得被删/移）…），
+并**自带 9 条注入负向对照**（第二条入网后逻辑 / 直连连接层 / 丢掉"只入网一次" / 抹掉留痕 /
 夹具自备判据 / **通道模块里再调一次 `sntp_boot_sync()`** / **通道模块里再调一次
-`net_probe_report()`** / **把 `sntp_boot_sync()` 挪到 `cloud_start_task` 之后**），
+`net_probe_report()`** / **把 `sntp_boot_sync()` 挪到 `cloud_start_task` 之后** /
+**删掉 NimBLE 起栈后那一处资源读数**），
 断言同一套检查**必须逐条报红**。
 任一条注入没被抓住 ⇒ 脚本自己判据空转 ⇒ 同样 `exit 1`。
 它还会**实跑主机侧夹具**（`tools/test-prov-priority.c`，有 `cc`/`gcc` 时）并要求
@@ -650,6 +654,8 @@ cc -std=c99 -Wall -Wextra -Werror -I main tools/test-prov-priority.c -o /tmp/tpp
   ⛔ **不据此声称 BLE 配网已通**。
 - **BLE 机型烧写后的运行期内存读数**（NimBLE 12 KB 内部 RAM vs 本板曾实测 `largest_internal_block=2304 B`）：
   见 §5.12.6（2026-10-07 第二批**已首次烧写**并实采串口；结论以那一节的串口原文为准）。
+  ★ **2026-10-07 第三批（本批）已有真实读数**：读数改为**未入网也必经**并带阶段标签，BLE 机型实测
+  `phase=ble-ready` = `free_internal=112,023 B / largest_internal_block=63,488 B / free_psram=7,983,016 B` —— 见 §5.12.7。
 - ~~**BLE 通道入网后的启动期自检/授时**：`net_probe_report()` 与 `sntp_boot_sync()` 目前只在
   `prov_boot_after_connect()`（`korvo2_oneye_main.c:773-786`）里执行，而该函数只被启动期 C3/C5
   成功路径调用 ⇒ **BLE 通道入网时不执行**。~~
@@ -735,12 +741,103 @@ cc -std=c99 -Wall -Wextra -Werror -I main tools/test-prov-priority.c -o /tmp/tpp
 ⛔ **无同场手机 ⇒ 不声称"BLE 配网端到端已通"**，只报"起来 + 停在哪一步"；
 `[res] free_internal/largest_internal_block` 这一行**没打印**（它在 `cloud_start_task` 内，本机型未入网
 ⇒ 没跑到）⇒ "12 KB 主机栈起来之后内部 RAM 还剩多少"**本批无读数**（未测，不是"测了不好"）。
+★ **2026-10-07 第三批已解决这一段**：读数改为**未入网也必经**（`app_main()` 配网前 + `wifi_prov_boot()`
+里 NimBLE 起栈后；门禁 A13 机械断言），BLE/SD 两机型实测读数与差值见 §5.12.7。
 
 **烧写红线**：`-SkipPartTable` —— 先读板 `0x8000..0x9000`，与构件 `partition-table.bin` 的
 3072 B 前段 sha256 **相同**（`DBB160ED…`）⇒ 全程**不写分区表**；烧前/烧后该区 sha256 均
 `DBB160ED…` **未变**。三个写入区 `overlap_creds=False` + `GUARD_OK`，每区 `Hash of data verified`，
 `FLASH_EXIT=0`；⛔ 无 `erase_flash`、⛔ 无整片擦写。`creds`（`0x510000`+16 KB）烧前/烧后/烧回后
 逐字节比对 `differing_bytes=0`、sha256 `1801b9c1…` 三次一致。
+
+### 5.12.7 `[res]` 资源读数移到「未入网也必经」（2026-10-07 第三批）：NimBLE 起栈后的内部 RAM 读数
+
+**缺口（上一批留下的）**：`[res]`（`free_internal` / `largest_internal_block` / `free_psram`）只有**一处**、
+写在 `cloud_start_task()` 里；而该任务由 `on_wifi_ready()`（拿到 IP 之后）创建 ⇒ **BLE 机型未入网时这一行
+永远打不出来**（上一批 BLE 件 120 s 抓包里 `[res]` 命中 0 行，而 NimBLE/广播/POP 那些行都在场）。
+于是"12 KB 的 NimBLE 主机栈起来之后内部 RAM 还剩多少"——BLE 机型最需要的一个数——**没有读数**。
+
+**改法（⛔ 不新建任务、⛔ 不删原读数）**：新增 `static void res_report(const char *phase)`
+（`main/korvo2_oneye_main.c:638-670`；单次、只读 `heap_caps_*`、不阻塞、不分配），**同一条格式串**在
+**3 个未入网也必经的点**各打一行，每行带 `phase=` 阶段标签：
+
+| 调用点（`文件:行`） | 阶段标签 | 何时可达 |
+| --- | --- | --- |
+| `main/korvo2_oneye_main.c:1651`（`app_main()`：外设/LCD/摄像头/SD/AEC/回放就绪之后、`wifi_prov_boot()` 之前） | `pre-prov（外设就绪、配网与 NimBLE 之前）` | **两机型都打**（跨机型同阶段可比） |
+| `main/korvo2_oneye_main.c:926`（`wifi_prov_boot()` 内 `wifi_prov_ble_start()` 成功之后） | `ble-ready（NimBLE 已起栈并广播、未入网）` | BLE 机型（`ENABLE_BLE_PROV=y` 且起栈成功） |
+| `main/korvo2_oneye_main.c:696`（`cloud_start_task()`，**原有的那一处**，位置与三个量逐字保留） | `cloud-start（入网后）` | 入网后（SD 机型可达） |
+
+**门禁**：`tools/check-prov-convergence.py` 新增 **A13**（同一个 helper、3 处调用点分别落在
+`app_main` / `wifi_prov_boot`（须在 `wifi_prov_ble_start()` **之后**）/ `cloud_start_task` 内；全工程
+`[res]` 格式串**唯一**且三个量逐字保留），并新增第 **9** 条注入负向对照「删掉 NimBLE 起栈后的资源读数」
+⇒ A13 报红。实跑：`正向断言（A1–A13）：PASS`、9/9 注入逐条被捕获、`CONV_EXIT=0`
+（`_tmp-phase2/res-conv.out`）。
+
+**受控构建两配置**（WSL / `ESP-IDF v5.5.5-dirty`；`-DSDKCONFIG=<构建目录>/sdkconfig` + 显式叠加 defaults +
+空证书目录；工作区那份 gitignored `sdkconfig` 的 sha256 构建前后同为 `ed2ac1b4…` ⇒ **未被读写**）：
+
+| 机型 | `BUILD_EXIT` | `korvo2_oneye.bin` | app 分区余量 | 镜像内 `[res]` 格式串 | 关键 `sdkconfig.h` |
+| --- | --- | --- | --- | --- | --- |
+| **BLE** | 0 | **1,586,816 B**（`0x183680`）sha256 `3f332a78…` | `0x27c980 B (62%) free` | **在场** | `ENABLE_BLE_PROV 1` / `BT_NIMBLE_ENABLED 1` / `BT_NIMBLE_HOST_TASK_STACK_SIZE 12288` / `ESP_COEX_SW_COEXIST_ENABLE 1`；`ENABLE_WIFI_FILE` 未定义 |
+| **SD** | 0 | **1,369,744 B**（`0x14e690`）sha256 `53148a16…` | `0x2b1970 B (67%) free` | **在场** | `ENABLE_WIFI_FILE 1`；无 BT/NimBLE 行 |
+
+共同：`TLS_INSECURE`/`ENABLE_PANEL_API`/`LOG_PROBE` **各 0 行**（未开）、`TRANSPORT_TLS 1`、
+`CLOUD_HOST "mqtt.oneye.me"`、`CLOUD_PORT 18886`、`CREDS_REQUIRED 1`、`ESP_SYSTEM_EVENT_TASK_STACK_SIZE 3072`。
+（"镜像内格式串在场"= `strings korvo2_oneye.bin | grep '\[res\]'` ⇒
+`I (%lu) %s: [res] phase=%s free_internal=%u B / largest_internal_block=%u B / free_psram=%u B`。）
+
+**真机读数（COM12 独占，两轮均 `-SkipPartTable`）**：
+
+| 机型（抓包） | `pre-prov`（配网前） | NimBLE 起栈后 / 入网后 | 同一次启动内的差值（后 − 前） |
+| --- | --- | --- | --- |
+| **BLE**（120 s，`res-serial-ble.txt:172` / `:191`） | `free_internal=162,631 B / largest_internal_block=63,488 B / free_psram=8,011,980 B` | **`phase=ble-ready`：`free_internal=112,023 B / largest_internal_block=63,488 B / free_psram=7,983,016 B`** | **`-50,608 B / ±0 B / -28,964 B`**（= NimBLE 主机栈的净代价） |
+| **SD**（200 s，`res-serial-sd.txt:170` / `:239`） | `free_internal=212,959 B / largest_internal_block=102,400 B / free_psram=8,011,980 B` | `phase=cloud-start（入网后）`：`free_internal=56,067 B / largest_internal_block=31,744 B / free_psram=7,635,024 B` | `-156,892 B / -70,656 B / -376,956 B`（Wi-Fi 入网 ＋ SDK 建链 ＋ 面板/net_probe/sntp 全链之后） |
+
+**同阶段跨机型对照（同一代码点 `pre-prov`）**：BLE `162,631 / 63,488 / 8,011,980` − SD
+`212,959 / 102,400 / 8,011,980` ⇒ `-50,328 B / -38,912 B / ±0 B`。
+⚠️ 这一差值**发生在 NimBLE 起栈之前** ⇒ 它**不是**主机栈的代价（BT 控制器/coex 的静态占用与镜像更大都在
+这里），⛔ 不要把它算成"蓝牙栈吃掉的量"；主机栈的代价只能看**同一台机器**的 `pre-prov → ble-ready`。
+
+**如实结论（⛔ 不美化、⛔ 不由"能起来"推断"长期稳定"）**：
+
+1. **数字**：BLE 机型在 NimBLE 主机栈起来（12 KB 栈已分配）、已广播、**尚未入网**时，
+   `largest_internal_block` = **63,488 B（62 KiB）**、`free_internal` = **112,023 B**。
+   ⇒ 本批**没有**出现"要不到 16 KB 连续内部块"的形态；`largest_internal_block` **不是** 2.2 KB。
+   ⚠️ 上一批/更早引用的 `largest_internal_block=2304 B` 是**不同批次、不同时刻**的读数，**本批未复现**，
+   成因**未深究**（如实登记，⛔ 不当作已解释）。
+2. **但入网后的 BLE 读数仍然没有**：BLE 机型没有同场手机 ⇒ 走不到 `cloud-start`。而 SD 机型在**同一代码点
+   之后**（入网 ＋ SDK 全链）`largest_internal_block` 从 102,400 B 掉到 **31,744 B**（`free_internal` 掉到
+   56,067 B）⇒ 这一段确实会**吃掉最大的连续块**，BLE 机型走到那一步还剩多少**仍未测**。
+3. 本批只跑了**单次启动**（BLE 120 s / SD 200 s）⇒ ⛔ **不声称**"BLE 机型长期稳定/可再起任务"：
+   63,488 B 是"能再起一个 ≤16 KB 新任务"的**必要**条件，不是充分条件；运行期碎片化未测。
+4. **一致性旁证**：SD 的 `cloud-start` 三个量与上一批（§5.12.6 / `_tmp-phase2/provisioning-priority-and-push.md`）
+   **逐值相同**（`free_internal=56067`、`largest_internal_block=31744`），仅 `free_psram` 差 16 B
+   （7,635,040 → 7,635,024）⇒ 同一代码点的读数跨批次可复现（该处读数**未**被本批改动影响）。
+
+**烧写红线（两轮，逐条）**：
+
+- **分区表**：烧前读板 `0x8000` 4 KiB（`res-part-pre.bin`）与构件 `partition-table.bin` 的 **3072 B 前段
+  sha256 相同**（`dbb160ed…`，`prefix_differing_bytes=0`，尾部 1024 B 全 `0xFF`）⇒ 两轮**全程
+  `-SkipPartTable`**；烧后回读（`res-part-post.bin`）整 4 KiB sha256 `04a5945b…` **未变**。
+- **写入区**：BLE 轮 `bootloader.bin off=0x0 len=20832 end=0x5160`、`korvo2_oneye.bin off=0x10000
+  len=1586816 end=0x193680`、`srmodels.bin off=0x410000 len=337952 end=0x462820`，**各 `overlap_creds=False`**
+  ＋ `GUARD_OK`；SD 轮同形（app `len=1369744 end=0x15e690`）。两轮各 3 区 `Hash of data verified`、
+  `FLASH_EXIT=0`（38 s / 34 s）。
+- **`creds`**（`0x510000`＋16 KiB）：烧前 / 烧完 BLE 后 / 烧完 SD 后 三次**逐字节 `differing_bytes=0`**、
+  sha256 三次一致 `1801b9c1…`。
+- ⛔ 无 `erase_flash`、⛔ 无整片擦写、⛔ 未 kill 无关进程、⛔ 未打印私钥。
+
+**抓包口径与同段对照**：端口先开＋读循环就位 → `RTS=1` 按住 EN 500 ms → 清缓冲 → 释放（`prod2-serial.ps1`）。
+BLE 段（11,980 字符 / 194 行）：开机前缀 `ESP-ROM:esp32s3`/`rst:0x`/`boot:  4 creds`/`app_init: Compile time`/
+`ELF file SHA256` **各 1 次**、`NimBLE: GAP procedure initiated: advertise;` `@183`、`[oneye][ble] 配网配对码
+POP=894767` `@188`、`BLE 配网通道已就绪` `@189`、`下一步：` `@190`、`board-check` 22 次，
+崩溃/异常类（`assert`/`Guru`/`Backtrace`/`WDT`/`Core dump`/`abort()`/`Panic`/`stack overflow`…）**全 0**；
+`CLOUD_LINK_UP`/`mqtt.oneye.me` **0 次**（未入网 ⇒ 符合预期）。SD 段（18,819 字符 / 273 行）：开机前缀各 1 次、
+`Wi-Fi 已获取 IP` `@218`、`[prov-priority]` `@172`、`[net-probe] cloud endpoint` `@222`、`[sntp] 已同步` `@225`、
+`CLOUD_LINK_UP` `@235`、`cloud_link_up` `@238`、`ONEYE-PROV1` `@230`、崩溃类**全 0**。
+
+⚠️ **诚实边界**：BLE 端到端仍**未验**（无同场手机）；`ble-ready` 是**入网前**的读数，⛔ 不能外推成
+"BLE 机型入网后也够用"。
 
 ---
 

@@ -1,0 +1,65 @@
+# =============================================================================
+# 「BLE 机型」预设 —— **无 SD 卡配网能力**的机型（或指定以 BLE 为主通道的机型）
+#
+# 叠加顺序（第三份之后、最后一份）：
+#   idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.defaults.production;sdkconfig.defaults.ble"
+#
+# ★ 这份文件存在的理由（ADR-0017 D3）★
+#   `CONFIG_ONEYE_FW_ENABLE_WIFI_FILE` 是**机型能力位**：没有卡槽的机型置 n。但**光置 n 是不够的** ——
+#   那样会变成"一个配网通道都没有 ⇒ `oneye_start()` 永不调用 ⇒ 设备上不了云"
+#   （这正是 2026-10-07 真机实测到的纯生产件故障）。所以本文件在关掉 SD 通道的**同时**
+#   打开 BLE 通道（C1/C2），并由 `main/CMakeLists.txt` 的构建期门禁保证
+#   「两个都关且 SSID 为空 ⇒ 编不过」。
+#
+# BLE 侧取值**不是**本文件新拟的：逐项照抄已真机打通的例程
+#   `examples/oneye/korvo2_llm_chat/sdkconfig.defaults:57-94`（真机取证 2026-09-17，
+#   BLE 配网首次打通、并与音频管线共存）。为什么照抄而不是"按需精简"：
+#   那几个值（主机任务栈 12 KB、MSYS 池 12、NimBLE 主机侧走 PSRAM、Wi-Fi 缓冲下调）
+#   每一条都对应一次真机上踩出来的崩溃/饥饿，不是保守取值。
+# =============================================================================
+
+# ---- 配网通道：关 SD 卡通道、开 BLE 通道 --------------------------------------
+# 机型能力位 = 本机型无 SD 卡配网能力（⚠️ 不是"量产开关"，见 ADR-0017 D3）
+# CONFIG_ONEYE_FW_ENABLE_WIFI_FILE is not set
+
+# ⚠️ **顺序有语义，不要重排**（2026-10-07 实测踩到）：Kconfig 的 defaults 是**按文件顺序**逐条
+#    施加的，而赋值给"当前不可见的符号"会被**静默丢弃**。
+#    `ONEYE_FW_ENABLE_BLE_PROV` 有 `depends on ONEYE_DEV_SDK_ENABLE_BLE`，而后者又
+#    `depends on ONEYE_DEV_SDK_ENABLE_LINK`、再上还有 SDK 总开关 `ONEYE_DEV_SDK_ENABLE`。
+#    第一次就是先把 `ENABLE_BLE_PROV=y` 写在前面 ⇒ 那一刻 `ENABLE_BLE` 还不是 y ⇒ 赋值被丢弃
+#    ⇒ 最终 `ENABLE_BLE_PROV=n`，并被构建期门禁挡下（报"没有任何可用的配网通道"）。
+#    所以：**依赖者在前，被依赖者在后**按下面这个次序写。
+CONFIG_ONEYE_DEV_SDK_ENABLE=y
+CONFIG_ONEYE_DEV_SDK_ENABLE_LINK=y
+CONFIG_ONEYE_DEV_SDK_ENABLE_BLE=y
+CONFIG_ONEYE_FW_ENABLE_BLE_PROV=y
+
+# ---- Wi-Fi + BLE 共存 ---------------------------------------------------------
+# BLE 广播与 Wi-Fi 同时工作必须开共存（否则 BLE 广播期间 Wi-Fi 连接不稳）
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
+
+# ---- BLE（NimBLE，自研 GATT 服务）---------------------------------------------
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=517
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+# **主机任务栈必须 ≥ 12 KB**（默认 4096 会在 BLE 配网时崩板）：
+#   GATT 的 RX 回调跑在 NimBLE 主机任务上，SDK 在该回调里处理 `prov.pair` 并**直接回帧**
+#   （oneye_dev_ble.c → oneye_dev_ble_send_frame → 分片+加密+notify），栈不够即踩穿。
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=12288
+# NimBLE MSYS 内存池是**内部 RAM 里的静态数组**，默认 24/24 会在 BLE 打开后吃紧并挤掉音频管线
+# （真机取证 2026-09-17：`I2S 读元素创建失败` → `采集任务创建失败`）。本机型 BLE 只跑配网
+# （帧 ≤600 B 分片），12/12 足够。
+CONFIG_BT_NIMBLE_MSYS1_BLOCK_COUNT=12
+CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=12
+CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=12
+# NimBLE **主机侧**分配改走 PSRAM（控制器侧仍在内部 RAM），给音频管线腾内部 RAM。
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
+
+# ---- Wi-Fi 内部 RAM 预算（与 BLE + AFE 共存）----------------------------------
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16

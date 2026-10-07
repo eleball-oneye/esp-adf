@@ -201,8 +201,8 @@ I2S0(CODEC_ADC_I2S_PORT) 16 kHz / 32 bit / ONLY_LEFT        ← 单麦口径：i
 | 串口取证 | `[wifi_prov] 从凭据文件读取 Wi-Fi：/sdcard/oneye-wifi.txt（ssid=…，密码已提供）` → `Wi-Fi 已获取 IP：192.168.x.x（ssid=…，来源=file:/sdcard/oneye-wifi.txt）` → `已联网 → 启动上云（oneye-dev-sdk）` |
 | 面板可见 | `GET /api/status` → `wifi{connected,ip,ssid,source}`；面板「Wi-Fi 配网」卡片显示**凭据来源** |
 | 运行期改配 | `POST /api/action {"op":"wifi_set","ssid":"…","password":"…"}`（面板表单同款）：只改**本次运行**、**不写文件**，用于换网/排障；持久化仍以 SD 文件（或 Kconfig）为准 |
-| 开关 | `CONFIG_ONEYE_FW_ENABLE_WIFI_FILE`（缺省 y）同时控制凭据文件读取与 `wifi_set`；量产**必须置 n** |
-| 安全口径 | 凭据文件在 SD 卡上是**明文** Wi-Fi 密码 ⇒ **仅台面/研发配网**。量产不得依赖该路径：走 claim + 一机一密凭据（ADR-0007） |
+| 开关 | `CONFIG_ONEYE_FW_ENABLE_WIFI_FILE`（缺省 y）同时控制凭据文件读取与 `wifi_set`。★ **这是机型能力位**（有卡槽机型 y / 无卡槽机型 n），⛔ **不是**「量产 vs 台面」开关 —— 见 §5.11 与 [ADR-0017](../../../../../docs/adr/0017-多通道配网与入网后收敛点.md) |
+| 安全口径 | 凭据文件在 SD 卡上是**明文** Wi-Fi 密码 ⇒ 有加密通道（BLE）的机型应以 **BLE 配网（§5.11）为首选通道**。该残余风险按 ADR-0017 D3 归属「配网凭据落盘形态」另行决策；⛔ 旧的"量产必须置 n"口径已废弃（它会让生产件**一个通道都不剩**） |
 
 连接超时为 20 s（`wifi_prov_connect(…, 0)` 取缺省）；失败只降级、不重启、不阻塞板级自检，
 串口给出 `Wi-Fi 连接失败（来源 …，ssid=…）→ 跳过上云` 与改配建议。
@@ -419,7 +419,220 @@ done
 ② SDK 内部源码 `components/oneye-dev-sdk/src/internal/oneye_ble_plat_nimble.c:102/:114/:126` 自述
    「量产应降为 `ESP_LOGD`（协议正文不落串口，PIPL）」：那是**另一个仓**（SDK）的实现，且本固件未启用 BLE，
    本预设管不到，登记为未做；
-③ 分区形态仍是**开发板台面形态**（`factory 4M`），量产分区表需单独评审（见 [`partitions.csv`](partitions.csv) 顶部）。
+③ 分区形态仍是**开发板台面形态**（`factory 4M`），量产分区表需单独评审（见 [`partitions.csv`](partitions.csv) 顶部）；
+④ 2026-10-07 起本工程**可以有 BLE 配网通道**（`sdkconfig.defaults.ble` 机型）⇒ 上面 ② 那条欠账在
+   **BLE 机型上从"管不到"变成"实际存在"**（NimBLE 平台层可能把协议正文打到串口）。仍未修，
+   属 SDK 仓改动（`build-all.sh --toolchains`）。
+
+---
+
+## 5.11 多通道配网与「入网后收敛点」（ADR-0017，2026-10-07）
+
+> 决策与口径的**事实源**：[ADR-0017](../../../../../docs/adr/0017-多通道配网与入网后收敛点.md)。
+> 本节只写本工程**怎么落地、怎么自证**。
+
+### 5.11.0 先记住两条（其余都是推论）
+
+1. **`ONEYE_FW_ENABLE_WIFI_FILE` 是机型能力位**（有卡槽机型 y / 无卡槽机型 n），
+   ⛔ **不是**「量产 vs 台面」开关。
+   旧口径把它当量产开关（`sdkconfig.defaults.production` 曾写 `is not set`），后果是**纯生产件
+   一个配网通道都不剩** ⇒ `main/korvo2_oneye_main.c` 的 `!have` 分支 `return` ⇒
+   **`oneye_start()` 从未被调用** ⇒ 设备永远上不了云，而构建/烧写/串口启动全部正常（故障**静默**）。
+2. **统一不变量**：任一通道入网成功 ⇒ `oneye_start()` 被调用，且全工程**只有一条**调用路径。
+
+### 5.11.1 通道清单（本工程的权威列表 = ADR-0017 D1）
+
+| 编号 | 通道 | 本工程落点 | 开关 | 状态 |
+| --- | --- | --- | --- | --- |
+| **C1** | BLE → 移动端 App | [`main/wifi_prov_ble.c`](main/wifi_prov_ble.c) | `ONEYE_FW_ENABLE_BLE_PROV`（+ `ONEYE_DEV_SDK_ENABLE_BLE`） | 已落地 |
+| **C2** | BLE → 另一台嵌入式设备 | 同 C1（对端是 `kind=device` 节点，无新协议） | 同上 | 已落地 |
+| **C3** | SD 卡 / SPIFFS `oneye-wifi.txt` | [`main/wifi_prov.c`](main/wifi_prov.c) `wifi_prov_load_file()` | `ONEYE_FW_ENABLE_WIFI_FILE`（**机型能力位**） | 已落地 |
+| **C4** | 台面 `POST /api/action {"op":"wifi_set"}` | [`main/media_api.c`](main/media_api.c) | 同 C3 | 已落地 |
+| **C5** | Kconfig `ONEYE_FW_WIFI_SSID` 兜底 | `main/korvo2_oneye_main.c` | 常量非空 | 兜底（**不算通道**） |
+| **R1** | 声波 | —— | —— | **仅预留扩展点，未实现** |
+| **R2** | 二维码 | —— | —— | **仅预留扩展点，未实现** |
+
+预留通道的接入口径（含 rank 登记）写在 [`main/wifi_prov_policy.h`](main/wifi_prov_policy.h) 文件头
+（三步：登记枚举与 rank / 只调 `wifi_prov_submit_credentials()` 交凭据 / ⛔ 不许自己调 `oneye_start()` 或直连连接层）。
+⛔ 本轮**没有**为声波/二维码写任何扫描、解码或协议代码。
+通道之间的**优先级**见 §5.12（ADR-0017 D2.1）。
+
+### 5.11.2 唯一收敛点（长什么样）
+
+```
+wifi_prov.c : on_wifi_event() 的 IP_EVENT_STA_GOT_IP 分支
+  └─ s_ready_cb()                        ← 唯一触发点
+       └─ main.c : on_wifi_ready()        ← 唯一注册点（app_main 里 wifi_prov_set_ready_cb）
+            └─ xTaskCreate(cloud_start_task, …)   ← 唯一创建点
+                 └─ oneye_start()        ← 唯一调用点
+```
+
+**通道的职责边界**：只负责「产出凭据并交给 `wifi_prov_submit_credentials()`」。
+「入网之后做什么」（本地面板启动 / `net_probe` / SNTP 授时 / `oneye_start` / 影子补发 / track 埋点）
+**全部**是上面那条路径的**下游**，通道侧不需要、也不允许知道。
+
+### 5.11.3 自证（结构性门禁，不是注释声称）
+
+```bash
+cd embedded/esp-adf/examples/oneye/korvo2_oneye
+python3 tools/check-prov-convergence.py          # RESULT=PASS ⇒ exit 0
+```
+
+它机械断言 A1–A10（`oneye_start()` 调用点唯一且在 `cloud_start_task` 内、`cloud_start_task`
+创建点唯一且在 `on_wifi_ready` 内、ready 回调注册点/触发点各唯一、BLE 通道只经唯一入口且
+自己不调 `oneye_start()`/`esp_wifi_connect()`、**SD 凭据在启动期先于 BLE 被递上去**、
+**非 `wifi_prov.c` 不得直连 `wifi_prov_connect()`/不得写 `wifi_prov_set_source()`**、
+**只入网一次**（一次性守卫 + 判据 `onboarded = s_connected && s_held_valid` + 判据顺序）、
+**夹具与判据同源**…），
+并**自带 5 条注入负向对照**（第二条入网后逻辑 / 直连连接层 / 丢掉"只入网一次" / 抹掉留痕 /
+夹具自备判据），断言同一套检查**必须逐条报红**。
+任一条注入没被抓住 ⇒ 脚本自己判据空转 ⇒ 同样 `exit 1`。
+它还会**实跑主机侧夹具**（`tools/test-prov-priority.c`，有 `cc`/`gcc` 时）并要求
+`RESULT=PASS` 且"负向对照通过"（见 §5.12）。
+
+### 5.11.4 两种机型的受控构建（在 §5.10 的受控路径上多一份 defaults）
+
+```bash
+EX=embedded/esp-adf/examples/oneye/korvo2_oneye
+CERT=/tmp/oneye-empty-certs && mkdir -p "$CERT"
+
+# ① SD 卡机型（有卡槽；WIFI_FILE=y 走机型能力位，其余全部生产口径）
+idf.py -B /tmp/korvo2-mp-sd -DSDKCONFIG=/tmp/korvo2-mp-sd/sdkconfig \
+  -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.defaults.production" \
+  -DONEYE_FW_CERT_DIR="$CERT" build
+
+# ② BLE 机型（无卡槽：WIFI_FILE=n + BLE 通道 y，其余全部生产口径）
+idf.py -B /tmp/korvo2-mp-ble -DSDKCONFIG=/tmp/korvo2-mp-ble/sdkconfig \
+  -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.defaults.production;sdkconfig.defaults.ble" \
+  -DONEYE_FW_CERT_DIR="$CERT" build
+```
+
+`-DSDKCONFIG=` 与「显式叠加 defaults」两条硬约束见 §5.10，⛔ 不要依赖工作区那份 gitignored `sdkconfig`。
+
+### 5.11.5 构建期门禁：「一个可用通道都没有」的配置**编不过**
+
+`main/CMakeLists.txt` 里有一条 `FATAL_ERROR`：`WIFI_FILE=n` **且** `ENABLE_BLE_PROV=n`
+**且** Kconfig `WIFI_SSID` 为空 ⇒ 直接失败（报错文案给出三条修法）。
+它恰好会打在**旧量产预设**上 —— 即把「生产件必然上不了云」从「可接受的现状」变成「构建不出来」。
+负向对照（期望报红）：
+
+```bash
+printf '# CONFIG_ONEYE_FW_ENABLE_WIFI_FILE is not set\n# CONFIG_ONEYE_FW_ENABLE_BLE_PROV is not set\nCONFIG_ONEYE_FW_WIFI_SSID=""\n' > /tmp/neg.defaults
+idf.py -B /tmp/korvo2-mp-neg -DSDKCONFIG=/tmp/korvo2-mp-neg/sdkconfig \
+  -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.defaults.production;/tmp/neg.defaults" \
+  -DONEYE_FW_CERT_DIR="$CERT" build      # 期望：FATAL_ERROR + exit ≠ 0
+```
+
+### 5.11.6 串口上「下一步」提示按**本机型实际具备的通道**给
+
+`WIFI_FILE=n` 且无凭据时，固件**不再**叫用户"把 `oneye-wifi.txt` 放 SD 卡根目录"（那条指引在该
+配置下**做不到** —— 本机型根本不读卡），改为给 BLE 配网指引（连接 `ONEYE-<id 后 4 位>`、
+输入串口打印的 6 位 POP）。见 `main/korvo2_oneye_main.c` 的 `wifi_prov_boot()`。
+
+### 5.11.7 仍未做 / 未证（如实登记）
+
+- **BLE 通道的真机端到端**（手机或另一台嵌入式设备经 BLE 下发凭据 → 入网 → 上云）：**未做**
+  （无同场手机侧真机；宿主侧可用 `components/oneye-dev-sdk/tools/ble_prov_e2e.py` 作后续入口）。
+- **R1 声波 / R2 二维码**：只有枚举扩展点，**没有**任何实现。
+- **C4 台面 API 通道**在 `PANEL_API=n` 的生产件上不可用（属预期）。
+- SDK 侧 PIPL 欠账（协议正文落串口）在 BLE 机型上**实际存在**，见 §5.10 已知边界 ④。
+
+---
+
+## 5.12 配网通道优先级（ADR-0017 D2.1，2026-10-07 生效）
+
+> 口径事实源：[ADR-0017](../../../../../docs/adr/0017-多通道配网与入网后收敛点.md) D2.1 与文末「决策记录」。
+> **优先级 = SD 卡 WiFi 凭据 > 蓝牙配网 > 其他（声波/二维码等预留）**。
+> ⚠️ 它是「同一台设备上多通道都可得时**谁先被采信**」的**采信规则**，⛔ **不是互斥开关**：
+> 通道该开就开（无卡槽机型照样可开 BLE），但**同一时刻只有一份凭据被采信**（"采信槽"）。
+
+### 5.12.1 判据（唯一，纯逻辑，与单测同源）
+
+[`main/wifi_prov_policy.h`](main/wifi_prov_policy.h) 是**唯一判据**（不 include ESP-IDF ⇒ 主机侧单测编译的是同一份源）：
+
+| rank（小 = 高） | 通道 |
+| --- | --- |
+| **0** | C3 SD 卡 / SPIFFS 凭据文件 |
+| **1** | C1/C2 蓝牙配网 |
+| **2** | 「其他」：C4 台面 API（显式改配）、C5 Kconfig 兜底、**R1 声波 / R2 二维码（预留，⛔ 未实现）**、未标注 |
+
+裁决顺序（`wifi_prov_policy_decide()`，⛔ 不可重排）：
+
+1. **已入网且采信槽未被显式释放 ⇒ 一律拒绝**（`REJECT_ALREADY_UP`，**只入网一次**；入网后连更高优先级也不抢占）；
+2. 槽为空（含被显式释放）⇒ **采信**（`ACCEPT_FIRST`）；
+3. 同一通道再次提交 ⇒ **采信**（`ACCEPT_SAME`，改配/重试）；
+4. 严格更高优先级且尚未入网 ⇒ **抢占**（`ACCEPT_PREEMPT`）；
+5. 其余 ⇒ **拒绝**（`REJECT_LOWER`）。
+
+**看优先级，不看到达顺序**：BLE 先到、SD 后到 ⇒ SD 仍然胜出（`ACCEPT_PREEMPT`）。
+理由：纯"先到先得"会让「手机先配了、卡是后来插上的」变成 BLE 胜出，与口径直接冲突。
+
+### 5.12.2 落码形状（`文件:行`）
+
+```
+C1/C2 BLE  wifi_prov_ble.c:56  wifi_prov_submit_credentials(ssid, password, WIFI_PROV_CHAN_BLE)
+C3  SD 卡  korvo2_oneye_main.c:821  wifi_prov_submit_credentials_src(..., WIFI_PROV_CHAN_FILE, src)
+C4  台面    media_api.c:395-396      wifi_prov_release_held("api-reprovision") + submit(..., CHAN_API)
+C5  兜底    korvo2_oneye_main.c:857  wifi_prov_submit_credentials_src(..., WIFI_PROV_CHAN_KCONFIG, "kconfig")
+                    ↓  全部进入
+wifi_prov.c:329  wifi_prov_submit_credentials_src()  →  :343 唯一判据 → :276 wifi_prov_connect()（**static**）
+                    ↓ 采信并入网
+wifi_prov.c:102  IP_EVENT_STA_GOT_IP  →  :113 s_ready_cb()  →  main.c:674 on_wifi_ready()  →  :643 oneye_start()
+```
+
+- **判据不可旁路**：连接层 `wifi_prov_connect()` 已收为 `wifi_prov.c` 内部 `static`、**不出现在头文件**，
+  ⇒ 模块外没有任何路径能绕过优先级（门禁 A8b/A8c 断言）。
+- **留痕**：拒绝/抢占都打 `[prov-priority] <决策 token>`（`wifi_prov_decision_str()`）+ 累计计数；
+  BLE 侧把拒绝以 `-1` 回给 SDK ⇒ 对端收到 `PROV_FAILED`（`oneye-dev-sdk/src/oneye_dev_link.c:317-320`），⛔ 不静默丢弃。
+- **启动期顺序 = 优先级顺序**：C3 → BLE → C5 兜底（`korvo2_oneye_main.c:808-887`）。
+  **C3 能解析但本次入网失败** ⇒ `:829` 显式 `wifi_prov_release_held("file-connect-failed")` 再降级，
+  否则 rank 0 会永久占位、把后面的通道全挡住（配网死锁）。
+- **显式改配/重置**走「先释放采信槽再提交」（台面 `wifi_set` / `prov.reset`），允许在已入网设备上换网；
+  ⛔ 但上云链路**仍只启动一次**（`on_wifi_ready()` 的一次性守卫 + 唯一 `oneye_start()` 调用点）。
+
+### 5.12.3 自证（非空转）
+
+```bash
+cd embedded/esp-adf/examples/oneye/korvo2_oneye
+python3 tools/check-prov-convergence.py     # A1–A10 + 5 条注入负向对照 + 实跑夹具 ⇒ RESULT=PASS / exit 0
+cc -std=c99 -Wall -Wextra -Werror -I main tools/test-prov-priority.c -o /tmp/tpp && /tmp/tpp
+```
+
+[`tools/test-prov-priority.c`](tools/test-prov-priority.c) 的三个夹具（对应任务口径，⛔ 不是空转）：
+
+| 夹具 | 内容 | 断言 |
+| --- | --- | --- |
+| **①** | **SD 凭据在 + BLE 也提交了 ⇒ SD 胜出** | SD 先（未入网）⇒ BLE 被 `REJECT_LOWER`；到达顺序反过来 ⇒ SD `ACCEPT_PREEMPT` 抢下采信槽；掉线不影响"谁被采信" |
+| **②** | **SD 不在 + BLE 提交 ⇒ BLE 胜出** | 空槽 + BLE ⇒ `ACCEPT_FIRST`；随后「其他」层（API/Kconfig/声波/二维码）一律 `REJECT_LOWER`（不越权） |
+| **③** | **重复入网被拒（只入网一次）** | 已入网后 SD/BLE/API/预留通道全部 `REJECT_ALREADY_UP`（含更高优先级也不抢占）；显式 `release_held` 是唯一换网路径；`prov.reset` 后仍需重新入网 |
+
+**负向对照（变异测试）**：同一组夹具再跑一遍「变异判据」（rank 反向 + 忽略"只入网一次"），**必须报红**；
+不报红 ⇒ 夹具对本判据没有区分力 ⇒ 退出码 1。
+
+### 5.12.4 本轮读数（受控构建三配置；`-DSDKCONFIG` + 显式叠加 defaults，全新目录）
+
+环境：WSL2 / `ESP-IDF v5.5.5-dirty`；每次**全新构建目录**（先 `rm -rf`）；脚本 `_tmp-phase2/prio-build.sh`、读数 `_tmp-phase2/prio-readings.txt`。
+工作区那份 gitignored `sdkconfig` 的 sha256 构建前后一致（`ed2ac1b4…`）⇒ **未被读写**。
+
+| 配置 | `BUILD_EXIT` | `korvo2_oneye.bin` | app 分区余量 | 关键 `sdkconfig.h` | 门禁 |
+| --- | --- | --- | --- | --- | --- |
+| ① **SD 机型**（`…production`，`WIFI_FILE` 取机型 y） | **0** | **1,369,616 B**（`0x14e610`）sha256 `76e9b9db…` | `0x2b19f0 B (67%) free` | `ENABLE_WIFI_FILE 1` / `CLOUD_HOST "mqtt.oneye.me"` / `CLOUD_PORT 18886` / `TRANSPORT_TLS 1` / `WIFI_SSID ""` / `CREDS_REQUIRED 1` / `COMPILER_OPTIMIZATION_SIZE 1`；`TLS_INSECURE`·`ENABLE_PANEL_API`·`LOG_PROBE` **不出现** | `GATE_TRIPPED=NO` |
+| ② **BLE 机型**（追加 `sdkconfig.defaults.ble`） | **0** | **1,576,768 B**（`0x180f40`）sha256 `391e9d37…` | `0x27f0c0 B (62%) free` | `ENABLE_BLE_PROV 1` / `ONEYE_DEV_SDK_ENABLE 1` / `…_LINK 1` / `…_BLE 1` / `BT_ENABLED 1` / `BT_NIMBLE_ENABLED 1` / `BT_NIMBLE_HOST_TASK_STACK_SIZE 12288` / `ESP_COEX_SW_COEXIST_ENABLE 1`；`# CONFIG_ONEYE_FW_ENABLE_WIFI_FILE is not set` | `GATE_TRIPPED=NO` |
+| ③ **负向对照**（`WIFI_FILE=n` + `BLE_PROV=n` + `SSID=""`） | **2**（期望失败 ⇒ 符合预期） | `ABSENT` | —— | —— | **`GATE_TRIPPED=YES`** |
+
+两机型共同读数：`bootloader.bin` 20,832 B（余 36%）、`partition-table.bin` 3,072 B、`srmodels.bin` 337,952 B；
+链接面 `链接预编译库（分域库，toolchain=xtensa-esp32s3-elf-gcc-14.2.0）：oneye_dev_ble_prebuilt;…`，预编译库哨兵通过（`0.4.0` / `src_sha256 036bb23b…`）。
+③ 的报错正文逐字为 `CMake Error at main/CMakeLists.txt:87 (message): 本构建没有任何可用的 Wi-Fi 配网通道 ⇒ 设备结构上不可能上云（oneye_start() 永不会被调用）。` 并给出三条修法 ⇒ 「生产件必然上不了云」仍是**构建失败**。
+
+### 5.12.5 仍未做 / 未证（⛔ 不声称完成）
+
+- **BLE 通道真机端到端**：**未做**（无同场手机侧真机）。本轮 BLE 侧证据 = 编译×链接×镜像成立 + 结构性断言 + 主机侧判据夹具，
+  ⛔ **不据此声称 BLE 配网已通**。
+- **BLE 机型烧写后的运行期内存读数**（NimBLE 12 KB 内部 RAM vs 本板 `largest_internal_block=2304 B`）：**未测**（BLE 机型本轮只构建、未烧写）。
+- **BLE 通道入网后的启动期自检/授时**：`net_probe_report()` 与 `sntp_boot_sync()` 目前只在 `prov_boot_after_connect()`
+  （`korvo2_oneye_main.c:773-786`）里执行，而该函数只被启动期 C3/C5 成功路径调用 ⇒ **BLE 通道入网时不执行**。
+  这是本轮**发现但未改**的既有差异（改它要动收敛点下游，属另一批），如实登记、⛔ 不当作已解决。
+- **C4 台面改配**在 `PANEL_API=n` 的生产件上不可用（属预期）；本轮**未**在真机上做台面改配实测。
 
 ---
 
@@ -433,7 +646,9 @@ done
 | `ONEYE_FW_PROV_ATTEST` | **y** | 开机打印一行产测自证串（`ONEYE-PROV1 …`）。**量产与产测共用同一份固件**，所以缺省开：靠编译期开关打开自证，等于维护"产测固件/量产固件"两个镜像，而发错固件会让整个产测环节**静默失效** |
 | `ONEYE_FW_CLOUD_TOKEN` | 空 | 设备令牌（空 = 匿名 dev 形态） |
 | `ONEYE_FW_TLS_INSECURE` | **n** | 仅 dev/产测可开；生产须投放自研 CA（`tls_ca_pem`） |
-| `ONEYE_FW_ENABLE_WIFI_FILE` | **y** | 凭据文件配网（SD/SPIFFS `oneye-wifi.txt`）+ `/api/action wifi_set`；**量产置 n** |
+| `ONEYE_FW_ENABLE_WIFI_FILE` | **y** | 凭据文件配网（SD/SPIFFS `oneye-wifi.txt`）+ `/api/action wifi_set`。★ **机型能力位**：有卡槽机型 y / 无卡槽机型 n（⛔ 不是量产/台面开关，见 §5.11 与 ADR-0017 D3） |
+| `ONEYE_FW_ENABLE_BLE_PROV` | n | 配网通道 **C1/C2：BLE**（自研 GATT + POP 配对）；依赖 `ONEYE_DEV_SDK_ENABLE_BLE=y`。**无卡槽机型应置 y**（此时 `WIFI_FILE=n`，构建期门禁保证仍有通道）。参考预设 `sdkconfig.defaults.ble` |
+| `ONEYE_FW_BLE_POP` | 空 | 固定 BLE 配对 POP（6 位数字；空 = SDK 随机生成并打印串口） |
 | `ONEYE_FW_WIFI_SSID` / `_PASSWORD` | 空 | 兜底凭据；空且无凭据文件 = 只跑板级自检与按键，不上云 |
 | `ONEYE_FW_ENABLE_KEYS` | y | 6 键 → `event/up` |
 | `ONEYE_FW_ENABLE_SDCARD` / `_LCD` | **y** / **y** | SD 缺省开（凭据文件、录音、板上回放都依赖它；未插卡只告警不阻塞）；LCD 已于 **2026-09-16 真机验证**（`panel.lcd.ready=true`、320×240、PSRAM 帧缓冲），故缺省开 |

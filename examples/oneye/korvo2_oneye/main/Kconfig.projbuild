@@ -55,9 +55,15 @@ menu "korvo2_oneye 板级固件配置"
             help
                 置 y：启动时先读凭据文件（`ssid=` / `password=` 逐行，`#` 注释），
                 命中即以文件为准连接；未命中再回落到下面的 Kconfig SSID。
-                该文件在 SD 卡上是**明文** Wi-Fi 密码，仅用于**台面/研发配网**；
-                量产形态必须关闭（n），改走 claim + 一机一密凭据（ADR-0007）。
-                同时该开关控制本地验证面的 /api/action wifi_set（运行期换网）。
+
+                ★ 这是**机型能力位**（ADR-0017 D3）：**有卡槽机型 y / 无卡槽机型 n**。
+                  ⛔ 它**不是**「量产 vs 台面」开关 —— 旧 help 曾写「量产形态必须关闭（n）」，
+                  后果是纯生产件一个配网通道都不剩、`oneye_start()` 永不调用、设备上不了云
+                  （2026-10-07 真机实测）。构建期门禁（main/CMakeLists.txt）现在保证
+                  「一个可用通道都没有」的配置**编不过**。
+                ⚠️ 文件在 SD 卡上是**明文** Wi-Fi 密码：有加密通道（BLE）的机型应以 BLE 为首选通道；
+                  该残余风险的归属见 ADR-0017 D3。
+                同时该开关控制本地验证面的 /api/action wifi_set（运行期换网，通道 C4）。
 
         config ONEYE_FW_WIFI_SSID
             string "Wi-Fi SSID（兜底；空且无凭据文件 = 不联网，仅跑板级自检）"
@@ -65,6 +71,27 @@ menu "korvo2_oneye 板级固件配置"
 
         config ONEYE_FW_WIFI_PASSWORD
             string "Wi-Fi 密码（兜底）"
+            default ""
+
+        config ONEYE_FW_ENABLE_BLE_PROV
+            bool "启用 BLE 配网通道 C1/C2（oneye-dev-sdk 自研 GATT + POP 配对）"
+            default n
+            depends on ONEYE_DEV_SDK_ENABLE_BLE
+            help
+                配网通道 C1（手机 App）与 C2（另一台嵌入式设备）：BLE 上跑 link 帧，
+                由 App/对端下发 SSID/密码（契约 contracts/local/ble-gatt.md）。
+                设备侧复用 SDK 的 `liboneye_dev_ble`（自研 GATT，POP→HKDF-SHA256→AES-128-GCM），
+                实现见 main/wifi_prov_ble.c —— 它**只**把凭据交给 wifi_prov_submit_credentials()，
+                入网后动作统一由 main/wifi_prov.c 的收敛点触发（ADR-0017 D2）。
+
+                依赖 `ONEYE_DEV_SDK_ENABLE_BLE=y`（SDK Kconfig），并需要 NimBLE 主机
+                （`CONFIG_BT_ENABLED=y`）与 Wi-Fi/BLE 共存；内部 RAM 代价见 ADR-0017 D6
+                与 sdkconfig.defaults.ble 的逐项注释。
+                **无 SD 卡槽的机型应打开本项**（此时 WIFI_FILE=n，由构建期门禁保证仍有通道）。
+
+        config ONEYE_FW_BLE_POP
+            depends on ONEYE_FW_ENABLE_BLE_PROV
+            string "固定 BLE 配对 POP（6 位数字；空 = SDK 随机生成并打印串口，TTL 见 SDK 配置）"
             default ""
     endmenu
 

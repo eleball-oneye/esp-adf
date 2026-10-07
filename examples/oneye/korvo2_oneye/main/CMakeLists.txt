@@ -35,6 +35,7 @@ idf_component_register(SRCS "korvo2_oneye_main.c"
                             "lcd_ui.c"
                             "camera_api.c"
                             "wifi_prov.c"
+                            "wifi_prov_ble.c"
                             "net_probe.c"
                             "sntp_boot.c"
                        INCLUDE_DIRS "."
@@ -59,10 +60,40 @@ idf_component_register(SRCS "korvo2_oneye_main.c"
                                 json
                                 spiffs
                                 fatfs
-                                vfs)
+                                vfs
+                                bt)
 
 if(_oneye_cert_files)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE ONEYE_FW_EMBED_CERTS=1)
+endif()
+
+# =============================================================================
+# 配网通道门禁：**至少有一条可用配网通道**（ADR-0017 D3）
+#
+# 为什么是编不过而不是告警：2026-10-07 真机实测的故障形态正是「量产预设把唯一通道关掉」——
+#   `sdkconfig.defaults.production` 曾写 `# CONFIG_ONEYE_FW_ENABLE_WIFI_FILE is not set`，
+#   而 Kconfig 兜底 SSID 为空 ⇒ `main/korvo2_oneye_main.c` 的 `!have` 分支 `return`，
+#   **`oneye_start()` 从未被调用**、设备永远上不了云，而构建、烧写、串口启动**全部正常**，
+#   只在"要上云"这一步静默失效（与 TLS/安全组无关）。
+# 把这条判据放在**构建期**：旧量产预设打在下面这个 FATAL_ERROR 上 ⇒ 「生产件必然上不了云」
+#   从"可接受的现状"变成"根本构建不出来"。
+#
+# 判据 = WIFI_FILE=n 且 BLE 通道未启用 且 Kconfig SSID 为空（三者同时成立才报错）。
+# 注意 `CONFIG_ONEYE_FW_WIFI_SSID` 是字符串配置：未定义时 CMake 里展开为空串。
+# =============================================================================
+if(NOT CONFIG_ONEYE_FW_ENABLE_WIFI_FILE
+   AND NOT CONFIG_ONEYE_FW_ENABLE_BLE_PROV
+   AND CONFIG_ONEYE_FW_WIFI_SSID STREQUAL "")
+    message(FATAL_ERROR
+        "本构建没有任何可用的 Wi-Fi 配网通道 ⇒ 设备结构上不可能上云（oneye_start() 永不会被调用）。\n"
+        "  当前取值：CONFIG_ONEYE_FW_ENABLE_WIFI_FILE=n、CONFIG_ONEYE_FW_ENABLE_BLE_PROV=n、"
+        "CONFIG_ONEYE_FW_WIFI_SSID=\"\"\n"
+        "  修法（任一）：① 本机型有 SD 卡槽 ⇒ 置 ONEYE_FW_ENABLE_WIFI_FILE=y（这是**机型能力位**，"
+        "不是量产/台面开关）；\n"
+        "                ② 本机型无 SD 卡槽 ⇒ 置 ONEYE_FW_ENABLE_BLE_PROV=y（配网通道 C1/C2，BLE），"
+        "参考 sdkconfig.defaults.ble；\n"
+        "                ③ 或给出 Kconfig 兜底 SSID（仅台面/产测联调可取）。\n"
+        "  依据：docs/adr/0017-多通道配网与入网后收敛点.md（D1 通道清单 / D2 唯一收敛点 / D3 能力位）")
 endif()
 
 # =============================================================================

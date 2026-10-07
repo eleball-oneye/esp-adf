@@ -60,8 +60,20 @@ CONFIG_ONEYE_FW_CLOUD_PORT=18886
 # CONFIG_ONEYE_FW_TLS_INSECURE is not set
 
 # ---- 台面能力一律关闭 ---------------------------------------------------------
-# SD 卡/SPIFFS 上的 Wi-Fi 凭据是**明文**，量产配网走 claim + 一机一密（ADR-0007）
-# CONFIG_ONEYE_FW_ENABLE_WIFI_FILE is not set
+# ★ 2026-10-07 订正（ADR-0017 D3）：**这一行原来写的是**
+#     `# CONFIG_ONEYE_FW_ENABLE_WIFI_FILE is not set`
+#   并把理由写成「SD 卡明文 Wi-Fi 密码不得进量产件」。**那个口径是错的**，而且代价极大：
+#   它把「机型能力位」当成「量产/台面开关」关掉，于是纯生产件**一个配网通道都不剩**
+#   （SD 卡通道被本预设关掉、BLE 通道当时还没接、Kconfig SSID 为空）
+#   ⇒ `main/korvo2_oneye_main.c` 的 `!have` 分支 `return`，**`oneye_start()` 从未被调用**，
+#      设备永远上不了云；而构建、烧写、串口启动全部正常，故障**静默**
+#      （2026-10-07 真机实测，串口原文见 `_tmp-phase2/prod2-serial.txt:170-171`）。
+#   ⇒ 本预设**不再**写这一行：
+#      · `WIFI_FILE` 由**机型**决定（korvo2_oneye 有卡槽 ⇒ 取 `sdkconfig.defaults` 的 y）；
+#      · 无卡槽机型**不能**靠"关掉它"来收场 —— 必须同时打开 BLE 通道（见 `sdkconfig.defaults.ble`），
+#        这条由 `main/CMakeLists.txt` 的构建期门禁强制（三条件同时成立即 `FATAL_ERROR`，编不过）。
+#      · 明文 Wi-Fi 密码的**残余风险仍在**，但归属改为「配网凭据落盘形态」单独决策
+#        （ADR-0017 D3），⛔ 不用"关掉唯一通道"来假装解决。
 # 设备侧本地 HTTP 验证面不是云端设备面契约
 # CONFIG_ONEYE_FW_ENABLE_PANEL_API is not set
 # 取证插桩（周期性 INFO + 长批量间隔）只用于取证
@@ -89,12 +101,15 @@ CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 #         grep -rn "量产\|生产" examples/oneye/korvo2_oneye --include=*.md --include=Kconfig*
 #         grep -rn "量产应\|量产必须\|生产必须\|不要在生产" components/oneye-dev-sdk
 #
-#  ① 明文 Wi-Fi 凭据配网
-#     · sdkconfig.defaults:95   「量产固件必须置 n」
-#     · README.md:200 / :368    「量产**必须置 n**」
-#     · main/Kconfig.projbuild:59「量产形态必须关闭（n）」
-#     · main/wifi_prov.h:12     「并在量产固件中关闭本文件的读取」
-#     ⇒ 本文件:64  `# CONFIG_ONEYE_FW_ENABLE_WIFI_FILE is not set`  ✅
+#  ① 明文 Wi-Fi 凭据配网 —— **2026-10-07 台账订正：这一条从「必须置 n」里移除**（ADR-0017 D3）
+#     · 旧自述（已全部改口径）：sdkconfig.defaults:95「量产固件必须置 n」、
+#       README.md「量产必须置 n」、main/Kconfig.projbuild:59「量产形态必须关闭（n）」、
+#       main/wifi_prov.h:12「并在量产固件中关闭本文件的读取」。
+#     · 为什么不是对齐项：`ONEYE_FW_ENABLE_WIFI_FILE` 是**机型能力位**（有卡槽机型 y / 无卡槽机型 n），
+#       不是量产/台面开关。把它当"量产必须关"的直接后果是 **纯生产件没有任何配网通道 ⇒
+#       `oneye_start()` 永不调用 ⇒ 上不了云**（2026-10-07 真机实测）。
+#     ⇒ **本文件不写这一行**；由机型 defaults 决定，并由 main/CMakeLists.txt 的构建期门禁
+#       「无任何可用通道 ⇒ FATAL_ERROR」兜底。SD 卡明文密码的残余风险按 ADR-0017 D3 另行决策。
 #  ② 设备侧本地验证 HTTP 面（非云端契约）
 #     · README.md:210 / :373    「量产应置 CONFIG_ONEYE_FW_ENABLE_PANEL_API=n」
 #     · main/Kconfig.projbuild:147「量产固件应置 n」
@@ -122,8 +137,10 @@ CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 # **未对齐 / 已知不属本文件能管**（如实登记，不假装对齐）：
 #  · SDK 内部源码 `components/oneye-dev-sdk/src/internal/oneye_ble_plat_nimble.c:102/:114/:126`
 #    自述「量产应降为 ESP_LOGD（协议正文不落串口，PIPL）」。它在 **SDK 源码**里，而本固件链接的
-#    是 SDK 的**预编译库**（见 README §5.6 末段），且本工程未启用 BLE ⇒ 本 defaults 管不到它。
+#    是 SDK 的**预编译库**（见 README §5.6 末段）；本预设（SD 卡机型）未启用 BLE ⇒ 管不到它。
 #    要落地必须改 SDK 并重跑 `build-all.sh --toolchains`，属**另一个仓的改动**，本轮未做。
+#    ⚠️ 2026-10-07 补充：BLE 机型（`sdkconfig.defaults.ble`）**会**启用该代码路径 ⇒
+#    这项欠账在 BLE 机型上从"管不到"变成"实际存在"（协议正文可能落串口），如实登记、未修。
 #  · 另一例程 `examples/oneye/korvo2_llm_chat`（自述 `ONEYE_LLM_ENABLE_WIFI_FILE` /
 #    `ONEYE_LLM_ENABLE_LAN_LINK` 量产置 n）是**另一份固件**，不在本轮写区，未动。
 # =============================================================================

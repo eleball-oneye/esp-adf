@@ -388,13 +388,19 @@ typedef struct {
 static void wifi_set_task(void *arg)
 {
     wifi_set_req_t *r = (wifi_set_req_t *)arg;
-    (void)wifi_prov_set_source("api");
-    esp_err_t rc = wifi_prov_connect(r->ssid, r->pass, 0);
+    /* ★ ADR-0017 D2/D4：运行期改配是**操作者明确表达的"重新配网"意图** ⇒ 先**显式**释放采信槽
+     *   再提交，否则优先级判据会以 `REJECT_ALREADY_UP`（已入网，只入网一次）把换网请求拒掉。
+     *   ⛔ 仍然只经**唯一入网入口**；连接层（`wifi_prov_connect`）已是 wifi_prov.c 的内部 static，
+     *      本文件拿不到，也就无从绕过判据。 */
+    wifi_prov_release_held("api-reprovision");
+    esp_err_t rc = wifi_prov_submit_credentials(r->ssid, r->pass, WIFI_PROV_CHAN_API);
     panel_api_set_wifi(wifi_prov_is_connected(), wifi_prov_ip(), wifi_prov_ssid(), wifi_prov_source());
     if (rc == ESP_OK) {
         ESP_LOGI(TAG, "运行期改配成功：ssid=%s ip=%s", r->ssid, wifi_prov_ip());
     } else {
-        ESP_LOGE(TAG, "运行期改配失败：ssid=%s（%s）", r->ssid, esp_err_to_name(rc));
+        ESP_LOGE(TAG, "运行期改配失败：ssid=%s（%s）%s", r->ssid, esp_err_to_name(rc),
+                 (rc == ESP_ERR_INVALID_STATE)
+                     ? " —— 被优先级判据拒绝（串口 [prov-priority] 有留痕）" : "");
     }
     free(r);
     vTaskDelete(NULL);

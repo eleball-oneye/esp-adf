@@ -45,6 +45,7 @@
 #include "lcd_ui.h"
 #include "camera_api.h"
 #include "wifi_prov.h"
+#include "wifi_prov_ble.h"     /* 配网通道 C1/C2（BLE）；入网后收敛点仍在 wifi_prov.c */
 #include "net_probe.h"
 #include "oneye_dev_creds.h"
 #include "sntp_boot.h"
@@ -672,6 +673,11 @@ static void cloud_start_task(void *arg)
 
 static void on_wifi_ready(void)
 {
+    /* ★ 收敛点的下游（ADR-0017 D2）：**无论凭据来自哪条通道**（C1/C2 BLE、C3 凭据文件、
+     *   C4 台面 API、C5 Kconfig），都在这一处进入上云链路。通道侧不需要、也不允许知道这里做什么。
+     *   ⛔ 不要在这里按通道分叉；⛔ 也不要把本函数改造成"每通道一份"。 */
+    wifi_prov_ble_stop_advertising();     /* 已入网 ⇒ 停 BLE 广播（幂等，重连时重复调无害） */
+
     static bool started;
     if (started) {
         return;
@@ -762,44 +768,10 @@ static void panel_start_if_enabled(void)
 #endif
 }
 
-/** 配网：凭据来源 = SD/SPIFFS 凭据文件 → Kconfig（SSID 非空时） */
-static void wifi_prov_boot(void)
+/** 启动期：某通道**已入网**之后的下游启动动作（与收敛点下游区分：这里只做启动自检、授时与面板）。
+ *  ⚠️ 上云**不在这里** —— `oneye_start()` 只由收敛点下游（on_wifi_ready → cloud_start_task）调用。 */
+static void prov_boot_after_connect(const char *src, const char *ssid)
 {
-    char ssid[WIFI_PROV_SSID_MAX] = { 0 };
-    char pass[WIFI_PROV_PASS_MAX] = { 0 };
-    char src[64] = { 0 };
-    bool have = false;
-
-#if CONFIG_ONEYE_FW_ENABLE_WIFI_FILE
-    /* SD 卡根目录 oneye-wifi.txt（用户投放）；SD 未挂载时自动试 SPIFFS 同名文件 */
-    if (wifi_prov_load_file(ssid, sizeof(ssid), pass, sizeof(pass), src, sizeof(src)) == ESP_OK &&
-        ssid[0] != '\0') {
-        have = true;
-    }
-#endif
-
-    if (!have && CONFIG_ONEYE_FW_WIFI_SSID[0] != '\0') {
-        snprintf(ssid, sizeof(ssid), "%s", CONFIG_ONEYE_FW_WIFI_SSID);
-        snprintf(pass, sizeof(pass), "%s", CONFIG_ONEYE_FW_WIFI_PASSWORD);
-        snprintf(src, sizeof(src), "%s", "kconfig");
-        have = true;
-    }
-
-    if (!have) {
-        ESP_LOGW(TAG, "未找到 Wi-Fi 凭据 → 跳过上云；板级自检/按键/录音/本地回放继续运行");
-        ESP_LOGW(TAG, "配网方式：把 oneye-wifi.txt（内容 ssid=… 与 password=…）放 SD 卡根目录后复位设备");
-        panel_start_if_enabled();     /* 无 IP ⇒ 提示并直接返回 */
-        return;
-    }
-
-    (void)wifi_prov_set_source(src);
-    if (wifi_prov_connect(ssid, pass, 0) != ESP_OK) {
-        ESP_LOGE(TAG, "Wi-Fi 连接失败（来源 %s，ssid=%s）→ 跳过上云；"
-                      "请核对凭据文件内容后复位（也可用面板 /api/action wifi_set 改配）", src, ssid);
-        panel_start_if_enabled();
-        return;
-    }
-
     ESP_LOGI(TAG, "Wi-Fi 已连接：ip=%s（ssid=%s，来源 %s）", wifi_prov_ip(), ssid, src);
 
     /* 板级网络自检（只读、带 errno）：把"没路由 / 网关不通 / 上行丢包"三种同形故障区分开。
@@ -812,6 +784,101 @@ static void wifi_prov_boot(void)
 
     panel_start_if_enabled();         /* 本地验证面与云端链路解耦：拿到 IP 就起 */
     /* 上云由 on_wifi_ready()（联网就绪回调）启动；此处无需重复调用 */
+}
+
+/** 配网启动：按 ADR-0017 D1/D2 的**优先级**依次尝试；没有任何通道可就地（按机型）把下一步讲清楚。
+ *
+ * 尝试顺序 = 优先级顺序（用户 2026-10-07 口径：**SD 卡 WiFi 凭据 > 蓝牙配网 > 其他**）：
+ *   C3 SD 卡 / SPIFFS 凭据文件（`ONEYE_FW_ENABLE_WIFI_FILE`，**机型能力位**）
+ *     → C1/C2 BLE 交互式通道（`ONEYE_FW_ENABLE_BLE_PROV`）
+ *       → C5 Kconfig 兜底 SSID（**不是通道**，属「其他」层，故排在 BLE 之后）
+ *         → 都没有/都没成 ⇒ 报"本次启动不会上云"并按**本机型做得到的方式**给下一步
+ *
+ * ⚠️ 这个顺序不是装饰：真正决定"谁被采信"的是 `wifi_prov_submit_credentials*()` 里的
+ *    `wifi_prov_policy_decide()`（SD rank 0 > BLE rank 1 > 其他 rank 2），本函数只是把
+ *    高优先级的通道**先递上去**。C3 解析成功但**本次入网失败**时，这里**显式**
+ *    `wifi_prov_release_held()` 释放采信槽再降级 —— 否则判据会把后续通道全挡住。
+ *
+ * ⛔ 本函数**不做任何「入网后」动作**。入网成功之后（面板启动 / net_probe / 授时 / 上云 / 影子 /
+ *    埋点）全部收口在 `on_wifi_ready()` —— 由 `wifi_prov.c` 的 `IP_EVENT_STA_GOT_IP` 处理器
+ *    经 ready 回调触发。**所有通道共用那一条路径**，这是本设计唯一的不变量（ADR-0017 D2）。
+ * ⛔ 新增通道（含预留的 R1 声波 / R2 二维码）时：在 `wifi_prov_policy.h` 登记枚举与 rank →
+ *    在通道模块里调 `wifi_prov_submit_credentials()` → **不要**在这里加"入网后分支"。
+ */
+static void wifi_prov_boot(void)
+{
+    char ssid[WIFI_PROV_SSID_MAX] = { 0 };
+    char pass[WIFI_PROV_PASS_MAX] = { 0 };
+    char src[64] = { 0 };
+
+#if CONFIG_ONEYE_FW_ENABLE_WIFI_FILE
+    /* C3（**rank 0，最高**）：SD 卡根目录 oneye-wifi.txt（用户投放）；SD 未挂载时自动试 SPIFFS 同名文件。
+     * ★ `ONEYE_FW_ENABLE_WIFI_FILE` 是**机型能力位**：有卡槽机型 y / 无卡槽机型 n。
+     *   ⛔ 它**不是**「量产 vs 台面」开关 —— 旧口径把它当量产开关，后果是纯生产件一个通道都不剩、
+     *   `oneye_start()` 永不调用、设备上不了云（2026-10-07 真机实测；见 ADR-0017 D3）。 */
+    if (wifi_prov_load_file(ssid, sizeof(ssid), pass, sizeof(pass), src, sizeof(src)) == ESP_OK &&
+        ssid[0] != '\0') {
+        if (wifi_prov_submit_credentials_src(ssid, pass, WIFI_PROV_CHAN_FILE, src) == ESP_OK) {
+            prov_boot_after_connect(src, ssid);
+            return;
+        }
+        /* ★ 卡上有凭据、但**本次入网失败** ⇒ 显式释放采信槽再降级。理由：优先级判据管的是
+         *   "多通道都可得时谁先被采信"，不是"已经失败的通道继续霸位"；不释放的话 rank 0 会一直占着
+         *   槽位，把 BLE 与兜底通道全部拒掉，设备只能反复重试那份连不上的旧凭据（配网体验死锁）。 */
+        ESP_LOGW(TAG, "SD 卡凭据未能入网（来源 %s，ssid=%s）⇒ 释放采信槽，降级到其它通道", src, ssid);
+        wifi_prov_release_held("file-connect-failed");
+        ssid[0] = '\0';
+        pass[0] = '\0';
+        src[0] = '\0';
+    }
+#else
+    ESP_LOGI(TAG, "本机型未启用 SD 卡/SPIFFS 凭据文件配网（ONEYE_FW_ENABLE_WIFI_FILE=n）"
+                  "——该位是机型能力位（无卡槽机型），不是量产开关");
+#endif
+
+    /* ---------------- C1/C2 BLE（**rank 1**，排在「其他」层之前） ----------------
+     * 起交互式通道，「还没有凭据」不等于「上不了云」：等通道把凭据交进来，交进来之后走的是
+     * 同一条收敛点（wifi_prov.c 的 GOT_IP → s_ready_cb）。 */
+#if CONFIG_ONEYE_FW_ENABLE_BLE_PROV
+    ESP_LOGI(TAG, "启动 BLE 配网通道 C1/C2（手机 App 或另一台嵌入式设备经 BLE 下发 SSID/密码）");
+    if (wifi_prov_ble_start() == ESP_OK) {
+        ESP_LOGW(TAG, "下一步：手机 App 连接 ONEYE-<设备 id 后 4 位>，"
+                      "输入串口打印的 6 位配对码（POP）后下发 Wi-Fi 凭据");
+        panel_start_if_enabled();     /* 无 IP ⇒ 提示并直接返回 */
+        return;                       /* 等通道提交凭据；入网后由收敛点统一触发上云 */
+    }
+    ESP_LOGE(TAG, "BLE 配网通道启动失败 ⇒ 继续尝试 Kconfig 兜底常量（若有）");
+#endif
+
+    /* ---------------- C5 Kconfig 兜底常量（**rank 2**，「其他」层） ----------------
+     * ⚠️ 它**不是通道**（非交互式、编译期常量），口径上属「其他」，故排在 BLE **之后**：
+     *    有 BLE 可用时不该由常量抢先入网。生产件里 `CONFIG_ONEYE_FW_WIFI_SSID` 通常为空。 */
+    if (CONFIG_ONEYE_FW_WIFI_SSID[0] != '\0') {
+        if (wifi_prov_submit_credentials_src(CONFIG_ONEYE_FW_WIFI_SSID, CONFIG_ONEYE_FW_WIFI_PASSWORD,
+                                             WIFI_PROV_CHAN_KCONFIG, "kconfig") == ESP_OK) {
+            prov_boot_after_connect("kconfig", CONFIG_ONEYE_FW_WIFI_SSID);
+            return;
+        }
+        ESP_LOGE(TAG, "Kconfig 兜底 SSID 未能入网（ssid=%s）", CONFIG_ONEYE_FW_WIFI_SSID);
+    }
+
+    /* ---------------- 没有任何可用通道（运行期） ---------------- */
+    ESP_LOGW(TAG, "未找到可用的 Wi-Fi 凭据 → 本次启动不会上云；板级自检/按键/录音/本地回放继续运行");
+    /* ★ 2026-10-07 修正：这里**原来**无条件叫用户"把 oneye-wifi.txt 放 SD 卡根目录后复位"——
+     *   而该分支在 `ONEYE_FW_ENABLE_WIFI_FILE=n` 时同样会走到，于是给出了一条**做不到**的指引
+     *   （让人去插一张本机型根本不读的卡）。改为按**本机型实际具备的通道**讲下一步。 */
+#if CONFIG_ONEYE_FW_ENABLE_WIFI_FILE
+    ESP_LOGW(TAG, "下一步：本机型支持 SD 卡配网 —— 把 oneye-wifi.txt（内容 ssid=… 与 password=…）"
+                  "放 SD 卡根目录后复位设备");
+#elif CONFIG_ONEYE_FW_ENABLE_BLE_PROV
+    ESP_LOGW(TAG, "下一步：本机型**不支持** SD 卡配网（ONEYE_FW_ENABLE_WIFI_FILE=n）"
+                  "⇒ 请用 BLE 配网：手机 App 连接 ONEYE-<设备 id 后 4 位>，"
+                  "输入串口打印的 6 位配对码（POP）后下发 Wi-Fi 凭据");
+#else
+    ESP_LOGE(TAG, "本机型既无 SD 卡配网能力（ONEYE_FW_ENABLE_WIFI_FILE=n）也无 BLE 通道"
+                  "（ONEYE_FW_ENABLE_BLE_PROV=n）⇒ 属于配置错误，请修正机型 defaults（ADR-0017 D3）");
+#endif
+    panel_start_if_enabled();     /* 无 IP ⇒ 提示并直接返回 */
 }
 
 /* ---------------------------------------------------------------- oneye 上云 */

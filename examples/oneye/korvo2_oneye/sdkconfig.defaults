@@ -92,8 +92,16 @@ CONFIG_SPIFFS_MAX_PARTITIONS=3
 # 板级功能开关（Kconfig 缺省已为 y；此处显式固化，保证「删掉 sdkconfig 后重建」结果一致——
 # Kconfig 的 default 只对**新建** sdkconfig 生效，改 default 不会改动既有 sdkconfig）
 #
-# 凭据文件配网：SD 卡根目录 oneye-wifi.txt → 开机自动配网（量产固件必须置 n）
+# 凭据文件配网：SD 卡根目录 oneye-wifi.txt → 开机自动配网。
+# ★ 这是**机型能力位**（ADR-0017 D3）：有卡槽机型 y / 无卡槽机型 n。
+#   ⛔ **不是**「量产 vs 台面」开关 —— 旧注释曾写「量产固件必须置 n」，正是它把纯生产件变成
+#   「一个配网通道都没有 ⇒ oneye_start() 永不调用 ⇒ 上不了云」（2026-10-07 真机实测）。
+#   korvo2_oneye 是带卡槽机型（见下方 ONEYE_FW_ENABLE_SDCARD）⇒ 保持 y；
+#   无卡槽机型应改用 `sdkconfig.defaults.ble`（WIFI_FILE=n + BLE 通道 y）。
 CONFIG_ONEYE_FW_ENABLE_WIFI_FILE=y
+# BLE 配网通道（C1/C2）：**基础 defaults 不开**（NimBLE + Wi-Fi + AFE 同栈要额外内部 RAM，
+# 见 ADR-0017 D6）⇒ 只在需要它的机型/构建里由 `sdkconfig.defaults.ble` 覆盖打开。
+CONFIG_ONEYE_FW_ENABLE_BLE_PROV=n
 # microSD：凭据文件、AEC 录音落盘、板上回放都依赖它（未插卡仅告警，不阻塞启动）
 CONFIG_ONEYE_FW_ENABLE_SDCARD=y
 

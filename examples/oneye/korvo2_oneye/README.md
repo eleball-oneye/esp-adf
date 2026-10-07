@@ -810,9 +810,11 @@ cc -std=c99 -Wall -Wextra -Werror -I main tools/test-prov-priority.c -o /tmp/tpp
    56,067 B）⇒ 这一段确实会**吃掉最大的连续块**，BLE 机型走到那一步还剩多少**仍未测**。
 3. 本批只跑了**单次启动**（BLE 120 s / SD 200 s）⇒ ⛔ **不声称**"BLE 机型长期稳定/可再起任务"：
    63,488 B 是"能再起一个 ≤16 KB 新任务"的**必要**条件，不是充分条件；运行期碎片化未测。
-4. **一致性旁证**：SD 的 `cloud-start` 三个量与上一批（§5.12.6 / `_tmp-phase2/provisioning-priority-and-push.md`）
-   **逐值相同**（`free_internal=56067`、`largest_internal_block=31744`），仅 `free_psram` 差 16 B
-   （7,635,040 → 7,635,024）⇒ 同一代码点的读数跨批次可复现（该处读数**未**被本批改动影响）。
+4. **一致性旁证（⛔ 不把三次说成"完全相同"）**：SD 在 `cloud-start` 处的读数 —— 本批
+   `56067 / 31744 / 7635024`；㊸ 批（`_tmp-phase2/prio-serial-sd.txt:237`）`56067 / 31744 / 7635040`；
+   中间那一批（收敛点批，`_tmp-phase2/conv-serial-sd.txt:238`）**`56079 / 31744 / 7635040`**。
+   ⇒ 三批**共同一致的是 `largest_internal_block=31744 B`**；`free_internal` 有 **±12 B 的批次间抖动**
+   （56067 / 56079），`free_psram` 本批比前两批少 **16 B**。⛔ 不要把这条读成"逐字节可复现"。
 
 **烧写红线（两轮，逐条）**：
 

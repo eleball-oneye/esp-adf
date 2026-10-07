@@ -463,13 +463,29 @@ done
 wifi_prov.c : on_wifi_event() 的 IP_EVENT_STA_GOT_IP 分支
   └─ s_ready_cb()                        ← 唯一触发点
        └─ main.c : on_wifi_ready()        ← 唯一注册点（app_main 里 wifi_prov_set_ready_cb）
-            └─ xTaskCreate(cloud_start_task, …)   ← 唯一创建点
+            ├─ ① 入网日志（ip/ssid/来源）
+            ├─ ② net_probe 自检（≤3×3 s，只读取证、不改变连接行为）
+            ├─ ③ SNTP 授时（≤2×10 s）        ← **必须在建链之前**：严格 TLS 校验需要有效时钟
+            ├─ ④ 本地面板（与云链路解耦，拿到 IP 就起）
+            └─ ⑤ xTaskCreate(cloud_start_task, …)   ← 唯一创建点
                  └─ oneye_start()        ← 唯一调用点
 ```
 
 **通道的职责边界**：只负责「产出凭据并交给 `wifi_prov_submit_credentials()`」。
 「入网之后做什么」（本地面板启动 / `net_probe` / SNTP 授时 / `oneye_start` / 影子补发 / track 埋点）
 **全部**是上面那条路径的**下游**，通道侧不需要、也不允许知道。
+
+⚠️ **2026-10-07 修正（本批）**：`net_probe_report()` 与 `sntp_boot_sync()` 原先写在一个只被
+**C3（SD/SPIFFS 凭据文件）/C5（Kconfig 兜底）**成功路径调用的辅助函数 `prov_boot_after_connect()`
+里（旧 `korvo2_oneye_main.c:773-786`，旧调用点 `:822`/`:859`）⇒ **BLE 通道入网后不跑这两步**，
+与上面这条不变量自相矛盾。其中 `sntp` 不是"少一条日志"：`sntp_boot.h:2` 逐字要求"设备侧 TLS 严格
+校验必须先有时间"，而运行期 `cloud_ts` 授时又要等 `CLOUD_LINK_UP` ⇒ 严格 TLS 下可能
+**bootstrap 死锁**。本批把两步搬进 `on_wifi_ready()` 的收敛点下游（顺序见上图），
+`prov_boot_after_connect()` **已删除**（旧结构留痕见 `main/korvo2_oneye_main.c`），
+门禁 A11/A12 机械拒绝回退。
+⚠️ 诚实边界：`sntp_boot_sync()` 最长等 2×10 s，而 `on_wifi_ready()` 跑在**系统事件任务**上下文
+⇒ 首次入网时该任务会被阻塞（有界）。实测正常路径 ≈1 s；这是**有意接受**的代价（换取"所有通道
+都有有效时钟"），⛔ 不是遗漏。
 
 ### 5.11.3 自证（结构性门禁，不是注释声称）
 
@@ -478,14 +494,18 @@ cd embedded/esp-adf/examples/oneye/korvo2_oneye
 python3 tools/check-prov-convergence.py          # RESULT=PASS ⇒ exit 0
 ```
 
-它机械断言 A1–A10（`oneye_start()` 调用点唯一且在 `cloud_start_task` 内、`cloud_start_task`
+它机械断言 A1–A12（`oneye_start()` 调用点唯一且在 `cloud_start_task` 内、`cloud_start_task`
 创建点唯一且在 `on_wifi_ready` 内、ready 回调注册点/触发点各唯一、BLE 通道只经唯一入口且
 自己不调 `oneye_start()`/`esp_wifi_connect()`、**SD 凭据在启动期先于 BLE 被递上去**、
 **非 `wifi_prov.c` 不得直连 `wifi_prov_connect()`/不得写 `wifi_prov_set_source()`**、
 **只入网一次**（一次性守卫 + 判据 `onboarded = s_connected && s_held_valid` + 判据顺序）、
-**夹具与判据同源**…），
-并**自带 5 条注入负向对照**（第二条入网后逻辑 / 直连连接层 / 丢掉"只入网一次" / 抹掉留痕 /
-夹具自备判据），断言同一套检查**必须逐条报红**。
+**夹具与判据同源**、**A11**`net_probe_report()`/`sntp_boot_sync()` 各只 1 处调用点且都在
+`on_wifi_ready()` 内（通道模块里不得出现）、**A12** 顺序 `net_probe → sntp → 面板 →
+cloud_start_task`（授时必须先于建链）…），
+并**自带 8 条注入负向对照**（第二条入网后逻辑 / 直连连接层 / 丢掉"只入网一次" / 抹掉留痕 /
+夹具自备判据 / **通道模块里再调一次 `sntp_boot_sync()`** / **通道模块里再调一次
+`net_probe_report()`** / **把 `sntp_boot_sync()` 挪到 `cloud_start_task` 之后**），
+断言同一套检查**必须逐条报红**。
 任一条注入没被抓住 ⇒ 脚本自己判据空转 ⇒ 同样 `exit 1`。
 它还会**实跑主机侧夹具**（`tools/test-prov-priority.c`，有 `cc`/`gcc` 时）并要求
 `RESULT=PASS` 且"负向对照通过"（见 §5.12）。
@@ -626,13 +646,101 @@ cc -std=c99 -Wall -Wextra -Werror -I main tools/test-prov-priority.c -o /tmp/tpp
 
 ### 5.12.5 仍未做 / 未证（⛔ 不声称完成）
 
-- **BLE 通道真机端到端**：**未做**（无同场手机侧真机）。本轮 BLE 侧证据 = 编译×链接×镜像成立 + 结构性断言 + 主机侧判据夹具，
+- **BLE 通道真机端到端**：**未做**（无同场手机侧真机）。BLE 侧证据 = 编译×链接×镜像成立 + 结构性断言 + 主机侧判据夹具，
   ⛔ **不据此声称 BLE 配网已通**。
-- **BLE 机型烧写后的运行期内存读数**（NimBLE 12 KB 内部 RAM vs 本板 `largest_internal_block=2304 B`）：**未测**（BLE 机型本轮只构建、未烧写）。
-- **BLE 通道入网后的启动期自检/授时**：`net_probe_report()` 与 `sntp_boot_sync()` 目前只在 `prov_boot_after_connect()`
-  （`korvo2_oneye_main.c:773-786`）里执行，而该函数只被启动期 C3/C5 成功路径调用 ⇒ **BLE 通道入网时不执行**。
-  这是本轮**发现但未改**的既有差异（改它要动收敛点下游，属另一批），如实登记、⛔ 不当作已解决。
+- **BLE 机型烧写后的运行期内存读数**（NimBLE 12 KB 内部 RAM vs 本板曾实测 `largest_internal_block=2304 B`）：
+  见 §5.12.6（2026-10-07 第二批**已首次烧写**并实采串口；结论以那一节的串口原文为准）。
+- ~~**BLE 通道入网后的启动期自检/授时**：`net_probe_report()` 与 `sntp_boot_sync()` 目前只在
+  `prov_boot_after_connect()`（`korvo2_oneye_main.c:773-786`）里执行，而该函数只被启动期 C3/C5
+  成功路径调用 ⇒ **BLE 通道入网时不执行**。~~
+  **2026-10-07 第二批已修**：两步搬进 `on_wifi_ready()` 的收敛点下游（`prov_boot_after_connect()` 删除），
+  门禁 A11/A12 断言（§5.11.2/§5.11.3）。⚠️ 但"BLE 通道真机走到这两步"仍**未在真机验证**（无同场手机）
+  ⇒ 该修复的真机证据只到"SD 机型上这两步仍在、且顺序正确"（§5.12.6）。
 - **C4 台面改配**在 `PANEL_API=n` 的生产件上不可用（属预期）；本轮**未**在真机上做台面改配实测。
+
+### 5.12.6 收敛点修复（2026-10-07 第二批）：`net_probe` + SNTP 全通道必经
+
+改动面：`main/korvo2_oneye_main.c`（`on_wifi_ready()` 内按 ①②③④⑤ 排列；**删除**
+`prov_boot_after_connect()`；C3/C5 两处调用点移除）、`main/wifi_prov.h`（ready 回调口径改成
+"有界同步 + 只建一个任务"）、`main/wifi_prov.c`（文件头注释）、`tools/check-prov-convergence.py`
+（A11/A12 + 3 条注入负向对照）、本 README。
+
+**门禁**（`_tmp-phase2/conv2.out`）：`正向断言（A1–A12）：PASS`；`CONV_EXIT=0`；
+8 条注入负向对照**逐条报红**，其中新增三条：
+`… sntp_boot_sync()（BLE 通道自建入网后逻辑）被 A11 捕获：A11b sntp_boot_sync() 调用点: 期望 1 处，实测 2 处`、
+`… net_probe_report()（台面 API 自建入网后逻辑）被 A11 捕获：A11a … 期望 1 处，实测 2 处`、
+`… 把 sntp_boot_sync() 挪到 cloud_start_task 之后（顺序退化）被 A12 捕获：A12b 顺序错：sntp_boot_sync()（第 728 行）必须在 cloud_start_task 创建点（第 722 行）**之前**`。
+
+**链接级证据（对照实验：同一受控路径、同一 defaults，只把 `main.c` 临时还原成 `HEAD` 版本）**
+
+| 件 | `korvo2_oneye.bin` | `.map` 里 `sntp_boot_sync` / `net_probe_report` / `esp_netif_sntp_init` / `esp_netif_sntp_sync_wait` / `sntp_init` |
+| --- | --- | --- |
+| 改动前 BLE 机型 | **1,576,768 B**（`0x180f40`）sha256 `67989a03…` | **全部未命中** |
+| 改动后 BLE 机型 | **1,586,624 B**（`0x1835c0`）sha256 `48a253d3…` | 全部命中（`0x4200f13c` / `0x4200efe4` / `0x42072508` / `0x42072660` / `0x420ba1bc`） |
+
+⇒ 旧结构下 BLE 件**在链接期就没有授时/自检代码**（`WIFI_FILE=n` 且 `WIFI_SSID=""` ⇒ 那个唯一调用点被
+常量折叠掉），不只是"运行期跳过"。差 **9,856 B** 与本批把两步移到恒可达路径一致。
+
+**三配置受控构建**（`_tmp-phase2/conv-build.out.txt` + `conv-readings.txt`；工作区 gitignored
+`sdkconfig` 的 sha256 构建前后一致 `ed2ac1b4…` ⇒ 未被读写）：
+
+| 配置 | `BUILD_EXIT` | `korvo2_oneye.bin` | app 分区余量 | 门禁 |
+| --- | --- | --- | --- | --- |
+| SD 机型 | **0** | **1,369,632 B**（`0x14e620`）sha256 `f372cc7b…` | `0x2b19e0 B (67%) free` | `GATE_TRIPPED=NO` |
+| BLE 机型 | **0** | **1,586,624 B**（`0x1835c0`）sha256 `48a253d3…` | `0x27ca40 B (62%) free` | `GATE_TRIPPED=NO` |
+| 无通道负向 | **2**（期望失败） | `ABSENT` | —— | **`GATE_TRIPPED=YES`** |
+
+三配置共同：`CONFIG_ONEYE_FW_TLS_INSECURE` / `ENABLE_PANEL_API` / `LOG_PROBE` **命中 0 行**（未开）、
+`TRANSPORT_TLS 1`、`CLOUD_HOST "mqtt.oneye.me"`、`CLOUD_PORT 18886`、`CREDS_REQUIRED 1`、
+`ESP_SYSTEM_EVENT_TASK_STACK_SIZE 3072`；BLE 机型另有 `BT_NIMBLE_ENABLED 1` /
+`BT_NIMBLE_HOST_TASK_STACK_SIZE 12288` / `ESP_COEX_SW_COEXIST_ENABLE 1`。
+
+**SD 机型真机复验**（COM12 独占，200 s，`_tmp-phase2/conv-serial-sd.txt`）：
+
+```
+217 | wifi_prov: Wi-Fi 已获取 IP：192.168.110.72（ssid=wanya，来源=file:/sdcard/oneye-wifi.txt）
+218 | korvo2_oneye: Wi-Fi 已连接：ip=192.168.110.72（ssid=wanya，来源 file:/sdcard/oneye-wifi.txt）   ← 本批新增的「入网日志」（所有通道共用）
+221 | net_probe: [net-probe] cloud endpoint  mqtt.oneye.me:18886 -> rc=0 errno=0(-) 480ms  OK（TCP 已建立）
+224 | sntp_boot: [sntp] 已同步：UTC=2026-10-07 05:53:37（epoch=1791352417）                          ← 先有钟
+234 | korvo2_oneye: [sdk-event] CLOUD_LINK_UP len=0                                                  ← 再建链
+235 | korvo2_oneye: 影子上报成功（shadow/up，含 credSource）：{"firmwareVersion":"0.1.0","power":true,"credSource":"partition"}
+241 | korvo2_oneye: [sdk-event] TIME_SYNCED len=8
+252 | korvo2_oneye: [track] boot 已上报（{"uptime_ms":9876}）；track_reported=1 track_dropped=0 frames_tx=1
+```
+
+崩溃/异常类（`assert`/`Guru`/`Backtrace`/`WDT`/`Core dump`/`abort()`/`Panic`/`stack overflow`/
+`Stack protection`/`StoreProhibited`…）**全 0**；开机前缀（`ESP-ROM:esp32s3`/`rst:0x`/
+`boot:  4 creds`/`app_init: Compile time`/`ELF file SHA256`）**各 1 次**；整段 18,507 字符。
+
+⚠️ **对照（诚实边界）**：**改动前**同一台机器的抓包（`_tmp-phase2/prio-serial-sd.txt`，上一批留档）
+里 `CLOUD_LINK_UP @233 (t=5461 ms)` **早于** `[sntp] 已同步 @250 (t=7123 ms)` ⇒ 旧结构下
+"先有钟、再建链"**并未成立**（SD 路径也在竞态里：GOT_IP 在事件任务里直接起了 `cloud_start_task`，
+而 `app_main` 还阻塞在 `submit_credentials` 里，之后才轮到 `prov_boot_after_connect()` 跑 sntp）。
+且**两种顺序下 TLS 都握手成功** ⇒ "未授时必然 `BADCERT_FUTURE`" 在本板上**未被实测复现**：
+本批修掉的是**竞态 + 通道差异**，不是"一个已经复现的连不上"。
+
+**BLE 机型首次烧写**（120 s，`_tmp-phase2/conv-serial-ble.txt`）：NimBLE 主机栈**起得来** ——
+
+```
+173 | korvo2_oneye: 启动 BLE 配网通道 C1/C2（手机 App 或另一台嵌入式设备经 BLE 下发 SSID/密码）
+176 | BLE_INIT: Feature Config, ADV:1, BLE_50:1, DTM:1, SCAN:1, CCA:0, SMP:1, CONNECT:1
+179 | oneye_ble: GATT 服务已注册（RX 句柄=0 TX 句柄=0，MTU 期望 247）
+182 | NimBLE: GAP procedure initiated: advertise;
+187 | [oneye][ble] 配网配对码 POP=931455（300 s 内有效）
+188 | wifi_prov_ble: BLE 配网通道已就绪：广播中（设备名 ONEYE-<id 后 4 位>），配对 POP=931455（TTL 300 s）
+189 | korvo2_oneye: 下一步：手机 App 连接 ONEYE-<设备 id 后 4 位>，输入串口打印的 6 位配对码（POP）后下发 Wi-Fi 凭据
+```
+
+停点 = 「等待 BLE 配网」；此后 117 s 静默、无崩溃、无"内存不足"行。
+⛔ **无同场手机 ⇒ 不声称"BLE 配网端到端已通"**，只报"起来 + 停在哪一步"；
+`[res] free_internal/largest_internal_block` 这一行**没打印**（它在 `cloud_start_task` 内，本机型未入网
+⇒ 没跑到）⇒ "12 KB 主机栈起来之后内部 RAM 还剩多少"**本批无读数**（未测，不是"测了不好"）。
+
+**烧写红线**：`-SkipPartTable` —— 先读板 `0x8000..0x9000`，与构件 `partition-table.bin` 的
+3072 B 前段 sha256 **相同**（`DBB160ED…`）⇒ 全程**不写分区表**；烧前/烧后该区 sha256 均
+`DBB160ED…` **未变**。三个写入区 `overlap_creds=False` + `GUARD_OK`，每区 `Hash of data verified`，
+`FLASH_EXIT=0`；⛔ 无 `erase_flash`、⛔ 无整片擦写。`creds`（`0x510000`+16 KB）烧前/烧后/烧回后
+逐字节比对 `differing_bytes=0`、sha256 `1801b9c1…` 三次一致。
 
 ---
 

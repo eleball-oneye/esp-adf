@@ -25,11 +25,18 @@ check-prov-convergence.py —— 结构性门禁：证明 korvo2_oneye 的「入
   A9     只入网一次：on_wifi_ready 一次性守卫、判据 `onboarded = s_connected && s_held_valid`、
          判据顺序（onboarded 先于 held_valid）、释放/重置都会清采信槽
   A10    夹具与判据**同源**（不抄件）且**自带变异负向对照**，并实跑一次（有 cc 时）
+  A11    入网后的**启动期自检与授时**（net_probe_report / sntp_boot_sync）各只有 1 处调用点，
+         且都在 korvo2_oneye_main.c 的 on_wifi_ready() 内（= 收敛点下游）⇒ **所有通道**都经过它们；
+         通道模块（wifi_prov_ble.c / media_api.c / wifi_prov.c / panel_api.c …）里不得出现这两个符号
+  A12    收敛点下游的**顺序**：net_probe → sntp → 面板 → `xTaskCreate(cloud_start_task,…)`。
+         ⚠️ sntp 必须在 cloud_start_task 之前：严格 TLS 校验需要先把时钟校好（设备无 RTC）
 
 退出码：0 = 全部断言通过；1 = 有断言失败（逐条打出）。
 **自带负向对照**：把 `main/` 与夹具复制到临时目录后逐条注入已知缺陷，同一套检查**必须逐条报红**
 （含 A1 的第二条入网后逻辑、A8b 的直连连接层、A9b 的丢掉"只入网一次"、A8e 的留痕缺失、
-A10b 的判据抄件）。任一条注入没有被对应断言抓住 ⇒ 本脚本自己的判据是空转的 ⇒ exit 1。
+A10b 的判据抄件、**A11 的"通道模块里再调一次 sntp_boot_sync()/net_probe_report()"**、
+**A12 的"把 sntp 挪到 cloud_start_task 之后"**）。任一条注入没有被对应断言抓住 ⇒ 本脚本自己的
+判据是空转的 ⇒ exit 1。
 """
 
 import os
@@ -58,6 +65,13 @@ GOT_IP = re.compile(r"IP_EVENT_STA_GOT_IP")
 LOAD_FILE_CALL = re.compile(r"wifi_prov_load_file\s*\(")
 BLE_START_CALL = re.compile(r"wifi_prov_ble_start\s*\(")
 RELEASE_HELD_CALL = re.compile(r"wifi_prov_release_held\s*\(")
+# A11/A12：入网后的启动期自检与授时（2026-10-07 起必须只在收敛点下游）
+CALL_NET_PROBE = re.compile(r"net_probe_report\s*\(")
+CALL_SNTP_BOOT = re.compile(r"sntp_boot_sync\s*\(")
+CALL_PANEL_START = re.compile(r"panel_start_if_enabled\s*\(")
+# 通道模块（判据侧只允许"交凭据"；出现上面两个符号即第二条入网后路径）
+CHANNEL_MODULES = ("wifi_prov_ble.c", "media_api.c", "wifi_prov.c", "panel_api.c",
+                   "wifi_prov_file.c", "wifi_prov_sonic.c", "wifi_prov_qrcode.c")
 DECISION_ENUM = [
     "WIFI_PROV_DECISION_ACCEPT_FIRST",
     "WIFI_PROV_DECISION_ACCEPT_SAME",
@@ -324,6 +338,62 @@ def run_checks(sources, headers, test_lines):
              "A10d 夹具缺少变异负向对照（mutant_decide / 负向对照）",
              "没有负向对照 ⇒ 夹具可能空转")
 
+    # ------------------------------------------- A11 自检/授时只能从收敛点下游调用（所有通道共用）
+    # 形状（2026-10-07 起）：on_wifi_ready() 内 入网日志 → net_probe → sntp → 面板 → cloud_start_task。
+    # 旧结构是 `prov_boot_after_connect()`（只被 C3/C5 成功路径调用）⇒ BLE 通道会跳过这两步：
+    # net_probe 只丢诊断；sntp 则是**真风险**（严格 TLS 需要有效时钟 ⇒ 可能连不上 ⇒ bootstrap 死锁）。
+    np_hits = expect(find_calls(sources, CALL_NET_PROBE), 1,
+                     "A11a net_probe_report() 调用点",
+                     "多于 1 处 = 某条通道又自建了一遍入网后自检（第二条路径）")
+    sb_hits = expect(find_calls(sources, CALL_SNTP_BOOT), 1,
+                     "A11b sntp_boot_sync() 调用点",
+                     "多于 1 处 = 某条通道又自建了一遍入网后授时（第二条路径）")
+    for hits, what in ((np_hits, "net_probe_report()"), (sb_hits, "sntp_boot_sync()")):
+        for fn, ln, func in hits:
+            if fn != "korvo2_oneye_main.c" or func != "on_wifi_ready":
+                fails.append("A11c {} 的调用点在 {}:{}（所在函数 {}）—— 只允许在 "
+                             "korvo2_oneye_main.c 的 on_wifi_ready() 内（收敛点下游）"
+                             .format(what, fn, ln, func))
+    for ch in CHANNEL_MODULES:
+        lines = sources.get(ch)
+        if not lines:
+            continue
+        for pat, what in ((CALL_NET_PROBE, "net_probe_report()"),
+                          (CALL_SNTP_BOOT, "sntp_boot_sync()")):
+            if find_calls({ch: lines}, pat):
+                fails.append("A11d 通道模块 {} 里出现了 {} —— 通道只负责交凭据，"
+                             "入网后动作归收敛点下游".format(ch, what))
+
+    # ------------------------------------------- A12 顺序：自检 → 授时 → 面板 → cloud_start_task
+    if not np_hits or not sb_hits:
+        fails.append("A12 缺少可判定顺序的调用点（net_probe_report / sntp_boot_sync 不在场）")
+    else:
+        np_ln, sb_ln = np_hits[0][1], sb_hits[0][1]
+        if not (np_hits[0][2] == "on_wifi_ready" and sb_hits[0][2] == "on_wifi_ready"):
+            fails.append("A12 自检/授时的调用点不在 on_wifi_ready() 内 ⇒ 顺序无法与 cloud_start_task 比较")
+        create = find_calls({"korvo2_oneye_main.c": main_lines}, CREATE_CLOUD_TASK)
+        if not create:
+            fails.append("A12 找不到 xTaskCreate(cloud_start_task, …) 创建点 ⇒ 顺序不可判定")
+        else:
+            cr_ln = create[0][1]
+            if not (np_ln < sb_ln):
+                fails.append("A12a 顺序错：net_probe_report()（第 {} 行）必须在 sntp_boot_sync()"
+                             "（第 {} 行）之前（日志顺序即「联网 → 自检 → 授时 → 上云」）"
+                             .format(np_ln, sb_ln))
+            if not (sb_ln < cr_ln):
+                fails.append("A12b 顺序错：sntp_boot_sync()（第 {} 行）必须在 cloud_start_task 创建点"
+                             "（第 {} 行）**之前** —— 严格 TLS 校验需要先把时钟校好"
+                             .format(sb_ln, cr_ln))
+            pn = [h for h in find_calls({"korvo2_oneye_main.c": main_lines}, CALL_PANEL_START)
+                  if h[2] == "on_wifi_ready"]
+            need(len(pn) == 1, "A12c on_wifi_ready() 内 panel_start_if_enabled() 调用点",
+                 "期望恰好 1 处，实测 {} 处（面板与云链路解耦，但仍在收敛点下游且只调一次）"
+                 .format(len(pn)))
+            if len(pn) == 1 and not (sb_ln < pn[0][1] < cr_ln):
+                fails.append("A12c 顺序错：面板调用（第 {} 行）必须落在 sntp（第 {} 行）与 "
+                             "cloud_start_task 创建点（第 {} 行）之间"
+                             .format(pn[0][1], sb_ln, cr_ln))
+
     return (not fails), fails
 
 
@@ -378,6 +448,22 @@ def _append(lines, payload):
     return list(lines) + payload.splitlines()
 
 
+def _move_sntp_after_cloud_start(lines):
+    """注入：把 `(void)sntp_boot_sync();` 从原位删掉，改插到 on_wifi_ready() 末尾
+    （= `xTaskCreate(cloud_start_task,…)` **之后**）。调用点总数仍为 1，只有**顺序**变坏 ⇒
+    只有 A12b（以及 A12c 的面板相对顺序）能抓住它 —— 这正是"顺序"断言不是空转的证据。"""
+    call = "(void)sntp_boot_sync();"
+    idx = [i for i, l in enumerate(lines) if call in l]
+    if len(idx) != 1:
+        raise RuntimeError("注入失败：期望命中 1 处 '{}'，实测 {} 处".format(call, len(idx)))
+    out = [l for i, l in enumerate(lines) if i != idx[0]]
+    anchor = [i for i, l in enumerate(out) if "已联网 → 启动上云" in l]
+    if len(anchor) != 1:
+        raise RuntimeError("注入失败：找不到 on_wifi_ready() 末尾的启动日志行（锚点）")
+    out.insert(anchor[0] + 1, "    " + call)
+    return out
+
+
 INJECTIONS = [
     # (说明, 文件相对 main/ 的路径, 目标断言 id, 变异函数)
     ("第二条入网后逻辑（在 BLE 通道里直接调 oneye_start()）", "wifi_prov_ble.c", "A1",
@@ -389,6 +475,14 @@ INJECTIONS = [
      lambda ls: _replace_in(ls, "s_connected && s_held_valid", "s_connected")),
     ("决策留痕被抹掉（判了但不留痕）", "wifi_prov.c", "A8e",
      lambda ls: _replace_in(ls, "[prov-priority]", "prov")),
+    # A11/A12（2026-10-07 新增）：入网后的自检/授时只能从收敛点下游调用，且必须在建链之前。
+    ("通道模块里再调一次 sntp_boot_sync()（BLE 通道自建入网后逻辑）", "wifi_prov_ble.c", "A11",
+     lambda ls: _append(ls, "\nstatic void injected_channel_sntp(void) { (void)sntp_boot_sync(); }")),
+    ("通道模块里再调一次 net_probe_report()（台面 API 自建入网后逻辑）", "media_api.c", "A11",
+     lambda ls: _append(ls, "\nstatic void injected_channel_probe(void) "
+                            "{ net_probe_report(\"host\", 18886); }")),
+    ("把 sntp_boot_sync() 挪到 cloud_start_task 之后（顺序退化）", "korvo2_oneye_main.c", "A12",
+     _move_sntp_after_cloud_start),
 ]
 
 
@@ -448,7 +542,7 @@ def main():
     ok, fails = run_checks(src, headers, test_lines)
     for f in fails:
         print("  ✗ " + f)
-    print("正向断言（A1–A10）：{}".format("PASS" if ok else "FAIL"))
+    print("正向断言（A1–A12）：{}".format("PASS" if ok else "FAIL"))
 
     status, detail = run_host_test(EXAMPLE)
     if status == "pass":
@@ -484,7 +578,8 @@ def main():
         return 1
     if not ok:
         return 1
-    print("RESULT=PASS 单一收敛点 + 优先级（SD>BLE>其他）+ 只入网一次 成立（ADR-0017 D2/D4）")
+    print("RESULT=PASS 单一收敛点 + 优先级（SD>BLE>其他）+ 只入网一次 + 自检/授时全通道必经"
+          "（ADR-0017 D2/D4）")
     return 0
 
 

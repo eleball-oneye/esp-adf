@@ -671,6 +671,25 @@ static void cloud_start_task(void *arg)
     uplink_maintain_run();
 }
 
+/* ★★ 2026-10-07（本批）：入网之后的**启动期动作**全部收进本函数，顺序逐字固定为
+ *   ① 入网日志 → ② net_probe 自检 → ③ SNTP 授时 → ④ 本地面板 → ⑤ cloud_start_task（→ oneye_start）
+ *
+ * 为什么 ③ 必须在 ⑤（cloud_start_task）之前：板子没有 RTC，未授时时系统时间是 1970，而服务端
+ *   证书的 notBefore 落在未来 ⇒ 严格 TLS 下 mbedtls 必然报 `BADCERT_FUTURE`（`sntp_boot.h:2-11`
+ *   逐字）。生产口径是**严格 TLS**（`CONFIG_ONEYE_FW_TLS_INSECURE=n`），所以"先有钟、再建链"
+ *   是硬顺序；而运行期 `cloud_ts` 授时要等 `CLOUD_LINK_UP` 才来 ⇒ 不在这里补钟可能构成
+ *   bootstrap 死锁（连不上 ⇒ 拿不到云端时间 ⇒ 更连不上）。
+ *
+ * ⚠️ 本函数在**系统事件任务**上下文执行（`wifi_prov.h` 的 ready 回调口径），因此 ②③ 是**有界的
+ *   同步等待**：net_probe 最多 3×3 s（三个探针各自 3 s 超时，`net_probe.c:102`）、sntp 最多
+ *   2×10 s（两台服务器各 10 s，`sntp_boot.c:15/34/41`）；真机正常路径实测分别 ≈71 ms 与 ≈1 s。
+ *   之所以接受这段阻塞：它只发生在**首次入网**（下方一次性守卫），此刻 Wi-Fi 已拿到 IP、SDK 尚未
+ *   建链；代价是这段时间内系统事件任务不处理新事件（Wi-Fi 断开事件会延后到返回后才被处理）。
+ *   ⛔ 不要为此"再建一个任务"：这台板子上任何 ≥16 KB 的新任务都实测失败
+ *   （`largest_internal_block=2304 B`，见 `cloud_start_task()` 注释）。
+ *
+ * ⛔ 也不要把 ②③ 降级成"只在某条通道里做"：那正是本批修掉的旧结构缺陷（见下方
+ *   `prov_boot_after_connect()` 的旧结构留痕）。门禁 A11/A12 机械拒绝这两种回退。 */
 static void on_wifi_ready(void)
 {
     /* ★ 收敛点的下游（ADR-0017 D2）：**无论凭据来自哪条通道**（C1/C2 BLE、C3 凭据文件、
@@ -683,7 +702,24 @@ static void on_wifi_ready(void)
         return;
     }
     started = true;
-    panel_start_if_enabled();     /* 掉线重连后拿到 IP 也能补起本地验证面 */
+
+    /* ① 入网日志（**每条通道**都在这里留一行）。此前只有 C3/C5 走 prov_boot_after_connect() 时才有
+     *    这一行；wifi_prov.c 的 GOT_IP 处理器已打过一行带 IP 的，这一行补齐"来源通道"的应用侧视角。 */
+    ESP_LOGI(TAG, "Wi-Fi 已连接：ip=%s（ssid=%s，来源 %s）",
+             wifi_prov_ip(), wifi_prov_ssid(), wifi_prov_source());
+
+    /* ② 板级网络自检（只读、带 errno，**不改变任何连接行为**）：把"没路由 / 网关不通 / 上行丢包"
+     *    三种同形故障区分开。放在建链之前 ⇒ 日志顺序即"联网 → 自检 → 授时 → 上云"。 */
+    net_probe_report(CONFIG_ONEYE_FW_CLOUD_HOST, (unsigned)CONFIG_ONEYE_FW_CLOUD_PORT);
+
+    /* ③ 启动期授时：**严格 TLS 校验的前置条件**（理由见本函数头）。失败不阻塞上云 —— 此时若严格
+     *    校验过不去，是**故意**的可见失败，而不是静默降级（`sntp_boot.h:9-11`）。 */
+    (void)sntp_boot_sync();
+
+    /* ④ 本地验证面与云端链路解耦：拿到 IP 就起（幂等；掉线重连后拿到 IP 也能补起） */
+    panel_start_if_enabled();
+
+    /* ⑤ 上云：**唯一**那个任务仍只在这里建（门禁 A2） */
     if (xTaskCreate(cloud_start_task, "cloud_start", 6144, NULL, 4, NULL) != pdPASS) {
         started = false;
         ESP_LOGE(TAG, "上云任务创建失败（内存不足）");
@@ -768,23 +804,28 @@ static void panel_start_if_enabled(void)
 #endif
 }
 
-/** 启动期：某通道**已入网**之后的下游启动动作（与收敛点下游区分：这里只做启动自检、授时与面板）。
- *  ⚠️ 上云**不在这里** —— `oneye_start()` 只由收敛点下游（on_wifi_ready → cloud_start_task）调用。 */
-static void prov_boot_after_connect(const char *src, const char *ssid)
-{
-    ESP_LOGI(TAG, "Wi-Fi 已连接：ip=%s（ssid=%s，来源 %s）", wifi_prov_ip(), ssid, src);
-
-    /* 板级网络自检（只读、带 errno）：把"没路由 / 网关不通 / 上行丢包"三种同形故障区分开。
-       放在 SDK 建链之前，日志顺序即为"联网 → 自检 → 上云"。 */
-    net_probe_report(CONFIG_ONEYE_FW_CLOUD_HOST, (unsigned)CONFIG_ONEYE_FW_CLOUD_PORT);
-
-    /* 启动期授时：**严格 TLS 校验的前置条件**（设备无 RTC，未授时时系统时间为 1970，
-       服务端证书 notBefore 落在未来 ⇒ mbedtls 必然 BADCERT_FUTURE）。失败不阻塞上云。 */
-    (void)sntp_boot_sync();
-
-    panel_start_if_enabled();         /* 本地验证面与云端链路解耦：拿到 IP 就起 */
-    /* 上云由 on_wifi_ready()（联网就绪回调）启动；此处无需重复调用 */
-}
+/* ------------------------------------------------ 旧结构留痕：prov_boot_after_connect() 已删除
+ *
+ * 2026-10-07 之前，入网后的「启动自检 + 授时 + 面板」写在一个叫 `prov_boot_after_connect(src, ssid)`
+ * 的辅助函数里（`static void prov_boot_after_connect(const char *src, const char *ssid)`），而它
+ * **只被 C3（SD/SPIFFS 凭据文件）与 C5（Kconfig 兜底）的成功路径调用**（旧调用点 `:822` / `:859`）。
+ * 后果：**BLE 通道（C1/C2）入网后根本不跑 net_probe 与 SNTP**。
+ *
+ * 为什么那是缺陷（不是风格问题）：
+ *   · `sntp_boot.h:2` 逐字 —— "设备侧 TLS 严格校验必须先有时间"。BLE 配网的机器若跳过授时，
+ *     在**严格 TLS**（生产口径）下可能直接连不上；而运行期 `cloud_ts` 授时要等 `CLOUD_LINK_UP`
+ *     驱动 ⇒ **bootstrap 死锁**（连不上 ⇒ 拿不到云端时间 ⇒ 更连不上）。这是**真风险**；
+ *   · `net_probe_report` 按 `net_probe.h:2` 只是取证（不改变连接行为），跳过它只丢诊断证据；
+ *   · 更直接的是：它与本文件 `wifi_prov_boot()` 上方那段注释**自相矛盾** —— 那里逐字写着
+ *     "入网成功之后（面板启动 / net_probe / 授时 / 上云 / 影子 / 埋点）**全部**收口在
+ *     `on_wifi_ready()` …… **所有通道共用那一条路径**，这是本设计唯一的不变量（ADR-0017 D2）"。
+ *
+ * 本批按那一条不变量收口：三步都搬进 `on_wifi_ready()` 的收敛点下游（顺序与理由见该函数头），
+ * 于是**所有通道**（含将来新增的声波 / 二维码）都必经它们。通道侧仍旧只负责交凭据。
+ * ⛔ 因此**不要**在这里重新长出第二个"入网后动作"函数，也⛔ **不要**在通道模块里直接调
+ *    `net_probe_report()` / `sntp_boot_sync()`：门禁 `tools/check-prov-convergence.py` 的
+ *    A11/A12 会机械拒绝「通道模块里出现这两步」与「把授时挪到 cloud_start_task 之后」。
+ * ⚠️ 诚实边界：这条收敛修复**尚未在 BLE 机型真机上验证过端到端配网**（无同场手机）。 */
 
 /** 配网启动：按 ADR-0017 D1/D2 的**优先级**依次尝试；没有任何通道可就地（按机型）把下一步讲清楚。
  *
@@ -819,7 +860,8 @@ static void wifi_prov_boot(void)
     if (wifi_prov_load_file(ssid, sizeof(ssid), pass, sizeof(pass), src, sizeof(src)) == ESP_OK &&
         ssid[0] != '\0') {
         if (wifi_prov_submit_credentials_src(ssid, pass, WIFI_PROV_CHAN_FILE, src) == ESP_OK) {
-            prov_boot_after_connect(src, ssid);
+            /* 入网后的动作（日志 / 自检 / 授时 / 面板 / 上云）全部在收敛点下游
+             * （on_wifi_ready → cloud_start_task）—— 这里只结束启动期通道分派。 */
             return;
         }
         /* ★ 卡上有凭据、但**本次入网失败** ⇒ 显式释放采信槽再降级。理由：优先级判据管的是
@@ -856,7 +898,7 @@ static void wifi_prov_boot(void)
     if (CONFIG_ONEYE_FW_WIFI_SSID[0] != '\0') {
         if (wifi_prov_submit_credentials_src(CONFIG_ONEYE_FW_WIFI_SSID, CONFIG_ONEYE_FW_WIFI_PASSWORD,
                                              WIFI_PROV_CHAN_KCONFIG, "kconfig") == ESP_OK) {
-            prov_boot_after_connect("kconfig", CONFIG_ONEYE_FW_WIFI_SSID);
+            /* 同 C3：入网后动作归收敛点下游，此处不重复做任何一步。 */
             return;
         }
         ESP_LOGE(TAG, "Kconfig 兜底 SSID 未能入网（ssid=%s）", CONFIG_ONEYE_FW_WIFI_SSID);

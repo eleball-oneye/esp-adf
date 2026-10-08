@@ -36,6 +36,10 @@ idf_component_register(SRCS "korvo2_oneye_main.c"
                             "camera_api.c"
                             "wifi_prov.c"
                             "wifi_prov_ble.c"
+                            # 广播厂商字段的设备身份（SN = creds 的 node_id）。**单独一个 TU** 的理由：
+                            # `oneye_dev_creds.h` 带进的 `oneye_dev_base.h:164` 与 `oneye_dev_link.h:163`
+                            # 同名不同构（`oneye_dev_link_status_t`）⇒ 同一 TU 同时包含两者必编译失败。
+                            "adv_identity.c"
                             "net_probe.c"
                             "sntp_boot.c"
                        INCLUDE_DIRS "."

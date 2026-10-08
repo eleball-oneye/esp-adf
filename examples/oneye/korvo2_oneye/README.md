@@ -961,3 +961,237 @@ LCD 状态屏与摄像头抓帧见 §5.7/§5.8（**已真机闭环**），`video
 - 抓帧与云端链路共享内部 DMA 内存：改摄像头配置后必须同时核对 `panel.heap.internal_free` 与 `cloud.link_up`（见 §5.8 的关键坑）；
 - 上游资产纪律：`esp-adf` 上游分支（`master` / `release/*`）与 `esp-repo/` 镜像**只读**，我方改动只进集成分支；`esp32-camera` 以 `idf_component.yml` **按 commit pin** 引入（不静默跟随上游默认分支）；
 - 真机烧录/取证（录音可听性、麦克风灵敏度、SD 插拔）登记为后续卡，不在本工程内声称通过。
+
+## 10. 广播厂商自定义字段（AD `0xFF`）＝ 第三重发现判据（2026-10-07 本批）
+
+> **用户裁定（逐字）**：「强判据用服务 UUID + 广播名前缀 + **自定义厂商字段**来确定，**设备侧也一并改**。
+> 配对码建议用能体现设备唯一性的标识符（**出产贴码后不会变动**），**设备侧广播时能带的字段**。」
+> **实现口径**：唯一标识 = **SN（= `creds` 分区的 `node_id`）**，本机实测 `KORVO2-0000`
+> （`_tmp-phase2/creds-preflash-mine.parse.txt`：`node_id`/`sn` 同值）。⛔ **不是**云端雪花 `deviceId`
+> （云端注册才分配，产线贴码时不存在）。
+> **契约登记**：总控仓 [`contracts/local/ble-gatt.md`](../../../../../../contracts/local/ble-gatt.md) **§1.1**（字节布局的唯一事实源）。
+
+### 10.1 字节布局（净荷 15 B，放**扫描响应**）
+
+空间实测算术（31 B 上限）：广播数据 `Flags(3) + 128-bit UUID(18) = 21`（余 10）；扫描响应 `设备名 AD(2+10=12)`（余 19）；
+厂商字段 AD = `1(len)+1(0xFF)+2(厂商 ID)+净荷` ⇒ **净荷 ≤ 15 B**，且 `12 + 19 = 31` **恰好用满**。
+
+| offset | 长度 | 字段 | 编码 |
+| --- | --- | --- | --- |
+| 0 | 1 | `ver_flags` | 高 4 bit = 版本（当前 `1`）；低 4 bit = 标志：`0x01` = `sn` 是 node_id 的**尾部**（非全文）、`0x02` = `pk_family` 有效 |
+| 1 | 11 | `sn` | `node_id` 的**尾部 ≤11 B**（ASCII，NUL 右补；≤11 B 时为全文） |
+| 12 | 3 | `pk_family` | `productKey` 的两段 `-` 之间的**品类段**（`OY-SPK-01` → `SPK`），无 ⇒ 全 `0x00` |
+
+- **厂商 ID** = `0x02E5`（链路小端 `E5 02`）= **Espressif Systems，Bluetooth SIG 已分配**
+  （依据：IDF 例程 `examples/bluetooth/esp_ble_mesh/.../main.c:30` `#define CID_ESP 0x02E5`）。
+  ⛔ 本仓没有 oneye 自己的 SIG company id ⇒ **不用**未分配值（那属于发明协议事实）。
+- **为什么 productKey 只剩 3 B**：15 B 装不下「SN 全文(11) + productKey 全文(9)」。SN 承重（配对码 = SN），
+  productKey 降为**已登记品类段**（`cloud/docs/00-naming-convention.md:4604-4607`）。被否决的替代：跨 adv/scan-rsp 拆两段
+  （依赖 Android 是否合并两包，**未经真机取证**）、扩展广播（改发现形态，属另一次契约变更）、放广播数据（只剩 6 B）。
+  ⚠️ 只带**品类段**、不带 `-01` 尾号 ⇒ App 侧要展示完整 `productKey` 需匹配它那份已登记品类表。
+
+### 10.2 SN 来源与**降级行为**（红线）
+
+| 情形 | 设备行为 | 串口/App 可判据 |
+| --- | --- | --- |
+| `creds` 合法 | 广播 `sn` = `creds.node_id` 尾部 ≤11 B；`ver_flags` 按实截断置位 | `广播身份：SN 取自 **creds 分区** node_id=…` ＋ 扫描响应逐字节行 |
+| `creds` 没写过 / 坏了 | **整段 `0xFF` 不产出**（⛔ 不用 `CONFIG_ONEYE_FW_DEVICE_ID` 冒充） | `广播身份：creds 不可用（…）⇒ 厂商字段(0xFF) **整段不产出**` |
+
+⛔ **`CONFIG_ONEYE_FW_DEVICE_ID`（缺省 `korvo2-0001`）是台面占位**，量产机上与真实身份不同 ⇒ 只用于广播名与配对 salt，
+**绝不**进厂商字段。⚠️ 已知不一致（本批**未改**，见 §10.5）：本机广播名仍是 `ONEYE-0001`（Kconfig），而真实 `node_id` 是
+`KORVO2-0000` ⇒ **App 侧不得用广播名后缀做配对码匹配**，应以厂商字段的 `sn` 为准。
+⚠️ 代价：`oneye_dev_creds_load()` 会按分区大小 malloc（本机 **16 KiB**）⇒ 本工程**先读、取 `node_id`、立刻 free，再起 NimBLE**
+（避免与 NimBLE 主机 12 KiB 栈同时在峰）。
+
+### 10.3 落码位置（`文件:行`）
+
+| 面 | 位置 | 内容 |
+| --- | --- | --- |
+| 线格式（编解码） | `components/oneye-dev-sdk/src/oneye_dev_ble_adv.c`（新） | `oneye_dev_ble_adv_mfg_encode/decode`（纯函数） |
+| 声明与常量 | `components/oneye-dev-sdk/include/oneye_dev_ble.h`（`ONEYE_DEV_BLE_ADV_MFG_*`） | 部署版本/定长/标志/厂商 ID |
+| 挂进扫描响应 | `components/oneye-dev-sdk/src/internal/oneye_ble_plat_nimble.c`（`start_advertising()`） | 名称 AD + 厂商 AD 同包；**开机一次**的逐字节取证行 |
+| 设备身份来源 | `main/wifi_prov_ble.c`（`adv_identity_load()`） | `oneye_dev_creds_load()` → `node_id` → free → 传 `bcfg.adv_sn` |
+| 品类来源 | `main/Kconfig.projbuild`（`ONEYE_FW_PRODUCT_KEY`，缺省 `OY-SPK-01`） | 机型属性（**已登记**，非新造） |
+| 单测/门禁 | `components/oneye-dev-sdk/tests/test_ble_adv_mfg.c`（新，9 用例） | 往返一致 / 无 SN 负向对照 / 逐字节布局 / AD 总长 |
+
+### 10.4 自证（非空转）
+
+- 宿主单测（WSL，`_tmp-phase2/mfg-host-test.sh`）：**22 组 / 260 用例，断言 3687 次、失败 0 次，退出码 0**；
+  新组 `ble_adv_mfg` **9/9**。
+- **变异探针（两条，各证一个新行为）**：
+  ① 让编码器在 `sn` 为空时照样产出 15 B ⇒ **恰好 1 条红**（`no_sn_yields_no_field`，`0 == 0, got 15`）；
+  ② 把截断改成取**头部** 11 B ⇒ **恰好 2 条红**（`roundtrip_production_shape_truncates` 得到 `"LAMN0000000"`、
+  `byte_layout_truncated_flag` 首字节不符）。⇒ 「不冒充」与「取尾部」这两条都是**承重**的。
+- 受控构建读数（两机型）与真机串口原文见 `_tmp-phase2/firmware-mfg-field.md`（本批报告）。
+
+### 10.5 仍未做 / 未证（⛔ 不声称完成）
+
+- **未**在真机上用手机/扫描器读到该字段（本机无手机扫描器）：设备侧证据 = 用**协议栈自己的编码器**打出的
+  「扫描响应实测 AD 字节」行（＝空口字节，非"我构造的字符串"），见报告 §真机。
+- **未**改广播名后缀与配对 `salt`（`device_id`）：二者同源于 `CONFIG_ONEYE_FW_DEVICE_ID`，改动会同时影响
+  广播名与 HKDF salt（契约 §4.3）⇒ 属**另一次决策**，本批只把不一致**登记**在此。
+- **未**带 productKey 的 `-NN` 尾号（只带品类段）；**未**做 App 侧解析器（另一批）。
+- ⛔ **安全边界**：SN 进广播 = **公开**，只能当「发现/筛选」标识，**不是授权凭据**；真正入网仍必须过 POP 与
+  Wi-Fi 凭据，⛔ 带不带 SN **都不豁免配对步**（`ProvFlowMachine` 的 6 位形状判据一个字未放宽）。
+
+## 11. 增量（2026-10-07 第四批）：**厂商 ID 落位 = `0x4F59`** + 设备侧占位检出载体（⛔ 纯追加，旧段一字未改）
+
+> **用户裁定（逐字）**：「**厂商 ID = `0x4F59`**（`'O'=0x4F` + `'Y'=0x59` = ASCII "OY"）」，并要求**同批重烧**。
+
+### 11.1 改了什么（两侧同批）
+
+| 侧 | `文件:行`（**2026-10-07 本批落笔读数**；⛔ 定位请以**常量名**为锚） | 旧值 → 新值 |
+| --- | --- | --- |
+| 设备侧 | `components/oneye-dev-sdk/include/oneye_dev_ble.h:92` 的 `ONEYE_DEV_BLE_ADV_MFG_COMPANY_ID` | `0x02E5u` → **`0x4F59u`** |
+| App 侧 | `mobile/Android/sdk-core/src/main/kotlin/com/oneye/core/prov/OneyeVendorField.kt:164` 的 `OneyeVendorField.COMPANY_ID` | `0x02E5` → **`0x4F59`** |
+
+- 空口链路字节：`E5 02` → **`59 4f`**（**BLE 小端**）。⛔ **编码方式未改**（仍 2 B 小端，见 `oneye_ble_plat_nimble.c` 的 `adv_mfg_prepare()`）。
+- ⛔ §10.1 里那句「厂商 ID = `0x02E5`（链路小端 `E5 02`）= Espressif Systems，Bluetooth SIG 已分配」**逐字留痕、已被本节取代**（⛔ 不删）。
+- 其余字节（名字 AD、`12` 长度、`ver_flags`、`sn`、`pk_family`）**逐字节不变**。
+
+### 11.2 ⚠️ 边界（**必须读**，⛔ 不许把 `0x4F59` 当"Oneye 已注册的公司号"）
+
+1. 🔴 **`0x4F59` ⛔ 不是 Bluetooth SIG 分配值**。SIG 的 Company Identifier 是**分配制**、16 位空间**已大量分配**
+   ⇒ 本值与某个**已分配 ID 存在撞号可能**（别人的扫描器/App 会把我们的广播当成他们的）。
+2. ⇒ **身份判定⛔ 不得依赖 Company ID**：App 侧解析器靠**长度（15 B 定长）+ 结构 + `ver_flags` 自证**
+   （Company ID **只**用于筛掉非本厂设备）。
+3. ⇒ **量产前必须替换为 Oneye 的正式 SIG Company ID**；**替换点两处、必须同批改**（否则空口与 App 不一致）：
+   ① 设备侧 `ONEYE_DEV_BLE_ADV_MFG_COMPANY_ID`；② App 侧 `OneyeVendorField.COMPANY_ID`。
+   ⛔ 替换时**同批**还要改：本文件 §11.3 的检出函数、`contracts/local/ble-gatt.md §1.1`、App 侧 `companyIdAssignment()` 表与文案、
+   两侧单测的常量断言。
+4. **旧值逐字留痕（两代）**：`0x02E5`（Espressif Systems，SIG 已分配）= **上一版可运行占位**（依据见 §10.1）；
+   `0xFFFF`（SIG 保留/测试值）= 更早一版占位。⛔ 两者都不可量产。
+
+### 11.3 设备侧"占位可检出"载体（⛔ 不是只写注释）——**上一批的待办，本批补齐**
+
+| 载体 | 位置 | 判据 |
+| --- | --- | --- |
+| 运行期函数 | `components/oneye-dev-sdk/src/oneye_dev_ble_adv.c` 的 `oneye_dev_ble_adv_mfg_company_id_is_placeholder()` / `oneye_dev_ble_adv_mfg_company_id_placeholder_warning()`（声明在 `include/oneye_dev_ble.h`；已登记 `abi/oneye_dev_ble.symbols`） | 当前值 ⇒ **必须为真**并返回带标记串的告警；非占位 ⇒ `NULL` |
+| 构建期 | 同文件 `#pragma message("ONEYE_BLE_MFG_COMPANY_ID_PLACEHOLDER: …")` | 每次编译都在日志里留一行（不靠谁去读注释） |
+| 真机 | `src/internal/oneye_ble_plat_nimble.c` 的 `oneye_ble_plat_init()`（`ESP_LOGW`） | 开机即打印同一标记串 |
+| 宿主单测 | `components/oneye-dev-sdk/tests/test_ble_adv_mfg.c` 的 `company_id_placeholder_is_detected`（**10/10 绿**） | 占位 ⇒ 真 + 告警串必须带标记串/点名 `0x4F59`/`SIG`/「量产前必须替换」/「不得依赖 Company ID」；⛔ 另断言 2 B 小端仍为 `59 4f` |
+
+- **标记串两侧逐字节同值**：设备侧 `ONEYE_DEV_BLE_ADV_MFG_COMPANY_ID_PLACEHOLDER` ＝ App 侧
+  `OneyeVendorField.PLACEHOLDER_WARNING_TOKEN` ＝ **`ONEYE_BLE_MFG_COMPANY_ID_PLACEHOLDER`** ⇒ 串口日志 / 构建日志 / 单测输出可用**同一个**字符串机械检索。
+- **变异探针（2 条，各证一条新行为）**：① 去掉 `0x4F59` 占位分支 ⇒ `TEST_EXIT=1`、**恰好 1 条红**（`company_id_placeholder_is_detected`）；
+  ② 把常量改成表外值 `0x1234` 而不同批改检出表 ⇒ 同样**恰好 1 条红**。⇒ 该检出是**承重**的，不是空转。
+
+### 11.4 本节仍未做 / 未证（⛔ 不声称完成）
+
+- **⛔ 不是 SIG 分配值**（见 §11.2）⇒ 正式公司号仍待取得并**同批替换两处**；本节的"已落位"只表示"**按用户裁定落到了当前值**"。
+- **真机字节复核**的读数与逐字节 diff 表见 `_tmp-phase2/mfg-cid-0x4F59-and-reflash.md`（本批报告）；⛔ 手机侧扫描取证仍未做（本机无同场手机）。
+
+## 12. 增量（2026-10-07 第五批）：**广播名与配对 salt 同批改为由 `creds` 的 `node_id` 派生**（⛔ 纯追加，旧段一字未改）
+
+> **用户裁定（逐字）**：「广播名来源**改为由 node_id 派生**」「**node_id 唯一形态按你建议来**（= 先定死唯一标识形态并补唯一性契约，再定字段宽度）」。
+>
+> 🔴 **副作用（用户已知情并同意）**：`salt` 与广播名同源 ⇒ 只改一侧 ⇒ 两端算出**不同的会话密钥** ⇒ 配不上对。
+> 故本批**两端同批改**（设备侧 + App 侧），并用固定 POP/node_id 的**向量逐字节比对**钉住。
+
+### 12.1 改了什么（`文件:行`；行号为 2026-10-07 本批落笔读数，⛔ 定位以函数/常量为锚）
+
+| 侧 | 位置 | 旧值 → 新值 |
+| --- | --- | --- |
+| 设备侧（示例工程） | `main/wifi_prov_ble.c` `wifi_prov_ble_start()` **第 0 步**（新增） | 身份**先读** `creds`：`s_adv_sn_ready = adv_identity_sn(s_adv_sn, …)`；读不到 ⇒ `ESP_LOGE` + **`return ESP_FAIL`（本通道不启动，fail-closed）** |
+| 设备侧（示例工程） | 同上，`lcfg.node_id` | `CONFIG_ONEYE_FW_DEVICE_ID`（`korvo2-0001`）→ **`s_adv_sn`**（= creds `node_id`） |
+| 设备侧（示例工程） | 同上，`bcfg.device_id` | `CONFIG_ONEYE_FW_DEVICE_ID` → **`s_adv_sn`** |
+| 设备侧（示例工程） | 同上，`bcfg.adv_sn` | `s_adv_sn_ready ? s_adv_sn : NULL` → **`s_adv_sn`**（Fail-closed 后必非空） |
+| 设备侧（示例工程） | `main/adv_identity.h` / `adv_identity.c` | 注释与日志口径：从"广播厂商字段的 SN"扩为**BLE 配网路径身份的单点读取**（广播名/salt/厂商字段三者同源） |
+| **SDK 源码** | `components/oneye-dev-sdk/**` | ✅ **零改动**（派生逻辑早已在 `src/oneye_dev_ble.c:471-474`；只需调用方传入真实 `device_id`）⇒ ⛔ 未动预编译归档（哨兵见 §12.4） |
+| App 侧 | `mobile/Android/sdk-android/.../ble/BleLinkClient.kt` | 删除 `peerNodeIdForKey()`（旧：`peerNodeId.ifEmpty { deviceName }.ifEmpty { deviceAddress }`）；`pair()` 只暂存 POP，收到 `prov.pair.ok` 后 `LinkCrypto.deriveKey(pop, nodeId)`；新增 `advertisedNameSuffix()` 旁证与 `NAME_SUFFIX_CHARS = 4` |
+| App 侧 | `mobile/Android/sdk-core/.../ble/LinkCrypto.kt` | `deriveKey` 的 KDoc 定死 salt 的**取值与编码**（`node_id` UTF-8、无 NUL、不折叠）＋取值点 |
+| App 侧 | `mobile/Android/sdk-core/.../prov/OneyeDiscoveryPredicate.kt` | 头注释：旧"已知功能风险"改为**已消除**（旧值逐字留痕）；自洽性判据**一字未放宽** |
+
+**派生函数与调用点（本批"先证后改"的那两处）**
+- 派生函数（唯一处）：`components/oneye-dev-sdk/src/oneye_dev_ble.c:471-474`
+  `oneye_snprintf(s_ble.adv_name, sizeof(s_ble.adv_name), "ONEYE-%s", (dev_len > 4u) ? (dev + dev_len - 4u) : dev)`
+  —— `dev = s_ble.device_id`（init 时由 `cfg->device_id` 拷入，`:454`）；**截取规则 = 取末尾 4 字符**，不足 4 字符则原样。
+- salt 计算（唯一处）：同文件 `:246` `oneye_ble_pair_derive_key(s_ble.pop, s_ble.device_id, s_ble.key)`
+  ⇒ HKDF-SHA256(ikm = POP ASCII, **salt = `device_id` UTF-8**, info = `"oneye-link-v1"`, 16 B)（实现 `src/internal/oneye_ble_pair.c:208-219`）。
+- 调用点：`main/wifi_prov_ble.c` 的 `bcfg.device_id = s_adv_sn`（同一串同时进 ①②③，见文件头注释）。
+- 契约同步：`contracts/local/ble-gatt.md §1`（广播名）／`§4.3`（salt 取值点）／**`§8`（`node_id` 唯一形态与宽度规则，新增）**。
+
+### 12.2 ⛔ 旧值逐字留痕（改动前）
+
+- `wifi_prov_ble.c:119`（旧）：`lcfg.node_id = CONFIG_ONEYE_FW_DEVICE_ID;`；`:135`（旧）：`bcfg.device_id = CONFIG_ONEYE_FW_DEVICE_ID;`
+- 后果（正是本批修掉的那个缺陷）：广播名 = `ONEYE-0001`（Kconfig 台面 id `korvo2-0001`），厂商字段 `sn` = creds 的 `KORVO2-0000`
+  ⇒ App 的「广播名后 4 位 == sn 后 4 位」自洽性校验**拒绝真机**（留空不列出／填码拒绝）。
+- §10.5 的那两条"仍未做"（**未改广播名后缀与配对 salt**、**未带 productKey 尾号**）**本条只完成前者**：
+  广播名与 salt 已同批改并由真机取证（§12.5 的空口 AD diff）；productKey 尾号仍未做。
+
+### 12.3 salt 改前/改后对照 + 两端密钥向量（逐字节）
+
+| | salt（= HKDF 的 `device_id`） | 来源 |
+| --- | --- | --- |
+| **改前** | `korvo2-0001`（10 B ASCII） | Kconfig `CONFIG_ONEYE_FW_DEVICE_ID` 台面占位 |
+| **改后** | `KORVO2-0000`（11 B ASCII，= creds `node_id`） | `creds` 分区 `node_id`（`oneye_dev_creds_load()`） |
+
+| POP | salt（改前/改后） | 设备侧实跑（`oneye_ble_pair_derive_key`，宿主构建链接交付库） | App 侧实跑（`LinkCrypto.deriveKey`，`:sdk-core` 单测同值断言） | 逐字节 |
+| --- | --- | --- | --- | --- |
+| `931455` | **改后** `KORVO2-0000` | `a9a3a021175337f7cb939cd781160737` | `a9a3a021175337f7cb939cd781160737` | ✅ 相同 |
+| `931455` | 改前 `korvo2-0001` | `236d6f6616e65545702c9e52d80ac89b` | `236d6f6616e65545702c9e52d80ac89b` | ✅ 相同（**且与改后不同** ⇒ 不同批改必配不上） |
+| `123456` | **改后** `KORVO2-0000` | `fc0cdccbc7755887515a250e27f3b240` | `fc0cdccbc7755887515a250e27f3b240` | ✅ 相同 |
+| `123456` | 改前 `korvo2-0001` | `b84000f1d7510ea7c5b51137e0262cb2` | `b84000f1d7510ea7c5b51137e0262cb2` | ✅ 相同 |
+
+- 设备侧读数来源：`_tmp-phase2/nid-vector.c`（**只调 SDK 那一个函数**）在宿主构建上链接 `liboneye_dev_ble.a` 实跑；
+  日志 `_tmp-phase2/nid-host-test.sh` 输出（`pop=931455 salt=KORVO2-0000 key=…`）。
+- App 侧读数来源：`sdk-core` 单测 `LinkCryptoTest.★ 会话密钥向量_与设备侧SDK逐字节一致（salt = creds 的 node_id）`
+  —— 期望值**由设备侧实跑得到**（不是本端算完抄回来），任一端改算法（salt 编码/长度/info 串）都会先红。
+- ⚠️ `POP=931455` 取自既有真机读数（`korvo2_llm_chat` 例程 §7.1 的就绪行），不是本批新造。
+
+### 12.4 受控构建读数（两机型，WSL / IDF v5.5.5）
+
+| 机型 | defaults | EXIT | `korvo2_oneye.bin` | 余量 | 关键 `sdkconfig.h` |
+| --- | --- | --- | --- | --- | --- |
+| SD（卡槽机型） | `sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.defaults.production` | **0** | 1369744 B / `1c9182c7d497f77c02b8ac0c8e7c2a7525e1571ed90fddb5ffce0febff944c09` | app 分区 0x400000，余 67%（`0x2b1970`） | `WIFI_FILE=1`、`BLE_PROV` 未定义、`DEVICE_ID="korvo2-0001"`、`CREDS_REQUIRED=1`、`TRANSPORT_TLS=1` |
+| BLE | 上 + `sdkconfig.defaults.ble` | **0** | 1590480 B / `3aa712e225563d86023b2a54b361e31827878b4b647cea96c6a1c2bebb2ede3a` | app 分区 0x400000，余 62%（`0x27bb30`） | `ENABLE_BLE_PROV=1`、`BT_NIMBLE_ENABLED=1`、`BT_NIMBLE_HOST_TASK_STACK_SIZE=12288`、`CREDS_REQUIRED=1` |
+
+- **SDK 源码零改动 ⇒ 归档哨兵仍通过**（逐字）：
+  `-- oneye-dev-sdk: 预编译库哨兵通过（版本 0.4.0 + 源内容 3049be3cc190c6b4711da30670738883d4a6d2213082a019ea313cfa799de4f1）`
+  `-- oneye-dev-sdk: 链接预编译库（分域库，toolchain=xtensa-esp32s3-elf-gcc-14.2.0）：oneye_dev_ble_prebuilt;oneye_dev_link_prebuilt;oneye_dev_mpp_prebuilt;oneye_dev_event_prebuilt;oneye_dev_log_prebuilt;oneye_dev_sdk_prebuilt`
+  ⇒ **未重生成归档**（自研源内容哈希与上一批同值 ⇒ 归档与源码一致）；`git status` 里 `lib/**` **无改动**。
+- 受控口径：构建目录在 `/tmp`，`-DSDKCONFIG=<build>/sdkconfig` ＋ `-DSDKCONFIG_DEFAULTS=...`；
+  仓库内 `examples/.../korvo2_oneye/sdkconfig` 的 SHA256 **前后同值**（`ed2ac1b4…`）⇒ ⛔ 未被构建污染。
+- 离线判据（镜像里确有本批新串）：`flashbin-nid-ble/korvo2_oneye.bin` 中命中
+  `身份来源 = creds 分区 node_id「%s」⇒ 广播名 ONEYE-<后 4 位> 与 HKDF salt 同源于此`、
+  `身份不可用（creds 分区的 node_id 读不到）⇒ **BLE 配网通道不启动**…`；旧串 `广播身份：SN 取自` **0 次**。
+
+### 12.5 真机（BLE 机型，COM12）：烧写红线 + creds 逐字节 + 空口 AD 改前/改后 diff
+
+- **四偏移烧写**（`nid-flash-verify.ps1` → `conv-flash.ps1`）：板载 `0x8000` 分区表与本次产物**逐字节相同**
+  （`PART first 3072 B differing bytes = 0`，board sha256 `04A5945B…` / artifact `DBB160ED…`）⇒ **`-SkipPartTable`**
+  （日志逐字：`SKIP partition-table.bin @0x8000 (caller proved board copy is byte-identical) -- NOT touching it`）。
+- **overlap 断言**（三区，逐字）：`bootloader.bin … overlap_creds=False` / `korvo2_oneye.bin … overlap_creds=False` /
+  `srmodels.bin … overlap_creds=False` ＋ `GUARD_OK: no write region touches creds 0x510000..0x514000`；
+  ⛔ 无 `erase_flash`；`Hash of data verified.` **3 次**（跳过的分区表不计）；`FLASH_EXIT=0 elapsed=38s`。
+- **creds 烧前/烧后逐字节**：sha256 两侧同为 `1801B9C1F08255992A10F117F82B4A3592D8E04098451163CD92AB2B016E1F71`、
+  `differing bytes = 0`、`crc32 f6ed1bb8 (header) / f6ed1bb8 (calculated) -> MATCH`、`node_id = KORVO2-0000`、
+  `VERDICT: valid ONEYECR1 credential image`。
+- **串口 200 s**（端口已开、读循环就位后按住 EN(RTS) 500 ms 再释放）：整段 14371 B；
+  开机前缀 `ESP-ROM:esp32s3` / `rst:0x1 (POWERON)` / `boot:  4 creds 00510000 00004000` / `app_init: Compile time` /
+  `ELF file SHA256` **各 1 次**；`assert`/`Guru`/`Backtrace`/`WDT`/`Core dump`/`abort()`/`Panic`/`Stack canary` **全 0**。
+- **身份同源三行（逐字在场）**：`设备身份：**creds 分区** node_id=KORVO2-0000（11 B，crc32=f6ed1bb8）⇒ ① 广播名 ONEYE-<后 4 位>、② 配对 HKDF salt、③ 厂商字段 sn 三者同源于此`；
+  `身份来源 = creds 分区 node_id「KORVO2-0000」⇒ 广播名 ONEYE-<后 4 位> 与 HKDF salt 同源于此`；
+  `BLE 配网通道已就绪：广播中（设备名 = SDK 由 node_id 派生 `ONEYE-<后 4 位>`，本机 node_id=KORVO2-0000），配对 POP=329214（TTL 300 s），厂商字段(0xFF) 已带 SN（= 同一个 creds 分区 node_id）＋品类段`。
+- **空口 AD 改前/改后 diff（同一个协议栈自己的 dump 行；31 B 扫描响应）**：
+
+  | 偏移 | 改前（上一批真机，`mfg-serial-cid-ble.txt`） | 改后（本批真机） | 差异 |
+  | --- | --- | --- | --- |
+  | 0..1 | `0b 09` | `0b 09` | — |
+  | 2..10 | `4f 4e 45 59 45 2d 30 30 30` (`ONEYE-000`) | 同 | — |
+  | **11** | **`31`（`1`）** | **`30`（`0`）** | ★ **唯一差异字节** |
+  | 12.. | `12 ff 59 4f 12 4b 4f 52 56 4f 32 2d 30 30 30 30 53 50 4b` | 逐字节相同 | **厂商段与（扫描响应里的）其余字节不变** |
+
+  ⇒ 即：广播名 `ONEYE-0001` → **`ONEYE-0000`**（= `node_id` `KORVO2-0000` 的后 4 位），
+  厂商字段 `sn="KORVO2-0000"`（company `0x4F59`、净荷 15 B、未截断）与①服务 UUID（广播数据 21 B：`02 01 06` + UUID128）**一字未变**。
+  机读判据脚本 `_tmp-phase2/nid-serial-check.py` 全 PASS（`VERDICT: PASS (failing checks: 0)`，退出码 0）。
+
+### 12.6 本节仍未做 / 未证（⛔ 不声称完成）
+
+- ⛔ **手机侧未同场取证**（本机无手机扫描器 / 无 BLE 中央设备）：**"App 能扫到 `ONEYE-0000` 并完成配对"未经真机验证**；
+  已证的是①设备侧空口字节（协议栈 dump）②两端派生函数在同一向量上逐字节一致（§12.3）③App 侧单测全绿。
+- ⛔ **SDK 头注释未同批订正**：`include/oneye_dev_ble.h:147` 对 `device_id` 的说明仍写"本机节点 id（广播名 ONEYE-<后 4 位>；配对 salt 亦用它）"，
+  未点明"必须是 creds 的 node_id、⛔ 不得用编译期常量"。**原因**：改 SDK 源码/头会让"预编译归档哨兵"的**源内容哈希**失配
+  ⇒ 必须**同批重生成 6 个 xtensa 归档**（`build-all.sh --toolchains esp32s5@5.5.5` 一类），代价与风险高于注释收益 ⇒ **登记为待办**（下一批若动 SDK，须一并做）。
+- ⚠️ **§12.5 的"改前"读数取自上一批（`0x4F59` 落位批）的同机型真机串口**，不是本批在同一台机器上"回退后再抓一次"；
+  两者的差异面被 `nid-serial-check.py` 限制为"仅偏移 11 一个字节"，故可作为"只差广播名"的机械证据；⛔ 但严格说它**不是**同一启动会话内的 A/B。

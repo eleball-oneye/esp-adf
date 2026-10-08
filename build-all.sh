@@ -191,6 +191,8 @@ SRC_INTERNAL="$SDK_DIR/src/internal"
 BASE_SRCS=(
     "$SDK_DIR/src/oneye_dev_base.c"
     "$SDK_DIR/src/oneye_dev_creds.c"
+    # 设备侧绑定准入签名（`oneye-bind-v1`，契约 `R68` ④）—— 与 creds 同属「设备身份」面
+    "$SDK_DIR/src/oneye_dev_bind.c"
     "$SRC_INTERNAL/oneye_internal.c"
     "$SRC_INTERNAL/oneye_test.c"
     "$SRC_INTERNAL/oneye_osal_posix.c"
@@ -222,6 +224,12 @@ LINK_SRCS=(
 )
 BLE_SRCS=(
     "$SDK_DIR/src/oneye_dev_ble.c"
+    # 2026-10-07：广播厂商自定义字段（AD 0xFF）的线格式编解码。**必须与组件侧
+    # `components/oneye-dev-sdk/CMakeLists.txt` 的 `ONEYE_LIB_BLE_SRCS` 同步**：
+    # 本列表同时驱动 ① 归档编译 ② `sdk_src_hash()`（哨兵口径 = 两端取同一文件集合）。
+    # 漏在这里的实测后果（本批踩到）：归档里只有 `U oneye_dev_ble_adv_mfg_encode`（引用、无定义）
+    # 且 `src_sha256` 与组件侧不一致 ⇒ 组件侧哨兵直接 FATAL_ERROR（预编译库与源码不同源）。
+    "$SDK_DIR/src/oneye_dev_ble_adv.c"
     "$SRC_INTERNAL/oneye_ble_pair.c"
     "$SRC_INTERNAL/oneye_ble_plat_nimble.c"
     "$SRC_INTERNAL/oneye_ble_plat_host.c"

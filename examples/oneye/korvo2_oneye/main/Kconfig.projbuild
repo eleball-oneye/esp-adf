@@ -91,13 +91,15 @@ menu "korvo2_oneye 板级固件配置"
             default ""
 
         config ONEYE_FW_ENABLE_BLE_PROV
-            bool "启用 BLE 配网通道 C1/C2（oneye-dev-sdk 自研 GATT + POP 配对）"
+            bool "启用 BLE 配网通道 C1/C2（oneye-dev-sdk 自研 GATT + 激活码配对）"
             default n
             depends on ONEYE_DEV_SDK_ENABLE_BLE
             help
                 配网通道 C1（手机 App）与 C2（另一台嵌入式设备）：BLE 上跑 link 帧，
                 由 App/对端下发 SSID/密码（契约 contracts/local/ble-gatt.md）。
-                设备侧复用 SDK 的 `liboneye_dev_ble`（自研 GATT，POP→HKDF-SHA256→AES-128-GCM），
+                设备侧复用 SDK 的 `liboneye_dev_ble`（自研 GATT；🔴 2026-10-09 起配对凭据 =
+                **激活码（`prov.pair.code`，用户从机身贴码输入）＋ 一次性 `chal`**
+                → HKDF-SHA256 → AES-128-GCM；🔻 POP 降为**兼容/产测档**，字段与实现保留、⛔ 不删），
                 实现见 main/wifi_prov_ble.c —— 它**只**把凭据交给 wifi_prov_submit_credentials()，
                 入网后动作统一由 main/wifi_prov.c 的收敛点触发（ADR-0017 D2）。
 
@@ -109,7 +111,65 @@ menu "korvo2_oneye 板级固件配置"
         config ONEYE_FW_BLE_POP
             depends on ONEYE_FW_ENABLE_BLE_PROV
             string "固定 BLE 配对 POP（6 位数字；空 = SDK 随机生成并打印串口，TTL 见 SDK 配置）"
+
+        config ONEYE_FW_DEV_CRED_REQUIRED
+            depends on ONEYE_FW_ENABLE_BLE_PROV
+            bool "本机型**需要激活凭证**（⇒ 配对应答 prov.pair.ok 的 cred_req=true）"
+            default y
+            help
+                机型级「配网时要不要激活凭证」，取值语义与 cloud 的
+                `dev_product_credential_policy.credential_required`（0=不需要 / 1=需要 /
+                NULL=没答案）**同源**；cloud 侧读不到那一格时 **fail-closed 视为「需要」**
+                （见 `DeviceProductCredentialPolicyMapper` / `DeviceActivationResolveDto`）
+                ⇒ 本项**缺省 y（需要）与之同向**，⛔ 不是"默认放宽"。
+
+                ★ 为什么设备侧由**编译期**承载（而不是 creds 字段 / 空口字段）：
+                  ① 配网期设备**无网**，拿不到 cloud 的机型表；
+                  ② 厂商字段里的 `pk_family` 段已按台账 #3 **删除** ⇒ 空口上已无机型信息，
+                     设备无法自己查表；
+                  ③ creds 镜像的字段集是**产线灌注契约**（`oneye_dev_creds_load()` 解析的键集），
+                     ⛔ 本批**不得**自行新增 creds 键（那要改灌注侧与镜像格式，属另一次决策）。
+                  ⇒ 只能由**机型位**（本 Kconfig，随机型 sdkconfig.defaults 固化）承载。
+                取值经 `oneye_dev_ble_config_t.adv_cred_required(_set)` 进入 SDK，
+                在**明文** `prov.pair.ok` 里以布尔 `cred_req` 回给 App（可选字段：置本项即发送）。
+                ⚠️ 它不是"授权决定"：是否真的放行绑定由 **cloud 的机型表 + App 代云校验**裁定
+                （台账 #8 / #9），设备侧这一位只是**如实转述**自己的机型档位。
             default ""
+
+        config ONEYE_FW_BLE_PROV_KEY_GATE
+            depends on ONEYE_FW_ENABLE_BLE_PROV
+            bool "BLE 配网改由按键进入/退出（长按 SET；开机只待机不广播）"
+            default n
+            help
+                置 y（**本批新语义**）：开机把 NimBLE 起栈并打印 `[res]` 读数，但**不广播**（待机）；
+                长按 SET 键进入配网模式（开始广播、串口打印 POP 与剩余时间），**再长按一次**退出；
+                进入后 `ONEYE_FW_BLE_PROV_PAIRING_WINDOW_S` 秒内没有设备入网 ⇒ 自动退出；
+                入网成功仍由收敛点（`on_wifi_ready()`）停广播。
+
+                ⚠️ 置 y 的代价（**必须知情**）：启动期不再接受配网 ⇒ 若无人长按 SET，
+                   `wifi_prov_submit_credentials()` 永不会被调用、`oneye_start()` 永不被调用，
+                   设备**不会上云**（串口会打印"待机"与"长按 SET"指引）。
+                置 n（缺省，= 旧行为）：开机即广播，随时可配网；此时长按 SET 仍可**退出/重新进入**
+                   配网模式（退出后同样靠再长按进入）。
+        config ONEYE_FW_BLE_PROV_PAIRING_WINDOW_S
+            depends on ONEYE_FW_ENABLE_BLE_PROV
+            int "BLE 配网模式超时（秒；进入后无成功入网则自动退出广播）"
+            range 30 3600
+            default 300
+            help
+                按用户口径取 300 s，与 SDK 的 POP 有效期
+                `CONFIG_ONEYE_DEV_SDK_BLE_POP_TTL_S`（缺省 300 s）对齐 ⇒
+                「POP 失效」与「配网窗口关闭」是同一刻，串口上的剩余时间与 App 侧看到的有效期一致。
+                ⚠️ 若把本值调**大于** POP TTL，则 POP 会先在窗口内轮换（App 侧需重新取码）——
+                   仍可用，但两端"有效期"不再一致，故非必要不要偏离 300。
+
+                ★ 2026-10-09 实测确认的机制（两条，都要记住）：`sdkconfig.h` 只对 **y 的 bool** 产出
+                   `#define`；**n 的 bool 与"依赖不满足"的符号都不会有任何宏**。
+                   ⇒ ① 顶层用 `#if CONFIG_ONEYE_FW_BLE_PROV` 判通道是必要的（本项为 n 时该宏不存在）；
+                     ② 用到本项的代码必须按 y/n 都写出**确定的**语义，
+                        ⛔ 不能用 `!CONFIG_ONEYE_FW_BLE_PROV_KEY_GATE` 这种"n 时也成立"的写法
+                        （n 时宏不存在 ⇒ `!0` = 1 ⇒ 语义被静默翻成 y）。
+                   本项放在 `menu "Wi-Fi"` 内 + 逐项 `depends on`：既被机型位门控，又不改变上面这个机制。
     endmenu
 
     menu "板级外设（默认关闭：未确认项不据推测启用）"

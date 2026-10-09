@@ -1,0 +1,35 @@
+# =============================================================================
+# 「BLE 机型 · 按键门控配网」预设 —— 在 sdkconfig.defaults.ble 之上再叠一层
+#
+# 叠加顺序（**必须排在 sdkconfig.defaults.ble 之后、最后一份**）：
+#   idf.py -B <构建目录> -DSDKCONFIG=<构建目录>/sdkconfig \
+#     -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.defaults.production;sdkconfig.defaults.ble;sdkconfig.defaults.ble-key" \
+#     -DONEYE_FW_CERT_DIR=<空目录> build
+#
+# ★ 为什么单独一份、而不是写进 sdkconfig.defaults.ble ★
+#   `sdkconfig.defaults.ble` 是**已真机打通的配网形态**（开机即广播、App 随时可配），
+#   本轮不动它，避免"为了加一个开关而重新验证一条已通过的路"。
+#   新语义只描述给**需要它的人**：按键门控是**取舍**而不是升级 ——
+#   开机不再广播 ⇒ 没人长按 SET 就永远不配网、不上云（Kconfig 帮助里写明这把代价）。
+#   两档并存 = 谁要哪一档就显式叠哪一档，改一份不影响另一份。
+#
+# ★ 顺序语义（沿用 sdkconfig.defaults.ble 的教训）★
+#   defaults 是**按文件顺序**逐条施加的；赋值给"当前不可见"的符号会被**静默丢弃**。
+#   本层两项都 `depends on ONEYE_FW_ENABLE_BLE_PROV`，而它由**上一层** `sdkconfig.defaults.ble`
+#   置 y（该文件内已按"依赖者在前"排好）⇒ 本层排在 .ble 之后才能生效。
+#   ⚠️ 把本文件排到 .ble 之前（或单独使用）= 两行被丢弃、构建出一个"看着开了门控其实没开"的件。
+#
+# ★ 生效自证（⛔ 不要只看"文件里写了"）★
+#   构建后 `build/config/sdkconfig.json` 里
+#   `ONEYE_FW_BLE_PROV_KEY_GATE` / `ONEYE_FW_BLE_PROV_PAIRING_WINDOW_S` 必须可见，
+#   且 `build/config/sdkconfig.h` 里 `CONFIG_ONEYE_FW_BLE_PROV_KEY_GATE` 必须有 `1`
+#   （bool 为 n 或依赖不满足时，sdkconfig.h 里**不会有任何宏**）。
+# =============================================================================
+
+# ---- 配网通道：在 BLE 通道之上改由按键进入/退出 --------------------------------
+# 开机把 NimBLE 起栈、打印读数，但**不广播**（待机）；长按 SET 进配网模式（开始广播 + 打印
+# POP 与剩余时间），再长按退出。取值与语义见 main/Kconfig.projbuild 的同名项（default n）。
+CONFIG_ONEYE_FW_BLE_PROV_KEY_GATE=y
+# 配网窗口 300 s：与 SDK 的 POP 有效期 `CONFIG_ONEYE_DEV_SDK_BLE_POP_TTL_S`（缺省 300 s）
+# 对齐 ⇒「POP 失效」与「窗口关闭」同一刻，串口剩余时间与 App 侧有效期一致。
+CONFIG_ONEYE_FW_BLE_PROV_PAIRING_WINDOW_S=300

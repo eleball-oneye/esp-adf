@@ -1195,3 +1195,61 @@ LCD 状态屏与摄像头抓帧见 §5.7/§5.8（**已真机闭环**），`video
   ⇒ 必须**同批重生成 6 个 xtensa 归档**（`build-all.sh --toolchains esp32s5@5.5.5` 一类），代价与风险高于注释收益 ⇒ **登记为待办**（下一批若动 SDK，须一并做）。
 - ⚠️ **§12.5 的"改前"读数取自上一批（`0x4F59` 落位批）的同机型真机串口**，不是本批在同一台机器上"回退后再抓一次"；
   两者的差异面被 `nid-serial-check.py` 限制为"仅偏移 11 一个字节"，故可作为"只差广播名"的机械证据；⛔ 但严格说它**不是**同一启动会话内的 A/B。
+
+## 13. 🔴 2026-10-09（第 4 批）：两串拆开 ＋ 广播载荷重排 ＋ 配对凭据改口径（就地订正）
+
+> **依据**：用户 2026-10-09 决策台账 #1 / #3 / #4 / #5 / #6 / #7 / #8 / #9；契约
+> [contracts/local/ble-gatt.md](../../../../../contracts/local/ble-gatt.md) 增量四 ＋ [link-frames.json](../../../../../contracts/local/link-frames.json)。
+> ⛔ **本节之前的 §10 / §12 里的身份口径（"广播名/salt/厂商字段三者同源 = node_id"）就地作废**（旧字逐字留痕，⛔ 不抹）。
+
+### 13.1 两串拆开（⛔ 不再"一个串喂三处"）
+
+| 串 | 属性 | 用途（本工程落点） |
+| --- | --- | --- |
+| **`node_id` = 激活码** | **私密**：⛔ 不广播、⛔ **不进明文帧**；✅ 贴机身 | ① `lcfg.node_id`（link 帧 `from`）`main/wifi_prov_ble.c:364`；② 配对 HKDF **salt** = `bcfg.device_id`（`:383`）；③ `prov.pair.code` 的**逐字比对基准**（`oneye_dev_ble.c` 的 `prov.pair` 处理） |
+| **`sn` = SN** | **公开**：贴机身、**可广播** | ① 广播名 `ONEYE-<SN 后 4 位>`（SDK 派生，名字只在 **GAP 层** 0x2A00）；② 厂商字段 `sn_field(24)` = `bcfg.adv_sn`（`:384`）；③ `prov.pair.ok.sn` |
+
+- **取值点（唯一处）**：`main/adv_identity.c:36` 的 `adv_identity_load()` —— 一次 `oneye_dev_creds_load()`
+  取**两串**（`:60` node_id、`:62` sn），取完即 free（16 KiB）；**`creds.sn` 为空 ⇒ 回落 `node_id`**（`:68`）
+  并置 `sn_fell_back`（**存量机行为不变**；厂商字段会因此被标 `0x04`）。
+- **头注释订正**：`include/oneye_dev_ble.h` 的 `device_id` / `adv_sn` 说明已改；§12.6 第 2 条登记的
+  "SDK 头注释未同批订正"待办 **本批已闭环**（含 `adv_product_key` 形参删除，见 13.2）。
+
+### 13.2 广播载荷重排（净荷 15 B → **27 B**；厂商 AD 31 B 用满）
+
+- 保留 128-bit Service UUID（系统层 `ScanFilter` ⛔ 不动）；**删 `pk_family` 段**；**SCAN_RSP ⛔ 不放设备名**；
+  `oneye_dev_ble_adv_mfg_encode(sn, out, cap)`（**`product_key` 形参已删**）+ `_decode(in, len, sn_out, sn_cap, flags_out)`。
+- 布局：`ver_flags(1)` ＋ `sn_field(24)` ＋ `reserved(2)`，**布局版本 1 → 2**；
+  `0x01` = sn_field 是 SN 的**尾部**（语义重定义，与 `node_id` 解耦）、`0x02` **退役恒 0**、`0x04` = **老世代 SN**（v1/v2 或回落形态）。
+- 实测（宿主侧跑**设备侧同一份编码器** `src/oneye_dev_ble_adv.c`，非真机空口）：
+
+  | 输入 | 净荷（27 B，hex） | flags | 厂商 AD |
+  | --- | --- | --- | --- |
+  | `KORVO2-0000`（存量机回落，11 B） | `24` `4b4f52564f322d30303030` ＋ 13×`00` ＋ `0000` | `0x04` | `1e ff 59 4f …`（**31 B**） |
+  | `SN-3-0042-567890ABCDE-05`（v3，24 B） | `20` `534e2d332d303034322d35363738393041424344452d3035` ＋ `0000` | `0x00` | `1e ff 59 4f …`（**31 B**） |
+  | `SN-2-0972-0059-MVQXP95XVSTJWAH…-64`（v2，44 B） | `25` `3935585653544a5741484146305032384e37534a342d3634` ＋ `0000` | `0x05`（截断＋老世代） | `1e ff 59 4f …`（**31 B**） |
+
+  ⇒ `sn_field` 恰好装下 v3 全量、**⛔ 不截断**；v1(29)/v2(44) 取**尾部 24 B** 并置 `0x01`；`reserved` 两字节恒 `00 00`。
+
+### 13.3 配对凭据改口径（主档 = 激活码 ＋ 一次性 `chal`；🔻 POP 兼容档保留）
+
+- `prov.hello` **明文回包**下发 `chal`（16 B；JSON 文本 = **32 位小写 hex**，编码点唯一 = `oneye_dev_ble.c` 的 `chal_hex()`）
+  ＋ `chal_ttl_s`（剩余秒数，取 `CONFIG_ONEYE_DEV_SDK_BLE_POP_TTL_S`，缺省 300）＋ `needs_pair` ⇒ ⛔ 不新增帧类型。
+- `prov.pair{code, chal}`：`code` = 激活码，设备**逐字比对**（`oneye_ble_activation_code_match()`，⛔ 不 trim / ⛔ 不折叠大小写）；
+  `chal` **一次性**（用后作废 / 过期作废 / 重放拒绝；`oneye_ble_chal_*`，纯函数、宿主 10 用例）；
+  `key = HKDF(ikm = node_id‖chal, salt = node_id, info="oneye-link-v1")`（`oneye_ble_pair_derive_key_chal()`）。
+  ⛔ `chal` 缺失/长度 ≠ 16 B ⇒ **fail-closed**（⛔ 不降级 `ikm = node_id`）。
+- `prov.pair.ok` ⇄ **`{sn, enc[, ttl_s][, cred_req]}`**，⛔ **不再回 `node_id`**；
+  `cred_req` = 机型级「是否要求激活凭证」，载体 = 本工程 Kconfig `ONEYE_FW_DEV_CRED_REQUIRED`（缺省 y，与 cloud fail-closed 同向）。
+- 🔻 **POP 通路整条保留**（`oneye_ble_pair_derive_key()` 与契约 §7.2 的 golden 向量逐字节一致 ⇒ 口径未改），仅降为兼容/产测档。
+
+### 13.4 本批自证（⛔ 不声称真机）
+
+- 宿主单测（WSL，`components/oneye-dev-sdk/build-host`）：**23 组 / 276 用例、断言 6386 次、失败 0 次、退出码 0**；
+  `ble_pair` **10/10**、`ble_adv_mfg` **11/11**（含"截断未置 `0x01` ⇒ 拒"与"忽略 `chal` 的探针"）。
+- **变异探针**（证明新用例非空转）：① 不置 `0x01` ⇒ `roundtrip_v2_and_v1_take_tail24` / `byte_layout_truncated_v2` /
+  `truncated_without_flag_is_rejected` / `truncation_flag_always_set` 全红；② `ikm` 退化为 `node_id` ⇒
+  `pair_key_derivation_with_challenge` 红；③ 消费后不清 `active` ⇒ `challenge_one_shot_semantics` 红（回退后 6 断言失败 / 2 组失败）。
+- 固件（WSL，`idf.py build`，`sdkconfig.defaults.ble-key` 叠加序）：**EXIT 0**（`korvo2_oneye.bin` 1,596,016 B）。
+- ⛔ **真机空口/串口读数本批未做**（⛔ 未烧写：等用户点）⇒ 13.2 的十六进制是**宿主侧同一编码器**的读数，
+  **不是**空口抓包；`扫描响应 实测 AD 字节（31 B）` 那行要烧写后才有。

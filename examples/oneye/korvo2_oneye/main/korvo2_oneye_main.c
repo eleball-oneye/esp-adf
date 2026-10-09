@@ -592,11 +592,64 @@ static esp_err_t sim_key_handler(const char *key, const char *action)
     return ESP_OK;
 }
 
+/* ---------------------------------------------------------------- 按键 → 配网模式（长按 SET）
+ *
+ * ★ 2026-10-09 本批：用户口径「按键进入/退出蓝牙配网模式」——
+ *   本板**没有独立 GPIO 按键**，6 键（REC/MUTE/SET/PLAY/VOL-/VOL+）是 ADC 梯形电阻共用 GPIO5
+ *   （`components/audio_board/esp32_s3_korvo2_v3/board.c:158-162`：`ADC_CHANNEL_4`，
+ *   阈值 `{190,600,1000,1375,1775,2195,3000}`）⇒ **唯一挂载点**就是下面的 `input_key_service_cb()`
+ *   （`keys_start()` 注册，`main/korvo2_oneye_main.c:606-625`）。⛔ 不为本功能新增 GPIO 依赖。
+ *
+ * 长按判据 = ESP-ADF `input_key_service` 归一化后的 **`INPUT_KEY_SERVICE_ACTION_PRESS`**：
+ *   短按 → `CLICK` + `CLICK_RELEASE`；长按 → `PRESS`（越过长按阈值那一刻）+ 松手时 `PRESS_RELEASE`
+ *   （映射见 `key_action_str()`，:445-454）。取 `PRESS` 而不是 `PRESS_RELEASE` 的理由：
+ *   PRESS 在用户"按住不放"时就触发，不必等到松手 —— 交互上按键立刻有反馈，且松手早/晚都不影响语义。
+ *   ⚠️ 类型字符 "press" 也**允许**从本地验证面注入（`POST /api/simulate/key`，`key_action_valid()` :573-582）
+ *   ⇒ 台面可以在**没有手**的情况下验证进入/退出路径（那正是该验证面存在的意义）。
+ *   ⚠️ 副作用（**已接受的语义**）：SET 键的 `press`（长按）此后**不再**上报为 `event/up` 按键事件 ——
+ *   它现在是"配网模式开关"，不是一条按键业务事件。短按 `set/click` 不受影响，仍然上报。
+ *
+ * ⛔ 门禁 `tools/check-prov-convergence.py` A8a/A13b 要求 `wifi_prov_ble_start()` 仍只在
+ *   `wifi_prov_boot()` 里被调用一次 ⇒ 本处**不调** `wifi_prov_ble_start()`，只调
+ *   `wifi_prov_ble_pairing_enter()`（它内部转调，见 wifi_prov_ble.c）。
+ */
+static bool ble_prov_mode_allowed(void)
+{
+#if !CONFIG_ONEYE_FW_ENABLE_BLE_PROV
+    return false;   /* 本机型没有这条通道：连提示都不打（与 boot 侧"未启用"提示同源，不重复刷屏） */
+#else
+    /* gate=n（缺省）= 旧的"开机即广播"语义：此时长按 SET **仍可**退出/重新进入配网模式
+     *（开机时 start() 已把 s_pairing 置真，长按一次即退出）；gate=y = 开机只待机。
+     * 两种取值下按键**都**可用 ⇒ 此处合并成一个分支（⛔ 不为 gate=y 另开一条按键路径）。 */
+    return true;
+#endif
+}
+
+static void ble_prov_key_toggle(void)
+{
+#if CONFIG_ONEYE_FW_ENABLE_BLE_PROV
+    if (wifi_prov_ble_pairing_is_active()) {
+        (void)wifi_prov_ble_pairing_exit();
+    } else {
+        (void)wifi_prov_ble_pairing_enter();
+    }
+#endif
+}
+
 static esp_err_t input_key_service_cb(periph_service_handle_t handle, periph_service_event_t *evt, void *ctx)
 {
     (void)handle;
     (void)ctx;
     if (evt == NULL) {
+        return ESP_OK;
+    }
+    /* ★ 进入/退出配网模式走**按键业务之前的**分支：它一旦命中就不再上报按键事件（见上段注释）。 */
+    if (ble_prov_mode_allowed() &&
+        evt->type == INPUT_KEY_SERVICE_ACTION_PRESS &&
+        evt->data == INPUT_KEY_USER_ID_SET) {
+        ESP_LOGI(TAG, "[key] set/press（长按）⇒ 切换 BLE 配网模式（%s）",
+                 wifi_prov_ble_pairing_is_active() ? "当前在配网模式 ⇒ 本次为退出" : "当前待机/已停 ⇒ 本次为进入");
+        ble_prov_key_toggle();
         return ESP_OK;
     }
     emit_key_event(key_user_str((int)evt->data), key_action_str((int)evt->type), false);
@@ -728,6 +781,9 @@ static void on_wifi_ready(void)
      *   C4 台面 API、C5 Kconfig），都在这一处进入上云链路。通道侧不需要、也不允许知道这里做什么。
      *   ⛔ 不要在这里按通道分叉；⛔ 也不要把本函数改造成"每通道一份"。 */
     wifi_prov_ble_stop_advertising();     /* 已入网 ⇒ 停 BLE 广播（幂等，重连时重复调无害） */
+    /* ★ 2026-10-09：上面这一处**不变**（它是"入网成功后自动停广播"的唯一收敛点）。
+     *   配网模式开关（`s_pairing`）由 `wifi_prov_ble_stop_advertising()` 之后的超时/按键路径收敛；
+     *   ⛔ 不在这里调 `wifi_prov_ble_pairing_exit()`（那会在重连路径上多出一条"退出配网模式"的重复日志）。 */
 
     static bool started;
     if (started) {
@@ -914,16 +970,49 @@ static void wifi_prov_boot(void)
      * 起交互式通道，「还没有凭据」不等于「上不了云」：等通道把凭据交进来，交进来之后走的是
      * 同一条收敛点（wifi_prov.c 的 GOT_IP → s_ready_cb）。 */
 #if CONFIG_ONEYE_FW_ENABLE_BLE_PROV
-    ESP_LOGI(TAG, "启动 BLE 配网通道 C1/C2（手机 App 或另一台嵌入式设备经 BLE 下发 SSID/密码）");
+    /* ★ 2026-10-09 本批：开机是否自动广播由**机型开关**决定，⛔ 不改 `wifi_prov_ble_start()` 的语义。
+     *   gate=n（缺省，= 旧行为）：开机即广播、随时可配网；
+     *   gate=y（新语义）：开机只"待机"（NimBLE 起栈、GATT 注册、**不广播**）⇒ 长按 SET 进入配网模式。
+     *   ⚠️ gate=y 时必须让 `start()` 知道 ⇒ 先 `set_autostart(false)` 再 `start()`。
+     *   ⚠️ 用局部常量而不是到处写 `CONFIG_..._KEY_GATE`：下面三处判断必须取**同一个值**，
+     *      否则串口说的与实际做的可能不是一回事（本批反复强调的"日志不许说假话"）。
+     *   ⚠️ `#ifdef` 兜底（2026-10-09 实测确认的机制）：`sdkconfig.h` 对 **bool 型 n 值不产出任何宏**
+     *      （只有 `CONFIG_X=y` 才有 `#define CONFIG_X 1`；`n` 是"根本没有这一行"）。
+     *      于是 `!CONFIG_..._KEY_GATE` 在预处理期等于 `!0` = **1** —— **编得过，但语义被悄悄翻成
+     *      gate=y**（比编不过更坏：没人会去查）。这里显式判 `#ifdef`：宏缺失 ⇒ `key_gate=false`
+     *      = 旧行为（开机广播），即"配置不明时不外扩"。⛔ 这不是第二事实源：Kconfig 仍是唯一入口，
+     *      只是给"宏不存在"这一种状态一个**保守**语义。 */
+#ifdef CONFIG_ONEYE_FW_BLE_PROV_KEY_GATE
+    const bool key_gate = true;
+#else
+    const bool key_gate = false;
+#endif
+    wifi_prov_ble_set_autostart(!key_gate);
+    ESP_LOGI(TAG, "启动 BLE 配网通道 C1/C2（手机 App 或另一台嵌入式设备经 BLE 下发 SSID/密码）"
+                  "：%s",
+             key_gate
+                 ? "按键门控模式 —— 开机不广播（待机），长按 SET 键进入配网模式"
+                 : "开机即广播（gate=n 的旧语义；长按 SET 可退出/重新进入配网模式）");
     if (wifi_prov_ble_start() == ESP_OK) {
-        ESP_LOGW(TAG, "下一步：手机 App 连接 ONEYE-<设备 id 后 4 位>，"
-                      "输入串口打印的 6 位配对码（POP）后下发 Wi-Fi 凭据");
+        if (key_gate) {
+            /* ★ 待机形态的"下一步"必须写清**怎么离开待机**，否则串口只说了"没广播"，
+             *   现场只能猜（2026-10-07 那批踩过的正是"指引做不到/没说"这一类）。 */
+            ESP_LOGW(TAG, "下一步：**长按 SET 键**进入 BLE 配网模式（串口会打印 6 位配对码 POP 与剩余时间；"
+                          "再长按一次退出，%d s 未配网成功也会自动退出）",
+                     (int)CONFIG_ONEYE_FW_BLE_PROV_PAIRING_WINDOW_S);
+        } else {
+            ESP_LOGW(TAG, "下一步：手机 App 连接 ONEYE-<设备 id 后 4 位>，"
+                          "输入串口打印的 6 位配对码（POP）后下发 Wi-Fi 凭据"
+                          "（长按 SET 键可退出配网模式）");
+        }
         /* ★ 2026-10-07（第三批）：**NimBLE 主机栈已起来（12 KB，
          *   `CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE 12288`）、已开始广播、而还没有入网**的这一刻，
          *   把内部 RAM 的三个量打出来 —— 这正是 BLE 机型此前**没有读数**的那一个时刻
          *   （入网后那处 `phase=cloud-start…` 本机型走不到）。与本函数上方/`app_main()` 里的
-         *   `phase=pre-prov…`（同一块板、外设已就绪、NimBLE 之前）相减即 NimBLE 的净代价。 */
-        res_report("ble-ready（NimBLE 已起栈并广播、未入网）");
+         *   `phase=pre-prov…`（同一块板、外设已就绪、NimBLE 之前）相减即 NimBLE 的净代价。
+         * ⚠️ 2026-10-09：gate=y 时此刻**未广播**，但"NimBLE 主机栈已起栈"这一点不变 ⇒ 读数同义
+         *   （它就是"起栈后、入网前"的量），故这一处**不动**（门禁 A13b 亦要求它在 start() 之后）。 */
+        res_report("ble-ready（NimBLE 已起栈；gate=y 时未广播、入网前）");
         panel_start_if_enabled();     /* 无 IP ⇒ 提示并直接返回 */
         return;                       /* 等通道提交凭据；入网后由收敛点统一触发上云 */
     }

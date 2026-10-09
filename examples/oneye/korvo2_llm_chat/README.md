@@ -45,7 +45,7 @@ REC 长按 ──► AFE(AEC+降噪) 采集 ──► 0x01 二进制上行(60 ms
 | `0x01` 上行 / `0x02` 下行 | `binary_kinds` |
 | `input.audio.commit` / `input.cancel` | `frames`（含 `cancelled` 回写字段） |
 | 单轮 30 s / 会话 10 min / 上行 64 KB/s | `limits`（固件侧 `ONEYE_LLM_TURN_MAX_MS` 兜底） |
-| BLE 配网 GATT/分片/POP 配对 | `contracts/local/ble-gatt.md`（由 `oneye-dev-sdk` 的 `oneye_dev_ble` 实现） |
+| BLE 配网 GATT/分片/配对（激活码＋一次性 `chal`） | `contracts/local/ble-gatt.md`（由 `oneye-dev-sdk` 的 `oneye_dev_ble` 实现） |
 | 局域网发现与帧面 | `contracts/local/lan-link.md`（本工程 `lan_link.c`） |
 | SmartConfig 设备侧 | `contracts/local/smartconfig.md`（**复用 ESP-IDF 内置实现**，端口 7001/ACK 11 B） |
 | link 帧信封与节点/组域 | `contracts/local/link-frames.json` + `README.md`（由 `oneye_dev_link` 实现） |
@@ -257,8 +257,9 @@ I (10807) llm_client: 状态 → SPEAKING
 I (13382) panel: [panel] 本轮结束：turn_seq=1 rtt=438 ms
 ```
 
-**仍未做**：手机侧（`mobile/Android`）真机连这个 GATT 服务走完 POP 配对 + 下发 Wi-Fi 凭据的端到端流程
+**仍未做**：手机侧（`mobile/Android`）真机连这个 GATT 服务走完配对（激活码＋一次性 `chal`）+ 下发 Wi-Fi 凭据的端到端流程
 （本机缺 JDK/Gradle/Android SDK，见 `mobile/README.md` 的"待验收（缺工具链）"清单）。
+〔⚠️ 2026-10-09 订正（依据 = 用户 2026-10-09 裁定「彻底删除 POP」）：旧字逐字留痕 =「走完 POP 配对」〕
 
 ### 7.1.4 根因：`link_report_task` 栈溢出踩坏自旋锁 → CPU1 中断看门狗（第 8 轮定位并修复）
 
@@ -350,7 +351,7 @@ HTTP `GET /healthz` 探同一 host:port，用来判定"是 socket/lwIP 层面"�
 | REC 键长按服务 | ✅ | `key_talk: REC 键就绪：长按 ≥ 600 ms 开始收音`（`press_judge_time` 覆写生效）；ADC 校准成功 |
 | 凭据文件配网（本板 SD 卡 `/sdcard/oneye-wifi.txt`） | ✅ | `prov_service: 凭据文件命中 … ssid=wanya` → `已联网：ssid=wanya ip=192.168.110.83 source=file` |
 | 局域网链路 | ✅ 启动 | `lan_link: UDP 发现已就绪（57321）` + `POST http://<ip>:80/api/link/frame` 已注册 |
-| BLE 配网 | ✅ 已通（第 9 轮） | `GATT 服务已注册` + `POP=xxxxxx` + `BLE 配网已就绪`；与语音闭环同跑（见 §7.1.3） |
+| BLE 配网 | ✅ 已通（第 9 轮，**历史读数**） | 第 9 轮现场：`GATT 服务已注册` + `POP=xxxxxx` + `BLE 配网已就绪`；与语音闭环同跑（见 §7.1.3）。⚠️ **2026-10-09 起 POP 已按用户裁定彻底删除** ⇒ 现值 = 激活码（机身贴码）＋一次性 `chal`，⛔ 串口不再打印配对码（该行是**当时的**实测读数，⛔ 不改写） |
 | 语音面一轮闭环 | ✅ 已闭环 | 见 §7.1.1：上行 82,560 B / 下行 88,320 B / 首帧 369–412 ms，无复位、无 `conflict` |
 
 **开机即复位的缺陷 → 第 2 轮已修（关键根因在 SDK 侧）**：
@@ -380,9 +381,11 @@ HTTP `GET /healthz` 探同一 host:port，用来判定"是 socket/lwIP 层面"�
 
 **BLE 配网（第 9 轮已通，见 §7.1.3）**
 
-设备侧已能：`GATT 服务已注册` → 广播（设备名走扫描响应）→ `POP` 打印 → `BLE 配网已就绪`，
-并与语音闭环同跑。**仍未做**的是手机侧真机走完 POP 配对 + 下发 Wi-Fi 凭据的端到端流程
+设备侧已能：`GATT 服务已注册` → 广播（设备名走扫描响应）→ `BLE 配网已就绪`，
+并与语音闭环同跑。**仍未做**的是手机侧真机走完配对（激活码＋一次性 `chal`）+ 下发 Wi-Fi 凭据的端到端流程
 （`mobile/Android` 工程已就位，但本机缺 JDK/Gradle/Android SDK，构建与单测登记"待验收（缺工具链）"）。
+〔⚠️ 2026-10-09 订正（依据 = 用户 2026-10-09 裁定「彻底删除 POP」）：旧字逐字留痕 =「→ `POP` 打印 →」
+与「走完 POP 配对 +」；该 POP 通路与串口打印均已删除。〕
 
 **其余待真机取证项**：
 
@@ -612,23 +615,26 @@ python tools/check-sdkconfig-drift.py --memory   # 只看内存/网络/BLE/AFE
 
 **① 实现（在 SDK 层，`oneye-dev-sdk` c78d0d6）**：把"连续计数 + 阈值判定"做成**纯函数守卫**
 （`oneye_ble_pair_guard_*`，宿主可单测），达阈值时由 BLE 层执行回退：清会话密钥/nonce、清配对态、
-按 TTL 轮换 POP、恢复广播；**有意不断链、不删 BLE bond**（契约要的是应用层重新 `prov.pair`；
+按 TTL 轮换 challenge、恢复广播；**有意不断链、不删 BLE bond**（契约要的是应用层重新 `prov.pair`；
 断链动作在收帧回调里做会与 NimBLE 主机任务重入）。解密**成功**即清零 —— 契约要的是"连续"。
-统计新增 `crypt_fail_count` / `unpair_by_crypt`（`oneye_dev_ble_get_status()` 可取）。
+统计 `crypt_fail_count` / `unpair_by_crypt`（`oneye_dev_ble_get_status()` 可取）。
+〔⚠️ 2026-10-09 订正（依据 = 用户 2026-10-09 裁定「彻底删除 POP」）：旧字逐字留痕 =「按 TTL 轮换 POP」。〕
 
 **② 真机取证（COM12，POP=153902；正/负双向）**：
 
 | 注入 | 判据（都是**正面证据**，不用超时判成功） | 结果 |
 | --- | --- | --- |
-| 用**错误密钥**连发 **3** 帧 | 设备回到未配对态 ⇒ **明文** `prov.pair{pop}` 应被重新受理并回明文 `prov.pair.ok` | ✅ `CRYPT_UNPAIR_AFTER_3=PASS` |
+| 用**错误密钥**连发 **3** 帧 | 设备回到未配对态 ⇒ **明文** `prov.pair{code, chal}`（现值；**历史判据逐字留痕** =「明文 `prov.pair{pop}`」，POP 已按用户 2026-10-09 裁定删除）应被重新受理并回明文 `prov.pair.ok` | ✅ `CRYPT_UNPAIR_AFTER_3=PASS` |
 | 用**错误密钥**连发 **2** 帧 | 设备**不应**回退 ⇒ 用正确密钥再发一帧必须仍能密文往返（`link.pong` nonce 一致） | ✅ `CRYPT_NO_UNPAIR_UNDER_3=PASS` |
 
 命令（`oneye-dev-sdk/tools/ble_prov_e2e.py`，新增 `--crypt-fault N`）：
 
 ```bash
-python tools/ble_prov_e2e.py --pop <串口 POP> --crypt-fault 3   # 正例：应回退
-python tools/ble_prov_e2e.py --pop <串口 POP> --crypt-fault 2   # 负向对照：不应回退
+python tools/ble_prov_e2e.py --code <机身贴码＝激活码> --crypt-fault 3   # 正例：应回退
+python tools/ble_prov_e2e.py --code <机身贴码＝激活码> --crypt-fault 2   # 负向对照：不应回退
 ```
+〔⚠️ 2026-10-09 订正（依据 = 用户 2026-10-09 裁定「彻底删除 POP」）：旧命令逐字留痕 =
+`--pop <串口 POP> --crypt-fault 3` / `--pop <串口 POP> --crypt-fault 2`（`--pop` 通路已删除）。〕
 
 **③ 踩坑（重要流程教训）**：第一次真机注入 **FAIL**，根因不在逻辑而在构建：
 例程 CMake **优先链接 `components/oneye-dev-sdk/lib/<toolchain>/` 下的预编译归档库**，

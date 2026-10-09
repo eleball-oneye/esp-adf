@@ -104,7 +104,8 @@ CONFIG_SPIFFS_MAX_PARTITIONS=3
 # 凭据文件配网（SD /sdcard/oneye-wifi.txt → SPIFFS /spiffs/oneye-wifi.txt）——**台面/研发用**，量产置 n
 CONFIG_ONEYE_LLM_ENABLE_WIFI_FILE=y
 CONFIG_ONEYE_LLM_ENABLE_SDCARD=y
-# BLE 配网（自研 GATT + POP）与 SmartConfig（ESPTouch v2）并行，先成功者胜出
+# BLE 配网（自研 GATT；配对凭据 = 激活码＋一次性 chal，⛔ POP 已按用户 2026-10-09 裁定删除）
+# 与 SmartConfig（ESPTouch v2）并行，先成功者胜出
 CONFIG_ONEYE_LLM_ENABLE_BLE_PROV=y
 CONFIG_ONEYE_LLM_ENABLE_SMARTCONFIG=y
 # 转写/模型文本是否打到串口（PIPL：正文**不落盘**；量产建议 n，避免日志外泄）

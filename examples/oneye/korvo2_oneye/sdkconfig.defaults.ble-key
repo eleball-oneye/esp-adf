@@ -28,8 +28,10 @@
 
 # ---- 配网通道：在 BLE 通道之上改由按键进入/退出 --------------------------------
 # 开机把 NimBLE 起栈、打印读数，但**不广播**（待机）；长按 SET 进配网模式（开始广播 + 打印
-# POP 与剩余时间），再长按退出。取值与语义见 main/Kconfig.projbuild 的同名项（default n）。
+# 本机型是否需要激活凭证与剩余时间），再长按退出。取值与语义见 main/Kconfig.projbuild 的同名项（default n）。
 CONFIG_ONEYE_FW_BLE_PROV_KEY_GATE=y
-# 配网窗口 300 s：与 SDK 的 POP 有效期 `CONFIG_ONEYE_DEV_SDK_BLE_POP_TTL_S`（缺省 300 s）
-# 对齐 ⇒「POP 失效」与「窗口关闭」同一刻，串口剩余时间与 App 侧有效期一致。
+# 配网窗口 300 s：与 SDK 的一次性 challenge（配对凭据）有效期
+# `CONFIG_ONEYE_DEV_SDK_BLE_CHAL_TTL_S`（缺省 300 s；⛔ POP 已按用户 2026-10-09 裁定彻底删除，
+# 旧名逐字留痕 = `CONFIG_ONEYE_DEV_SDK_BLE_POP_TTL_S`）对齐 ⇒「chal 失效」与「窗口关闭」同一刻，
+# 串口剩余时间与 App 侧有效期一致。
 CONFIG_ONEYE_FW_BLE_PROV_PAIRING_WINDOW_S=300

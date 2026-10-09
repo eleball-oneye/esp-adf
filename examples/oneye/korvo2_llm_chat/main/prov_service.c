@@ -433,12 +433,13 @@ esp_err_t prov_service_init(esp_periph_set_handle_t periph_set, prov_ready_cb_t 
     if (err != ONEYE_DEV_SDK_OK) {
         ESP_LOGW(TAG, "oneye_dev_ble_init 失败：%d（BLE 配网不可用）", (int)err);
     } else {
-        if (CONFIG_ONEYE_LLM_PROV_POP[0] != '\0') {
-            (void)oneye_dev_ble_set_pop(CONFIG_ONEYE_LLM_PROV_POP);
-        }
+        /* ⛔ 旧代码逐字留痕（⛔ 不抹）：`if (CONFIG_ONEYE_LLM_PROV_POP[0] != '\0') {
+         *   (void)oneye_dev_ble_set_pop(CONFIG_ONEYE_LLM_PROV_POP); }` —— 固定 POP 注入口，
+         *   按用户 2026-10-09 裁定「彻底删除实现及契约」整段删除（含 Kconfig 同名项）。 */
         (void)oneye_dev_ble_start();
         (void)oneye_dev_ble_bind_to_link(); /* 把 BLE 注册为 link 的 ble 信道发送器 */
-        ESP_LOGI(TAG, "BLE 配网已就绪（未配网时会以 ONEYE-<id 后 4 位> 广播；POP 在 start 时打印）");
+        ESP_LOGI(TAG, "BLE 配网已就绪（未配网时会以 ONEYE-<id 后 4 位> 广播；"
+                      "配对凭据 = 激活码（机身贴码）＋一次性 chal，⛔ 串口不再打印 POP）");
     }
 #endif
 
@@ -541,16 +542,17 @@ esp_err_t prov_service_start(void)
 
     /* 无凭据 → 开启配网通道（BLE + SmartConfig 并行）；Wi-Fi 已在 init 阶段 start（供扫描用） */
     prov_report(ONEYE_DEV_LINK_PROV_PAIRING, NULL);
-    ESP_LOGI(TAG, "未配网：等待手机经 BLE（POP 配对）或 SmartConfig 下发凭据");
+    ESP_LOGI(TAG, "未配网：等待手机经 BLE（配对凭据 = 激活码＋一次性 chal，⛔ POP 已删）"
+                  "或 SmartConfig 下发凭据");
 
 #if CONFIG_ONEYE_LLM_ENABLE_BLE_PROV
     if (oneye_dev_ble_is_initialized()) {
         if (oneye_dev_ble_advertise(true) == ONEYE_DEV_SDK_OK) {
             s_st.ble_active = true;
-            char pop[ONEYE_DEV_BLE_POP_LEN] = { 0 };
-            if (oneye_dev_ble_get_pop(pop, sizeof(pop)) == ONEYE_DEV_SDK_OK) {
-                ESP_LOGI(TAG, "BLE 已开始广播（配对 POP：%s，TTL 300 s）", pop);
-            }
+            /* ⛔ 旧代码逐字留痕（⛔ 不抹）：读回并打印 `配对 POP：%s，TTL 300 s`
+             *   （`oneye_dev_ble_get_pop()`）—— 按用户 2026-10-09 裁定「彻底删除实现及契约」整段删除。 */
+            ESP_LOGI(TAG, "BLE 已开始广播（配对凭据 = 激活码（机身贴码）＋一次性 chal；"
+                          "⛔ 串口不再打印 POP）");
         }
     }
 #endif

@@ -997,12 +997,12 @@ static void wifi_prov_boot(void)
         if (key_gate) {
             /* ★ 待机形态的"下一步"必须写清**怎么离开待机**，否则串口只说了"没广播"，
              *   现场只能猜（2026-10-07 那批踩过的正是"指引做不到/没说"这一类）。 */
-            ESP_LOGW(TAG, "下一步：**长按 SET 键**进入 BLE 配网模式（串口会打印 6 位配对码 POP 与剩余时间；"
-                          "再长按一次退出，%d s 未配网成功也会自动退出）",
+            ESP_LOGW(TAG, "下一步：**长按 SET 键**进入 BLE 配网模式（串口会打印本机型是否需要激活凭证"
+                          "与剩余时间；再长按一次退出，%d s 未配网成功也会自动退出）",
                      (int)CONFIG_ONEYE_FW_BLE_PROV_PAIRING_WINDOW_S);
         } else {
             ESP_LOGW(TAG, "下一步：手机 App 连接 ONEYE-<设备 id 后 4 位>，"
-                          "输入串口打印的 6 位配对码（POP）后下发 Wi-Fi 凭据"
+                          "输入**机身贴码（激活码＝node_id）**后下发 Wi-Fi 凭据"
                           "（长按 SET 键可退出配网模式）");
         }
         /* ★ 2026-10-07（第三批）：**NimBLE 主机栈已起来（12 KB，
@@ -1042,7 +1042,7 @@ static void wifi_prov_boot(void)
 #elif CONFIG_ONEYE_FW_ENABLE_BLE_PROV
     ESP_LOGW(TAG, "下一步：本机型**不支持** SD 卡配网（ONEYE_FW_ENABLE_WIFI_FILE=n）"
                   "⇒ 请用 BLE 配网：手机 App 连接 ONEYE-<设备 id 后 4 位>，"
-                  "输入串口打印的 6 位配对码（POP）后下发 Wi-Fi 凭据");
+                  "输入**机身贴码（激活码＝node_id）**后下发 Wi-Fi 凭据");
 #else
     ESP_LOGE(TAG, "本机型既无 SD 卡配网能力（ONEYE_FW_ENABLE_WIFI_FILE=n）也无 BLE 通道"
                   "（ONEYE_FW_ENABLE_BLE_PROV=n）⇒ 属于配置错误，请修正机型 defaults（ADR-0017 D3）");

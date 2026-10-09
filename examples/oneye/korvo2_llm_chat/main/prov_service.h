@@ -3,7 +3,8 @@
  *
  * 三条通道**并行**，先成功者胜出（契约 contracts/local/README.md §4）：
  *   1. 凭据文件（台面/研发）：`/sdcard/oneye-wifi.txt` → `/spiffs/oneye-wifi.txt` → Kconfig 兜底；
- *   2. BLE（主通道，加密）：`oneye_dev_ble` 自研 GATT + POP 配对；AP 扫描/连接由本模块
+ *   2. BLE（主通道，加密）：`oneye_dev_ble` 自研 GATT + 配对凭据（激活码＋一次性 `chal`，⛔ POP 已删）；
+ *      AP 扫描/连接由本模块
  *      以 `oneye_dev_ble_prov_handlers_t` 注入（契约要求 Wi-Fi 生命周期归应用）；
  *   3. SmartConfig（备用，无 BLE 权限时）：ESP-IDF 内置 ESPTouch v2（设备侧不自研协议栈）。
  *

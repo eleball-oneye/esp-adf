@@ -97,9 +97,9 @@ menu "korvo2_oneye 板级固件配置"
             help
                 配网通道 C1（手机 App）与 C2（另一台嵌入式设备）：BLE 上跑 link 帧，
                 由 App/对端下发 SSID/密码（契约 contracts/local/ble-gatt.md）。
-                设备侧复用 SDK 的 `liboneye_dev_ble`（自研 GATT；🔴 2026-10-09 起配对凭据 =
+                设备侧复用 SDK 的 `liboneye_dev_ble`（自研 GATT；配对凭据 =
                 **激活码（`prov.pair.code`，用户从机身贴码输入）＋ 一次性 `chal`**
-                → HKDF-SHA256 → AES-128-GCM；🔻 POP 降为**兼容/产测档**，字段与实现保留、⛔ 不删），
+                → HKDF-SHA256 → AES-128-GCM；⛔ POP（6 位数字）已按用户 2026-10-09 裁定彻底删除），
                 实现见 main/wifi_prov_ble.c —— 它**只**把凭据交给 wifi_prov_submit_credentials()，
                 入网后动作统一由 main/wifi_prov.c 的收敛点触发（ADR-0017 D2）。
 
@@ -108,9 +108,9 @@ menu "korvo2_oneye 板级固件配置"
                 与 sdkconfig.defaults.ble 的逐项注释。
                 **无 SD 卡槽的机型应打开本项**（此时 WIFI_FILE=n，由构建期门禁保证仍有通道）。
 
-        config ONEYE_FW_BLE_POP
-            depends on ONEYE_FW_ENABLE_BLE_PROV
-            string "固定 BLE 配对 POP（6 位数字；空 = SDK 随机生成并打印串口，TTL 见 SDK 配置）"
+        # ⛔ 旧项逐字留痕（⛔ 不抹）——`config ONEYE_FW_BLE_POP` / `string "固定 BLE 配对 POP
+        #   （6 位数字；空 = SDK 随机生成并打印串口，TTL 见 SDK 配置）"`：按用户 2026-10-09 裁定
+        #   「彻底删除实现及契约」整项删除（台面注入口 ⇒ 无处可注）。
 
         config ONEYE_FW_DEV_CRED_REQUIRED
             depends on ONEYE_FW_ENABLE_BLE_PROV
@@ -142,7 +142,8 @@ menu "korvo2_oneye 板级固件配置"
             default n
             help
                 置 y（**本批新语义**）：开机把 NimBLE 起栈并打印 `[res]` 读数，但**不广播**（待机）；
-                长按 SET 键进入配网模式（开始广播、串口打印 POP 与剩余时间），**再长按一次**退出；
+                长按 SET 键进入配网模式（开始广播、串口打印**本机型是否需要激活凭证**与剩余时间），
+                **再长按一次**退出；
                 进入后 `ONEYE_FW_BLE_PROV_PAIRING_WINDOW_S` 秒内没有设备入网 ⇒ 自动退出；
                 入网成功仍由收敛点（`on_wifi_ready()`）停广播。
 
@@ -157,10 +158,11 @@ menu "korvo2_oneye 板级固件配置"
             range 30 3600
             default 300
             help
-                按用户口径取 300 s，与 SDK 的 POP 有效期
-                `CONFIG_ONEYE_DEV_SDK_BLE_POP_TTL_S`（缺省 300 s）对齐 ⇒
-                「POP 失效」与「配网窗口关闭」是同一刻，串口上的剩余时间与 App 侧看到的有效期一致。
-                ⚠️ 若把本值调**大于** POP TTL，则 POP 会先在窗口内轮换（App 侧需重新取码）——
+                按用户口径取 300 s，与 SDK 的一次性 challenge（配对凭据）有效期
+                `CONFIG_ONEYE_DEV_SDK_BLE_CHAL_TTL_S`（缺省 300 s；⚠️ 旧名逐字留痕：
+                `CONFIG_ONEYE_DEV_SDK_BLE_POP_TTL_S`，POP 已按用户 2026-10-09 裁定彻底删除）对齐 ⇒
+                「chal 失效」与「配网窗口关闭」是同一刻，串口上的剩余时间与 App 侧看到的有效期一致。
+                ⚠️ 若把本值调**大于** chal TTL，则 chal 会先在窗口内轮换（App 侧需重新取 chal）——
                    仍可用，但两端"有效期"不再一致，故非必要不要偏离 300。
 
                 ★ 2026-10-09 实测确认的机制（两条，都要记住）：`sdkconfig.h` 只对 **y 的 bool** 产出

@@ -27,7 +27,8 @@ static const char *TAG = "wifi_prov_ble";
 
 static bool s_started;
 static bool s_advertising;
-static char s_pop[ONEYE_DEV_BLE_POP_LEN];
+/* ⛔ 旧值逐字留痕（⛔ 不抹）：`static char s_pop[ONEYE_DEV_BLE_POP_LEN];` —— POP（6 位数字）已按
+ *   用户 2026-10-09 裁定「彻底删除实现及契约」整条删除（含本工程 Kconfig 的 `ONEYE_FW_BLE_POP`）。 */
 
 /* ------------------------------------------------- 「配网模式」状态（2026-10-09 本批）
  *
@@ -89,6 +90,11 @@ static bool s_ids_ready;
  * 计时器，而它们的定义在下方「配网模式」段 —— C 的单遍扫描要求此处先声明。 */
 static void window_restart(void);
 static void window_stop(void);
+/* 前置声明：`pairing_enter()` 的"进入配网模式"日志要打印**本机型是否需要激活凭证**（非敏感口径，
+ * ⛔ 不打印 POP / 激活码 / chal），而 `dev_cred_required()` 的定义在下方「通道启动」段的
+ * `#if CONFIG_ONEYE_FW_ENABLE_BLE_PROV` 之内 ⇒ 与 window_* 同理，此处先声明（C 单遍扫描）。
+ * ⚠️ 该调用点自身也在 `#if CONFIG_ONEYE_FW_ENABLE_BLE_PROV` 的 `#else` 分支里（通道关时不可达）。 */
+static bool dev_cred_required(void);
 
 /* 扫描：直接转发给 wifi_prov.c 的实现（Wi-Fi 生命周期归它管，本模块不碰 esp_wifi_*） */
 static int ble_prov_scan(char *json_out, size_t cap, void *ctx)
@@ -256,12 +262,15 @@ esp_err_t wifi_prov_ble_pairing_enter(void)
     s_pairing = true;
     window_restart();
     /* ★ 可观测性（用户 2026-10-09 口径：进入/退出/超时各一行明确日志，⛔ 不含凭据）：
-     *   本行是"进入"那一行；POP 只在串口，⛔ 不进任何上行帧。
+     *   本行是"进入"那一行；⛔ POP 已按用户 2026-10-09 裁定彻底删除 ⇒ 串口**不再打印 POP**，
+     *   改为打印**本机型是否需要激活凭证**等非敏感信息（⛔ 不打印激活码 / chal，
+     *   ⛔ 也不打印任何新凭据）。
      *   "剩余时间" = 整个窗口（刚进入），后续由超时那一行给出结论。 */
-    ESP_LOGI(TAG, "已进入 BLE 配网模式：广播中，POP=%s（有效期 %d s），"
+    ESP_LOGI(TAG, "已进入 BLE 配网模式：广播中；本机型%s激活凭证（cred_req=%d）；"
+                  "配对凭据 = 激活码（机身贴码）＋一次性 chal（chal TTL %d s）；"
                   "配网窗口剩余 %d s；再长按 SET 退出",
-             (s_pop[0] != '\0') ? s_pop : "(未读出，见上方就绪日志)",
-             (int)CONFIG_ONEYE_DEV_SDK_BLE_POP_TTL_S,
+             dev_cred_required() ? "需要" : "不需要", dev_cred_required() ? 1 : 0,
+             (int)CONFIG_ONEYE_DEV_SDK_BLE_CHAL_TTL_S,
              (int)CONFIG_ONEYE_FW_BLE_PROV_PAIRING_WINDOW_S);
     return ESP_OK;
 #endif
@@ -397,13 +406,8 @@ esp_err_t wifi_prov_ble_start(void)
         ESP_LOGE(TAG, "BLE 初始化失败（%d）⇒ 本通道不可用（其余通道不受影响）", (int)rc);
         return ESP_FAIL;
     }
-    if (CONFIG_ONEYE_FW_BLE_POP[0] != '\0') {
-        /* 固定 POP（产测/台面）；不是 6 位数字时 SDK 会拒，这里退回随机 POP 而不是硬失败 */
-        if (oneye_dev_ble_set_pop(CONFIG_ONEYE_FW_BLE_POP) != ONEYE_DEV_SDK_OK) {
-            ESP_LOGW(TAG, "固定 POP「%s」被拒（须 6 位数字）⇒ 改用 SDK 随机 POP",
-                     CONFIG_ONEYE_FW_BLE_POP);
-        }
-    }
+    /* ⛔ 旧代码逐字留痕（⛔ 不抹）—— 固定 POP 注入口（`oneye_dev_ble_set_pop(CONFIG_ONEYE_FW_BLE_POP)`）：
+     *   按用户 2026-10-09 裁定「彻底删除实现及契约」整段删除（含 Kconfig 的 `ONEYE_FW_BLE_POP`）。 */
     rc = oneye_dev_ble_start();
     if (rc != ONEYE_DEV_SDK_OK) {
         ESP_LOGE(TAG, "BLE 启动失败（%d）⇒ 本通道不可用", (int)rc);
@@ -431,34 +435,29 @@ esp_err_t wifi_prov_ble_start(void)
     }
 
     s_started = true;
-    s_pop[0] = '\0';
     /* ⚠️ 走到这里 `s_ids_ready` 必为真（第 0 步 fail-closed 已保证）：故此处不再有"身份缺失"分支，
-     *    ⛔ 该分支不是被放宽，而是**不可达**了 —— 读不到 creds 时本函数在上面就返回 ESP_FAIL。 */
-    if (oneye_dev_ble_get_pop(s_pop, sizeof(s_pop)) == ONEYE_DEV_SDK_OK) {
-        /* ★ 2026-10-09（台账 #1 / #3 / #7）：就绪行必须把**两串**讲清楚 ——
-         *   · 激活码 `node_id`（私密）只喂：link 节点 id + HKDF salt + `prov.pair.code` 比对基准；
-         *   · SN（公开）喂：广播名（GAP 层，SDK 派生 `ONEYE-<SN 后 4 位>`）、厂商字段、`prov.pair.ok.sn`。
-         *   ⛔ 不再写"三者同源于 node_id"（那是 2026-10-07 那批的口径，本批已就地作废）。
-         *   ⚠️ 广播名的**后缀不在本文件里另算一遍**（那是第二处派生 = 第二事实源）：
-         *      空口字节由 SDK 平台层开机打印（`oneye_ble_plat_nimble.c` 的扫描响应逐字节行）。
-         * ★ 2026-10-09：状态词按**实际是否在广播**打印（"广播中"/"待机"），
-         *   ⛔ 不许在待机时沿用"广播中"——那会让串口说假话（本批第一个要防的形态）。 */
-        ESP_LOGI(TAG, "BLE 配网通道已就绪：%s；激活码 node_id=%s（私密：salt+code 比对基准）；"
-                      "SN=%s（公开：广播名 `ONEYE-<后 4 位>`/厂商字段(24 B)/prov.pair.ok；%s）；"
-                      "配对凭据 = 激活码＋一次性 chal（POP=%s 仅兼容/产测档，TTL %d s）；cred_req=%d",
-                 s_advertising ? "广播中" : "待机（未广播，等按键进入配网模式）",
-                 s_ids.node_id, s_ids.sn,
-                 s_ids.sn_fell_back ? "creds.sn 为空⇒回落 node_id（SDK 将标 0x04 老世代）" : "来源 creds.sn",
-                 s_pop, CONFIG_ONEYE_DEV_SDK_BLE_POP_TTL_S,
-                 dev_cred_required() ? 1 : 0);
-    } else {
-        s_pop[0] = '\0';
-        ESP_LOGI(TAG, "BLE 配网通道已就绪：%s（POP 读回失败，串口另有 SDK 日志）；"
-                      "激活码 node_id=%s（私密）；SN=%s（公开；%s）",
-                 s_advertising ? "广播中" : "待机（未广播，等按键进入配网模式）",
-                 s_ids.node_id, s_ids.sn,
-                 s_ids.sn_fell_back ? "creds.sn 为空⇒回落 node_id" : "来源 creds.sn");
-    }
+     *    ⛔ 该分支不是被放宽，而是**不可达**了 —— 读不到 creds 时本函数在上面就返回 ESP_FAIL。
+     *
+     * ★ 2026-10-09（台账 #1 / #3 / #7）：就绪行必须把**两串**讲清楚 ——
+     *   · 激活码 `node_id`（私密）只喂：link 节点 id + HKDF salt + `prov.pair.code` 比对基准；
+     *   · SN（公开）喂：广播名（GAP 层，SDK 派生 `ONEYE-<SN 后 4 位>`）、厂商字段、`prov.pair.ok.sn`。
+     *   ⛔ 不再写"三者同源于 node_id"（那是 2026-10-07 那批的口径，本批已就地作废）。
+     *   ⚠️ 广播名的**后缀不在本文件里另算一遍**（那是第二处派生 = 第二事实源）：
+     *      空口字节由 SDK 平台层开机打印（`oneye_ble_plat_nimble.c` 的扫描响应逐字节行）。
+     * ★ 2026-10-09：状态词按**实际是否在广播**打印（"广播中"/"待机"），
+     *   ⛔ 不许在待机时沿用"广播中"——那会让串口说假话（本批第一个要防的形态）。
+     * ⛔ 用户 2026-10-09 裁定（彻底删除 POP）：本行**不再读回 / 不再打印 POP**，
+     *   改为打印**非敏感**信息（本机型是否需要激活凭证 + chal TTL 档位）。
+     *   旧代码逐字留痕（⛔ 不抹）：`if (oneye_dev_ble_get_pop(s_pop, sizeof(s_pop)) ==
+     *   ONEYE_DEV_SDK_OK) { … "POP=%s 仅兼容/产测档，TTL %d s" … }`。 */
+    ESP_LOGI(TAG, "BLE 配网通道已就绪：%s；激活码 node_id=%s（私密：salt+code 比对基准）；"
+                  "SN=%s（公开：广播名 `ONEYE-<后 4 位>`/厂商字段(24 B)/prov.pair.ok；%s）；"
+                  "配对凭据 = 激活码＋一次性 chal（chal TTL %d s）；本机型%s激活凭证（cred_req=%d）",
+             s_advertising ? "广播中" : "待机（未广播，等按键进入配网模式）",
+             s_ids.node_id, s_ids.sn,
+             s_ids.sn_fell_back ? "creds.sn 为空⇒回落 node_id（SDK 将标 0x04 老世代）" : "来源 creds.sn",
+             (int)CONFIG_ONEYE_DEV_SDK_BLE_CHAL_TTL_S,
+             dev_cred_required() ? "需要" : "不需要", dev_cred_required() ? 1 : 0);
     return ESP_OK;
 #endif /* CONFIG_ONEYE_FW_ENABLE_BLE_PROV */
 }
@@ -468,10 +467,9 @@ bool wifi_prov_ble_active(void)
     return s_started && s_advertising;
 }
 
-const char *wifi_prov_ble_pop(void)
-{
-    return s_pop;
-}
+/* ⛔ 旧函数逐字留痕（⛔ 不抹）—— `const char *wifi_prov_ble_pop(void)`（返回当前配对 POP，
+ *   兼容/产测档读数）：按用户 2026-10-09 裁定「彻底删除实现及契约」整函数删除
+ *   （头文件声明同步删除；⛔ 不留不可达死代码）。 */
 
 void wifi_prov_ble_stop_advertising(void)
 {

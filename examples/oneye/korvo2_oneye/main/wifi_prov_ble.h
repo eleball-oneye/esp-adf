@@ -63,12 +63,11 @@ bool wifi_prov_ble_pairing_is_active(void);
 bool wifi_prov_ble_active(void);
 
 /**
- * 当前配对 POP（🔻 **兼容/产测档**；未启用/未生成时返回 ""）。
- * **只在串口打印**，⛔ 不进任何上行帧。
- * ⚠️ 2026-10-09 起**主档配对凭据** = 激活码（`prov.pair.code`，用户从机身贴码输入）＋ 一次性
- *    `chal`（设备在 `prov.hello` 明文回包下发）⇒ 本函数只是兼容/产测档的读数（台账 #5：⛔ 未删）。
+ * ⛔ 旧声明逐字留痕（⛔ 不抹）—— `const char *wifi_prov_ble_pop(void);`
+ *   （「当前配对 POP（🔻 兼容/产测档；未启用/未生成时返回 ""）。**只在串口打印**，⛔ 不进任何上行帧」）：
+ *   按用户 2026-10-09 裁定「彻底删除实现及契约」整条删除；配对凭据现值 = 激活码
+ *   （`prov.pair.code`，用户从机身贴码输入）＋ 一次性 `chal`（设备在 `prov.hello` 明文回包下发）。
  */
-const char *wifi_prov_ble_pop(void);
 
 /** 入网成功后停广播（由 `wifi_prov.c` 的收敛点下游调用；unpair 后可用 `wifi_prov_ble_start` 重开） */
 void wifi_prov_ble_stop_advertising(void);

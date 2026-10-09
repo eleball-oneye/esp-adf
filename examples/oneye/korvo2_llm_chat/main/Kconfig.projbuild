@@ -134,7 +134,7 @@ menu "korvo2_llm_chat —— 云端 LLM 实时语音对话例程"
                 （改走 claim + 一机一密凭据，见总控 ADR-0007）。
 
         config ONEYE_LLM_ENABLE_BLE_PROV
-            bool "启用 BLE 配网（oneye-dev-sdk 自研 GATT + POP 配对）"
+            bool "启用 BLE 配网（oneye-dev-sdk 自研 GATT + 配对凭据 = 激活码＋一次性 chal）"
             default y
 
         config ONEYE_LLM_ENABLE_SMARTCONFIG
@@ -158,9 +158,9 @@ menu "korvo2_llm_chat —— 云端 LLM 实时语音对话例程"
             string "Wi-Fi 密码兜底"
             default ""
 
-        config ONEYE_LLM_PROV_POP
-            string "固定 BLE 配对 POP（6 位数字；空 = 随机生成并打印串口，TTL 300 s）"
-            default ""
+        # ⛔ 旧项逐字留痕（⛔ 不抹）——`config ONEYE_LLM_PROV_POP` / `string "固定 BLE 配对 POP
+        #   （6 位数字；空 = 随机生成并打印串口，TTL 300 s）"`：按用户 2026-10-09 裁定
+        #   「彻底删除实现及契约」整项删除（SDK 的 set_pop/get_pop 已不存在）。
 
     endmenu
 

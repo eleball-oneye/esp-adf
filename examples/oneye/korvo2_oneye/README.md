@@ -551,7 +551,9 @@ idf.py -B /tmp/korvo2-mp-neg -DSDKCONFIG=/tmp/korvo2-mp-neg/sdkconfig \
 
 `WIFI_FILE=n` 且无凭据时，固件**不再**叫用户"把 `oneye-wifi.txt` 放 SD 卡根目录"（那条指引在该
 配置下**做不到** —— 本机型根本不读卡），改为给 BLE 配网指引（连接 `ONEYE-<id 后 4 位>`、
-输入串口打印的 6 位 POP）。见 `main/korvo2_oneye_main.c` 的 `wifi_prov_boot()`。
+输入**机身贴码（激活码＝`node_id`）**）。见 `main/korvo2_oneye_main.c` 的 `wifi_prov_boot()`。
+〔⚠️ 2026-10-09 订正（依据 = 用户 2026-10-09 裁定「彻底删除 POP」）：旧字逐字留痕 =「输入串口打印的
+6 位 POP」——POP 通路已删除，⛔ 串口不再打印任何配对码。〕
 
 ### 5.11.7 仍未做 / 未证（如实登记）
 
@@ -854,8 +856,8 @@ POP=894767` `@188`、`BLE 配网通道已就绪` `@189`、`下一步：` `@190`�
 | `ONEYE_FW_CLOUD_TOKEN` | 空 | 设备令牌（空 = 匿名 dev 形态） |
 | `ONEYE_FW_TLS_INSECURE` | **n** | 仅 dev/产测可开；生产须投放自研 CA（`tls_ca_pem`） |
 | `ONEYE_FW_ENABLE_WIFI_FILE` | **y** | 凭据文件配网（SD/SPIFFS `oneye-wifi.txt`）+ `/api/action wifi_set`。★ **机型能力位**：有卡槽机型 y / 无卡槽机型 n（⛔ 不是量产/台面开关，见 §5.11 与 ADR-0017 D3） |
-| `ONEYE_FW_ENABLE_BLE_PROV` | n | 配网通道 **C1/C2：BLE**（自研 GATT + POP 配对）；依赖 `ONEYE_DEV_SDK_ENABLE_BLE=y`。**无卡槽机型应置 y**（此时 `WIFI_FILE=n`，构建期门禁保证仍有通道）。参考预设 `sdkconfig.defaults.ble` |
-| `ONEYE_FW_BLE_POP` | 空 | 固定 BLE 配对 POP（6 位数字；空 = SDK 随机生成并打印串口） |
+| `ONEYE_FW_ENABLE_BLE_PROV` | n | 配网通道 **C1/C2：BLE**（自研 GATT + 配对凭据 = 激活码＋一次性 `chal`）；依赖 `ONEYE_DEV_SDK_ENABLE_BLE=y`。**无卡槽机型应置 y**（此时 `WIFI_FILE=n`，构建期门禁保证仍有通道）。参考预设 `sdkconfig.defaults.ble` |
+| ~~`ONEYE_FW_BLE_POP`~~ | — | ⛔ **已删除**（原：固定 BLE 配对 POP（6 位数字），台面注入口）。依据 = 用户 2026-10-09 裁定「彻底删除实现及契约（POP）」 |
 | `ONEYE_FW_WIFI_SSID` / `_PASSWORD` | 空 | 兜底凭据；空且无凭据文件 = 只跑板级自检与按键，不上云 |
 | `ONEYE_FW_ENABLE_KEYS` | y | 6 键 → `event/up` |
 | `ONEYE_FW_ENABLE_SDCARD` / `_LCD` | **y** / **y** | SD 缺省开（凭据文件、录音、板上回放都依赖它；未插卡只告警不阻塞）；LCD 已于 **2026-09-16 真机验证**（`panel.lcd.ready=true`、320×240、PSRAM 帧缓冲），故缺省开 |
@@ -1031,8 +1033,10 @@ LCD 状态屏与摄像头抓帧见 §5.7/§5.8（**已真机闭环**），`video
 - **未**改广播名后缀与配对 `salt`（`device_id`）：二者同源于 `CONFIG_ONEYE_FW_DEVICE_ID`，改动会同时影响
   广播名与 HKDF salt（契约 §4.3）⇒ 属**另一次决策**，本批只把不一致**登记**在此。
 - **未**带 productKey 的 `-NN` 尾号（只带品类段）；**未**做 App 侧解析器（另一批）。
-- ⛔ **安全边界**：SN 进广播 = **公开**，只能当「发现/筛选」标识，**不是授权凭据**；真正入网仍必须过 POP 与
-  Wi-Fi 凭据，⛔ 带不带 SN **都不豁免配对步**（`ProvFlowMachine` 的 6 位形状判据一个字未放宽）。
+- ⛔ **安全边界**：SN 进广播 = **公开**，只能当「发现/筛选」标识，**不是授权凭据**；真正入网仍必须过
+  **配对凭据（激活码 `code` ＋ 一次性 `chal`）**与 Wi-Fi 凭据，⛔ 带不带 SN **都不豁免配对步**。
+  〔⚠️ 2026-10-09 订正（依据 = 用户 2026-10-09 裁定「彻底删除 POP」）：旧字逐字留痕 =「真正入网仍必须过
+  POP 与 Wi-Fi 凭据…（`ProvFlowMachine` 的 6 位形状判据一个字未放宽）」—— POP 与 6 位形状判据均已删除。〕
 
 ## 11. 增量（2026-10-07 第四批）：**厂商 ID 落位 = `0x4F59`** + 设备侧占位检出载体（⛔ 纯追加，旧段一字未改）
 
@@ -1231,17 +1235,22 @@ LCD 状态屏与摄像头抓帧见 §5.7/§5.8（**已真机闭环**），`video
 
   ⇒ `sn_field` 恰好装下 v3 全量、**⛔ 不截断**；v1(29)/v2(44) 取**尾部 24 B** 并置 `0x01`；`reserved` 两字节恒 `00 00`。
 
-### 13.3 配对凭据改口径（主档 = 激活码 ＋ 一次性 `chal`；🔻 POP 兼容档保留）
+### 13.3 配对凭据改口径（**唯一通路** = 激活码 ＋ 一次性 `chal`；⛔ POP 已彻底删除）
 
 - `prov.hello` **明文回包**下发 `chal`（16 B；JSON 文本 = **32 位小写 hex**，编码点唯一 = `oneye_dev_ble.c` 的 `chal_hex()`）
-  ＋ `chal_ttl_s`（剩余秒数，取 `CONFIG_ONEYE_DEV_SDK_BLE_POP_TTL_S`，缺省 300）＋ `needs_pair` ⇒ ⛔ 不新增帧类型。
+  ＋ `chal_ttl_s`（剩余秒数，取 `CONFIG_ONEYE_DEV_SDK_BLE_CHAL_TTL_S`，缺省 300；⚠️ 旧名逐字留痕 =
+  `CONFIG_ONEYE_DEV_SDK_BLE_POP_TTL_S`）＋ `needs_pair` ⇒ ⛔ 不新增帧类型。
 - `prov.pair{code, chal}`：`code` = 激活码，设备**逐字比对**（`oneye_ble_activation_code_match()`，⛔ 不 trim / ⛔ 不折叠大小写）；
   `chal` **一次性**（用后作废 / 过期作废 / 重放拒绝；`oneye_ble_chal_*`，纯函数、宿主 10 用例）；
   `key = HKDF(ikm = node_id‖chal, salt = node_id, info="oneye-link-v1")`（`oneye_ble_pair_derive_key_chal()`）。
   ⛔ `chal` 缺失/长度 ≠ 16 B ⇒ **fail-closed**（⛔ 不降级 `ikm = node_id`）。
-- `prov.pair.ok` ⇄ **`{sn, enc[, ttl_s][, cred_req]}`**，⛔ **不再回 `node_id`**；
-  `cred_req` = 机型级「是否要求激活凭证」，载体 = 本工程 Kconfig `ONEYE_FW_DEV_CRED_REQUIRED`（缺省 y，与 cloud fail-closed 同向）。
-- 🔻 **POP 通路整条保留**（`oneye_ble_pair_derive_key()` 与契约 §7.2 的 golden 向量逐字节一致 ⇒ 口径未改），仅降为兼容/产测档。
+- `prov.pair.ok` ⇄ **`{sn, enc[, ttl_s][, cred_req][, sig]}`**，⛔ **不再回 `node_id`**；
+  `cred_req` = 机型级「是否要求激活凭证」，载体 = 本工程 Kconfig `ONEYE_FW_DEV_CRED_REQUIRED`（缺省 y，与 cloud fail-closed 同向）；
+  `sig` = 机型乙的**可选**字段（内嵌证书对 `chal` 签名，base64，契约 `link-frames.json` 已登记）。
+- ⛔ **POP（6 位数字）已按用户 2026-10-09 裁定「彻底删除实现及契约」整条删除**（SDK 的 `set_pop`/`get_pop`、
+  `prov.pair{pop}` 受理分支、POP 密钥派生与 POP 向量、本工程 Kconfig `ONEYE_FW_BLE_POP`、串口 POP 打印、
+  `wifi_prov_ble_pop()` 读数函数）。**旧字逐字留痕（⛔ 不抹）**：「🔻 **POP 通路整条保留**
+  （`oneye_ble_pair_derive_key()` 与契约 §7.2 的 golden 向量逐字节一致 ⇒ 口径未改），仅降为兼容/产测档。」
 
 ### 13.4 本批自证（⛔ 不声称真机）
 
@@ -1253,3 +1262,9 @@ LCD 状态屏与摄像头抓帧见 §5.7/§5.8（**已真机闭环**），`video
 - 固件（WSL，`idf.py build`，`sdkconfig.defaults.ble-key` 叠加序）：**EXIT 0**（`korvo2_oneye.bin` 1,596,016 B）。
 - ⛔ **真机空口/串口读数本批未做**（⛔ 未烧写：等用户点）⇒ 13.2 的十六进制是**宿主侧同一编码器**的读数，
   **不是**空口抓包；`扫描响应 实测 AD 字节（31 B）` 那行要烧写后才有。
+
+> 🔴 **2026-10-09 追加读数（本批「彻底删除 POP」，依据 = 用户 2026-10-09 裁定）**：删除后重跑（WSL，`components/oneye-dev-sdk/build-host`）＝
+> **23 组 / 274 用例、断言 6167 次、失败 0 次、退出码 0**；其中 `ble_pair` **8/8**（上面那行 10/10 与 276 是**本册该批当时的读数**，⛔ 不改写）。
+> 差异说明：删除 `pop` / `pop_compat_path_unchanged` 两用例（−2），`pair_key_derivation` 改写为 `ikm = node_id‖chal` 口径（保留，⛔ 不是删用例）。
+> `abi-check.sh`（宿主 `lib/x86_64-linux-gnu-gcc-13.3.0`）：**OK——公共 API 与 `abi/*.symbols` 一致**（`oneye_dev_ble` 公共 API 24 → **22**，删掉的正是 `oneye_dev_ble_set_pop` / `oneye_dev_ble_get_pop`）。
+> 固件读数见本文件 §6 的构建行（`sdkconfig.defaults.ble-key` 叠加序）。

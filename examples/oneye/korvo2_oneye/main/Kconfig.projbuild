@@ -339,4 +339,22 @@ menu "korvo2_oneye 板级固件配置"
         bool "板级自检失败即中止上云（推荐）"
         default y
 
+    config ONEYE_FW_DIAG_PROV_TRACE
+        bool "诊断构建：配网链路逐步留痕（默认 n；只由 sdkconfig.defaults.diag 打开）"
+        default n
+        help
+            仅用于**诊断固件**：量产预设 sdkconfig.defaults.production ⛔ 不设本项 ⇒ 默认 n
+            ⇒ 下面这段代码在量产件里**根本不编进去**（⛔ 不改变量产固件的日志面）。
+
+            打开后额外产出（全部 INFO/WARN，⛔ 不含密码 / 激活码 / chal / 令牌）：
+              1) 开机回显**运行期生效的日志级别**（esp_log_level_get 与编译期缺省/上限），
+                 并把 wifi_prov / wifi_prov_ble / oneye_ble 三个 tag 放宽到 DEBUG；
+              2) 5 s 一次心跳（SDK 配网状态 + Wi-Fi 状态快照）—— 证明"串口是活的、级别是 INFO"，
+                 把"INFO 被日志级别滤掉"与"抓取窗口晚于开机"这两种解释分开；
+              3) SDK 侧配网状态事件回显（与 BLE 是否真发出**无关**）：区分
+                 "SDK 没上报"与"上报了但没送达对端"。
+
+            ⛔ 不新增帧 / ⛔ 不改帧字段 / ⛔ 不改状态机 / ⛔ 不改错误码。日志**级别**本身由
+            sdkconfig.defaults.diag（构建期）决定；本开关只决定"要不要多打这几行"。
+
 endmenu

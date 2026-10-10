@@ -1,0 +1,51 @@
+# =============================================================================
+# 诊断固件预设 —— **只用于定位**（2026-10-10 配网诊断批）
+#
+# 用法（必须**显式叠加、且排在最后**：IDF 按顺序取"后写者胜"）：
+#   idf.py -B <build> \
+#     -DSDKCONFIG=<build>/sdkconfig \
+#     -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32s3;\
+#       sdkconfig.defaults.production;sdkconfig.defaults.ble;sdkconfig.defaults.ble-key;\
+#       sdkconfig.defaults.diag" \
+#     -DONEYE_FW_CERT_DIR=<空目录> -DONEYE_SDK_LIB_OUT_DIR=<不存在目录> build
+#
+# 为什么单独一份：量产口径（`sdkconfig.defaults.production`）里**没有**日志级别项，
+# 级别来自 `sdkconfig.defaults:21` 的 `CONFIG_LOG_DEFAULT_LEVEL_INFO=y` ＋
+# `:28` 的 `CONFIG_LOG_MAXIMUM_EQUALS_DEFAULT=y`（⇔ `CONFIG_LOG_MAXIMUM_LEVEL=3`）。
+# 诊断要"必要时能看 DEBUG"，就必须把**上限**抬起来 —— 而 `CONFIG_LOG_MAXIMUM_LEVEL_*`
+# 是 choice 成员，写进任何一份**被量产叠加的** defaults 都会改变量产件
+# ⇒ 只能新增一份**只给诊断用**的预设，⛔ 不动 production、⛔ 不动基础 defaults。
+#
+# ⛔ **不污染 production 默认的证据（可机械复核）**：
+#   ① 本文件**不在**任何既有构建命令的 `SDKCONFIG_DEFAULTS` 列表里：
+#        grep -rn "SDKCONFIG_DEFAULTS" --include=*.sh --include=*.ps1 --include=*.md .
+#      ⇒ 旧口径列出的 5 份 defaults 逐字不变（本文件只出现在诊断构建脚本里）；
+#   ② 量产预设 `sdkconfig.defaults.production` 与本文件**无任何交集符号**
+#      （production 管身份/承载/台面能力/体积；本文件只管 log 上限 + 诊断开关）；
+#   ③ 本文件写的每一项都能在**诊断构建产物的 sdkconfig** 里看到（见下面"自证"命令），
+#      而用量产 5 份 defaults 构建时这些项**不会出现**（默认值即 `INFO` + `EQUALS_DEFAULT`）。
+#
+# 自证命令（构建后对产物 sdkconfig 跑，预期输出逐条见注释）：
+#   grep -E "^CONFIG_(LOG_DEFAULT_LEVEL|LOG_MAXIMUM|ONEYE_FW_DIAG_PROV_TRACE)" <build>/sdkconfig
+#     ⇒ CONFIG_LOG_DEFAULT_LEVEL_INFO=y        （= 3，**INFO 本来就是开的**，本文件没动它）
+#        CONFIG_LOG_MAXIMUM_EQUALS_DEFAULT 未设 + CONFIG_LOG_MAXIMUM_LEVEL_VERBOSE=y（= 5）
+#        CONFIG_ONEYE_FW_DIAG_PROV_TRACE=y
+# =============================================================================
+
+# ---- 日志上限：抬到 VERBOSE（=5），让 DEBUG 真的能被编译进来并在运行期打开 -------------
+# 为什么需要：`CONFIG_LOG_MAXIMUM_LEVEL` 是**编译期**上限，低于它的 `ESP_LOGD` 根本不生成代码
+#   ⇒ 运行期 `esp_log_level_set(tag, ESP_LOG_DEBUG)` 那样也只会"什么都不会多"。真机现场第一次
+#   排查时看到的正是"调级别没有效果"这一类症状，所以诊断版必须先把上限抬起来。
+# ⚠️ IDF 的 `config LOG_MAXIMUM_LEVEL_VERBOSE` 带 `depends on LOG_DEFAULT_LEVEL < 5`
+#   （同族已知坑见 `sdkconfig.defaults:22-28` 的注释）：缺省级别是 INFO(=3) ⇒ `3 < 5` 成立，
+#   本项可选。⛔ 相反地，**不要**在这里把缺省级别也改成 DEBUG：那会让 BT/WiFi/ADF 的 DEBUG 全量
+#   涌上串口，把配网那几行淹掉。缺省级别保持 INFO，DEBUG 只按 tag 开（见
+#   `main/korvo2_oneye_main.c` 的 `diag_boot_report()`）。
+# ⛔ 同一 choice 的另一成员（基础 defaults 里显式钉过的）必须显式关掉，避免"看起来两条都生效"：
+# CONFIG_LOG_MAXIMUM_EQUALS_DEFAULT is not set
+CONFIG_LOG_MAXIMUM_LEVEL_VERBOSE=y
+
+# ---- 诊断留痕开关（main/Kconfig.projbuild 的 `ONEYE_FW_DIAG_PROV_TRACE`）----------------
+# 打开后：开机回显运行期日志级别 + 5 s 心跳 + SDK 侧 prov.status 事件回显。
+# ⛔ 量产默认 n：`sdkconfig.defaults.production` 不设本项，且本文件**只**在诊断构建里叠加。
+CONFIG_ONEYE_FW_DIAG_PROV_TRACE=y

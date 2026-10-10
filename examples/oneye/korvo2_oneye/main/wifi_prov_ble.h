@@ -96,6 +96,15 @@ void wifi_prov_ble_stop_advertising(void);
  */
 esp_err_t wifi_prov_ble_report_prov_connected(const char *ssid, const char *ip, const char *source);
 
+/**
+ * ★ 2026-10-10（诊断版）：把「链路 / 配网」状态打成一行心跳（诊断构建每 5 s 一次）。
+ *
+ * 实现只在 `CONFIG_ONEYE_FW_DIAG_PROV_TRACE=y` 时**编进来**（见 `wifi_prov_ble.c`）：
+ * 诊断构建下声明与定义都在；量产构建下两者都不在（调用点也用同一个宏包起来 ⇒ 不会有未定义符号）。
+ * ⛔ 只读状态、⛔ 不发帧、⛔ 不改任何判据。
+ */
+void wifi_prov_ble_diag_dump(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -15,6 +15,13 @@
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_timer.h"     /* 配网窗口超时：既有依赖（ESP-IDF 核心组件，多处在用），⛔ 不引新依赖 */
+/* 诊断留痕（2026-10-10）：provider 现在跑在 **SDK 的 prov worker 任务**上（`oneye_prov`，见
+ * `oneye-dev-sdk/src/oneye_dev_link.c` §5.1），而它曾经跑在 NimBLE 收包任务上。
+ * "到底是谁在执行、有没有回到执行点"是"既无 connected 也无 failed"的第一分岔点
+ * ⇒ 诊断行里打出**当前任务名**（`pcTaskGetName`）—— 它把"worker 没回到执行点 / 队列卡住"
+ * 这类怀疑变成一眼可见的事实。⛔ 只打任务名，⛔ 不打任何凭据。 */
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "oneye_dev_ble.h"
 #include "oneye_dev_link.h"
@@ -94,6 +101,29 @@ static adv_identity_status_t s_ids_reason;
 
 /* ------------------------------------------------------------------ provider（应用侧 Wi-Fi 动作） */
 
+/* ---- 诊断留痕：SDK 侧「决定上报什么状态」的回显（2026-10-10；仅诊断构建） -------------------
+ *
+ * 为什么非它不可：SDK 的 `oneye_dev_link_prov_report_status()`（`src/oneye_dev_link.c:1508`）
+ *   先 `link_event(PROV_STATE, payload)`，**再** `if (s_link.started) oneye_dev_link_broadcast(...)`
+ *   —— 并且**无论广播成功与否都 `return ONEYE_DEV_SDK_OK`**（广播返回值被 `(void)` 丢弃）。
+ *   ⇒ "SDK 决定了要报 connected / failed" 与 "这一帧有没有真发到 App" 是**两件事**，
+ *      而真机症状恰恰是 App 侧一帧都没收到 ⇒ 必须能把这两件事分开看。
+ *   ⇒ 本回调把 PROV_STATE 的**载荷**打到串口：只要它出现在串口上，就说明设备侧**确实报了**，
+ *      问题就不再是"没上报"。
+ * ⛔ 只在诊断构建（`CONFIG_ONEYE_FW_DIAG_PROV_TRACE=y`，量产预设为 n）打开；
+ * ⛔ 载荷里只有 state / ssid / ip / source / err（SDK 组帧原样），⛔ 不含密码 / 激活码 / chal。 */
+#if CONFIG_ONEYE_FW_DIAG_PROV_TRACE
+static void diag_link_evt_cb(oneye_dev_event_t evt, const void *payload, size_t len, void *ctx)
+{
+    (void)ctx;
+    if (evt != ONEYE_DEV_LINK_EVT_PROV_STATE || payload == NULL || len == 0u) {
+        return;
+    }
+    ESP_LOGI(TAG, "[diag] SDK 决定上报配网状态（本行与 BLE 是否真发出无关）：%.*s",
+             (int)len, (const char *)payload);
+}
+#endif
+
 /* 前置声明：provider 里的 `ble_prov_reset()`（清凭据 ⇒ 重新进入可配网态）与 enter/exit 共用配网窗口
  * 计时器，而它们的定义在下方「配网模式」段 —— C 的单遍扫描要求此处先声明。 */
 static void window_restart(void);
@@ -115,7 +145,15 @@ static const char *dev_onboarding_tier_basis(void);
 static int ble_prov_scan(char *json_out, size_t cap, void *ctx)
 {
     (void)ctx;
-    return wifi_prov_scan_json(json_out, cap) == ESP_OK ? 0 : -1;
+    /* 诊断留痕（2026-10-10）：本函数 = 「worker 已执行到 prov.scan.req 这一步」的**唯一**证据
+     * （它只可能被 SDK 的 prov worker 调用）。任务名 + 耗时一起打出来。 */
+    int64_t t0 = esp_timer_get_time();
+    ESP_LOGI(TAG, "[diag] prov.scan.req → provider 调用：task=%s", pcTaskGetName(NULL));
+    int rc = wifi_prov_scan_json(json_out, cap) == ESP_OK ? 0 : -1;
+    ESP_LOGI(TAG, "[diag] prov.scan.req → provider 返回 rc=%d（耗时 %lld ms）"
+                  "⇒ SDK 将据此回 prov.scan.rsp（或 error）",
+             rc, (long long)((esp_timer_get_time() - t0) / 1000));
+    return rc;
 }
 
 /*
@@ -142,12 +180,25 @@ static int ble_prov_connect(const char *ssid, const char *password, const char *
 {
     (void)token;    /* 契约 §4 的 rvd 自定义数据：korvo2_oneye 暂不使用（不臆造语义） */
     (void)ctx;
-    ESP_LOGI(TAG, "BLE 通道收到凭据：ssid=%s（密码不打印）⇒ 交给唯一入网入口（含优先级判据）", ssid);
+    /* 诊断留痕（2026-10-10）：本函数 = 「worker 已执行到 prov.connect.req 这一步」的**唯一**证据。
+     * ⛔ 密码按既有纪律只打**长度**，⛔ 绝不打印内容；ssid 沿用既有口径（既有日志已在打）。 */
+    int64_t t0 = esp_timer_get_time();
+    ESP_LOGI(TAG, "[diag] prov.connect.req → provider 调用：task=%s ssid=%s 密码长度=%u",
+             pcTaskGetName(NULL), ssid, (unsigned)((password != NULL) ? strlen(password) : 0u));
     esp_err_t rc = wifi_prov_submit_credentials(ssid, password, WIFI_PROV_CHAN_BLE);
+    int64_t ms = (esp_timer_get_time() - t0) / 1000;
     if (rc == ESP_ERR_INVALID_STATE) {
         ESP_LOGW(TAG, "本次 BLE 凭据**未被采信**（优先级判据拒绝；串口 [prov-priority] 有留痕）"
                       "⇒ 向对端报失败，不发起入网");
     }
+    /* 三种归宿一眼可分：
+     *   · ESP_OK            ⇒ 已拿到 IP（connected 由收敛点上报，**不在本函数**）；
+     *   · ESP_ERR_TIMEOUT   ⇒ 等满 20 s 没等到 GOT_IP ⇒ SDK 会报 failed{auth_failed}；
+     *   · ESP_ERR_INVALID_STATE ⇒ 判据拒绝 ⇒ SDK 同样报 failed{auth_failed}。 */
+    ESP_LOGI(TAG, "[diag] prov.connect.req → provider 返回 %s（耗时 %lld ms）⇒ SDK 侧归宿=%s",
+             esp_err_to_name(rc), (long long)ms,
+             (rc == ESP_OK) ? "已在网（等收敛点上报 connected）"
+                            : "将上报 prov.status{state=failed, err=auth_failed}");
     return (rc == ESP_OK) ? 0 : -1;
 }
 
@@ -196,11 +247,21 @@ esp_err_t wifi_prov_ble_report_prov_connected(const char *ssid, const char *ip, 
                  (ip != NULL) ? ip : "");
         return ESP_ERR_INVALID_STATE;
     }
+    /* 诊断留痕（2026-10-10）：link 侧前置条件逐项打出来 —— "上报被前置条件挡住"是最容易被
+     * 误读成"上报被吞"的一种形态。 */
+    ESP_LOGI(TAG, "[diag] 上报 connected 前置条件：link init=%d start=%d ip=%s source=%s",
+             (int)oneye_dev_link_is_initialized(), (int)oneye_dev_link_is_started(),
+             (ip != NULL) ? ip : "(空)", (source != NULL) ? source : "(空)");
     rc = oneye_dev_link_prov_report_status(ONEYE_DEV_LINK_PROV_CONNECTED,
                                            (ssid != NULL && ssid[0] != '\0') ? ssid : NULL,
                                            ip,
                                            (source != NULL && source[0] != '\0') ? source : NULL,
                                            NULL);   /* err 为空 = 没有错误（契约 optional） */
+    /* ⚠️ 这个返回码**只能证明调用返回**，⛔ 不能证明帧真发出去了：SDK 的
+     * `oneye_dev_link_prov_report_status()` 无论广播成败都回 OK（见本文件顶部诊断注释）。
+     * 真正的"有没有发"要看 `[diag] SDK 决定上报配网状态…` 那行与对端是否收到。 */
+    ESP_LOGI(TAG, "[diag] prov.status 上报调用已返回：返回码=%d（⛔ SDK 侧恒 OK，不代表已送达对端）",
+             (int)rc);
     if (rc != ONEYE_DEV_SDK_OK) {
         ESP_LOGW(TAG, "prov.status{connected, ip=%s} 上报失败（%d）", (ip != NULL) ? ip : "", (int)rc);
         return ESP_FAIL;
@@ -210,8 +271,30 @@ esp_err_t wifi_prov_ble_report_prov_connected(const char *ssid, const char *ip, 
     return ESP_OK;
 }
 
-/* ------------------------------------------------------------------ 配网模式：进入 / 退出 / 超时 */
+/* ---- 诊断留痕：心跳快照（2026-10-10；仅诊断构建） -------------------------------------------
+ * 为什么要心跳：本轮真机串口"只有每秒一次 SD 卡报错、没有任何 wifi/prov 行"，于是无法区分
+ *   「日志级别把 INFO 滤掉了」与「抓取窗口在开机之后才开始」。心跳每 5 s 一行，把这个歧义**消掉**：
+ *   · 有心跳 ⇒ 串口是活的、级别确实放到了 INFO（本行就是一条 INFO）；
+ *   · 没心跳 ⇒ 是抓取/级别问题，而不是设备行为。
+ * ⛔ 只读状态：⛔ 不发帧、⛔ 不改任何判据、⛔ 不碰 A14a 的"唯一上报点"。 */
+#if CONFIG_ONEYE_FW_DIAG_PROV_TRACE
+void wifi_prov_ble_diag_dump(void)
+{
+    /* ⚠️ 这里**故意**只打 SDK 配网状态的**数值**（不写枚举名）：本文件的枚举名一旦出现在代码行里，
+     *    `tools/check-prov-convergence.py` 的 A14h 会把它判成"第二个状态上报点"（该门禁按 token
+     *    计数，它保护的是"只上报 connected 一次"这条不变量）。
+     *    数值 ↔ 名称（SDK `include/oneye_dev_link.h`）：0 idle / 1 pairing / 2 scanning /
+     *    3 scan_done / 4 connecting / 5 connected / 6 failed；`-1` = link 未初始化。
+     *    ⛔ 只读、⛔ 不发帧：状态名与人读载荷由 `[diag] SDK 决定上报配网状态…` 那行给出。 */
+    int st = oneye_dev_link_is_initialized() ? (int)oneye_dev_link_prov_state() : -1;
 
+    ESP_LOGI(TAG, "[diag] 心跳：link init=%d start=%d sdk_prov_state=%d ble_started=%d 广播中=%d 配网模式=%d",
+             (int)oneye_dev_link_is_initialized(), (int)oneye_dev_link_is_started(), st,
+             (int)s_started, (int)s_advertising, (int)s_pairing);
+}
+#endif /* CONFIG_ONEYE_FW_DIAG_PROV_TRACE */
+
+/* ------------------------------------------------------------------ 配网模式：进入 / 退出 / 超时 */
 /*
  * 「已入网」判据 = `wifi_prov_is_connected()`（wifi_prov.c 的唯一事实源）。
  * ⛔ 本模块不看 SDK 链路状态、也不看 BLE 配对状态：那两者都不等于"这台设备已经上得了网"。
@@ -530,6 +613,11 @@ esp_err_t wifi_prov_ble_start(void)
          *    这里既没有读任何编译期常量，也没有替设备声称任何身份。
          */
         lcfg.node_id = (s_ids.node_id[0] != '\0') ? s_ids.node_id : NULL;
+#if CONFIG_ONEYE_FW_DIAG_PROV_TRACE
+        /* 诊断留痕（2026-10-10）：把 SDK 侧 PROV_STATE 事件接到串口。
+         * ⛔ 只挂回调、⛔ 不改任何发帧路径与状态序列。 */
+        lcfg.event_cb = diag_link_evt_cb;
+#endif
         /* 只跑 BLE：不给 wan_uri ⇒ wan 信道不启用；allow_plaintext_chan 保持缺省
          * （本工程没有 lan 信道，明文口径无从触发）。 */
         oneye_dev_sdk_err_t lrc = oneye_dev_link_init(&lcfg);
@@ -569,6 +657,15 @@ esp_err_t wifi_prov_ble_start(void)
     bcfg.prov.scan = ble_prov_scan;
     bcfg.prov.connect = ble_prov_connect;
     bcfg.prov.reset = ble_prov_reset;
+#if CONFIG_ONEYE_FW_DIAG_PROV_TRACE
+    /* 🔴 诊断留痕（2026-10-10 配网诊断批）：**应用确实把三件套交出去了**的第一手证据。
+     *   缺了这一行，"provider 没注册" 与 "SDK 收下配置却从不使用" 两件事在串口上不可分辨。
+     * ⛔ 只打是否存在（0/1），⛔ 不打任何函数指针值之外的机密（这里本来也没有机密）。 */
+    ESP_LOGI(TAG, "[diag] prov 三件套注入 BLE 配置：scan=%d connect=%d reset=%d"
+                  "（SDK 在 init()/start() 两处转交 link 层；转交结果由 SDK 侧 'prov provider 转交 link' 行给出）",
+             (bcfg.prov.scan != NULL) ? 1 : 0, (bcfg.prov.connect != NULL) ? 1 : 0,
+             (bcfg.prov.reset != NULL) ? 1 : 0);
+#endif
 
     oneye_dev_sdk_err_t rc = oneye_dev_ble_init(&bcfg);
     if (rc != ONEYE_DEV_SDK_OK) {
@@ -583,8 +680,19 @@ esp_err_t wifi_prov_ble_start(void)
         return ESP_FAIL;
     }
     /* 3) 绑定为 link 的 ble 信道发送器（链路回帧用；失败只影响 link 帧，不影响配网本身） */
-    if (oneye_dev_ble_bind_to_link() != ONEYE_DEV_SDK_OK) {
-        ESP_LOGW(TAG, "BLE 绑定 link 信道失败 ⇒ link/组域帧不走 BLE（配网仍可用）");
+    {
+        oneye_dev_sdk_err_t brc = oneye_dev_ble_bind_to_link();
+
+        if (brc != ONEYE_DEV_SDK_OK) {
+            ESP_LOGW(TAG, "BLE 绑定 link 信道失败 ⇒ link/组域帧不走 BLE（配网仍可用）");
+        }
+#if CONFIG_ONEYE_FW_DIAG_PROV_TRACE
+        /* 🔴 诊断留痕（2026-10-10 配网诊断批）：`prov.scan.rsp` / `prov.status` 是 **link 层** 组的帧，
+         *   它们只能经这条 BLE 发送器出站 ⇒ "provider 跑了但 App 收不到回帧" 时，本行是第一个要看的量。
+         * ⛔ 只读返回值，⛔ 不改绑定语义。 */
+        ESP_LOGI(TAG, "[diag] link←BLE 发送器绑定 rc=%d（0=成功；link 侧回帧只能经此信道出站）",
+                 (int)brc);
+#endif
     }
     if (s_autostart) {
         if (oneye_dev_ble_advertise(true) == ONEYE_DEV_SDK_OK) {

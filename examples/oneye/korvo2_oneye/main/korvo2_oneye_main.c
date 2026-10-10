@@ -805,6 +805,9 @@ static void prov_status_report_connected_once(void)
 
     if (!wifi_prov_connected_should_report(wifi_prov_is_connected(), ip, reported)) {
         /* 没拿到 IP，或已经报过（多为掉线重连路径的重复触发）⇒ 什么都不做，⛔ 不刷屏 */
+        ESP_LOGI(TAG, "[diag] connected 上报判据=否：wifi_connected=%d ip=%s already_reported=%d"
+                      "（前者为 0 ⇒ 还没拿到 IP，如实停在「配网中」）",
+                 wifi_prov_is_connected() ? 1 : 0, (ip != NULL) ? ip : "(空)", reported ? 1 : 0);
         return;
     }
     /* 发送收在 BLE 通道模块里（link 的 init/start 与 `oneye_dev_link.h` 都在那一层；理由见
@@ -1729,6 +1732,109 @@ static void panel_sync_task(void *arg)
     }
 }
 
+/* ---------------------------------------------------------------- 诊断构建（2026-10-10）
+
+ * 只编进**诊断固件**（`CONFIG_ONEYE_FW_DIAG_PROV_TRACE=y`，由 `sdkconfig.defaults.diag` 打开；
+ * 量产预设 `sdkconfig.defaults.production` ⛔ 不设这一项 ⇒ 默认 n ⇒ 本段连代码都不编进去）。
+ *
+ * 为什么需要（本轮真机第一个分歧点）：
+ *   串口只看到每秒一次的 SD 卡报错（`E PERIPH_SDCARD`），于是"INFO 被日志级别滤掉"与
+ *   "抓取窗口在开机之后才开始"这两种解释**在事后无法区分**。诊断版把
+ *   ① **运行期生效的级别**打在开机第 3 行；② 每 5 s 一条 INFO 心跳（含链路/配网状态快照）
+ *   ⇒ 心跳在 = 串口是活的、级别就是 INFO，抓不到只能怪窗口；心跳不在 = 才是级别/抓取问题。
+ * ⛔ 只读配置与状态：⛔ 不新建任务（本板内部 RAM 连续块很小）、⛔ 不发帧、⛔ 不改协议语义。
+ * ⛔ 不打印任何机密（密码 / 激活码 / chal / 令牌）。 */
+#if CONFIG_ONEYE_FW_DIAG_PROV_TRACE
+static void diag_heartbeat_cb(void *arg)
+{
+    (void)arg;
+    static unsigned tick;
+    tick++;
+    ESP_LOGI(TAG, "[diag] 心跳 #%u：uptime=%lld s 运行期级别(*)=%d 编译期缺省=%d 上限=%d"
+                  " wifi_connected=%d ip=%s ssid=%s 来源=%s",
+             tick, (long long)(esp_timer_get_time() / 1000000),
+             (int)esp_log_level_get("*"), (int)CONFIG_LOG_DEFAULT_LEVEL,
+             (int)CONFIG_LOG_MAXIMUM_LEVEL,
+             wifi_prov_is_connected() ? 1 : 0, wifi_prov_ip(), wifi_prov_ssid(), wifi_prov_source());
+    wifi_prov_ble_diag_dump();
+}
+
+static void diag_boot_report(void)
+{
+    esp_timer_handle_t hb = NULL;
+    esp_timer_create_args_t ta = { 0 };
+
+    ESP_LOGI(TAG, "[diag] 日志级别自证：运行期 esp_log_level_get(\"*\")=%d；编译期"
+                  " CONFIG_LOG_DEFAULT_LEVEL=%d / CONFIG_LOG_MAXIMUM_LEVEL=%d"
+                  "（OFF=0 E=1 W=2 I=3 D=4 V=5；**上限 < 4 时 ESP_LOGD 根本不编进来**）",
+             (int)esp_log_level_get("*"), (int)CONFIG_LOG_DEFAULT_LEVEL,
+             (int)CONFIG_LOG_MAXIMUM_LEVEL);
+    ESP_LOGI(TAG, "[diag] 本构建 = 诊断版（CONFIG_ONEYE_FW_DIAG_PROV_TRACE=y）：每 5 s 一条心跳；"
+                  "⛔ 量产预设不含本开关（见 sdkconfig.defaults.diag 头注）");
+    /* 把配网链路上的三个 tag 放宽到 DEBUG（上限已在 sdkconfig.defaults.diag 抬到 VERBOSE），
+     * ⛔ 只放宽配网链路，⛔ 不动全局级别（否则 BT/WiFi/ADF 的 DEBUG 会把串口淹掉）。 */
+    esp_log_level_set("wifi_prov", ESP_LOG_DEBUG);
+    esp_log_level_set("wifi_prov_ble", ESP_LOG_DEBUG);
+    esp_log_level_set("oneye_ble", ESP_LOG_DEBUG);
+    /* 🔴 2026-10-10〔配网诊断批〕link 层（帧分发 / prov 投递 / worker / 回帧）在设备侧改走 IDF 日志管线
+     * （`src/internal/oneye_internal.c` 的出口），tag = "oneye_link" ⇒ 这里一并放宽到 DEBUG。 */
+    esp_log_level_set("oneye_link", ESP_LOG_DEBUG);
+    /* 基库内部日志出口（`bint_log`）在设备侧的 tag = "oneye" */
+    esp_log_level_set("oneye", ESP_LOG_DEBUG);
+    ESP_LOGI(TAG, "[diag] 已放宽 wifi_prov / wifi_prov_ble / oneye_ble 到 DEBUG"
+                  "（实际生效：%d / %d / %d）",
+             (int)esp_log_level_get("wifi_prov"), (int)esp_log_level_get("wifi_prov_ble"),
+             (int)esp_log_level_get("oneye_ble"));
+    ESP_LOGI(TAG, "[diag] 已放宽 oneye_link / oneye 到 DEBUG（实际生效：%d / %d）",
+             (int)esp_log_level_get("oneye_link"), (int)esp_log_level_get("oneye"));
+    ta.callback = diag_heartbeat_cb;
+    ta.name = "diag_hb";      /* ⚠️ esp_timer 名上限 16 字符（含 NUL） */
+    if (esp_timer_create(&ta, &hb) == ESP_OK) {
+        (void)esp_timer_start_periodic(hb, 5000000ULL);
+    } else {
+        ESP_LOGW(TAG, "[diag] 心跳计时器创建失败 ⇒ 本次没有周期心跳（不影响配网）");
+    }
+}
+#endif /* CONFIG_ONEYE_FW_DIAG_PROV_TRACE */
+
+/* ---------------------------------------------------------------- SD 卡缺失刷屏降噪（2026-10-10）
+
+ * 用户裁定（逐字）：
+ *   问题「SD卡拔出的打印日志频率降低避免刷屏」；选项 =「静音日志，但保留自动挂载（推荐）」。
+ *
+ * 现象与成因（真机取证）：本板无卡检测引脚（`get_sdcard_intr_gpio() == -1`，板级自检同一读数）
+ *   ⇒ ADF 的 `sdcard_is_exist()`（components/esp_peripherals/lib/sdcard/sdcard.c:192-197）恒为真
+ *   ⇒ `periph_sdcard` 的 **1 Hz 重试定时器**每秒都真的去挂一次卡
+ *   （components/esp_peripherals/periph_sdcard.c:99 `esp_periph_start_timer(self, 1000 / portTICK_RATE_MS, ...)`
+ *   → `sdcard_timer_handler` → `_sdcard_run()` → `periph_sdcard_mount()`），
+ *   无卡时每秒打一行 `E PERIPH_SDCARD: mount sdcard error!`（同文件 :139）——这就是"刷屏"。
+ *
+ * 落法（只静音、**不停定时器**）：把 SD 卡链路上的 4 个 tag 运行期级别设为 ESP_LOG_NONE ——
+ *   ① `PERIPH_SDCARD` —— ADF 外设层（periph_sdcard.c；刷屏那一行的 tag）
+ *   ② `SDCARD`        —— ADF 卡驱动层（components/esp_peripherals/lib/sdcard/sdcard.c:49）
+ *   ③ `sdmmc_common`  —— IDF SD 协议层（components/sdmmc/sdmmc_common.c:23）
+ *   ④ `vfs_fat_sdmmc` —— IDF FATFS 挂载层（components/fatfs/vfs/vfs_fat_sdmmc.c:25）
+ *
+ * 为什么**只静音、不停定时器**：静音是"降噪"，停定时器是"改行为"——那 1 Hz 定时器正是
+ *   **插卡自动挂载**的唯一通路（定时器 → SDCARD_STATUS_CARD_DETECT_CHANGE → `_sdcard_run()` 里
+ *   `sdcard_is_exist() && !sdcard->is_mounted` ⇒ `periph_sdcard_mount()`）；停掉它，插卡后就必须
+ *   重启或手动触发才能挂上，违背用户裁定里的「**保留自动挂载**」。
+ *   ⇒ ⛔ 只调 esp_log_level_set；⛔ 不碰 ADF 上游代码（components/esp_peripherals/ 下一个字符都不改）；
+ *     ⛔ 不改任何协议行为/帧/状态/错误码；⛔ 不动其它 tag 的级别（含 `*`）。
+ *
+ * 时机：必须在 SD 卡外设**首次挂载尝试之前**——本函数在 `app_main()` 里、`board_init_peripherals()`
+ *   之前调用（后者才 `audio_board_sdcard_init()`），故早于任何一次失败日志。
+ * 只打**一行** INFO 说明本次状态，⛔ 不每秒重复。 */
+static void sd_silence_mount_noise(void)
+{
+    esp_log_level_set("PERIPH_SDCARD", ESP_LOG_NONE);
+    esp_log_level_set("SDCARD",        ESP_LOG_NONE);
+    esp_log_level_set("sdmmc_common",  ESP_LOG_NONE);
+    esp_log_level_set("vfs_fat_sdmmc", ESP_LOG_NONE);
+
+    ESP_LOGI(TAG, "SD 卡未插入（后续挂载重试日志已静音）");
+}
+
 /* ---------------------------------------------------------------- 入口 */
 
 void app_main(void)
@@ -1737,6 +1843,14 @@ void app_main(void)
 
     ESP_LOGI(TAG, "korvo2_oneye 启动：ESP32-S3-Korvo-2 v3 板级固件（ESP-ADF v2.8 / IDF 5.5）");
     ESP_LOGI(TAG, "编译期板级断言：board_expect.h 已通过（rst V3.1 ↔ board_def.h）");
+#if CONFIG_ONEYE_FW_DIAG_PROV_TRACE
+    diag_boot_report();
+#endif
+
+    /* SD 卡缺失刷屏降噪（用户裁定「静音日志，但保留自动挂载（推荐）」）：**必须**早于
+     * `board_init_peripherals()` 里的 `audio_board_sdcard_init()`（SD 首次挂载尝试 + 1 Hz 重试）。
+     * ⛔ 只静音日志，⛔ 不停 1 Hz 重试定时器（插卡后仍自动挂载）。详见函数上方注释。 */
+    sd_silence_mount_noise();
 
     panel_api_set_identity(ONEYE_FW_VERSION, "ESP32-S3-Korvo-2 v3");
 

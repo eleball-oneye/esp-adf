@@ -1,0 +1,41 @@
+# =============================================================================
+# devkitc_oneye · **乙类（BETA）**档位预设
+#
+# 叠加顺序（最后一份）：
+#   sdkconfig.defaults
+#     ; sdkconfig.defaults.esp32s3
+#       ; sdkconfig.defaults.ble
+#         ; sdkconfig.defaults.beta      ← 本文件
+#
+# ★ 乙的物理事实（契约 §4.4.8（〇）用户逐字）：
+#   「乙型有内嵌证书**只是作为设备自身入网准入前提**」＋「乙型丙型在上平台前都无身份」
+#   ⇒ · ⛔ 无 creds 分区（无实例身份）；
+#     · ✅ 有**品类级**内嵌证书（入网准入前提；⛔ 非一机一密、⛔ 非身份）；
+#     · ✅ 能连云（`prov.verify.req` **必经**，判据 = `node_id` 形态/有效性；权威在云侧准入）。
+#
+# ⚠️ 本文件**只**写档位与平台准入两件事；其余全部由上面的通用/BLE 预设承载。
+#    一份预设只答一个机型问题 —— 混着放会让"这一项到底属于谁"变得不可读。
+# =============================================================================
+
+# ---- 档位（三值 choice；唯一的分派依据）-----------------------------------------
+# 乙 ⇒ `prov.verify.req` **必经**（形态/有效性判据）；`cred_req=false`；配对判据只剩 chal。
+CONFIG_ONEYE_FW_ONBOARDING_ROLE_BETA=y
+
+# ---- 旧载体（兼容项）：契约要求乙 ⇒ `cred_req=false` -----------------------------
+# ⚠️ 与上一行**必须一致**，不一致时 `main/wifi_prov_ble.c:522-530` 编译期 `#error` 拦下。
+CONFIG_ONEYE_FW_DEV_CRED_REQUIRED=n
+
+# ---- SDK 侧「creds 分区缺失时不许回退」= **n** -----------------------------------
+# 乙**没有** creds 分区（上平台前无实例身份）⇒ 若这一项为 y，`oneye_dev_creds_load()`
+# 拿到 `ERR_NOT_FOUND` 就会被判定为"必须拒绝联网"，乙**永远上不了云**（与档位定义直接矛盾）。
+# ⚠️ 符号名是 SDK 的 `ONEYE_DEV_CREDS_REQUIRED`（生成物 = `CONFIG_ONEYE_DEV_CREDS_REQUIRED`），
+#    **不是**上面的 `ONEYE_FW_DEV_CRED_REQUIRED`。
+# ⚠️ 本项为 n 时，`main/CMakeLists.txt` 的「REQUIRED=y 与内嵌证书不能同时成立」门禁**不会**触发
+#    ⇒ 乙档**必须**给非空证书目录（否则固件自带的 `#error` 会让构建失败 —— 那是**故意**的：
+#    「乙 = 有内嵌证书」这条判据在构建期就要成立）。
+CONFIG_ONEYE_DEV_CREDS_REQUIRED=n
+
+# ---- 配网形态：开机即广播（配网+绑定闭环验证的第一诉求是"上电就能被 App 发现"）----
+# 长按 BOOT(GPIO0) 仍可退出 / 重新进入配网模式（见 main/devkitc_oneye_main.c 的按键段）。
+# CONFIG_ONEYE_FW_BLE_PROV_KEY_GATE is not set      # = Kconfig 缺省 n
+CONFIG_ONEYE_FW_BLE_PROV_PAIRING_WINDOW_S=300

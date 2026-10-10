@@ -1,0 +1,12 @@
+# devkitc_oneye —— **零 audio/display/camera 依赖**的 BLE 配网工程。
+#
+# 为什么这里是**空**的（⛔ 不是漏写）：
+#   本工程**只**依赖 ESP-IDF 内建组件（esp_wifi / esp_netif / esp_event / nvs_flash / bt /
+#   mbedtls / json）＋ 本仓组件 `components/oneye-dev-sdk`（按路径解析，不是注册表组件）。
+#   ⇒ **不需要**任何组件管理器（registry）依赖。
+#
+# korvo2_oneye 的 `main/idf_component.yml` 里只有 `espressif/esp_jpeg`（摄像头组件
+# `esp32-camera` 声明的依赖）—— 本工程无摄像头 ⇒ 该依赖**不适用**，故本文件为空。
+# ★ 附带好处（如实登记）：`managed_components/` 在构建前后**必然是同一个空集合**
+#   （见 README「managed_components 清单一致」一节），因为本工程没有任何 registry 依赖。
+dependencies: {}

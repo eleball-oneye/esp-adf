@@ -1,0 +1,29 @@
+# =============================================================================
+# devkitc_oneye —— ESP32-S3 目标板级缺省（**DevKitC-1**，不是 Korvo-2）
+#
+# ★ 与 korvo2_oneye/sdkconfig.defaults.esp32s3 的差异（逐条）：
+#   ⛔ 无 `CONFIG_ESP32_S3_KORVO2_V3_BOARD=y`（那是 ADF 的板卡选择；本工程不链接 ADF）；
+#   ⛔ 无 `CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=3072`（那是"ADF 音频通路对系统事件
+#      任务栈的要求"；本工程无音频通路 ⇒ 保留 IDF 缺省 2048，⛔ 不无理由抬高）；
+#   ⛔ 无 esp-sr / AFE / WakeNet 段（`CONFIG_MODEL_IN_FLASH` / `CONFIG_AFE_INTERFACE_V1` /
+#      `CONFIG_SR_*`）；本工程**不链接 esp-sr**，那些符号不可见。
+# =============================================================================
+
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_IDF_TARGET_ESP32S3=y
+CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240=y
+CONFIG_ESP32S3_DEFAULT_CPU_FREQ_MHZ=240
+
+# ---- Flash ---------------------------------------------------------------------
+# ESP32-S3-DevKitC-1（官方板）常见模组 = **ESP32-S3-WROOM-1 N8 = 8 MB**。
+# ⚠️ 若手上是 N16R8（16 MB）等其它模组，必须显式改这两行 —— ⛔ 不要靠"反正用不到那么大"。
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="8MB"
+
+# ---- PSRAM：**显式关闭** -------------------------------------------------------
+# 为什么显式关（而不是"不写"）：DevKitC-1 的模组 PSRAM 随批次不同（N8 无 / N8R8 有 / N16R8 有）
+# ⇒ 打开 PSRAM 会让固件**只在部分板子上能跑**。本工程零音频依赖 ⇒ 不需要 PSRAM。
+# ⚠️ 后果（如实登记）：`free_psram=0` 在 `[res]` 读数里恒为 0，且
+#    `CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL` 不可用（见 sdkconfig.defaults.ble）。
+# CONFIG_SPIRAM is not set
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y

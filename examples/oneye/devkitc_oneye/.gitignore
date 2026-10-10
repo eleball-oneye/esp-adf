@@ -1,0 +1,12 @@
+# devkitc_oneye —— 构建产物不入库（idf.py 的默认目录名是 `build`，本工程按档位分目录）
+#
+# ⚠️ 为什么要显式写这两行：本工程的两套固件用 `build-<档位>/`（见 tools/build-devkitc.sh），
+#    而仓库 `.gitignore` 里忽略的是 `build/`（单数）⇒ 不写就会把两套固件（约 2.4 MB 的可执行件
+#    与上千个 .obj）暴露成待提交文件。
+#
+# ⚠️ 而 `examples/**/sdkconfig` 由仓库根 `.gitignore` 统一忽略（`build-*/sdkconfig` 同样命中）
+#    ⇒ 本文件不重复声明。
+build/
+build-beta/
+build-gamma/
+build-diag/

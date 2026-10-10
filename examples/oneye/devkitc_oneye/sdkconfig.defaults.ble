@@ -1,0 +1,73 @@
+# =============================================================================
+# devkitc_oneye · BLE 机型预设 —— 本工程**唯一**的配网通道就是 BLE（C1/C2）
+#
+# 叠加顺序（**逐字**；`SDKCONFIG_DEFAULTS` 按文件**顺序**施加）：
+#   devkitc_oneye/sdkconfig.defaults
+#     ; devkitc_oneye/sdkconfig.defaults.esp32s3
+#       ; devkitc_oneye/sdkconfig.defaults.ble
+#         ; devkitc_oneye/sdkconfig.defaults.<档位>      （beta / gamma）
+#
+# ★ 这份文件的**来源**（⛔ 不是新拟）：逐项照抄
+#   `examples/oneye/korvo2_oneye/sdkconfig.defaults.ble`（真机取证 2026-09-17，
+#   BLE 配网首次打通、并与音频管线共存）。B 段里那几条（主机任务栈 12 KB、MSYS 池 12、
+#   Wi-Fi 缓冲下调）每条都对应一次真机上踩出来的崩溃/饥饿，不是保守取值 ⇒ **照抄不精简**。
+#
+# 🔴 **两处与源预设的**逐字差异**（都是"本工程机型事实不同"，⛔ 不是放宽）：
+#   ① `CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL` ⇒ 本工程**不开 PSRAM**（DevKitC-1 模组
+#      PSRAM 随批次不同）⇒ 该符号不可见、赋值会被**静默丢弃** ⇒ 显式改 `..._INTERNAL`，
+#      并把原因写清（⛔ 不留"看着走 external、其实回 internal"的假配置）；
+#   ② `CONFIG_ESP_WIFI_*_RX_BUFFER_NUM` ⇒ 源预设的 8/16 是"Wi-Fi + BLE + AFE 三栈共存"的
+#      取值；本工程无音频链路 ⇒ **保留 IDF 缺省**（不缩）。
+#
+# ⚠️ **顺序语义（源预设踩过的坑，照抄教训）**：defaults 是**按文件顺序**逐条施加的，
+#    而赋值给"当前不可见的符号"会被**静默丢弃**。
+#    `ONEYE_FW_ENABLE_BLE_PROV` 有 `depends on ONEYE_DEV_SDK_ENABLE_BLE`，后者又
+#    `depends on ONEYE_DEV_SDK_ENABLE_LINK`、再上还有 SDK 总开关 `ONEYE_DEV_SDK_ENABLE`。
+#    所以：**依赖者在前，被依赖者在后**按下面这个次序写。
+# =============================================================================
+
+# ---- 配网通道：**只有** BLE 一条（DevKitC-1 无 SD 卡槽 ⇒ 无凭据文件通道）---------
+# ⚠️ 本工程**不定义** `ONEYE_FW_ENABLE_WIFI_FILE` 这个符号（那是 korvo2 机型能力位；
+#    这里连"有没有卡槽"这个问题都不该被问出来）⇒ 代码里 C3 那一段**编不进来**。
+#    依据：ADR-0017 D3「无卡槽机型 = WIFI_FILE n + BLE 通道 y」。
+CONFIG_ONEYE_DEV_SDK_ENABLE=y
+CONFIG_ONEYE_DEV_SDK_ENABLE_LINK=y
+CONFIG_ONEYE_DEV_SDK_ENABLE_BLE=y
+CONFIG_ONEYE_FW_ENABLE_BLE_PROV=y
+
+# ---- 平台准入前提（乙 / 丙 共用）：**没有 creds 分区** ---------------------------
+# 契约 §4.4.8（〇）：乙 / 丙 有「品类资格」、**没有**「实例身份」⇒ 两档都不读 creds 分区。
+# ⚠️ 符号名是 SDK 的 `ONEYE_DEV_CREDS_REQUIRED`（生成物里 = `CONFIG_ONEYE_DEV_CREDS_REQUIRED`），
+#    **不是**本工程 Kconfig 的 `ONEYE_FW_DEV_CRED_REQUIRED`（后者是"要不要激活凭证"，
+#    进 `prov.pair.ok.cred_req`）—— 两者是**不同**的载体，⛔ 不要混。
+CONFIG_ONEYE_DEV_CREDS_REQUIRED=n
+
+# ---- Wi-Fi + BLE 共存 ---------------------------------------------------------
+# BLE 广播与 Wi-Fi 同时工作必须开共存（否则 BLE 广播期间 Wi-Fi 连接不稳）
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
+
+# ---- BLE（NimBLE，自研 GATT 服务）---------------------------------------------
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=517
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+# **主机任务栈必须 ≥ 12 KB**（默认 4096 会在 BLE 配网时崩板）：
+#   GATT 的 RX 回调跑在 NimBLE 主机任务上，SDK 在该回调里处理 `prov.pair` 并**直接回帧**
+#   （oneye_dev_ble.c → oneye_dev_ble_send_frame → 分片+加密+notify），栈不够即踩穿。
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=12288
+# NimBLE MSYS 内存池是**内部 RAM 里的静态数组**，默认 24/24 会在 BLE 打开后吃紧。
+# 本机型 BLE 只跑配网（帧 ≤600 B 分片），12/12 足够（与源预设同值）。
+CONFIG_BT_NIMBLE_MSYS1_BLOCK_COUNT=12
+CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=12
+CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=12
+# 🔴 devkitc_oneye 订正：本工程**不开 PSRAM** ⇒ 显式走**内部 RAM**（理由见文件头 ①）。
+# CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL is not set
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_INTERNAL=y
+
+# ---- Wi-Fi 缓冲区：**保留 IDF 缺省**（理由见文件头 ②）--------------------------
+# CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=10      # 缺省；本工程不缩
+# CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32     # 缺省；本工程不缩

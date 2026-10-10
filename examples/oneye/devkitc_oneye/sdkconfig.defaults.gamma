@@ -1,0 +1,41 @@
+# =============================================================================
+# devkitc_oneye · **丙类（GAMMA）**档位预设
+#
+# 叠加顺序（最后一份）：
+#   sdkconfig.defaults
+#     ; sdkconfig.defaults.esp32s3
+#       ; sdkconfig.defaults.ble
+#         ; sdkconfig.defaults.gamma     ← 本文件
+#
+# ★ 丙的物理事实（契约 §4.4.2 / §4.4.8（〇）用户逐字）：
+#   「丙型由 app 保证鉴权来入网」＋「丙型丙型在上平台前都无身份」
+#   ⇒ · ⛔ 无 creds 分区（无实例身份）；
+#     · ⛔ **不连云**（入网能力全交 App）⇒ 设备侧 `prov.verify.req` = **SKIP（零帧）**；
+#     · ⛔ **不落地身份**（设备侧零存储；`node_id` 由 App↔cloud 双方核验后**赋予**，
+#        且「丙的设备不需要拿到 `node_id`」）；
+#     · 广播厂商字段**可有可无**（带则与乙同形：`0x28` ＋ 空 `sn_field`）。
+#
+# ⚠️ 本文件**只**写档位与平台准入两件事。
+# =============================================================================
+
+# ---- 档位（三值 choice；唯一的分派依据）-----------------------------------------
+# 丙 ⇒ `prov.verify.req` **SKIP**（⛔ 不发现场帧、连 rsp 也不回）；`cred_req=false`；
+#      设备侧 ⛔ 不落地身份、⛔ 不建云链路（见 main/devkitc_oneye_main.c 的两处 `#else`）。
+CONFIG_ONEYE_FW_ONBOARDING_ROLE_GAMMA=y
+
+# ---- 旧载体（兼容项）：契约要求丙 ⇒ `cred_req=false` -----------------------------
+CONFIG_ONEYE_FW_DEV_CRED_REQUIRED=n
+
+# ---- SDK 侧「creds 分区缺失时不许回退」= **n** -----------------------------------
+# 理由与乙档**逐字相同**（丙同样没有 creds 分区）。区别只在"有没有内嵌证书"：
+# 丙的证书**不参与本地面任何判据**（服务端不验签、设备不连云）⇒ 本档按
+# **不嵌入证书**构建（`-DONEYE_FW_CERT_DIR=<空目录>`），`main/CMakeLists.txt` 的门禁亦不触发。
+CONFIG_ONEYE_DEV_CREDS_REQUIRED=n
+
+# ---- 配网形态：开机即广播 --------------------------------------------------------
+# CONFIG_ONEYE_FW_BLE_PROV_KEY_GATE is not set      # = Kconfig 缺省 n
+CONFIG_ONEYE_FW_BLE_PROV_PAIRING_WINDOW_S=300
+
+# ⚠️ 如实登记（⛔ 不静默）：本档**仍然**把 `CONFIG_ONEYE_FW_CLOUD_HOST/_PORT` 编进固件
+#    （它们来自通用预设，是"钉死端点"的纪律）。丙**不调用** `oneye_dev_base_start()`
+#    ⇒ 这两个串只是**未被使用**的常量，⛔ 不代表丙"会连云"。

@@ -1,0 +1,229 @@
+menu "devkitc_oneye 板级固件配置（ESP32-S3-DevKitC-1 · 零音频依赖）"
+
+    # =========================================================================
+    # 身份 / 机型位（**逐字沿用** korvo2_oneye 的语义，⛔ 不改判据）
+    # =========================================================================
+
+    config ONEYE_FW_DEVICE_ID
+        string "设备 node_id（同时作为 MQTT username / client_id）"
+        default "devkitc-0001"
+        help
+            对应契约 topic 中的 {node} 段（rmng/dev/{node}/...）。
+            EMQX ACL 变量 %u 依赖 username，故默认三者同值。
+
+            ⚠️ 它只是**台面占位**：真实身份来自 `creds` 分区的 node_id
+            （`oneye_dev_creds_load()` → `oneye_dev_creds_apply()`）。
+            ⇒ ⛔ 不得把它当"这台设备的 SN"用（蓝牙广播的厂商字段因此**只**从 creds 取 SN）。
+            ⚠️ **乙 / 丙 档下 `creds` 分区按量产口径不存在** ⇒ 本项就是设备上云时用的标识
+            （见 `main/devkitc_oneye_main.c` 的 `oneye_start()` 注释；⛔ 不声称它是实例身份）。
+
+    config ONEYE_FW_PRODUCT_KEY
+        string "产品品类 productKey（机型标识；cloud 机型表 dev_product_credential_policy 的键）"
+        default "OY-SPK-01"
+        help
+            **本工程取 `OY-SPK-01`（与 korvo2_oneye 同值）**，理由与取处如下（⛔ 非本处新造）：
+
+              取处：`examples/oneye/korvo2_oneye/main/Kconfig.projbuild:14-20`（逐字）
+                    其 help 逐字指向 cloud/docs/00-naming-convention.md:4604-4607 的机型清单。
+
+            ★ 它是**机型属性**、不是设备属性 ⇒ 允许来自构建配置
+              （一台设备一个 node_id，但同机型共用一个 productKey）。
+
+            ⚠️ **本工程没有为 DevKitC-1 新造机型码**（⛔ 不自行增删判据）：乙 / 丙 两档
+               **共用** `OY-SPK-01` —— 因此 cloud 侧**不能**靠 product_key 区分乙与丙，
+               区分乙 / 丙 的**唯一**载体是 `dev_product_credential_policy.onboarding_actor`
+               ＋ 设备侧的 `ONEYE_FW_ONBOARDING_ROLE`（契约 §4.4.7 / §4.4.10（十）1.）。
+               ⚠️ 这意味着**同一 product_key 上不能同时登记乙与丙**（两者 onboarding_actor 不同）
+               —— 属**需 cloud 侧裁定**的缺口，见本工程 README「缺口与占位」。
+
+            ⚠️ 用途：蓝牙扫描响应里的厂商自定义字段（AD 0xFF）只带 productKey 的**品类段**
+              （`OY-<FAMILY>-<NN>` 中间的 FAMILY，如 `SPK`；3 B —— 31 B 广播包放不下全量，
+               理由与字节布局见 contracts/local/ble-gatt.md 与 include/oneye_dev_ble.h）。
+               空串 ⇒ 只带 SN、不带品类（App 侧 `pk_present=0`），⛔ 不填默认值。
+
+    config ONEYE_FW_VERSION
+        string "固件版本字符串（进 caps/up 与影子 firmwareVersion）"
+        default "0.1.0-devkitc"
+
+    # =========================================================================
+    # 接入（EMQX / 云端）—— 与 korvo2_oneye 同口径（乙：连平台；丙：⛔ 不连云）
+    # =========================================================================
+
+    menu "接入（EMQX / 云端）"
+
+        config ONEYE_FW_CLOUD_HOST
+            string "云端主机（host 或 IP）"
+            default "mqtt.oneye.me"
+
+        config ONEYE_FW_CLOUD_PORT
+            int "端口（0 = 按承载取契约缺省：1883/8883/8083/8084）"
+            range 0 65535
+            default 18886
+            help
+                18886 = 平台 CA（`oneye-iot-device-ca`）那台 broker 的设备面监听器；
+                取处与理由逐字见 `korvo2_oneye/sdkconfig.defaults:145-152`。
+
+        config ONEYE_FW_CLOUD_WS_PATH
+            string "WebSocket 路径（空 = /mqtt，契约 §9）"
+            default ""
+
+        config ONEYE_FW_CLOUD_TOKEN
+            string "设备令牌 token（空 = 匿名/dev 形态）"
+            default ""
+
+        choice ONEYE_FW_TRANSPORT
+            prompt "承载（契约：tcp 1883 / tls 8883 / ws 8083 / wss 8084）"
+            default ONEYE_FW_TRANSPORT_TLS
+            config ONEYE_FW_TRANSPORT_TCP
+                bool "MQTT over TCP（开发/联调；⚠️ 与内嵌证书的 CA 是矛盾组合）"
+            config ONEYE_FW_TRANSPORT_WS
+                bool "MQTT over WebSocket（/mqtt）"
+            config ONEYE_FW_TRANSPORT_TLS
+                bool "MQTT over TLS（生产主承载；乙档用内嵌证书 + 平台 CA）"
+            config ONEYE_FW_TRANSPORT_WSS
+                bool "MQTT over WSS（/mqtt）"
+        endchoice
+
+        config ONEYE_FW_TLS_INSECURE
+            bool "TLS 跳过证书校验（仅 dev/产测；生产必须 n）"
+            default n
+            help
+                置 y 时 SDK 会打 WARN。生产形态须通过
+                `oneye_dev_base_config_t.tls_ca_pem` 投放 CA，不得跳过校验。
+                ★ 乙档的「内嵌证书」正是走这条路（见 main/CMakeLists.txt 的 ONEYE_FW_CERT_DIR）。
+    endmenu
+
+    # =========================================================================
+    # Wi-Fi（本机型**只有** BLE 一条配网通道 —— 无卡槽、无 SD 卡凭据文件）
+    # =========================================================================
+
+    menu "Wi-Fi 与 BLE 配网通道"
+
+        config ONEYE_FW_WIFI_SSID
+            string "Wi-Fi SSID（兜底；空 = 不使用兜底常量）"
+            default ""
+            help
+                ⚠️ 本机型**不开**凭据文件通道（无卡槽）⇒ 本项是唯一可能"不需要 App"的入网点。
+                缺省为空（= 必须用 BLE 配网）。台面联调可显式给值，但它**不是配网通道**
+                （ADR-0017 D1 的 C5，属「其他」层，rank 2）。
+
+        config ONEYE_FW_WIFI_PASSWORD
+            string "Wi-Fi 密码（兜底）"
+            default ""
+
+        config ONEYE_FW_ENABLE_BLE_PROV
+            bool "启用 BLE 配网通道 C1/C2（oneye-dev-sdk 自研 GATT + 激活码配对）"
+            default y
+            depends on ONEYE_DEV_SDK_ENABLE_BLE
+            help
+                配网通道 C1（手机 App）与 C2（另一台嵌入式设备）：BLE 上跑 link 帧，
+                由 App/对端下发 SSID/密码（契约 contracts/local/ble-gatt.md）。
+                设备侧复用 SDK 的 `liboneye_dev_ble`（自研 GATT；配对判据 =
+                **一次性 `chal` 合法**（存在/16 B/未过期/未用过）＋ **配对阶段⛔ 不判 `code`**
+                （契约 §4.4.10（三））；⛔ POP（6 位数字）已按用户 2026-10-09 裁定彻底删除），
+                实现见 main/wifi_prov_ble.c —— 它**只**把凭据交给 wifi_prov_submit_credentials()，
+                入网后动作统一由 main/wifi_prov.c 的收敛点触发（ADR-0017 D2）。
+
+                依赖 `ONEYE_DEV_SDK_ENABLE_BLE=y`（SDK Kconfig），并需要 NimBLE 主机
+                （`CONFIG_BT_ENABLED=y`）与 Wi-Fi/BLE 共存（见 sdkconfig.defaults.ble）。
+
+        # =====================================================================
+        # 🔴 设备侧档位（甲 / 乙 / 丙）—— **逐字沿用** korvo2_oneye 的三值机型位
+        # =====================================================================
+
+        choice ONEYE_FW_ONBOARDING_ROLE
+            prompt "设备侧档位（甲 / 乙 / 丙；契约 ble-gatt.md §4.4.2，须与云 onboarding_actor 一致）"
+            depends on ONEYE_FW_ENABLE_BLE_PROV
+            default ONEYE_FW_ONBOARDING_ROLE_ALPHA
+            help
+                三型定义（契约 §4.4.2 的矩阵逐字）：
+
+                | 档位 | 物理事实 | `cred_req` | `prov.verify.req` |
+                | 甲 ALPHA | 有 creds（一机一密）＋能连云 | true | **必经**：与自身 `creds.node_id` 逐字比对 |
+                | 乙 BETA  | 无 creds ＋ 品类级内嵌证书 ＋能连云 | false | **必经**：判据 = `node_id` 的**形态 / 有效性** |
+                | 丙 GAMMA | 无 creds ＋ 连不上云（入网能力全交 App） | false | **SKIP**：⛔ 不发现场帧 |
+
+                ★ **缺省 = 甲（最严）**：与 cloud 机型表读不到时 fail-closed 取 `true`、
+                  §4.4.7「失败方向写死 = 最严」**同向**；⛔ 不是"默认放宽"。
+                ★ **未声明档位**（SDK 侧 `adv_device_tier_set = false`）⇒ 三态判据 fail-closed 按**甲**。
+                ★ 乙的判据⛔ **不是身份证明**：乙**无设备级秘密** ⇒ 本地**不可能**证明
+                  「这个 `node_id` 就是我」⇒ 形态判据拦的是「空码 / 形态非法」，
+                  **权威在云侧准入**。
+
+            config ONEYE_FW_ONBOARDING_ROLE_ALPHA
+                bool "甲 ALPHA：有 creds 一机一密 ＋ 能连云"
+            config ONEYE_FW_ONBOARDING_ROLE_BETA
+                bool "乙 BETA：无 creds ＋ 品类级内嵌证书 ＋ 能连云（verify 必经：形态判据）"
+            config ONEYE_FW_ONBOARDING_ROLE_GAMMA
+                bool "丙 GAMMA：无 creds ＋ 连不上云（verify **SKIP**：⛔ 一帧不发）"
+        endchoice
+
+        config ONEYE_FW_DEV_CRED_REQUIRED
+            depends on ONEYE_FW_ENABLE_BLE_PROV
+            bool "本机型**需要激活凭证**（⇒ 配答应答 prov.pair.ok 的 cred_req=true）"
+            default y
+            help
+                ⚠️ **降级为「旧载体 / 兼容载体」** —— 它**只能判甲 vs（乙 | 丙）**
+                （契约 §4.4.4 逐字：这一格**判不出乙与丙**）⇒ **三态分型请用上面的
+                `ONEYE_FW_ONBOARDING_ROLE`**；本项保留只为"取值与 cloud 的
+                `dev_product_credential_policy.credential_required` 同源"这一可读性。
+
+                ★ **乙 / 丙 两档必须置 n**（契约：两型都 `cred_req=false`）；
+                  与档位不一致时 `main/wifi_prov_ble.c:522-530` 在**编译期** `#error` 拦下
+                  （⛔ 不静默选一边）。
+                ⚠️ 与 SDK 的 `ONEYE_DEV_CREDS_REQUIRED`（**另一个符号**，见
+                  `components/oneye-dev-sdk/Kconfig:25`）**不是同一件事**：
+                  前者 = "本机型要不要激活凭证"（进 `prov.pair.ok.cred_req`）；
+                  后者 = "creds 分区缺失时**不许回退**"（量产红线）。
+                  乙 / 丙 档 **两者都必须为 n**（⛔ 不靠改 production 默认绕）。
+
+        config ONEYE_FW_BLE_PROV_KEY_GATE
+            depends on ONEYE_FW_ENABLE_BLE_PROV
+            bool "BLE 配网改由按键进入/退出（长按 BOOT/GPIO0；开机只待机不广播）"
+            default n
+            help
+                置 y：开机把 NimBLE 起栈并打印 `[res]` 读数，但**不广播**（待机）；
+                长按 **BOOT 键（GPIO0）** 进入配网模式（开始广播、串口打印**本机型档位**与
+                剩余时间），**再长按一次**退出；
+                进入后 `ONEYE_FW_BLE_PROV_PAIRING_WINDOW_S` 秒内没有设备入网 ⇒ 自动退出；
+                入网成功仍由收敛点（`on_wifi_ready()`）停广播。
+
+                ⚠️ 置 y 的代价（**必须知情**）：启动期不再接受配网 ⇒ 若无人长按 BOOT，
+                   `wifi_prov_submit_credentials()` 永不会被调用、`oneye_start()` 永不被调用，
+                   设备**不会上云**（串口会打印"待机"与"长按 BOOT"指引）。
+                ★ 本工程**缺省 n**（= 开机即广播、随时可配网）：配网+绑定闭环验证要的是
+                  "上电就能被 App 发现"，而不是"先找到按键"。
+                  ⚠️ 长按 BOOT **仍然有效**：gate=n 时它用于**退出 / 重新进入**配网模式
+                  （见 main/devkitc_oneye_main.c 的按键段）。
+
+        config ONEYE_FW_BLE_PROV_PAIRING_WINDOW_S
+            depends on ONEYE_FW_ENABLE_BLE_PROV
+            int "BLE 配网模式超时（秒；进入后无成功入网则自动退出广播）"
+            range 30 3600
+            default 300
+            help
+                按用户口径取 300 s，与 SDK 的一次性 challenge（配对凭据）有效期
+                `CONFIG_ONEYE_DEV_SDK_BLE_CHAL_TTL_S`（缺省 300 s）对齐 ⇒
+                「chal 失效」与「配网窗口关闭」是同一刻。
+                ⚠️ 若把本值调**大于** chal TTL，则 chal 会先在窗口内轮换（App 侧需重新取 chal）
+                —— 仍可用，但两端"有效期"不再一致，故非必要不要偏离 300。
+    endmenu
+
+    # =========================================================================
+    # 诊断（心跳 + 配网链路留痕）—— 逐字沿用 korvo2_oneye 的 `diag` 口径
+    # =========================================================================
+
+    config ONEYE_FW_DIAG_PROV_TRACE
+        bool "诊断构建：配网链路逐步留痕 ＋ 5 s 心跳（默认 n；只由 sdkconfig.defaults.diag 打开）"
+        default n
+        help
+            打开后额外产出（全部 INFO/WARN，⛔ 不含密码 / 激活码 / chal / 令牌）：
+              1) 开机回显**运行期生效的日志级别**（esp_log_level_get 与编译期缺省/上限），
+                 并把 wifi_prov / wifi_prov_ble / oneye_ble / oneye_link / oneye 五个 tag 放宽到 DEBUG；
+              2) **5 s 一次心跳**（SDK 配网状态 + Wi-Fi 状态快照 + `[res]` 资源读数）——
+                 证明"串口是活的、级别是 INFO"，把"INFO 被日志级别滤掉"与"抓取窗口晚于开机"
+                 这两种解释分开；
+              3) SDK 侧配网状态事件回显（与 BLE 是否真发出**无关**）。
+
+            ⛔ 不新增帧 / ⛔ 不改帧字段 / ⛔ 不改状态机 / ⛔ 不改错误码。
+endmenu

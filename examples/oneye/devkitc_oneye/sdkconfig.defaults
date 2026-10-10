@@ -1,0 +1,54 @@
+# =============================================================================
+# devkitc_oneye 通用缺省（芯片参数见 sdkconfig.defaults.esp32s3；
+#                        BLE 通道见 sdkconfig.defaults.ble；档位见 sdkconfig.defaults.<beta|gamma>）
+#
+# ★ 与 korvo2_oneye/sdkconfig.defaults 的**逐项差异**（⛔ 不是抄一份，逐条给理由）：
+#   ① ⛔ 无 PSRAM 段（`CONFIG_SPIRAM*`）—— 零音频依赖之后没有任何需要 PSRAM 的缓冲；
+#      DevKitC-1 的模组 PSRAM 随批次不同 ⇒ **不假定有**（`CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_*`
+#      随之改为 internal，见 sdkconfig.defaults.ble）。
+#   ② ⛔ 无 FATFS / SPIFFS 段 —— 无 SD 卡、无录音兜底存储。
+#   ③ ⛔ 无 ADF 相关项（`CONFIG_FREERTOS_ENABLE_BACKWARD_COMPATIBILITY` 是给 ADF 的
+#      `xTaskCreateRestrictedPinnedToCore` 补丁用的；本工程不链接 ADF ⇒ **不需要**）。
+#      ⚠️ 这条**同时消掉了** korvo2 README §1 那条「必须给 IDF 打 ADF 的 FreeRTOS 补丁」前置。
+#   ④ ⛔ 无 `CONFIG_ONEYE_FW_ENABLE_SDCARD` / `_ENABLE_KEYS` / `_ENABLE_LCD` /
+#      `_ENABLE_AEC_CAPTURE` / `_ENABLE_PANEL_API` / `_LOG_PROBE` / `_PROV_ATTEST` 等
+#      板级/取证开关 —— 本工程**不定义**这些符号（不是"定义了但关掉"：
+#      定义一堆恒为 n 的开关会让人以为"打开就能用"，而对应实现根本不存在）。
+#   ⑤ ✅ 保留：bootloader/分区表偏移、日志级别口径、承载与端点钉死、NVS 可用性相关项。
+# =============================================================================
+
+# Bootloader / 分区表：与 IDF 缺省一致（bootloader 0x1000、分区表 0x8000）。
+# ⚠️ 这里**故意不写** `CONFIG_PARTITION_TABLE_SINGLE_APP=y`：
+#    它与 `CUSTOM=y` 是同一个 choice 的两个成员，"两行都写"只是靠"后写者胜"才成立，
+#    读起来却像两条同时生效 —— 分区表只有一处选择，就只留一处。
+CONFIG_BOOTLOADER_OFFSET_IN_FLASH=0x1000
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_MD5=y
+
+CONFIG_ESPTOOLPY_HEADER_FLASHSIZE_UPDATE=y
+CONFIG_ESPTOOLPY_BEFORE_RESET=y
+
+# ---- 日志（板级自检已不存在，但"串口证据"这次是**唯一**观测面）------------------
+# 本工程没有本地 HTTP 验证面（无 panel_api）⇒ 全部证据来自串口 + App 侧。
+# 因此 INFO 必须完整打印；两档固件用 `-DSDKCONFIG_DEFAULTS` 叠加诊断预设时可再抬上限。
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+# 显式钉 `LOG_MAXIMUM_EQUALS_DEFAULT`（它是一个**真实符号**、门禁看得见；语义 = 运行期可调到缺省级别）。
+CONFIG_LOG_MAXIMUM_EQUALS_DEFAULT=y
+
+# ---- 承载：**必须钉死** ---------------------------------------------------------
+# 为什么钉：Kconfig 的承载缺省虽然也是 TLS，但"只写在 sdkconfig 里"的项会在
+# `sdkconfig` 一旦从 defaults 重新生成时掉回缺省；而 SDK 对"承载不是 TLS 却给了
+# tls_ca_pem"是**报错**的（一对矛盾配置早报早好）⇒ 设备完全不上线（korvo2 已实测踩到）。
+CONFIG_ONEYE_FW_TRANSPORT_TLS=y
+# ---- 云端端点：**同样钉死**（理由同上：掉回占位值 = 设备能起来但连不到平台）----
+# ⚠️ 端口必须与"信任签发 CA 的那台监听器"一致（平台 CA ⇒ 18886）；依据逐字见
+#    korvo2_oneye/sdkconfig.defaults:145-152。
+CONFIG_ONEYE_FW_CLOUD_HOST="mqtt.oneye.me"
+CONFIG_ONEYE_FW_CLOUD_PORT=18886
+
+# ---- 档位载体（**逐档覆盖**，见 sdkconfig.defaults.beta / .gamma）---------------
+# ⚠️ 这里**不写**默认档位：档位是"机型事实"，必须由档位预设显式给出，
+#    ⛔ 不允许"忘了叠档位预设 ⇒ 悄悄编出一个甲型件"（Kconfig 的 choice 缺省是甲，最严）。
+#    两档预设都必须同时给出：`ONEYE_FW_ONBOARDING_ROLE_*` 与 `ONEYE_FW_DEV_CRED_REQUIRED=n`
+#    （不一致时 `main/wifi_prov_ble.c:522-530` 在**编译期** `#error` 拦下）。

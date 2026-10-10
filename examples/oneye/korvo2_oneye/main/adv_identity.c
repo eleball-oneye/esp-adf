@@ -12,10 +12,12 @@
  *
  * 🔴 2026-10-09（台账 #1 / #3 / #4）：**两串拆开**，⛔ 不再同源：
  *   · `node_id`（**私密**：激活码 = 设备证书 CN，⛔ 不广播、⛔ 不进明文帧，✅ 贴机身）
- *       ⇒ ① `lcfg.node_id`（link 帧 `from`）② 配对 HKDF **salt** ③ `prov.pair.code` 的**逐字比对基准**。
+ *       ⇒ ① `lcfg.node_id`（link 帧 `from`）② **甲型** `prov.verify.req` 的**逐字核验基准**。
+ *         ⚠️ **2026-10-10 订正**：它**不再是 HKDF 的 `salt`**（契约 §4.4.10（四）：`salt = chal`）、
+ *         **也不再是** `prov.pair` 阶段的比对基准（§4.4.10（三）：配对不判码）。
  *   · `sn`（**公开**：贴机身、**可广播**）
- *       ⇒ ① 广播名 `ONEYE-<SN 后 4 位>` ② 厂商字段 `sn_field(24)` ③ `prov.pair.ok.sn`。
- *   ⛔ 读失败 ⇒ 返回 false（调用方据此**本通道不启动**），⛔ 不回落编译期 device_id。
+ *       ⇒ ① 广播名 `ONEYE-<SN 后 4 位>` ② 厂商字段 `sn_field(24)` ③ `prov.pair.ok.sn`（条件必填）。
+ *   ⛔ 读失败 ⇒ **甲**型本通道不启动（⛔ 不回落编译期 device_id）；**乙 / 丙** 可在**无实例身份**下起栈。
  * ★ `creds.sn` 为空 ⇒ **回落 `node_id`** 并置 `sn_fell_back`（**存量机行为不变**）：
  *   广播名 / 厂商字段仍取那一串，只是如实标注"非现役 v3 形态"（SDK 按串形自动置 0x04）。
  * ⚠️ 代价：`oneye_dev_creds_load()` 按分区大小 malloc（本机 16 KiB）。故本函数**取完即 free**，
@@ -33,29 +35,41 @@
 
 static const char *TAG = "wifi_prov_ble";
 
-bool adv_identity_load(adv_identity_t *out)
+adv_identity_status_t adv_identity_load_ex(adv_identity_t *out, adv_identity_status_t *reason)
 {
     oneye_dev_creds_t creds;
     oneye_dev_sdk_err_t rc;
 
+    if (reason != NULL) {
+        *reason = ADV_IDENTITY_ERR_CREDS;
+    }
     if (out == NULL) {
-        return false;
+        return ADV_IDENTITY_ERR_CREDS;
     }
     memset(out, 0, sizeof(*out));
 
     rc = oneye_dev_creds_load(&creds);
     if (rc != ONEYE_DEV_SDK_OK) {
-        /* 「没写过」与「坏了」对身份的处置**相同**（BLE 配网通道不启动），但日志分开讲，
-         * 与 oneye_start() 的失败姿态口径一致（合同 §2 冻结项）。 */
-        ESP_LOGW(TAG, "身份不可用：creds 读取失败（%s）⇒ **BLE 配网通道不启动**（广播名/salt 无来源）"
-                      "且厂商字段(0xFF) **整段不产出**（⛔ 不用编译期 device_id 冒充身份）",
+        /* 「没写过」与「坏了」对身份的处置**相同**（甲：BLE 配网通道不启动），但日志分开讲，
+         * 与 oneye_start() 的失败姿态口径一致（合同 §2 冻结项）。
+         * 🔴 2026-10-10：本分支**不再**由本文件决定"通道起不起" —— 那个决定是**档位感知**的
+         *    （甲 fail-closed / 乙·丙 可无身份起），见 `wifi_prov_ble.c` 的 `wifi_prov_ble_start()`。 */
+        ESP_LOGW(TAG, "身份不可用：creds 读取失败（%s）⇒ **甲型**BLE 配网通道不启动；"
+                      "乙 / 丙 档可在**无实例身份**下起栈（⛔ 仍不回落编译期 device_id 冒充身份）",
                  oneye_dev_strerror(rc));
-        return false;
+        if (reason != NULL) {
+            *reason = ADV_IDENTITY_ERR_CREDS;
+        }
+        return ADV_IDENTITY_ERR_CREDS;
     }
     if (creds.node_id == NULL || creds.node_id[0] == '\0') {
-        ESP_LOGE(TAG, "身份不可用：creds 分区里 node_id 为空 ⇒ 不启动 BLE 配网、不产出厂商字段（⛔ 不冒充）");
+        ESP_LOGE(TAG, "身份不可用：creds 分区里 node_id 为空 ⇒ **甲型**不启动 BLE 配网；"
+                      "乙 / 丙 档可在无身份下起栈（⛔ 不冒充）");
         oneye_dev_creds_free(&creds);
-        return false;
+        if (reason != NULL) {
+            *reason = ADV_IDENTITY_ERR_EMPTY;
+        }
+        return ADV_IDENTITY_ERR_EMPTY;
     }
     snprintf(out->node_id, sizeof(out->node_id), "%s", creds.node_id);
 
@@ -70,11 +84,19 @@ bool adv_identity_load(adv_identity_t *out)
     }
 
     ESP_LOGI(TAG, "设备身份（creds 分区，crc32=%08x）："
-                  "① 激活码 node_id=%s（私密：link 节点 id + HKDF salt + prov.pair.code 比对基准）；"
+                  "① 激活码 node_id=%s（私密：link 节点 id + `prov.pair.code` 的核验基准（甲）；⛔ 不再是 HKDF salt）；"
                   "② SN=%s（公开：广播名/厂商字段/prov.pair.ok，来源=%s，%u B）",
              (unsigned)creds.image_crc32, out->node_id, out->sn,
              out->sn_fell_back ? "**回落 node_id（存量机：creds.sn 为空）**" : "creds.sn",
              (unsigned)strlen(out->sn));
     oneye_dev_creds_free(&creds); /* 先把 16 KiB 还回去，再起 NimBLE（见文件头 ⚠️） */
-    return (out->node_id[0] != '\0');
+    if (reason != NULL) {
+        *reason = ADV_IDENTITY_OK;
+    }
+    return ADV_IDENTITY_OK;
+}
+
+bool adv_identity_load(adv_identity_t *out)
+{
+    return adv_identity_load_ex(out, NULL) == ADV_IDENTITY_OK;
 }

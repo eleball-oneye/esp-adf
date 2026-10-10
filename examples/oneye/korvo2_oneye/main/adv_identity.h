@@ -32,8 +32,23 @@ extern "C" {
 /* 会话/身份缓冲上界：激活码与 SN 的契约字符集上界均为 64（`^[A-Za-z0-9._-]{1,64}$`）+ 余量 */
 #define ADV_IDENTITY_BUF 72u
 
+/*
+ * 🔴 **2026-10-10 新增**：身份装载的**结果**（供调用方按**档位**决定能否继续）。
+ *
+ * 为什么不能只返回 `bool`（契约 §4.4.10（七·一）1. 的实现依据）：
+ *   「读不到身份」对**甲**与对**乙 / 丙**的处置**不同** —— 甲必须 fail-closed（⛔ 不冒充身份），
+ *   而乙 / 丙**在上平台前本来就没有实例身份**（契约 §4.4.8（一）身份状态矩阵：T1 / T2 无身份）
+ *   ⇒ 它们**必须**能在无身份下起 BLE 配网栈（否则"乙 / 丙 永远配不上网"）。
+ *   ⛔ 但**无论哪一档**都⛔ **不得**回落 `CONFIG_ONEYE_FW_DEVICE_ID`（第二来源 = 冒充）。
+ */
+typedef enum {
+    ADV_IDENTITY_OK = 0,      /* 身份已装载：`node_id` 非空（`sn` 非空：读不到时回落 `node_id`） */
+    ADV_IDENTITY_ERR_CREDS,   /* `creds` 读失败（没写过 / 坏了）—— `out` 已全清零 */
+    ADV_IDENTITY_ERR_EMPTY,   /* `creds` 读到了，但 `node_id` 为空 —— `out` 已全清零 */
+} adv_identity_status_t;
+
 typedef struct {
-    /* 激活码（= `creds.node_id`）：link 节点 id + HKDF salt + `prov.pair.code` 比对基准 */
+    /* 激活码（= `creds.node_id`）：link 节点 id + `prov.pair.code` 的**核验基准**（甲，见 `prov.verify.req`） */
     char node_id[ADV_IDENTITY_BUF];
     /* SN（= `creds.sn`；为空时**回落** `node_id`，见 `sn_fell_back`）：公开身份 */
     char sn[ADV_IDENTITY_BUF];
@@ -44,14 +59,20 @@ typedef struct {
 /*
  * 读取本机身份（一次性 `creds` 读取，两个串一起取出）。
  *
- * | 返回 | 条件 |
- * | --- | --- |
- * | `true` | `out->node_id` 非空（`out->sn` 保证非空：读不到 `creds.sn` 时回落 `node_id`） |
- * | `false` | 参数非法 / `creds` 读失败 / `node_id` 为空 ⇒ 调用方**不得**启动 BLE 配网通道 |
+ * | 返回 | 条件 | 调用方处置 |
+ * | --- | --- | --- |
+ * | `ADV_IDENTITY_OK` | `out->node_id` 非空（`out->sn` 保证非空：读不到 `creds.sn` 时回落 `node_id`） | 照常起通道 |
+ * | `ADV_IDENTITY_ERR_CREDS` | 参数非法 / `creds` 读失败 | **甲**：⛔ 不起通道；**乙 / 丙**：可**无身份**起通道（⛔ 仍不回落编译期常量） |
+ * | `ADV_IDENTITY_ERR_EMPTY` | `creds` 读到了但 `node_id` 为空 | 同上 |
  *
- * ⛔ 失败时 `out` 全清零（不留半截值）：广播里不得出现"看起来像 SN 的东西"，
- *    也不得回落编译期常量（那会让广播名与 salt 出现第二个来源）。
+ * ⛔ 任何失败路径下 `out` 都**全清零**（不留半截值）：广播里不得出现"看起来像 SN 的东西"，
+ *    也不得回落编译期常量（那会让广播名与身份出现第二个来源）。
+ * ⚠️ `reason` 可为 NULL（调用方不关心成因时）。
  */
+adv_identity_status_t adv_identity_load_ex(adv_identity_t *out, adv_identity_status_t *reason);
+
+/* 旧签名（**逐字保留**，⛔ 不删）：`true` ⇔ `adv_identity_load_ex(...) == ADV_IDENTITY_OK`。
+ * ⚠️ 新代码请用 `_ex` 版 —— 只有它能区分"读失败"与"node_id 为空"，而乙 / 丙 的档位感知需要这个区分。 */
 bool adv_identity_load(adv_identity_t *out);
 
 #ifdef __cplusplus

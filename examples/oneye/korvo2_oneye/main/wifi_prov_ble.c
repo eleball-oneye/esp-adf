@@ -60,21 +60,26 @@ static esp_timer_handle_t s_window_timer;
  * 🔴 2026-10-09（台账 #1 / #3 / #4）：**两串拆开**，⛔ `node_id` 不再喂三处：
  *   · **`node_id` = 激活码**（**私密**：= 设备证书 CN；⛔ 不广播、⛔ **不进明文帧**；✅ 贴机身）
  *       ① `lcfg.node_id`（link 帧 `from`，`oneye_dev_link.c`）；
- *       ② 配对 HKDF **salt**（`bcfg.device_id`；契约 §4.3：`salt = node_id`，⛔ 不做大小写折叠）；
- *       ③ `prov.pair.code` 的**逐字比对基准**（台账 #8：设备本地比对、fail-fast）。
+ *       ② **甲型** `prov.verify.req` 的**逐字核验基准**（台账 #8：设备本地比对、fail-fast）。
+ *       ⚠️ **2026-10-10 订正（旧字逐字留痕，⛔ 不抹）**：本处此前逐字为「② 配对 HKDF **salt**
+ *       （`bcfg.device_id`；契约 §4.3：`salt = node_id`，⛔ 不做大小写折叠）；③ `prov.pair.code` 的
+ *       **逐字比对基准**」—— **两条都已作废**：契约 §4.4.10（四）改为 **`salt = chal`**、
+ *       §4.4.10（三）改为**配对不判码**（甲型的比对移到 `prov.verify.req`）。
  *   · **`sn` = SN**（**公开**：贴机身、**可广播**）
  *       ① **广播名** = `ONEYE-<SN 后 4 位>`（派生函数与调用点 = SDK
  *          `components/oneye-dev-sdk/src/oneye_dev_ble.c` 的 `oneye_dev_ble_init()`：
  *          `oneye_snprintf(s_ble.adv_name, …, "ONEYE-%s", (nm_len > 4u) ? (nm + nm_len - 4u) : nm)`；
  *          本文件把 `bcfg.adv_name` 留空 ⇒ 走自动派生）；⚠️ 名字只在 **GAP 层**（0x2A00），
  *          ⛔ 不进广播数据、⛔ 不进扫描响应（台账 #3）；
- *       ② **厂商字段 `sn_field(24)`**（`bcfg.adv_sn`，布局见 SDK 头「广播厂商自定义字段」段）；
- *       ③ **`prov.pair.ok.sn`**（⛔ 该帧**不再回 `node_id`**，台账 #7）。
+ *       ② **厂商字段 `sn_field(24)`**（`bcfg.adv_sn`，布局见 SDK 头「广播自定义字段」段）；
+ *          乙 / 丙 无身份时 ⇒ `0x28` ＋ 空 `sn_field` 占位（契约 §4.4.10（一）/（二））；
+ *       ③ **`prov.pair.ok.sn`**（**条件必填**：甲必给 / 乙·丙 可缺，⛔ 该帧**不回 `node_id`**）。
  *   ⛔ **不许留第二个来源**：本文件内**不再**出现 `CONFIG_ONEYE_FW_DEVICE_ID` 作为设备身份
  *      （旧值逐字留痕：上一版 `lcfg.node_id = CONFIG_ONEYE_FW_DEVICE_ID;`（:119）与
  *      `bcfg.device_id = CONFIG_ONEYE_FW_DEVICE_ID;`（:135））。
- *   ⛔ **读不到 ⇒ 本通道不启动**（fail-closed，见 `wifi_prov_ble_start()` 第 0 步）：
- *      回落编译期常量等于"替一台设备声称另一个身份"，且会让 App 算出的密钥与设备不一致。
+ *   🔴 **读不到怎么办 —— 档位感知（2026-10-10 订正；旧值为"⛔ 读不到 ⇒ 本通道不启动"）**：
+ *       **甲 / 档位未声明** ⇒ **仍 fail-closed**（⛔ 不启动，理由见 `wifi_prov_ble_start()` 第 0 步）；
+ *       **乙 / 丙** ⇒ **允许无实例身份起栈**（那是它们的正常起点；⛔ 仍不回落编译期常量）。
  *   ★ **`creds.sn` 为空 ⇒ 回落 `node_id`**（存量机；`s_ids.sn_fell_back`）—— 行为与 2026-10-07 那批一致，
  *      只是厂商字段会如实标注 `0x04`（老世代）。
  * ⚠️ 读取在**独立 TU**（`adv_identity.c`）里做：`oneye_dev_creds.h` 与 `oneye_dev_link.h`
@@ -83,6 +88,9 @@ static esp_timer_handle_t s_window_timer;
  */
 static adv_identity_t s_ids;
 static bool s_ids_ready;
+/* 🔴 2026-10-10：身份装载的**结果与成因**（档位感知的判据 —— "读不到"对甲与对乙 / 丙 处置不同） */
+static adv_identity_status_t s_ids_status;
+static adv_identity_status_t s_ids_reason;
 
 /* ------------------------------------------------------------------ provider（应用侧 Wi-Fi 动作） */
 
@@ -95,6 +103,13 @@ static void window_stop(void);
  * `#if CONFIG_ONEYE_FW_ENABLE_BLE_PROV` 之内 ⇒ 与 window_* 同理，此处先声明（C 单遍扫描）。
  * ⚠️ 该调用点自身也在 `#if CONFIG_ONEYE_FW_ENABLE_BLE_PROV` 的 `#else` 分支里（通道关时不可达）。 */
 static bool dev_cred_required(void);
+/* 🔴 2026-10-10 补前置声明（上一批**漏声明**，真机轨唯一的硬失败点）：`pairing_enter()` 新增的
+ * "本机型档位 = …（依据 …）"日志（见下方 `ESP_LOGI`）在**定义之前**用了这两个 `static` 函数，
+ * 而它们的定义在文件后段（`:355` / `:368`）⇒ 缺声明即 `-Werror=implicit-function-declaration`
+ * ＋ 连带 `conflicting types`（IDF 轨把告警当错误，固件构建停在第 457/474 步）。
+ * ⛔ 只补声明，⛔ 不改这两个函数的取值口径、⛔ 不改任何日志内容。 */
+static oneye_dev_ble_device_tier_t dev_onboarding_tier(void);
+static const char *dev_onboarding_tier_basis(void);
 
 /* 扫描：直接转发给 wifi_prov.c 的实现（Wi-Fi 生命周期归它管，本模块不碰 esp_wifi_*） */
 static int ble_prov_scan(char *json_out, size_t cap, void *ctx)
@@ -397,24 +412,58 @@ esp_err_t wifi_prov_ble_start(void)
         return ESP_OK;
     }
 
-    /* 0) 身份（本批的唯一来源）：**先读 creds 分区**，一次取出 **node_id（激活码）与 sn（公开）**
-     *    两串（独立 TU，见 adv_identity.c）。顺序上必须先读、取完立刻 free，再起 NimBLE
-     *    （避免 16 KiB 与 NimBLE 主机 12 KiB 栈同时在峰）。 */
+    /*
+     * 0) 身份：**先读 creds 分区**，一次取出 **node_id（激活码）与 sn（公开）** 两串
+     *    （独立 TU，见 adv_identity.c）。顺序上必须先读、取完立刻 free，再起 NimBLE
+     *    （避免 16 KiB 与 NimBLE 主机 12 KiB 栈同时在峰）。
+     *
+     * 🔴 **2026-10-10 订正：本步改为「档位感知」**（契约 §4.4.10（七·一）1.；依据 = 用户逐字
+     *    裁定「**乙型丙型在上平台前都无身份**」）：
+     *   · **甲**（缺省，最严）＋ 读不到 creds / `node_id` 为空 ⇒ **仍 `ESP_FAIL`、零广播**
+     *     （⛔ 成对负向：⛔ 不得把甲一起放宽 —— 甲的 `prov.verify.req` 要拿 `node_id` 逐字比对，
+     *      没有它这一档**一道闸都没有**）；
+     *   · **乙 / 丙** ＋ 无身份 ⇒ **允许起栈**（`ESP_OK`；⛔ 不 `ESP_FAIL`）：
+     *     空口照契约产出 `0x28` ＋ 空 `sn_field` 占位（乙必 / 丙两可，见 §4.4.10（一）/（二）），
+     *     `prov.pair` 的判据只剩 `chal`（§4.4.10（三）：配对不判码）⇒ **无 `node_id` 也能配对**；
+     *   · **档位未声明 / 档位值非法** ⇒ **按甲** fail-closed（⛔ 不猜档位）。
+     * ⛔ **两条硬边界（无论哪一档）**：
+     *   ① ⛔ **不回落 `CONFIG_ONEYE_FW_DEVICE_ID`**（第二来源 = 替一台设备声称另一个身份）；
+     *   ② 无身份时 `node_id` / `sn` **保持空**（⛔ 不编占位串；空口由 SDK 按档位产出 `0x28` 占位）。
+     */
     if (!s_ids_ready) {
-        s_ids_ready = adv_identity_load(&s_ids);
+        s_ids_status = adv_identity_load_ex(&s_ids, &s_ids_reason);
+        s_ids_ready = (s_ids_status == ADV_IDENTITY_OK);
     }
-    if (!s_ids_ready) {
-        /* fail-closed：⛔ 不回落 CONFIG_ONEYE_FW_DEVICE_ID（那会造成身份的第二个来源，
-         * 且 App 会用错 salt ⇒ 配对必失败）。宁可本通道不可用，也不冒充身份。 */
-        ESP_LOGE(TAG, "身份不可用（creds 分区的 node_id 读不到）⇒ **BLE 配网通道不启动**："
-                      "HKDF salt 与 prov.pair.code 的比对基准都必须来自真实 node_id，"
-                      "⛔ 不回落编译期 CONFIG_ONEYE_FW_DEVICE_ID（第二来源）");
-        return ESP_FAIL;
+    {
+        bool tier_known = (dev_onboarding_tier() == ONEYE_DEV_TIER_A_CREDS_DEVICE ||
+                           dev_onboarding_tier() == ONEYE_DEV_TIER_B_CERT_DEVICE ||
+                           dev_onboarding_tier() == ONEYE_DEV_TIER_C_APP_ONBOARDED);
+        bool tier_is_alpha = (dev_onboarding_tier() == ONEYE_DEV_TIER_A_CREDS_DEVICE) || !tier_known;
+
+        if (!s_ids_ready && tier_is_alpha) {
+            /* fail-closed（**仅甲 / 未声明**）：⛔ 不回落 CONFIG_ONEYE_FW_DEVICE_ID（第二来源，
+             * 且会让 App 用错派生根 ⇒ 配对必失败）。宁可本通道不可用，也不冒充身份。 */
+            ESP_LOGE(TAG, "身份不可用（creds 的 node_id 读不到，原因=%s）＋ 档位=%s（按甲 fail-closed）"
+                          "⇒ **BLE 配网通道不启动**：甲的 prov.verify.req 必须拿自身 node_id 逐字比对，"
+                          "⛔ 不回落编译期 CONFIG_ONEYE_FW_DEVICE_ID（第二来源）",
+                     s_ids_reason == ADV_IDENTITY_ERR_EMPTY ? "creds.node_id 为空" : "creds 读取失败",
+                     oneye_dev_ble_device_tier_name((int)dev_onboarding_tier()));
+            return ESP_FAIL;
+        }
+        if (!s_ids_ready) {
+            /* 乙 / 丙：**无实例身份**是它们的**正常起点**（§4.4.8（一）T1 / T2）⇒ 起栈、零冒充。 */
+            ESP_LOGW(TAG, "身份不可用（原因=%s）＋ 档位=%s ⇒ **允许无实例身份起 BLE 配网栈**："
+                          "空口产出 `0x28` ＋ 空 sn_field 占位（乙必 / 丙两可）；配对判据只剩 chal；"
+                          "⛔ 不回落编译期 device_id、⛔ 不编占位身份串",
+                     s_ids_reason == ADV_IDENTITY_ERR_EMPTY ? "creds.node_id 为空" : "creds 读取失败",
+                     oneye_dev_ble_device_tier_name((int)dev_onboarding_tier()));
+        } else {
+            ESP_LOGI(TAG, "身份已装载：激活码 node_id「%s」（私密：link 节点 id + 甲型核验基准）、"
+                          "SN「%s」（公开：广播名/厂商字段/prov.pair.ok；%s）",
+                     s_ids.node_id, s_ids.sn,
+                     s_ids.sn_fell_back ? "**creds.sn 为空 ⇒ 回落 node_id（存量机）**" : "来源 creds.sn");
+        }
     }
-    ESP_LOGI(TAG, "身份已装载：激活码 node_id「%s」（私密：salt + code 比对基准）、"
-                  "SN「%s」（公开：广播名/厂商字段/prov.pair.ok；%s）",
-             s_ids.node_id, s_ids.sn,
-             s_ids.sn_fell_back ? "**creds.sn 为空 ⇒ 回落 node_id（存量机）**" : "来源 creds.sn");
 
     /* 1) link：prov.* 帧的内置处理器在 link 层（oneye_dev_link.c:267-331），必须先于 ble 起来。
      *    本工程只用它的 ble 信道，不启用 lan/wan（那两条是别的通道/别的决策）。
@@ -425,7 +474,14 @@ esp_err_t wifi_prov_ble_start(void)
         memset(&lcfg, 0, sizeof(lcfg));
         ONEYE_DEV_STRUCT_INIT(lcfg);
         oneye_dev_link_config_defaults(&lcfg);
-        lcfg.node_id = s_ids.node_id;
+        /*
+         * ⚠️ 无实例身份（乙 / 丙 的起点）⇒ 传 **NULL**（让 SDK 用其**自己文档化的**缺省节点 id），
+         *    ⛔ 不传空串：link 的 `oneye_node_id_valid("")` 为 false ⇒ `oneye_dev_link_init()`
+         *    会返回 `ERR_INVALID`，把"无身份起栈"变成"通道不可用"（那是本批要修掉的现象）。
+         * ⛔ NULL **不是**回落 `CONFIG_ONEYE_FW_DEVICE_ID`（那才是第二来源 / 冒充）；
+         *    这里既没有读任何编译期常量，也没有替设备声称任何身份。
+         */
+        lcfg.node_id = (s_ids.node_id[0] != '\0') ? s_ids.node_id : NULL;
         /* 只跑 BLE：不给 wan_uri ⇒ wan 信道不启用；allow_plaintext_chan 保持缺省
          * （本工程没有 lan 信道，明文口径无从触发）。 */
         oneye_dev_sdk_err_t lrc = oneye_dev_link_init(&lcfg);
@@ -442,10 +498,15 @@ esp_err_t wifi_prov_ble_start(void)
     ONEYE_DEV_STRUCT_INIT(bcfg);
     oneye_dev_ble_config_defaults(&bcfg);
     /* ★ 2026-10-09 核心改动（台账 #1 / #3）：**两串各喂各的** ——
-     *   `device_id` = **激活码 node_id**（HKDF salt + `prov.pair.code` 比对基准）；
-     *   `adv_sn`    = **SN**（广播名派生 + 厂商字段 + `prov.pair.ok.sn`）。 */
-    bcfg.device_id = s_ids.node_id;
-    bcfg.adv_sn = s_ids.sn;
+     *   `device_id` = **激活码 node_id**（link 帧 `from` 用；⛔ 2026-10-10 起**不再是** HKDF salt、
+     *                 ⛔ 也**不再是** `prov.pair` 的比对基准 —— 只剩**甲型 `prov.verify.req` 的核验基准**）；
+     *   `adv_sn`    = **SN**（广播名派生 + 厂商字段 + `prov.pair.ok.sn`）。
+     * 🔴 2026-10-10（档位感知）：**无实例身份**时两者传 NULL ——
+     *   · `adv_sn = NULL` ＋ 档位乙 / 丙 ⇒ 平台层产出 `0x28` ＋ 空 `sn_field` 占位（契约 §4.4.10（一）/（二））；
+     *   · `adv_sn = NULL` ＋ 档位甲 / 未声明 ⇒ 整段 0xFF 不产出（⛔ 不冒充，一字未改）。
+     * ⛔ 两者都⛔ **不得**回落 `CONFIG_ONEYE_FW_DEVICE_ID`。 */
+    bcfg.device_id = (s_ids.node_id[0] != '\0') ? s_ids.node_id : "";
+    bcfg.adv_sn = (s_ids.sn[0] != '\0') ? s_ids.sn : NULL;
     /* 机型级「是否要求激活凭证」⇒ `prov.pair.ok.cred_req`（可选字段，台账 #7 / #9）。
      * 载体 = 本工程 Kconfig（编译期）：配网期无网 + 厂商字段里已无 `pk_family`（台账 #3）
      * ⇒ 设备侧拿不到 cloud 机型表，只能由机型位承载；缺省 y（与 cloud 的 fail-closed 同向）。 */
@@ -495,11 +556,13 @@ esp_err_t wifi_prov_ble_start(void)
     }
 
     s_started = true;
-    /* ⚠️ 走到这里 `s_ids_ready` 必为真（第 0 步 fail-closed 已保证）：故此处不再有"身份缺失"分支，
-     *    ⛔ 该分支不是被放宽，而是**不可达**了 —— 读不到 creds 时本函数在上面就返回 ESP_FAIL。
+    /* ⚠️ 🔴 **2026-10-10 订正（旧字逐字留痕，⛔ 不抹）**：本段此前逐字写「走到这里 `s_ids_ready` 必为真
+     *    （第 0 步 fail-closed 已保证）：故此处不再有"身份缺失"分支」—— ⚠️ 该"必为真"**只对甲成立**：
+     *    乙 / 丙 现在**允许** `s_ids_ready == false`（无实例身份起栈）⇒ 就绪行必须按**实际有无身份**讲清。
      *
-     * ★ 2026-10-09（台账 #1 / #3 / #7）：就绪行必须把**两串**讲清楚 ——
-     *   · 激活码 `node_id`（私密）只喂：link 节点 id + HKDF salt + `prov.pair.code` 比对基准；
+     * ★ 2026-10-09（台账 #1 / #3 / #7）：就绪行把**两串**讲清楚 ——
+     *   · 激活码 `node_id`（私密）只喂：link 节点 id ＋ **甲型** `prov.verify.req` 的逐字核验基准；
+     *     ⚠️ 2026-10-10：它**不再是** HKDF `salt`（`salt = chal`）**也不再是**配对阶段的比对基准；
      *   · SN（公开）喂：广播名（GAP 层，SDK 派生 `ONEYE-<SN 后 4 位>`）、厂商字段、`prov.pair.ok.sn`。
      *   ⛔ 不再写"三者同源于 node_id"（那是 2026-10-07 那批的口径，本批已就地作废）。
      *   ⚠️ 广播名的**后缀不在本文件里另算一遍**（那是第二处派生 = 第二事实源）：
@@ -509,14 +572,15 @@ esp_err_t wifi_prov_ble_start(void)
      * ⛔ 用户 2026-10-09 裁定（彻底删除 POP）：本行**不再读回 / 不再打印 POP**，
      *   改为打印**非敏感**信息（本机型是否需要激活凭证 + chal TTL 档位）。
      *   旧代码逐字留痕（⛔ 不抹）：`if (oneye_dev_ble_get_pop(s_pop, sizeof(s_pop)) ==
-     *   ONEYE_DEV_SDK_OK) { … "POP=%s 仅兼容/产测档，TTL %d s" … }`。 */
-    ESP_LOGI(TAG, "BLE 配网通道已就绪：%s；激活码 node_id=%s（私密：salt+code 比对基准）；"
-                  "SN=%s（公开：广播名 `ONEYE-<后 4 位>`/厂商字段(24 B)/prov.pair.ok；%s）；"
-                  "配对凭据 = 激活码＋一次性 chal（chal TTL %d s）；"
+     *   ONEYE_DEV_SDK_OK) { … "POP=%s 仅兼容/产测档，TTL %d s" … }`。
+     * ⛔ 无身份档位下**不打印** `node_id` / `SN`（它们本来就是空 —— ⛔ 不许编一个值出来充门面）。 */
+    ESP_LOGI(TAG, "BLE 配网通道已就绪：%s；身份=%s；"
+                  "配对判据 = 一次性 chal（合法＝存在/16 B/未过期/未用过；⛔ 配对阶段**不判 code**，chal TTL %d s）；"
                   "★ 本机档位=%s（依据 %s）⇒ prov.verify.req 处置=%s；%s激活凭证（cred_req=%d）",
              s_advertising ? "广播中" : "待机（未广播，等按键进入配网模式）",
-             s_ids.node_id, s_ids.sn,
-             s_ids.sn_fell_back ? "creds.sn 为空⇒回落 node_id（SDK 将标 0x04 老世代）" : "来源 creds.sn",
+             s_ids_ready
+                 ? "已装载（激活码 node_id=**私密**（甲型核验基准）/ SN=公开（广播名+厂商字段+prov.pair.ok））"
+                 : "**无实例身份**（乙 / 丙 的起点：空口 = `0x28` ＋ 空 sn_field 占位；上平台后由 cloud 赋身份）",
              (int)CONFIG_ONEYE_DEV_SDK_BLE_CHAL_TTL_S,
              oneye_dev_ble_device_tier_name((int)dev_onboarding_tier()), dev_onboarding_tier_basis(),
              (dev_onboarding_tier() == ONEYE_DEV_TIER_C_APP_ONBOARDED)

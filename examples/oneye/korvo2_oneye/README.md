@@ -494,7 +494,7 @@ cd embedded/esp-adf/examples/oneye/korvo2_oneye
 python3 tools/check-prov-convergence.py          # RESULT=PASS ⇒ exit 0
 ```
 
-它机械断言 A1–A13（`oneye_start()` 调用点唯一且在 `cloud_start_task` 内、`cloud_start_task`
+它机械断言 A1–A14（`oneye_start()` 调用点唯一且在 `cloud_start_task` 内、`cloud_start_task`
 创建点唯一且在 `on_wifi_ready` 内、ready 回调注册点/触发点各唯一、BLE 通道只经唯一入口且
 自己不调 `oneye_start()`/`esp_wifi_connect()`、**SD 凭据在启动期先于 BLE 被递上去**、
 **非 `wifi_prov.c` 不得直连 `wifi_prov_connect()`/不得写 `wifi_prov_set_source()`**、
@@ -504,11 +504,22 @@ python3 tools/check-prov-convergence.py          # RESULT=PASS ⇒ exit 0
 cloud_start_task`（授时必须先于建链）、**A13** 资源读数 `[res]` 由**同一个** helper 在 3 个
 **未入网也必经**的点各打一行且带 `phase=` 阶段标签：`app_main()`（配网/NimBLE 之前）·
 `wifi_prov_boot()` 内 `wifi_prov_ble_start()` **之后**（NimBLE 已起栈、尚未入网）·
-`cloud_start_task()`（原有的入网后那一处，⛔ 不得被删/移）…），
-并**自带 9 条注入负向对照**（第二条入网后逻辑 / 直连连接层 / 丢掉"只入网一次" / 抹掉留痕 /
+`cloud_start_task()`（原有的入网后那一处，⛔ 不得被删/移）…、
+**A14**（🔴 2026-10-10 本批：**落实既有契约状态 `prov.status{state=connected, ip=…}`**，⛔ 不新增帧 /
+⛔ 不新增错误码 / ⛔ 不动契约 —— `connected` 是 `contracts/local/link-frames.json` 的 `prov_states`
+里**既有**项，契约同处写明「connected 时 ip 必填」）：
+`oneye_dev_link_prov_report_status()` 全工程只 1 处调用且落在发帧包装 `wifi_prov_ble.c:
+wifi_prov_ble_report_prov_connected()` 内、该包装只被 `korvo2_oneye_main.c:
+prov_status_report_connected_once()` 调 1 次、后者只被收敛点下游 `on_wifi_ready()` 调 1 次、
+上报状态必须是 `ONEYE_DEV_LINK_PROV_CONNECTED`、判据本体只在 `main/wifi_prov_status.h`
+（固件与夹具同源）、判据里必须有「ip 非空」与「只报一次」两条、幂等位只由发送结果推进、
+且 main/ 下不得出现 `prov.status` 帧名字面量），
+并**自带 15 条注入负向对照**（第二条入网后逻辑 / 直连连接层 / 丢掉"只入网一次" / 抹掉留痕 /
 夹具自备判据 / **通道模块里再调一次 `sntp_boot_sync()`** / **通道模块里再调一次
 `net_probe_report()`** / **把 `sntp_boot_sync()` 挪到 `cloud_start_task` 之后** /
-**删掉 NimBLE 起栈后那一处资源读数**），
+**删掉 NimBLE 起栈后那一处资源读数** / **丢掉 ip 非空判据** / **丢掉幂等判据** /
+**发送失败也置位** / **第二个 connected 上报点** / **再开一个绕过判据的直发点** /
+**把 connected 改报成别的状态**），
 断言同一套检查**必须逐条报红**。
 任一条注入没被抓住 ⇒ 脚本自己判据空转 ⇒ 同样 `exit 1`。
 它还会**实跑主机侧夹具**（`tools/test-prov-priority.c`，有 `cc`/`gcc` 时）并要求

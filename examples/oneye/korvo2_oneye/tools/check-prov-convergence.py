@@ -36,12 +36,28 @@ check-prov-convergence.py —— 结构性门禁：证明 korvo2_oneye 的「入
          （NimBLE 已起栈、尚未入网）· `cloud_start_task()`（原有的入网后那一处，⛔ 不得被删/移）。
          旧形状只有第 3 处 ⇒ BLE 机型未入网时这一行**永远打不出来**（2026-10-07 真机实证：
          BLE 件 120 s 抓包 `[res]` 命中 0 行），"NimBLE 12 KB 主机栈之后内部 RAM 还剩多少"因此无读数。
+  A14    🔴 2026-10-10（本批）：**落实既有契约状态 `prov.status{state=connected, ip=…}`** ——
+         `connected` 是 `contracts/local/link-frames.json` 的 `prov_states` 里**既有**项，
+         契约同处写明「connected 时 ip 必填」；本批只是把它**发出去**，⛔ 不新增帧 / ⛔ 不新增错误码。
+         A14a `oneye_dev_link_prov_report_status()` 在 main/ 下恰好 1 处调用，且在
+              `prov_status_report_connected_once()` 内（⛔ 不许有第二个上报点）
+         A14b 这一处传的状态**必须**是 `ONEYE_DEV_LINK_PROV_CONNECTED`（⛔ 不许改报别的状态）
+         A14c 该 helper 的调用点恰好 1 处，且在收敛点下游 `on_wifi_ready()` 内
+         A14d 判据**单源**：本体只在 `wifi_prov_status.h`（固件与夹具编译同一份），
+              main/ 下的 .c ⛔ 不得自备一份（抄件）
+         A14e 判据里**有**"ip 非空"这一条（⛔ 拿不到 IP 不许报 connected —— App 判据是
+              `state=="connected" && ip 非空`）
+         A14f 判据里**有**"只报一次"这一条（⛔ 不刷屏：收敛点每次 GOT_IP 都会被调）
+         A14g 幂等位**只在发送成功后**置位（失败 ⇒ 下一次 GOT_IP 仍补报，⛔ 不把发失败写成已上报）
+         A14h ⛔ 不新增帧 / 不新增状态：main/ 下 `ONEYE_DEV_LINK_PROV_CONNECTED` 恰好 1 处、
+              且**不得**出现 `prov.status` 帧名字面量（帧名由 SDK 组，设备侧不自造帧）
 
 退出码：0 = 全部断言通过；1 = 有断言失败（逐条打出）。
 **自带负向对照**：把 `main/` 与夹具复制到临时目录后逐条注入已知缺陷，同一套检查**必须逐条报红**
 （含 A1 的第二条入网后逻辑、A8b 的直连连接层、A9b 的丢掉"只入网一次"、A8e 的留痕缺失、
 A10b 的判据抄件、**A11 的"通道模块里再调一次 sntp_boot_sync()/net_probe_report()"**、
 **A12 的"把 sntp 挪到 cloud_start_task 之后"**、**A13 的"删掉 NimBLE 起栈后那一处资源读数"**）。
+**A14 的「丢掉 ip 非空判据 / 丢掉幂等判据 / 发送失败也置位 / 第二个上报点 / 改报别的状态」**。
 任一条注入没有被对应断言抓住 ⇒ 本脚本自己的判据是空转的 ⇒ exit 1。
 """
 
@@ -79,6 +95,21 @@ CALL_PANEL_START = re.compile(r"panel_start_if_enabled\s*\(")
 CALL_RES_REPORT = re.compile(r"res_report\s*\(")
 RES_LOG_FORMAT = re.compile(r'ESP_LOGI\s*\(\s*TAG\s*,\s*"\[res\]\s+phase=%s')
 RES_RESERVED_KINDS = ("app_main", "wifi_prov_boot", "cloud_start_task")
+# A14：`prov.status{state=connected, ip=…}` 上报（2026-10-10 本批：落实**既有**契约状态）
+CALL_PROV_REPORT = re.compile(r"oneye_dev_link_prov_report_status\s*\(")
+CALL_PROV_WRAPPER = re.compile(r"wifi_prov_ble_report_prov_connected\s*\(")
+CALL_PROV_CONNECTED_REPORT = re.compile(r"prov_status_report_connected_once\s*\(")
+CALL_STATUS_JUDGE = re.compile(r"wifi_prov_connected_should_report\s*\(")
+CALL_STATUS_MARK = re.compile(r"wifi_prov_connected_reported_after\s*\(")
+PROV_CONNECTED_TOKEN = re.compile(r"ONEYE_DEV_LINK_PROV_CONNECTED")
+FRAME_NAME_LITERAL = re.compile(r'"(prov\.status)"')
+STATUS_HEADER = "wifi_prov_status.h"
+STATUS_HELPER = "prov_status_report_connected_once"
+STATUS_WRAPPER = "wifi_prov_ble_report_prov_connected"
+STATUS_WRAPPER_FILE = "wifi_prov_ble.c"
+STATUS_JUDGE_DEF = re.compile(r"bool\s+wifi_prov_connected_should_report\s*\(")
+STATUS_IP_GUARD = re.compile(r"ip\[0\]\s*==\s*'\\0'")
+STATUS_ONCE_GUARD = re.compile(r"if\s*\(\s*already_reported\s*\)")
 # 通道模块（判据侧只允许"交凭据"；出现上面两个符号即第二条入网后路径）
 CHANNEL_MODULES = ("wifi_prov_ble.c", "media_api.c", "wifi_prov.c", "panel_api.c",
                    "wifi_prov_file.c", "wifi_prov_sonic.c", "wifi_prov_qrcode.c")
@@ -95,6 +126,10 @@ JUDGE_NAMES = [
     "wifi_prov_channel_rank",
     "wifi_prov_decision_is_accept",
     "wifi_prov_decision_str",
+    # A14d：prov.status{connected} 上报判据（同样只许引用固件那一份）
+    "wifi_prov_connected_reportable",
+    "wifi_prov_connected_should_report",
+    "wifi_prov_connected_reported_after",
 ]
 
 
@@ -341,9 +376,9 @@ def run_checks(sources, headers, test_lines):
         dup = [n for n in defined_functions(test_lines) if n in JUDGE_NAMES]
         need(not dup, "A10b 夹具自定义了判据函数（抄件）：{}".format(",".join(sorted(set(dup)))),
              "夹具只能引用固件判据，不得自备一份")
-        for tag in ("[夹具①]", "[夹具②]", "[夹具③]"):
+        for tag in ("[夹具①]", "[夹具②]", "[夹具③]", "[夹具④]"):
             need(tag in t, "A10c 夹具缺少 {}".format(tag),
-                 "三个夹具：SD 胜出 / BLE 胜出 / 重复入网被拒")
+                 "四个夹具：SD 胜出 / BLE 胜出 / 重复入网被拒 / prov.status{connected} 上报判据")
         need("mutant_decide" in t and "负向对照" in t,
              "A10d 夹具缺少变异负向对照（mutant_decide / 负向对照）",
              "没有负向对照 ⇒ 夹具可能空转")
@@ -440,6 +475,89 @@ def run_checks(sources, headers, test_lines):
             need(token in main_lines[fmt[0] - 1], "A13e `[res]` 读数缺少 `{}`".format(token),
                  "三个量必须逐字保留（本批只加 phase 阶段标签，不动量本身）")
 
+    # ------------------------------------------- A14 prov.status{connected,ip} 上报（2026-10-10 本批）
+    # 形状：`on_wifi_ready()`（收敛点下游）→ `prov_status_report_connected_once()`
+    #        → 判据 `wifi_prov_connected_should_report()`（本体在 wifi_prov_status.h，与夹具同源）
+    #        → SDK 既有发送路径 `oneye_dev_link_prov_report_status(ONEYE_DEV_LINK_PROV_CONNECTED, …)`
+    # ⛔ 不新增帧 / 不新增错误码：`connected` 是机读契约 `prov_states` 里的**既有**状态。
+    status_h = headers.get(STATUS_HEADER, [])
+    status_text = "\n".join(status_h)
+    need(bool(status_h), "A14d 缺少 main/{}（上报判据的唯一事实源）".format(STATUS_HEADER),
+         "缺了它 ⇒ 判据只能散落在 .c 里（固件与夹具会各跑一份）")
+
+    # A14a 上报调用点唯一，且在发帧包装里（link 的 init/start 与 oneye_dev_link.h 都在通道模块；
+    #      ⚠️ main.c 结构上不能引该头：`oneye_dev_link_status_t` 在 base/link 两份定义不兼容）
+    rp = expect(find_calls(sources, CALL_PROV_REPORT), 1,
+                "A14a oneye_dev_link_prov_report_status() 调用点（main/ 下）",
+                "⛔ 第二个上报点 = 刷屏或绕过判据")
+    if rp:
+        if rp[0][2] != STATUS_WRAPPER:
+            fails.append("A14a 上报调用点不在 {}() 内（实测在 {}）".format(STATUS_WRAPPER, rp[0][2]))
+        if rp[0][0] != STATUS_WRAPPER_FILE:
+            fails.append("A14a 上报调用点不在 {} 里（实测在 {}）".format(STATUS_WRAPPER_FILE, rp[0][0]))
+
+    # A14b 上报的状态必须是 connected（⛔ 不许改报别的状态）
+    if rp:
+        fn, ln, _func = rp[0]
+        window = "\n".join(sources[fn][ln - 1:ln + 3])
+        need(PROV_CONNECTED_TOKEN.search(window) is not None,
+             "A14b 上报的状态不是 ONEYE_DEV_LINK_PROV_CONNECTED（调用点后 4 行内未见该 token）",
+             "契约 §4.1：这一帧要落实的是**既有**状态 connected（⛔ 不许换别的状态）")
+
+    # A14c 两级调用点唯一：收敛点 on_wifi_ready() → helper → 发帧包装
+    hr = expect(find_calls(sources, CALL_PROV_CONNECTED_REPORT), 1,
+                "A14c {}() 调用点".format(STATUS_HELPER),
+                "上报必须只在收敛点下游发生一次（⛔ 通道侧不得自建第二条）")
+    if hr and hr[0][2] != "on_wifi_ready":
+        fails.append("A14c {}() 的调用点不在 on_wifi_ready() 内（实测在 {}）"
+                     .format(STATUS_HELPER, hr[0][2]))
+    wr = expect(find_calls(sources, CALL_PROV_WRAPPER), 1,
+                "A14c {}() 调用点".format(STATUS_WRAPPER),
+                "发帧只能由 helper 调一次（⛔ 别处再发 = 绕过判据/刷屏）")
+    if wr and wr[0][2] != STATUS_HELPER:
+        fails.append("A14c {}() 的调用点不在 {}() 内（实测在 {}）"
+                     .format(STATUS_WRAPPER, STATUS_HELPER, wr[0][2]))
+
+    # A14d 判据单源：本体只在 wifi_prov_status.h；调用方只**引用**它（⛔ 不得抄一份）
+    need(STATUS_JUDGE_DEF.search(status_text) is not None,
+         "A14d {} 的判据本体不在 {}".format("wifi_prov_connected_should_report", STATUS_HEADER),
+         "判据必须在纯逻辑头里（固件与主机夹具编译同一份源）")
+    judge_calls = find_calls(sources, CALL_STATUS_JUDGE)
+    need(len(judge_calls) >= 1, "A14d 没有任何 .c 调用判据 wifi_prov_connected_should_report()",
+         "上报前必须过判据（否则等于没有 ip/幂等约束）")
+    for fn, lines in sources.items():
+        if any(n == "wifi_prov_connected_should_report" for n in defined_functions(lines)):
+            fails.append("A14d {} 里自定义了 wifi_prov_connected_should_report()（判据抄件）".format(fn))
+
+    # A14e 「ip 非空」这一条必须在判据里（⛔ 拿不到 IP 不许报 connected）
+    need(STATUS_IP_GUARD.search(status_text) is not None,
+         "A14e 判据缺少「ip 非空」这一条（ip 为 NULL/空串时的判否）",
+         "契约：connected 时 ip 必填；App 判据 = state==\"connected\" && ip 非空")
+    # A14f 「只报一次」这一条必须在判据里（⛔ 不刷屏）
+    need(STATUS_ONCE_GUARD.search(status_text) is not None,
+         "A14f 判据缺少「只报一次」（already_reported）这一条",
+         "收敛点每次 GOT_IP 都会被调 ⇒ 没有幂等判据就是刷屏")
+    # A14g 幂等位只在发送成功后置位：调用方必须经 wifi_prov_connected_reported_after(…, send_ok)
+    mk = find_calls(sources, CALL_STATUS_MARK)
+    need(len(mk) == 1, "A14g wifi_prov_connected_reported_after() 调用点",
+         "期望恰好 1 处（幂等位只由发送结果推进），实测 {} 处".format(len(mk)))
+    if mk:
+        need(mk[0][2] == STATUS_HELPER,
+             "A14g 幂等位的推进不在 {}() 内（实测在 {}）".format(STATUS_HELPER, mk[0][2]),
+             "⛔ 不许在别处置位（例如发送失败也置位 ⇒ App 永远等不到 connected）")
+        need("ESP_OK" in sources[mk[0][0]][mk[0][1] - 1],
+             "A14g 传给判据的 send_ok 不是发送结果（该行内未见 ESP_OK）",
+             "⛔ 不许恒为 true：发失败也必须保持「未报」，否则 App 永远等不到 connected")
+    # A14h ⛔ 不新增帧 / 不新增状态
+    expect(find_calls(sources, PROV_CONNECTED_TOKEN), 1,
+           "A14h main/ 下 ONEYE_DEV_LINK_PROV_CONNECTED 的出现次数",
+           "⛔ 本批只落实这一个**既有**状态；多出来的 = 有人新增了状态上报点")
+    for fn, lines in sources.items():
+        for i, l in enumerate(lines):
+            if FRAME_NAME_LITERAL.search(l):
+                fails.append("A14h {}:{} 出现了 prov.status 帧名字面量 —— 帧名由 SDK 组，"
+                             "设备侧自造帧名就是新增协议面".format(fn, i + 1))
+
     return (not fails), fails
 
 
@@ -532,6 +650,23 @@ INJECTIONS = [
     # A13（2026-10-07 第三批）：把「NimBLE 起栈后、入网前」那一处资源读数删掉 ⇒ 退回"只有入网后可见"。
     ("删掉 NimBLE 起栈后的资源读数（[res] 退回「只有入网后才可见」）", "korvo2_oneye_main.c", "A13",
      lambda ls: _replace_in(ls, 'res_report("ble-ready', 'res_report_disabled("ble-ready')),
+    # A14（2026-10-10 本批）：prov.status{connected} 上报的四条硬口径 + 上报点唯一。
+    ("丢掉 ip 非空判据（拿不到 IP 也报 connected）", "wifi_prov_status.h", "A14e",
+     lambda ls: _replace_in(ls, "if (ip == NULL || ip[0] == '\\0')", "if (false)")),
+    ("丢掉幂等判据（每次 GOT_IP 都重报 ⇒ 刷屏）", "wifi_prov_status.h", "A14f",
+     lambda ls: _replace_in(ls, "if (already_reported)", "if (false)")),
+    ("发送失败也置位（App 永远等不到 connected）", "korvo2_oneye_main.c", "A14g",
+     lambda ls: _replace_in(ls, "wifi_prov_connected_reported_after(reported, rc == ESP_OK)",
+                            "true")),
+    ("第二个 connected 上报点（在别处再报一次）", "korvo2_oneye_main.c", "A14c",
+     lambda ls: _append(ls, "\nstatic void injected_second_status_report(void) "
+                            "{ prov_status_report_connected_once(); }")),
+    ("再开一个绕过判据的直发点（在别的函数里直接调 SDK 发帧）", "wifi_prov_ble.c", "A14a",
+     lambda ls: _append(ls, "\nvoid injected_direct_prov_report(void) "
+                            "{ (void)oneye_dev_link_prov_report_status("
+                            "ONEYE_DEV_LINK_PROV_CONNECTED, NULL, \"1.2.3.4\", NULL, NULL); }")),
+    ("把 connected 改报成别的状态", "wifi_prov_ble.c", "A14b",
+     lambda ls: _replace_in(ls, "ONEYE_DEV_LINK_PROV_CONNECTED", "ONEYE_DEV_LINK_PROV_SCAN_DONE")),
 ]
 
 
@@ -573,7 +708,7 @@ def mutated_test_copy(root, tmp_root):
 def load(root):
     sources = read_sources(root)
     headers = {}
-    for name in ("wifi_prov.h", "wifi_prov_policy.h"):
+    for name in ("wifi_prov.h", "wifi_prov_policy.h", "wifi_prov_status.h"):
         p = os.path.join(root, MAIN_REL, name)
         headers[name] = read_lines(p) if os.path.isfile(p) else []
     test = os.path.join(root, TEST_REL)
@@ -591,7 +726,7 @@ def main():
     ok, fails = run_checks(src, headers, test_lines)
     for f in fails:
         print("  ✗ " + f)
-    print("正向断言（A1–A13）：{}".format("PASS" if ok else "FAIL"))
+    print("正向断言（A1–A14）：{}".format("PASS" if ok else "FAIL"))
 
     status, detail = run_host_test(EXAMPLE)
     if status == "pass":
@@ -628,7 +763,8 @@ def main():
     if not ok:
         return 1
     print("RESULT=PASS 单一收敛点 + 优先级（SD>BLE>其他）+ 只入网一次 + 自检/授时全通道必经"
-          "（ADR-0017 D2/D4）+ 资源读数未入网可见（A13，带阶段标签）")
+          "（ADR-0017 D2/D4）+ 资源读数未入网可见（A13，带阶段标签）"
+          "+ prov.status{connected,ip} 落地既有契约状态（A14，ip 非空 / 只报一次 / 失败不置位）")
     return 0
 
 

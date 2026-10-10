@@ -46,6 +46,7 @@
 #include "camera_api.h"
 #include "wifi_prov.h"
 #include "wifi_prov_ble.h"     /* 配网通道 C1/C2（BLE）；入网后收敛点仍在 wifi_prov.c */
+#include "wifi_prov_status.h"  /* ★ 2026-10-10：prov.status{connected,ip} 上报判据（纯逻辑，与夹具同源） */
 #include "net_probe.h"
 #include "oneye_dev_creds.h"
 #include "sntp_boot.h"
@@ -756,6 +757,70 @@ static void cloud_start_task(void *arg)
     uplink_maintain_run();
 }
 
+/* ------------------------------------------------------------------ 配网状态上报（契约 §4.1 prov.status）
+
+ * 🔴 2026-10-10（本批）：**落实既有契约状态 `connected`**。
+ *   在本批之前，本工程**从不**上报 `prov.status{state=connected}`：全仓 `ONEYE_DEV_LINK_PROV_CONNECTED`
+ *   只出现在 `korvo2_llm_chat` 例程；本工程的配网路径上，SDK link 层只会报
+ *   `scan_done` / `connecting` / `failed` / `idle`。
+ *   后果（App 侧 + 真机 logcat 实证）：App 的「配网中 → **设备连网成功**」这一阶段等的就是**这个**状态，
+ *   只收到 `scan_done` ⇒ 流程会一直卡在"配网中"直到超时（用户实测就是这么失败的）。
+ *
+ * ⛔ **不新增帧 / 不新增错误码 / ⛔ 不动契约**：`connected` 是 `contracts/local/link-frames.json`
+ *   的 `prov_states` 里**既有**的状态，`prov.status` 的字段（`state` / `ssid` / `ip` / `source` / `err`）
+ *   逐字沿用，契约同处已写明「**connected 时 ip 必填**」。本函数只做"把既有的那一个状态，
+ *   在既有的那一帧里，于**真的拿到 IP** 的时刻发出去"。
+ *
+ * ★ 四条硬口径（判据本体在 `wifi_prov_status.h`，与主机夹具**编译同一份源**，⛔ 不在这里抄一遍）★
+ *   ① **非空 ip**：拿不到 IP ⇒ ⛔ **不报 connected**（如实停在"配网中"），⛔ 不许拿空串/占位串冒充
+ *      —— App 的判据就是 `isOnline = (state=="connected") && ip 非空`；
+ *   ② **只报一次**（幂等）：本函数在**每次** GOT_IP 都会被调（掉线重连也经过收敛点），
+ *      没有幂等判据就是刷屏；幂等位是下面的 `static bool reported`；
+ *   ③ **非阻塞**：只发**一帧**，且走 SDK **既有**发送路径 —— 本函数调
+ *      `wifi_prov_ble_report_prov_connected()`（BLE 通道模块），后者调
+ *      `oneye_dev_link_prov_report_status()` → `oneye_dev_link_broadcast()` → 信道 sender
+ *      ⇒ **天然经过**它自己的发送锁（TX 串行化），⛔ 没有绕开它、⛔ 没有自建第二条发送路径、
+ *      ⛔ 不在这里等回报 / 不重试（那会把"发一帧"变成阻塞动作）。SDK 的组帧缓冲走堆
+ *      （8 KB 栈需求已在 `oneye_dev_link_send()` 里消除）⇒ 本函数可以安全地跑在
+ *      **系统事件任务**（3 KB 栈，见 `sdkconfig.defaults.esp32s3`）上。
+ *      ⚠️ 为什么发帧收在 BLE 通道模块、而不是本文件直接调 SDK：`oneye_dev_link_status_t`
+ *      在 `oneye_dev_base.h:164` 与 `oneye_dev_link.h:163` 有**两份不兼容的定义**（SDK 既有缺陷），
+ *      而本文件必须 include `oneye_dev_sdk.h`（→ base）与 `oneye_dev_creds.h`
+ *      ⇒ **结构上不能**引 `oneye_dev_link.h`（与 `adv_identity.c` 另立独立 TU 同一成因）。
+ *   ④ **失败不置位**：链路还没 init/start（例如本机型未启用 BLE ⇒ 本工程不 init link）时
+ *      `wifi_prov_ble_report_prov_connected()` 返回非 `ESP_OK` ⇒ 保持"未报过"，
+ *      下一次 GOT_IP 再试；⛔ 不假装成功、⛔ 不静默（两处都有 WARN 行）。
+ *
+ * ⚠️ 与既有 `failed` / `idle` 的关系（⛔ 本批一个字都没改）：
+ *   `connect` 失败 ⇒ `failed{err=auth_failed}`、队列满 ⇒ `failed{err=busy}`、
+ *   `prov.reset` 成功 ⇒ `idle` —— 这三条仍由 SDK link 层在**既有**路径上、按**既有**顺序上报
+ *   （`oneye_dev_link.c` 的 `link_prov_execute()` / `link_handle_prov()`）。本函数不碰它们，
+ *   只在"Wi-Fi 真的拿到 IP"这一刻补上同一个状态机里**缺的那一个**状态。
+ */
+static void prov_status_report_connected_once(void)
+{
+    static bool reported;      /* ★ 幂等位：只报一次（⛔ 不刷屏）；未发出**不**置位（见 ④） */
+    const char *ip = wifi_prov_ip();
+    esp_err_t rc;
+
+    if (!wifi_prov_connected_should_report(wifi_prov_is_connected(), ip, reported)) {
+        /* 没拿到 IP，或已经报过（多为掉线重连路径的重复触发）⇒ 什么都不做，⛔ 不刷屏 */
+        return;
+    }
+    /* 发送收在 BLE 通道模块里（link 的 init/start 与 `oneye_dev_link.h` 都在那一层；理由见
+     * `wifi_prov_ble.h` 的函数注释 —— 含 `oneye_dev_link_status_t` 的 SDK 既有类型冲突）。 */
+    rc = wifi_prov_ble_report_prov_connected(wifi_prov_ssid(), ip, wifi_prov_source());
+    reported = wifi_prov_connected_reported_after(reported, rc == ESP_OK);
+    if (rc != ESP_OK) {
+        ESP_LOGW(TAG, "prov.status{state=connected, ip=%s} **未发出**（%s）⇒ 幂等位未置，"
+                      "下一次 GOT_IP 会再试（⛔ 不把『未发出』写成『已上报』）",
+                 ip, esp_err_to_name(rc));
+        return;
+    }
+    ESP_LOGI(TAG, "★ prov.status{state=connected, ip=%s, ssid=%s, source=%s} 已发出（只报一次）",
+             ip, wifi_prov_ssid(), wifi_prov_source());
+}
+
 /* ★★ 2026-10-07（本批）：入网之后的**启动期动作**全部收进本函数，顺序逐字固定为
  *   ① 入网日志 → ② net_probe 自检 → ③ SNTP 授时 → ④ 本地面板 → ⑤ cloud_start_task（→ oneye_start）
  *
@@ -784,6 +849,15 @@ static void on_wifi_ready(void)
     /* ★ 2026-10-09：上面这一处**不变**（它是"入网成功后自动停广播"的唯一收敛点）。
      *   配网模式开关（`s_pairing`）由 `wifi_prov_ble_stop_advertising()` 之后的超时/按键路径收敛；
      *   ⛔ 不在这里调 `wifi_prov_ble_pairing_exit()`（那会在重连路径上多出一条"退出配网模式"的重复日志）。 */
+
+    /* ★ 2026-10-10：向 App 上报 `prov.status{state=connected, ip=…}`（契约 §4.1 的既有状态，本批落实）。
+     *   ⚠️ 位置**故意在下面那次「一次性守卫」之前**：本行是**每次 GOT_IP 都要考虑**的事件级动作
+     *   （幂等由它自己的静态位保证 ⇒ 全局仍然只报一次），与"上云链路只启动一次"的那把守卫**不是**同一件事。
+     *   为什么不能挪到守卫之后：守卫之后还有 `net_probe`/`sntp`/`cloud_start_task`，其中
+     *   `xTaskCreate(cloud_start_task, …)` **在内存不足时会失败**（本板实测过 `largest_internal_block`
+     *   只有 2.2 KB 的历史读数）—— 那一刻若把上报一起跳过，App 会**明明设备已联网却收不到 connected**，
+     *   正是本批要修的那条失败路径。⛔ 也不在这里做任何阻塞动作（只发一帧，见函数注释 ③）。 */
+    prov_status_report_connected_once();
 
     static bool started;
     if (started) {

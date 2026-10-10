@@ -72,6 +72,30 @@ bool wifi_prov_ble_active(void);
 /** 入网成功后停广播（由 `wifi_prov.c` 的收敛点下游调用；unpair 后可用 `wifi_prov_ble_start` 重开） */
 void wifi_prov_ble_stop_advertising(void);
 
+/**
+ * ★ 2026-10-10：上报 `prov.status{state=connected, ip=…}`（契约 §4.1 的**既有**状态，本批落实）。
+ *
+ * 为什么这一帧由**本模块**发出（而不是收敛点 `main.c` 直接调 SDK）：
+ *   ① link 的初始化与 prov provider 都归本模块（`wifi_prov_ble_start()` 里的 `oneye_dev_link_init`
+ *      / `oneye_dev_link_prov_set_provider`）—— 发帧用的 `oneye_dev_link.h` 与它同属这一层；
+ *   ② **类型冲突（SDK 既有缺陷，⛔ 本批不修）**：`oneye_dev_link_status_t` 同时定义在
+ *      `oneye_dev_base.h:164` 与 `oneye_dev_link.h:163` 且**不兼容**，而 `main.c` 必须 include
+ *      `oneye_dev_sdk.h`（→ `oneye_dev_base.h`）与 `oneye_dev_creds.h` ⇒ **main.c 结构上不能**引
+ *      `oneye_dev_link.h`（这与 `adv_identity.c`「另立独立 TU」是同一个成因）。
+ *   ⇒ 收敛点只表达"该不该报"（判据在 `wifi_prov_status.h`），"怎么发"收在本模块。
+ *
+ * 返回：
+ *   - `ESP_OK` —— 帧已交给 SDK **既有**发送路径（`oneye_dev_link_prov_report_status()` →
+ *     `oneye_dev_link_broadcast()`），因此**天然经过**它自己的发送锁（TX 串行化）；
+ *   - `ESP_ERR_INVALID_STATE` —— link 未 init / 未 start（本机型没起这条通道）⇒ 没有发出；
+ *   - `ESP_FAIL` —— SDK 返回了非 OK。
+ * ⚠️ 调用方（`korvo2_oneye_main.c` 的 `prov_status_report_connected_once()`）**只在 `ESP_OK` 时**
+ *    置"已上报"幂等位；其余情况**保持未报**，下一次 GOT_IP 再试（⛔ 不把失败写成已上报）。
+ * ⛔ 本函数不阻塞、不等回报、不重试、⛔ 不自建第二条发送路径；`ssid` / `source` 可为 NULL/空
+ *    （契约里它们是 `optional`，但 `ip` **必须非空** —— 那一条由调用方的判据保证）。
+ */
+esp_err_t wifi_prov_ble_report_prov_connected(const char *ssid, const char *ip, const char *source);
+
 #ifdef __cplusplus
 }
 #endif

@@ -15,6 +15,17 @@
  *   ② SD 不在 + BLE 提交 ⇒ **BLE 胜出**；且「其他」层（台面 API / Kconfig / 预留通道）不越权
  *   ③ **只入网一次**：入网后任何通道（含更高优先级）的提交一律被拒；
  *      唯一能重新配网的路径是**显式释放采信槽**（台面改配）或 prov.reset
+ *   ④ **★ 2026-10-10 新增：`prov.status{state=connected}` 上报判据**（`wifi_prov_status.h`，
+ *      契约 `contracts/local/link-frames.json` 的 `prov_states` 里 `connected` 是**既有**状态、
+ *      且同文件 `prov.status` 的 `desc` 写明「connected 时 ip 必填」）：
+ *      ④a 拿到 IP ⇒ **报**（含非空 ip）
+ *      ④b/④c/④d **负向**：未入网 / ip 为空 / ip 为 NULL ⇒ **都不报**（⛔ 不拿空 ip 冒充在线）
+ *      ④e **负向**：连续多次 GOT_IP ⇒ **只报一次**（不刷屏）
+ *      ④f 发送失败 ⇒ 幂等位**不**置，下一次 GOT_IP 仍报（⛔ 不许把"发失败"写成"已上报"）
+ *      ④g 掉线重连后再拿 IP（已报过）⇒ 不重复
+ *  ⚠️ 「失败走既有 failed」属 SDK link 层的既有行为（`tests/test_prov_provider.c` /
+ *     `test_prov_worker.c` 断言 `prov.status{failed, err=auth_failed}`），本夹具**不**重造它
+ *     —— 那是 SDK 宿主测试的职责，⛔ 不在这里抄一份。
  *
  * 构建/运行（WSL 或任何有 cc 的环境）：
  *   cc -std=c99 -Wall -Wextra -Werror -I ../main test-prov-priority.c -o /tmp/tpp && /tmp/tpp
@@ -24,10 +35,14 @@
 #include <stdio.h>
 
 #include "wifi_prov_policy.h"   /* ← 固件里跑的同一份判据（纯逻辑头，无 ESP 依赖） */
+#include "wifi_prov_status.h"   /* ← 同上：prov.status{connected} 上报判据（同一份源） */
 
-/* 若有人把上面那行换成"本地抄件"，本 include guard 就不存在了 ⇒ 编译期直接失败。 */
+/* 若有人把上面那两行换成"本地抄件"，这两个 include guard 就不存在了 ⇒ 编译期直接失败。 */
 #ifndef _WIFI_PROV_POLICY_H_
 #error "必须 include 固件的 wifi_prov_policy.h（判据唯一事实源），不得另抄一份"
+#endif
+#ifndef _WIFI_PROV_STATUS_H_
+#error "必须 include 固件的 wifi_prov_status.h（上报判据唯一事实源），不得另抄一份"
 #endif
 
 typedef wifi_prov_decision_t (*decide_fn)(bool, wifi_prov_channel_t, wifi_prov_channel_t, bool);
@@ -73,6 +88,18 @@ static void expect_rank(const char *what, int got, int want)
         printf("  \xe2\x9c\x97 %s：期望 rank=%d，实测 rank=%d\n", what, want, got);
     } else {
         printf("  \xe2\x9c\x93 %s（rank=%d）\n", what, got);
+    }
+}
+
+static void expect_bool(const char *what, bool got, bool want)
+{
+    g_checks++;
+    if (got != want) {
+        g_fail++;
+        printf("  \xe2\x9c\x97 %s：期望 %s，实测 %s\n", what,
+               want ? "true" : "false", got ? "true" : "false");
+    } else {
+        printf("  \xe2\x9c\x93 %s ⇒ %s\n", what, got ? "true" : "false");
     }
 }
 
@@ -215,6 +242,88 @@ static void fixture_3(const policy_t *p)
            submit(p, &c, WIFI_PROV_CHAN_BLE, true), WIFI_PROV_DECISION_ACCEPT_FIRST);
 }
 
+/* --------------------------------------------------- 夹具④：prov.status{connected} 上报判据
+ *
+ * 被断言的形状（`wifi_prov_status.h`；契约依据见该头）：
+ *   · **非空 ip** —— App 的 `isOnline` 判据是 `(state=="connected") && ip 非空`；
+ *     ⛔ 空串 / NULL 一律不许报 connected（否则把"没联网"报成"在线"）；
+ *   · **只报一次** —— `on_wifi_ready()` 每次 GOT_IP 都会调 ⇒ 幂等位保证不刷屏；
+ *   · **失败不置位** —— "已报过"只在发送成功后成立 ⇒ 失败时下一次 GOT_IP 仍会补报。
+ */
+
+typedef struct {
+    const char *name;
+    bool (*should_report)(bool got_ip, const char *ip, bool already_reported);
+    bool (*reported_after)(bool already_reported, bool send_ok);
+} status_policy_t;
+
+static void fixture_4(const status_policy_t *p)
+{
+    printf("[夹具④] prov.status{connected}：非空 ip + 只报一次 + 失败不置位\n");
+
+    /* ④a 正对照：拿到 IP ⇒ 报（ip 非空） */
+    expect_bool("④a 已入网 + ip=192.168.110.80 ⇒ **报** connected",
+                p->should_report(true, "192.168.110.80", false), true);
+
+    /* ④b–④d **负向对照**：三种"没有真 IP"的形态都**不许**报 */
+    expect_bool("④b **负向** 未入网 + ip=\"\" ⇒ 不报",
+                p->should_report(false, "", false), false);
+    expect_bool("④c **负向** 已入网但 ip=\"\" ⇒ 不报（契约：connected 时 ip 必填）",
+                p->should_report(true, "", false), false);
+    expect_bool("④d **负向** 已入网但 ip=NULL ⇒ 不报",
+                p->should_report(true, NULL, false), false);
+    expect_bool("④d' **负向** 未入网但 ip 非空（旧回调/重连窗口）⇒ 不报",
+                p->should_report(false, "192.168.110.80", false), false);
+
+    /* ④e **负向：不刷屏** —— 连续 5 次 GOT_IP（每次都发成功）只允许报 1 次 */
+    {
+        bool reported = false;
+        int sent = 0;
+        int i;
+        for (i = 0; i < 5; i++) {
+            if (p->should_report(true, "10.0.0.7", reported)) {
+                sent++;
+            }
+            reported = p->reported_after(reported, true);
+        }
+        g_checks++;
+        if (sent != 1) {
+            g_fail++;
+            printf("  \xe2\x9c\x97 ④e **负向** 连续 5 次 GOT_IP ⇒ 期望只报 1 次，实测 %d 次（刷屏）\n",
+                   sent);
+        } else {
+            printf("  \xe2\x9c\x93 ④e **负向** 连续 5 次 GOT_IP ⇒ 只报 1 次（不刷屏）\n");
+        }
+    }
+
+    /* ④f 失败不置位：发送失败 ⇒ 下一次 GOT_IP 仍要报；成功之后才不再报 */
+    {
+        bool reported = false;
+        reported = p->reported_after(reported, false);
+        expect_bool("④f 首次发送**失败** ⇒ 幂等位仍为 false（⛔ 不把发失败写成已上报）",
+                    reported, false);
+        expect_bool("④f 发送失败后的下一次 GOT_IP ⇒ 仍**报**（补报）",
+                    p->should_report(true, "10.0.0.7", reported), true);
+        reported = p->reported_after(reported, true);
+        expect_bool("④f 发送**成功**之后 ⇒ 不再报", p->should_report(true, "10.0.0.7", reported),
+                    false);
+    }
+
+    /* ④g 掉线重连（已有一次成功上报）⇒ 不重复 */
+    expect_bool("④g 掉线重连后再拿 IP（已报过）⇒ 不重复（只报一次跨掉线成立）",
+                p->should_report(true, "10.0.0.7", true), false);
+}
+
+static int run_status_fixtures(const status_policy_t *p)
+{
+    printf("=== prov.status{connected} 判据：%s ===\n", p->name);
+    g_fail = 0;
+    g_checks = 0;
+    fixture_4(p);
+    printf("  小计：%d 条断言，%d 条不符\n", g_checks, g_fail);
+    return g_fail;
+}
+
 static int run_fixtures(const policy_t *p)
 {
     printf("=== 判据：%s ===\n", p->name);
@@ -256,17 +365,41 @@ static wifi_prov_decision_t mutant_decide(bool held_valid, wifi_prov_channel_t h
     return WIFI_PROV_DECISION_REJECT_LOWER;
 }
 
+/* 变异③（针对夹具④）：丢掉"ip 非空"判据 —— 只要没报过就报（拿不到 IP 也报 connected） */
+static bool mutant_should_report(bool got_ip, const char *ip, bool already_reported)
+{
+    (void)got_ip;
+    (void)ip;
+    return !already_reported;
+}
+
+/* 变异④（针对夹具④）：发送**失败**也算"已报过" ⇒ App 永远等不到 connected */
+static bool mutant_reported_after(bool already_reported, bool send_ok)
+{
+    (void)already_reported;
+    (void)send_ok;
+    return true;
+}
+
 int main(void)
 {
     const policy_t real = { "固件判据 wifi_prov_policy_decide()（wifi_prov_policy.h）",
                             wifi_prov_policy_decide, wifi_prov_channel_rank };
     const policy_t mutant = { "变异判据（rank 反向 + 忽略只入网一次）",
                               mutant_decide, mutant_rank };
+    const status_policy_t real_status = {
+        "固件判据 wifi_prov_connected_should_report()（wifi_prov_status.h）",
+        wifi_prov_connected_should_report, wifi_prov_connected_reported_after };
+    const status_policy_t mutant_status = {
+        "变异判据（丢掉 ip 非空判据 + 发送失败也置位）",
+        mutant_should_report, mutant_reported_after };
 
-    const int real_fail = run_fixtures(&real);
+    int real_fail = run_fixtures(&real);
+    real_fail += run_status_fixtures(&real_status);
 
     printf("=== 负向对照（同一组夹具 × 变异判据，**必须报红**）===\n");
-    const int mutant_fail = run_fixtures(&mutant);
+    int mutant_fail = run_fixtures(&mutant);
+    mutant_fail += run_status_fixtures(&mutant_status);
     if (mutant_fail == 0) {
         printf("\xe2\x9c\x97 负向对照失败：变异判据也全绿 ⇒ 本夹具对判据没有区分力（空转）\n");
         return 1;
@@ -274,10 +407,11 @@ int main(void)
     printf("\xe2\x9c\x93 负向对照通过：变异判据被夹具抓出 %d 条不符（夹具非空转）\n", mutant_fail);
 
     if (real_fail != 0) {
-        printf("\xe2\x9c\x97 RESULT=FAIL 固件判据有 %d 条断言不符（ADR-0017 优先级/只入网一次）\n",
-               real_fail);
+        printf("\xe2\x9c\x97 RESULT=FAIL 固件判据有 %d 条断言不符（ADR-0017 优先级/只入网一次"
+               " ＋ prov.status{connected} 上报）\n", real_fail);
         return 1;
     }
-    printf("RESULT=PASS 优先级（SD>BLE>其他）与「只入网一次」成立（ADR-0017 D2/D4）\n");
+    printf("RESULT=PASS 优先级（SD>BLE>其他）＋「只入网一次」＋ prov.status{connected} 上报判据"
+           "（非空 ip / 只报一次 / 失败不置位）成立（ADR-0017 D2/D4）\n");
     return 0;
 }

@@ -121,14 +121,22 @@ static int ble_prov_scan(char *json_out, size_t cap, void *ctx)
 /*
  * 连接：**只**把凭据交给唯一入网入口，然后返回。
  * ⛔ 这里不调 oneye_start()、不建任务、不碰面板/授时/影子/埋点 —— 那些都在收敛点的下游。
- * ⚠️ 本函数在 NimBLE 主机任务上下文（`ble_on_rx → oneye_dev_link_inject_frame → link_handle_prov`
- *    → 本 provider，见 `oneye_dev_sdk/src/oneye_dev_ble.c:202-207` 与 `oneye_dev_link.c:289-320`）
- *    里被**同步**调用，因此会阻塞该任务至多 `wifi_prov_connect` 的超时（缺省 20 s）。
- *    这与既有例程 `korvo2_llm_chat/main/prov_service.c:280-287` 的口径一致；
- *    不另起任务的原因见本工程 `korvo2_oneye_main.c` 关于内部 RAM（`largest_internal_block`）的实测注释。
+ * ⚠️ 本函数**允许阻塞**（它内部会等 `wifi_prov_connect` 的超时，缺省 20 s），
+ *    因为它跑在 **SDK 的 prov worker 任务**上（`oneye-dev-sdk` 的 `link_handle_prov()` 只做
+ *    "解析 + 入队"，耗时动作由 worker 执行）—— **谁负责非阻塞 = SDK 的 link 层**：
+ *    BLE 收包路径（NimBLE 主机任务）因此不再被本函数占住，ATT 写回报能立刻发出去。
+ *    🔴 2026-10-10〔旧字逐字留痕，⛔ 不抹〕本段此前逐字为：
+ *      「⚠️ 本函数在 NimBLE 主机任务上下文（`ble_on_rx → oneye_dev_link_inject_frame → link_handle_prov`
+ *        → 本 provider，见 `oneye_dev_sdk/src/oneye_dev_ble.c:202-207` 与 `oneye_dev_link.c:289-320`）
+ *        里被**同步**调用，因此会阻塞该任务至多 `wifi_prov_connect` 的超时（缺省 20 s）。」
+ *      —— 该口径**已作废**：同步调用正是真机缺陷本体（App 写回报等满 3 s 超时、入站帧被挤掉），
+ *      修法见 SDK 侧 `src/internal/oneye_link_prov.h` 与 `src/oneye_dev_link.c` §5.1。
+ *    ⛔ 不另起任务的原因不变（本工程内部 RAM 实测 `largest_internal_block` 很小、见
+ *      `korvo2_oneye_main.c` 的 `[res]` 读数），但**现在不需要**：worker 由 SDK 统一持有。
  * ★ 被优先级判据拒绝时（`ESP_ERR_INVALID_STATE`：槽里已有 SD 卡凭据，或设备已入网 ⇒ 只入网一次）
  *   本函数返回 **-1**，立刻返回、**不阻塞**；SDK 据此向对端报 `PROV_FAILED`
- *   （`oneye_dev_link.c:317-320`）⇒ 手机侧能立刻知道"这一次没被采信"，而不是静默超时。
+ *   （`oneye_dev_link.c` 的 `link_prov_execute()` 里 connect 失败分支）⇒ 手机侧能立刻知道
+ *   "这一次没被采信"，而不是静默超时。
  */
 static int ble_prov_connect(const char *ssid, const char *password, const char *token, void *ctx)
 {
@@ -160,6 +168,46 @@ static int ble_prov_reset(void *ctx)
         window_restart();
     }
     return 0;
+}
+
+/* ------------------------------------------------------------------ prov.status 上报（契约 §4.1，2026-10-10）
+
+ * 🔴 本批落实的**既有**契约状态：`prov.status{state=connected, ip=…}`。
+ *   在本批之前，本工程**从不**上报 `connected`（`ONEYE_DEV_LINK_PROV_CONNECTED` 只出现在
+ *   `korvo2_llm_chat` 例程），App 的「配网中 → **设备连网成功**」因此永远等不到，卡到超时。
+ *   ⛔ 不新增帧 / ⛔ 不新增错误码 / ⛔ 不动契约：`connected` 是机读契约 `prov_states` 里的既有项，
+ *   `prov.status` 的字段逐字沿用（同处写明「connected 时 ip 必填」）。
+ *
+ * ⛔ 本模块只负责"**怎么发**"（走 SDK 既有发送路径 ⇒ 天然经过它的 TX 串行化锁）；
+ *   "**该不该报**"（非空 ip / 只报一次 / 失败不置位）是调用方的判据
+ *   （`wifi_prov_status.h`，与主机夹具编译同一份源）—— 两件事分开，⛔ 不在这里抄一遍判据。
+ *
+ * ⚠️ 本函数**不在** `CONFIG_ONEYE_FW_ENABLE_BLE_PROV` 之内：通道关掉的机型也要能编；
+ *   那时 link 不会被 init ⇒ 返回 `ESP_ERR_INVALID_STATE`（调用方据此**保持未报**，⛔ 不假装成功）。
+ */
+esp_err_t wifi_prov_ble_report_prov_connected(const char *ssid, const char *ip, const char *source)
+{
+    oneye_dev_sdk_err_t rc;
+
+    if (!oneye_dev_link_is_initialized() || !oneye_dev_link_is_started()) {
+        ESP_LOGW(TAG, "link 未就绪（init=%d start=%d）⇒ prov.status{connected, ip=%s} **未发出**"
+                      "（⛔ 不把 connected 报成既成事实；下一次 GOT_IP 再试）",
+                 (int)oneye_dev_link_is_initialized(), (int)oneye_dev_link_is_started(),
+                 (ip != NULL) ? ip : "");
+        return ESP_ERR_INVALID_STATE;
+    }
+    rc = oneye_dev_link_prov_report_status(ONEYE_DEV_LINK_PROV_CONNECTED,
+                                           (ssid != NULL && ssid[0] != '\0') ? ssid : NULL,
+                                           ip,
+                                           (source != NULL && source[0] != '\0') ? source : NULL,
+                                           NULL);   /* err 为空 = 没有错误（契约 optional） */
+    if (rc != ONEYE_DEV_SDK_OK) {
+        ESP_LOGW(TAG, "prov.status{connected, ip=%s} 上报失败（%d）", (ip != NULL) ? ip : "", (int)rc);
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "★ 已上报 prov.status{state=connected, ssid=%s, ip=%s, source=%s}",
+             (ssid != NULL) ? ssid : "", (ip != NULL) ? ip : "", (source != NULL) ? source : "");
+    return ESP_OK;
 }
 
 /* ------------------------------------------------------------------ 配网模式：进入 / 退出 / 超时 */

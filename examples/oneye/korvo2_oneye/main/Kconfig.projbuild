@@ -112,14 +112,62 @@ menu "korvo2_oneye 板级固件配置"
         #   （6 位数字；空 = SDK 随机生成并打印串口，TTL 见 SDK 配置）"`：按用户 2026-10-09 裁定
         #   「彻底删除实现及契约」整项删除（台面注入口 ⇒ 无处可注）。
 
+        # =====================================================================
+        # 🔴 设备侧档位（甲 / 乙 / 丙）—— 2026-10-10 本批新增的**三值**机型位
+        #
+        # 为什么必须三值（⛔ 不能继续用"要不要激活凭证"这个布尔）：
+        #   · 契约 `contracts/local/ble-gatt.md` §4.4.2 / §4.4.4 逐字：`cred_req=false`
+        #     **对乙 / 丙 同时成立** ⇒ 旧布尔**只能判甲 vs（乙 | 丙）**，**判不出乙与丙**；
+        #   · 而乙与丙在 `prov.verify.req` 上的行为**不同**：乙 **必经**（判据 = `node_id` 的
+        #     形态 / 有效性），丙 **SKIP**（⛔ 一帧不发）。这个差别只能由**档位**承载。
+        #
+        # ⚠️ 与云端 `onboarding_actor` 的关系（一致性由谁保证）：
+        #   **构建期声明（本 choice）＋ 契约要求二者对同一 `product_key` 必须一致**；
+        #   ⛔ **不是**"云侧下发"（配网期设备无网、厂商字段里又没有 `productKey`；
+        #   见下面各项 help 与 `wifi_prov_ble.c` 的启动日志）。
+        #   **权威值在云侧**（`dev_product_credential_policy.credential_required` ＋
+        #   `onboarding_actor`，经只读端点 `resolve` 的 `onboardingActor` 给 App）；
+        #   本项是**设备自称**，用于回答"设备自己在没有网的时候该怎么处置 `prov.verify.req`"。
+        # =====================================================================
+        choice ONEYE_FW_ONBOARDING_ROLE
+            prompt "设备侧档位（甲 / 乙 / 丙；契约 ble-gatt.md §4.4.2，须与云 onboarding_actor 一致）"
+            depends on ONEYE_FW_ENABLE_BLE_PROV
+            default ONEYE_FW_ONBOARDING_ROLE_ALPHA
+            help
+                三型定义（契约 §4.4.2 的矩阵逐字）：
+
+                | 档位 | 物理事实 | `cred_req` | `prov.verify.req` |
+                | 甲 ALPHA | 有 creds（一机一密）＋能连云 | true | **必经**：与自身 `creds.node_id` 逐字比对 |
+                | 乙 BETA  | 无 creds ＋ 品类级内嵌证书 ＋能连云 | false | **必经**：判据 = `node_id` 的**形态 / 有效性** |
+                | 丙 GAMMA | 无 creds ＋ 连不上云（入网能力全交 App） | false | **SKIP**：⛔ 不发现场帧 |
+
+                ★ **缺省 = 甲（最严）**：与 cloud 机型表读不到时 fail-closed 取 `true`、
+                  §4.4.7「失败方向写死 = 最严」**同向**；⛔ 不是"默认放宽"。
+                ★ **未声明档位**（SDK 侧 `adv_device_tier_set = false`）⇒ 三态判据 fail-closed 按**甲**。
+                ★ 乙的判据⛔ **不是身份证明**：乙**无设备级秘密** ⇒ 本地**不可能**证明
+                  「这个 `node_id` 就是我」⇒ 形态判据拦的是「空码 / 形态非法」，
+                  **权威在云侧准入**（设备拿该 `node_id` 连服务时由云侧裁决）。
+
+            config ONEYE_FW_ONBOARDING_ROLE_ALPHA
+                bool "甲 ALPHA：有 creds 一机一密 ＋ 能连云（`prov.pair` 逐字比对 ＋ verify 必经）"
+            config ONEYE_FW_ONBOARDING_ROLE_BETA
+                bool "乙 BETA：无 creds ＋ 品类级内嵌证书 ＋ 能连云（verify 必经：形态判据）"
+            config ONEYE_FW_ONBOARDING_ROLE_GAMMA
+                bool "丙 GAMMA：无 creds ＋ 连不上云（verify **SKIP**：⛔ 一帧不发）"
+        endchoice
+
         config ONEYE_FW_DEV_CRED_REQUIRED
             depends on ONEYE_FW_ENABLE_BLE_PROV
-            bool "本机型**需要激活凭证**（⇒ 配对应答 prov.pair.ok 的 cred_req=true）"
+            bool "本机型**需要激活凭证**（⇒ 配答应答 prov.pair.ok 的 cred_req=true）"
             default y
             help
-                机型级「配网时要不要激活凭证」，取值语义与 cloud 的
-                `dev_product_credential_policy.credential_required`（0=不需要 / 1=需要 /
-                NULL=没答案）**同源**；cloud 侧读不到那一格时 **fail-closed 视为「需要」**
+                ⚠️ **2026-10-10 起本项降级为「旧载体 / 兼容载体」** —— 它**只能判甲 vs（乙 | 丙）**
+                （契约 §4.4.4 逐字：这一格**判不出乙与丙**）⇒ **三态分型请用上面的
+                `ONEYE_FW_ONBOARDING_ROLE`**；本项保留只为"取值与 cloud 的
+                `dev_product_credential_policy.credential_required` 同源"这一可读性。
+
+                语义与 cloud 的 `credential_required`（0=不需要 / 1=需要 / NULL=没答案）**同源**；
+                cloud 侧读不到那一格时 **fail-closed 视为「需要」**
                 （见 `DeviceProductCredentialPolicyMapper` / `DeviceActivationResolveDto`）
                 ⇒ 本项**缺省 y（需要）与之同向**，⛔ 不是"默认放宽"。
 
@@ -130,11 +178,12 @@ menu "korvo2_oneye 板级固件配置"
                   ③ creds 镜像的字段集是**产线灌注契约**（`oneye_dev_creds_load()` 解析的键集），
                      ⛔ 本批**不得**自行新增 creds 键（那要改灌注侧与镜像格式，属另一次决策）。
                   ⇒ 只能由**机型位**（本 Kconfig，随机型 sdkconfig.defaults 固化）承载。
-                取值经 `oneye_dev_ble_config_t.adv_cred_required(_set)` 进入 SDK，
-                在**明文** `prov.pair.ok` 里以布尔 `cred_req` 回给 App（可选字段：置本项即发送）。
+                ★ **一致性**：本项取值必须与档位 choice **一致**（甲 ⇔ y；乙 / 丙 ⇔ n）——
+                  `wifi_prov_ble.c` 在编译期用 `#error` 拦下"两个载体打架"（⛔ 不静默选一边）。
+                  取值经 `oneye_dev_ble_config_t.adv_cred_required(_set)` 进入 SDK，
+                  在**明文** `prov.pair.ok` 里以布尔 `cred_req` 回给 App（可选字段：置本项即发送）。
                 ⚠️ 它不是"授权决定"：是否真的放行绑定由 **cloud 的机型表 + App 代云校验**裁定
                 （台账 #8 / #9），设备侧这一位只是**如实转述**自己的机型档位。
-            default ""
 
         config ONEYE_FW_BLE_PROV_KEY_GATE
             depends on ONEYE_FW_ENABLE_BLE_PROV

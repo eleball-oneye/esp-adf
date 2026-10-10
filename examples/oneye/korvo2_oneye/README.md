@@ -1245,8 +1245,15 @@ LCD 状态屏与摄像头抓帧见 §5.7/§5.8（**已真机闭环**），`video
   `key = HKDF(ikm = node_id‖chal, salt = node_id, info="oneye-link-v1")`（`oneye_ble_pair_derive_key_chal()`）。
   ⛔ `chal` 缺失/长度 ≠ 16 B ⇒ **fail-closed**（⛔ 不降级 `ikm = node_id`）。
 - `prov.pair.ok` ⇄ **`{sn, enc[, ttl_s][, cred_req][, sig]}`**，⛔ **不再回 `node_id`**；
-  `cred_req` = 机型级「是否要求激活凭证」，载体 = 本工程 Kconfig `ONEYE_FW_DEV_CRED_REQUIRED`（缺省 y，与 cloud fail-closed 同向）；
-  `sig` = 机型乙的**可选**字段（内嵌证书对 `chal` 签名，base64，契约 `link-frames.json` 已登记）。
+  `cred_req` = 设备**自称**的档位投影（甲 ⇒ `true`；乙 / 丙 ⇒ `false`；⛔ 未声明 ⇒ **不发该字段**）；
+  载体 = 本工程 Kconfig **`ONEYE_FW_ONBOARDING_ROLE`**（三值 choice，缺省**甲**，与 cloud fail-closed 同向）；
+  ⚠️ 旧载体 `ONEYE_FW_DEV_CRED_REQUIRED`（布尔）**降级为兼容项**（契约 §4.4.4：它**判不出乙与丙**）；
+  两个载体打架 ⇒ 本工程在**编译期 `#error`**（⛔ 不静默选一边）；
+  `sig` = **机型乙**的**可选**字段（内嵌证书对 `chal` 签名，base64，契约 `link-frames.json` 已登记）。
+- 🔴 **`prov.verify.req` 三态（2026-10-10 本批）**：判据 = 设备档位 ——
+  **甲**：与自身 `creds.node_id` **逐字比对**；**乙**：**必经**，判据 = `node_id` 的**形态 / 有效性**
+  （⚠️ ⛔ **不是身份证明**：乙无设备级秘密，权威在**云侧准入**）；**丙**：**SKIP**（⛔ 一帧不发）。
+  ⚠️ 档位未声明 / 值非法 ⇒ **fail-closed 按甲**。
 - ⛔ **POP（6 位数字）已按用户 2026-10-09 裁定「彻底删除实现及契约」整条删除**（SDK 的 `set_pop`/`get_pop`、
   `prov.pair{pop}` 受理分支、POP 密钥派生与 POP 向量、本工程 Kconfig `ONEYE_FW_BLE_POP`、串口 POP 打印、
   `wifi_prov_ble_pop()` 读数函数）。**旧字逐字留痕（⛔ 不抹）**：「🔻 **POP 通路整条保留**

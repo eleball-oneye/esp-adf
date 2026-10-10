@@ -266,9 +266,10 @@ esp_err_t wifi_prov_ble_pairing_enter(void)
      *   改为打印**本机型是否需要激活凭证**等非敏感信息（⛔ 不打印激活码 / chal，
      *   ⛔ 也不打印任何新凭据）。
      *   "剩余时间" = 整个窗口（刚进入），后续由超时那一行给出结论。 */
-    ESP_LOGI(TAG, "已进入 BLE 配网模式：广播中；本机型%s激活凭证（cred_req=%d）；"
+    ESP_LOGI(TAG, "已进入 BLE 配网模式：广播中；本机型档位=%s（依据 %s；%s激活凭证 cred_req=%d）；"
                   "配对凭据 = 激活码（机身贴码）＋一次性 chal（chal TTL %d s）；"
                   "配网窗口剩余 %d s；再长按 SET 退出",
+             oneye_dev_ble_device_tier_name((int)dev_onboarding_tier()), dev_onboarding_tier_basis(),
              dev_cred_required() ? "需要" : "不需要", dev_cred_required() ? 1 : 0,
              (int)CONFIG_ONEYE_DEV_SDK_BLE_CHAL_TTL_S,
              (int)CONFIG_ONEYE_FW_BLE_PROV_PAIRING_WINDOW_S);
@@ -312,7 +313,9 @@ void wifi_prov_ble_set_autostart(bool autostart)
 #if CONFIG_ONEYE_FW_ENABLE_BLE_PROV
 /*
  * 机型级「需要激活凭证」⇒ `prov.pair.ok` 的可选字段 `cred_req`（台账 #7 / #9）。
- * 载体 = 本工程 Kconfig `ONEYE_FW_DEV_CRED_REQUIRED`（缺省 y），理由逐条写在 Kconfig 同名项里。
+ * 载体 = 本工程 Kconfig `ONEYE_FW_ONBOARDING_ROLE`（三值，缺省**甲**）；
+ * ⚠️ 旧载体 `ONEYE_FW_DEV_CRED_REQUIRED`（布尔）**降级为兼容项**（契约 §4.4.4：它判不出乙 / 丙），
+ *    本文件只把它当"与档位的一致性核对项"。
  *
  * ⚠️ **必须**写成 `#if … #else …`，⛔ **不得**写成 `CONFIG_X ? a : b`（也不得用 `!CONFIG_X`）：
  *    `sdkconfig.h` 只对 **y 的 bool** 产出 `#define`；置 n 时那个标识符**根本不存在**
@@ -327,6 +330,58 @@ static bool dev_cred_required(void)
     return false; /* n = 明确"不需要" */
 #endif
 }
+
+/*
+ * 🔴 **设备侧档位（甲 / 乙 / 丙）** —— 契约 §4.4.2 / §4.4.6（四）；载体 = 本工程 Kconfig 的
+ *    `ONEYE_FW_ONBOARDING_ROLE` choice（**编译期**，随机型 sdkconfig.defaults 固化）。
+ *
+ * ⛔ **为什么不由云侧下发**：配网期设备**无网**（拿不到 `resolve` / 机型表），厂商字段里又
+ *    没有 `productKey`（台账 #3 已删 `pk_family`）⇒ 设备**无从查表**；且本档位要回答的是
+ *    "**设备自己**在没有网的时候怎么处置 `prov.verify.req`"，这是一个**本地面**问题。
+ * ⇒ **一致性由谁保证**：**构建期声明（本处）＋ 契约要求二者对同一 `product_key` 必须一致**；
+ *    权威值仍在云侧（`dev_product_credential_policy.credential_required` ＋ `onboarding_actor`，
+ *    经 `resolve` 的 `onboardingActor` 给 App）—— 设备这一位是**自称**，⛔ 不是授权。
+ *    ⚠️ 若将来要改成"云侧下发"，那是**新帧 / 新字段**（属契约变更）⇒ 本批⛔ 不预先发明，
+ *       已在任务报告的"未做/待裁定"里登记。
+ */
+static oneye_dev_ble_device_tier_t dev_onboarding_tier(void)
+{
+#if CONFIG_ONEYE_FW_ONBOARDING_ROLE_BETA
+    return ONEYE_DEV_TIER_B_CERT_DEVICE;   /* 乙：无 creds ＋ 品类级内嵌证书 ＋ 能连云 */
+#elif CONFIG_ONEYE_FW_ONBOARDING_ROLE_GAMMA
+    return ONEYE_DEV_TIER_C_APP_ONBOARDED; /* 丙：无 creds ＋ 连不上云（入网能力全交 App） */
+#else
+    return ONEYE_DEV_TIER_A_CREDS_DEVICE;  /* 甲（缺省，最严）：有 creds ＋ 能连云 */
+#endif
+}
+
+/* 档位 → 可打印短名（⛔ 不含机密；与 SDK 的 `oneye_dev_ble_device_tier_name()` 同源，
+ * 这里再包一层只为把"依据"（Kconfig 宏名）一并打印出来）。 */
+static const char *dev_onboarding_tier_basis(void)
+{
+#if CONFIG_ONEYE_FW_ONBOARDING_ROLE_BETA
+    return "CONFIG_ONEYE_FW_ONBOARDING_ROLE_BETA";
+#elif CONFIG_ONEYE_FW_ONBOARDING_ROLE_GAMMA
+    return "CONFIG_ONEYE_FW_ONBOARDING_ROLE_GAMMA";
+#else
+    return "CONFIG_ONEYE_FW_ONBOARDING_ROLE_ALPHA";
+#endif
+}
+
+/*
+ * 🔴 **两个载体不许打架**（编译期拦，⛔ 不静默选一边）：契约 §4.4.2 的三型映射是**死**的 ——
+ *    甲 ⇔ `cred_req=true`；乙 / 丙 ⇔ `cred_req=false`。
+ *    ⛔ 不用 `#if A && !B` 之类的"n 时也成立"的写法（见上面 `dev_cred_required()` 的机制说明）。
+ */
+#if CONFIG_ONEYE_FW_DEV_CRED_REQUIRED
+#if CONFIG_ONEYE_FW_ONBOARDING_ROLE_BETA || CONFIG_ONEYE_FW_ONBOARDING_ROLE_GAMMA
+#error "机型位自相矛盾：档位选了乙 / 丙（契约要求 cred_req=false），但 ONEYE_FW_DEV_CRED_REQUIRED=y（需要激活凭证）。请二者取一致（见 Kconfig 两个选项的 help）。"
+#endif
+#else
+#if CONFIG_ONEYE_FW_ONBOARDING_ROLE_ALPHA
+#error "机型位自相矛盾：档位选了甲（契约要求 cred_req=true），但 ONEYE_FW_DEV_CRED_REQUIRED=n（不需要激活凭证）。请二者取一致（见 Kconfig 两个选项的 help）。"
+#endif
+#endif
 #endif /* CONFIG_ONEYE_FW_ENABLE_BLE_PROV */
 
 esp_err_t wifi_prov_ble_start(void)
@@ -396,6 +451,11 @@ esp_err_t wifi_prov_ble_start(void)
      * ⇒ 设备侧拿不到 cloud 机型表，只能由机型位承载；缺省 y（与 cloud 的 fail-closed 同向）。 */
     bcfg.adv_cred_required = dev_cred_required();
     bcfg.adv_cred_required_set = true;
+    /* 🔴 设备侧**档位**（三态的唯一分派依据；契约 §4.4.2 / §4.4.6（四））：
+     *   甲逐字比对 / 乙形态校验 / 丙 SKIP。载体 = 同一份 Kconfig choice（编译期），
+     *   与上面的 `cred_req` **同批**给出 ⇒ 二者一致（不一致时本文件已在编译期 `#error`）。 */
+    bcfg.adv_device_tier = dev_onboarding_tier();
+    bcfg.adv_device_tier_set = true;
     bcfg.auto_advertise = false;      /* 起完再显式开始广播，便于把结果讲清楚 */
     bcfg.prov.scan = ble_prov_scan;
     bcfg.prov.connect = ble_prov_connect;
@@ -452,11 +512,18 @@ esp_err_t wifi_prov_ble_start(void)
      *   ONEYE_DEV_SDK_OK) { … "POP=%s 仅兼容/产测档，TTL %d s" … }`。 */
     ESP_LOGI(TAG, "BLE 配网通道已就绪：%s；激活码 node_id=%s（私密：salt+code 比对基准）；"
                   "SN=%s（公开：广播名 `ONEYE-<后 4 位>`/厂商字段(24 B)/prov.pair.ok；%s）；"
-                  "配对凭据 = 激活码＋一次性 chal（chal TTL %d s）；本机型%s激活凭证（cred_req=%d）",
+                  "配对凭据 = 激活码＋一次性 chal（chal TTL %d s）；"
+                  "★ 本机档位=%s（依据 %s）⇒ prov.verify.req 处置=%s；%s激活凭证（cred_req=%d）",
              s_advertising ? "广播中" : "待机（未广播，等按键进入配网模式）",
              s_ids.node_id, s_ids.sn,
              s_ids.sn_fell_back ? "creds.sn 为空⇒回落 node_id（SDK 将标 0x04 老世代）" : "来源 creds.sn",
              (int)CONFIG_ONEYE_DEV_SDK_BLE_CHAL_TTL_S,
+             oneye_dev_ble_device_tier_name((int)dev_onboarding_tier()), dev_onboarding_tier_basis(),
+             (dev_onboarding_tier() == ONEYE_DEV_TIER_C_APP_ONBOARDED)
+                 ? "SKIP（丙：⛔ 不发现场帧）"
+                 : ((dev_onboarding_tier() == ONEYE_DEV_TIER_B_CERT_DEVICE)
+                        ? "必经：node_id 形态/有效性（⛔ 非身份证明；权威在云侧准入）"
+                        : "必经：与自身 creds.node_id 逐字比对"),
              dev_cred_required() ? "需要" : "不需要", dev_cred_required() ? 1 : 0);
     return ESP_OK;
 #endif /* CONFIG_ONEYE_FW_ENABLE_BLE_PROV */

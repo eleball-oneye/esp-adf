@@ -36,6 +36,13 @@
  *      ④e **负向**：连续多次 GOT_IP ⇒ **只报一次**（不刷屏）
  *      ④f 发送失败 ⇒ 幂等位**不**置，下一次 GOT_IP 仍报（⛔ 不许把"发失败"写成"已上报"）
  *      ④g 掉线重连后再拿 IP（已报过）⇒ 不重复
+ *   ⑥ **★ 2026-10-12〔本批〕`prov.status{connected}` 的会话边界复位**（判据本体 = `wifi_prov_status.h` 的 ④）：
+ *      ⑥a 第一轮配网 ⇒ 报一次；**同一会话**内第二次 GOT_IP ⇒ 不再报（② 的"不刷屏"仍在）
+ *      ⑥b Wi-Fi 断开（会话结束）⇒ 幂等位**复位**
+ *      ⑥c 重连后再拿 IP ⇒ **再次报**一次（这正是真机第二轮"App 卡在配网中"要修的那条路径）
+ *      ⑥d 断开-重连 ×3 ⇒ 各自恰好 1 次
+ *      ⑥e **负向**：复位只动**状态** —— 复位后仍未拿到 IP ⇒ 仍**不报**（① ip 非空判据一字未改）
+ *      ★ 专项负向对照（变异⑥ = **本批要修掉的旧行为**）：断开**不**复位 ⇒ ⑥b/⑥c 必须报红。
  *  ⚠️ 「失败走既有 failed」属 SDK link 层的既有行为（`tests/test_prov_provider.c` /
  *     `test_prov_worker.c` 断言 `prov.status{failed, err=auth_failed}`），本夹具**不**重造它
  *     —— 那是 SDK 宿主测试的职责，⛔ 不在这里抄一份。
@@ -379,6 +386,8 @@ typedef struct {
     const char *name;
     bool (*should_report)(bool got_ip, const char *ip, bool already_reported);
     bool (*reported_after)(bool already_reported, bool send_ok);
+    /* ★ 2026-10-12〔本批〕会话边界（Wi-Fi 断开）⇒ 复位"已报过"（`wifi_prov_status.h` 的 ④） */
+    bool (*reported_after_disconnect)(bool already_reported);
 } status_policy_t;
 
 static void fixture_4(const status_policy_t *p)
@@ -438,12 +447,83 @@ static void fixture_4(const status_policy_t *p)
                 p->should_report(true, "10.0.0.7", true), false);
 }
 
+/* --------------------------------------------------- 夹具⑥：会话边界复位（2026-10-12 本批）
+ *
+ * 真机证据（⛔ 不重复采集，2026-10-12 两轮）：
+ *   · 15:25 第一轮：`GOT_IP 192.168.110.90` ⇒ `★ 已上报 prov.status{state=connected}`（只报一次）；
+ *   · 15:36 第二轮（栈修好后重跑）：`[prov-switch] 先断开现有连接 rc=0 ⇒ set_config + connect`
+ *     → `GOT_IP`（1.3 s）→ provider 返回 `ESP_OK` ⇒ **此后没有再报 connected**
+ *     ⇒ App 一直停在"配网中"直到超时。
+ *   成因 = ② 的幂等位**跨会话不复位**：第二轮是**新的一次配网**，位却还停在第一轮的 true。
+ *
+ * 被断言的形状（`wifi_prov_status.h` 的 ④ `wifi_prov_connected_reported_after_disconnect()`）：
+ *   · **复位**：Wi-Fi 断开（这一次配网会话结束）⇒ 幂等位作废 ⇒ 下一段会话**可以再报一次**；
+ *   · ⛔ 判据本体（① ip 非空 / ② 本会话只报一次）**一字未改** —— 复位的是**状态**，不是判据；
+ *   · 专项负向对照 = 变异⑥（断开**不**复位 = 旧行为）⇒ 本夹具必须报红（否则等于空转）。
+ */
+static void fixture_6(const status_policy_t *p)
+{
+    printf("[夹具⑥] 会话边界复位：断开 ⇒ 重新配网可再报 connected（各一次，⛔ 不刷屏）\n");
+
+    /* ⑥a 第一轮配网：报一次；**同一会话**内不再报（② 仍成立） */
+    bool reported = false;
+    expect_bool("⑥a 第一轮 GOT_IP（未报过）⇒ **报**",
+                p->should_report(true, "192.168.110.90", reported), true);
+    reported = p->reported_after(reported, true);
+    expect_bool("⑥a 同一会话内第二次 GOT_IP（已报过）⇒ 不报（不刷屏）",
+                p->should_report(true, "192.168.110.90", reported), false);
+
+    /* ⑥b 断开 = 这一次配网会话结束 ⇒ 复位 */
+    reported = p->reported_after_disconnect(reported);
+    expect_bool("⑥b Wi-Fi 断开（会话结束）⇒ 幂等位**复位**（false）", reported, false);
+
+    /* ⑥c 第二轮配网（重新拿到 IP）⇒ **可以再报一次**（真机缺陷现场） */
+    expect_bool("⑥c 重连后再拿 IP ⇒ **再次报**（App 不再卡在「配网中」）",
+                p->should_report(true, "192.168.110.91", reported), true);
+    reported = p->reported_after(reported, true);
+    expect_bool("⑥c 第二轮会话内不再报（仍是本会话只报一次）",
+                p->should_report(true, "192.168.110.91", reported), false);
+
+    /* ⑥d 断开-重连 ×3 ⇒ 每一段会话**各自恰好 1 次**（不是 0 次、也不是每次 GOT_IP 都报） */
+    {
+        int sent = 0;
+        int i;
+        reported = p->reported_after_disconnect(reported);
+        for (i = 0; i < 3; i++) {
+            if (p->should_report(true, "10.1.1.1", reported)) {      /* 重连后拿到 IP */
+                sent++;
+            }
+            reported = p->reported_after(reported, true);
+            if (p->should_report(true, "10.1.1.1", reported)) {      /* 同会话内重复 GOT_IP */
+                sent++;
+            }
+            reported = p->reported_after_disconnect(reported);       /* 再次断开 */
+        }
+        g_checks++;
+        if (sent != 3) {
+            g_fail++;
+            printf("  \xe2\x9c\x97 ⑥d 断开-重连 ×3 ⇒ 期望每段会话各报 1 次（共 3 次），实测 %d 次"
+                   "（0 次 = 未复位；> 3 = 每段会话内刷屏）\n", sent);
+        } else {
+            printf("  \xe2\x9c\x93 ⑥d 断开-重连 ×3 ⇒ 每段会话各报 1 次（共 3 次）\n");
+        }
+    }
+
+    /* ⑥e **负向**：复位只动状态 —— 复位后仍未拿到 IP ⇒ 仍不报（① 未放宽） */
+    reported = p->reported_after_disconnect(true);
+    expect_bool("⑥e **负向** 复位后仍未拿到 IP（got_ip=false）⇒ 仍**不报**（⛔ 复位不放宽 ip 判据）",
+                p->should_report(false, "", reported), false);
+    expect_bool("⑥e **负向** 复位后 `ip=NULL` ⇒ 仍**不报**",
+                p->should_report(true, NULL, reported), false);
+}
+
 static int run_status_fixtures(const status_policy_t *p)
 {
     printf("=== prov.status{connected} 判据：%s ===\n", p->name);
     g_fail = 0;
     g_checks = 0;
     fixture_4(p);
+    fixture_6(p);
     printf("  小计：%d 条断言，%d 条不符\n", g_checks, g_fail);
     return g_fail;
 }
@@ -506,6 +586,15 @@ static bool mutant_reported_after(bool already_reported, bool send_ok)
     return true;
 }
 
+/* 变异⑥（针对夹具⑥，= **本批要修掉的旧行为**）：Wi-Fi 断开**不复位** ⇒ 第二轮配网再也报不出
+ *   `connected`（App 卡在"配网中"的原因）。
+ *   ⛔ 这条负向对照存在的意义：万一有人把 `wifi_prov_connected_reported_after_disconnect()`
+ *     改回 `return already_reported;`（或干脆删掉复位边），夹具⑥ 必须立刻红，而不是继续全绿。 */
+static bool mutant_reported_after_disconnect(bool already_reported)
+{
+    return already_reported;      /* 旧行为：跨会话永不复位 */
+}
+
 /* 变异⑤（针对夹具⑤，= **本批要修掉的旧行为**）：把"已入网一律拒绝"放回
  *   —— 不看通道、不放行权威通道 ⇒ 夹具⑤ 的 ⑤a/⑤b 必须报红（"App 卡在配网中"的原形态）。
  *   ⛔ 这条负向对照存在的意义：万一有人把 `onboarded && !authoritative` 的按通道分派改回
@@ -539,10 +628,17 @@ int main(void)
                                      mutant_decide_reject_up_all, wifi_prov_channel_rank };
     const status_policy_t real_status = {
         "固件判据 wifi_prov_connected_should_report()（wifi_prov_status.h）",
-        wifi_prov_connected_should_report, wifi_prov_connected_reported_after };
+        wifi_prov_connected_should_report, wifi_prov_connected_reported_after,
+        wifi_prov_connected_reported_after_disconnect };
     const status_policy_t mutant_status = {
         "变异判据（丢掉 ip 非空判据 + 发送失败也置位）",
-        mutant_should_report, mutant_reported_after };
+        mutant_should_report, mutant_reported_after,
+        wifi_prov_connected_reported_after_disconnect };
+    /* 变异⑥（夹具⑥专用）= **本批要修掉的旧行为**：断开不复位（判据本来那一份 + 只换复位跃迁） */
+    const status_policy_t mutant_no_reset_status = {
+        "变异判据（断开不复位 = 本批要修掉的旧行为）",
+        wifi_prov_connected_should_report, wifi_prov_connected_reported_after,
+        mutant_reported_after_disconnect };
 
     int real_fail = run_fixtures(&real);
     real_fail += run_status_fixtures(&real_status);
@@ -568,13 +664,26 @@ int main(void)
     printf("\xe2\x9c\x93 负向对照通过：把 REJECT_ALREADY_UP 放回后被夹具抓出 %d 条不符"
            "（断旧连新可判定）\n", mutant_up_fail);
 
+    /* ★ 2026-10-12 专项负向对照（夹具⑥）：Wi-Fi 断开**不复位**（= 本批要修掉的旧行为）⇒ 夹具⑥ 必须红。
+     *   它证明"重新配网后可以**再报一次** connected（同一会话内仍只报一次）"是可判定的。 */
+    printf("=== 负向对照（变异⑥：断开不复位 ⇒ 夹具⑥ 必须报红）===\n");
+    int mutant_no_reset_fail = run_status_fixtures(&mutant_no_reset_status);
+    if (mutant_no_reset_fail == 0) {
+        printf("\xe2\x9c\x97 负向对照失败：断开不复位（旧行为）后夹具⑥ 仍全绿"
+               " ⇒ 「会话边界复位」判据没有区分力（空转）\n");
+        return 1;
+    }
+    printf("\xe2\x9c\x93 负向对照通过：断开不复位被夹具⑥ 抓出 %d 条不符"
+           "（会话边界复位可判定）\n", mutant_no_reset_fail);
+
     if (real_fail != 0) {
         printf("\xe2\x9c\x97 RESULT=FAIL 固件判据有 %d 条断言不符（ADR-0017 优先级/只入网一次"
-               " ＋ 权威通道断旧连新 ＋ prov.status{connected} 上报）\n", real_fail);
+               " ＋ 权威通道断旧连新 ＋ prov.status{connected} 上报与会话边界复位）\n", real_fail);
         return 1;
     }
     printf("RESULT=PASS 优先级（SD>BLE>其他）＋「只入网一次（权威通道 BLE/App 除外）」"
            "＋ 权威通道**断旧连新**（恰好一次断链 / 旧 SSID 不再被采信）"
-           "＋ prov.status{connected} 上报判据（非空 ip / 只报一次 / 失败不置位）成立（ADR-0017 D2/D4）\n");
+           "＋ prov.status{connected} 上报判据（非空 ip / 同一会话只报一次 / 失败不置位）"
+           "＋ **会话边界复位**（Wi-Fi 断开 ⇒ 重新配网可再报一次）成立（ADR-0017 D2/D4）\n");
     return 0;
 }

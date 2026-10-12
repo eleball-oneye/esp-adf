@@ -771,11 +771,11 @@ static void cloud_start_task(void *arg)
  *   逐字沿用，契约同处已写明「**connected 时 ip 必填**」。本函数只做"把既有的那一个状态，
  *   在既有的那一帧里，于**真的拿到 IP** 的时刻发出去"。
  *
- * ★ 四条硬口径（判据本体在 `wifi_prov_status.h`，与主机夹具**编译同一份源**，⛔ 不在这里抄一遍）★
+ * ★ 五条硬口径（判据本体在 `wifi_prov_status.h`，与主机夹具**编译同一份源**，⛔ 不在这里抄一遍）★
  *   ① **非空 ip**：拿不到 IP ⇒ ⛔ **不报 connected**（如实停在"配网中"），⛔ 不许拿空串/占位串冒充
  *      —— App 的判据就是 `isOnline = (state=="connected") && ip 非空`；
- *   ② **只报一次**（幂等）：本函数在**每次** GOT_IP 都会被调（掉线重连也经过收敛点），
- *      没有幂等判据就是刷屏；幂等位是下面的 `static bool reported`；
+ *   ② **只报一次**（幂等，**以一次配网会话为界**）：本函数在**每次** GOT_IP 都会被调
+ *      （掉线重连也经过收敛点），没有幂等判据就是刷屏；幂等位是上面的 `static bool reported`；
  *   ③ **非阻塞**：只发**一帧**，且走 SDK **既有**发送路径 —— 本函数调
  *      `wifi_prov_ble_report_prov_connected()`（BLE 通道模块），后者调
  *      `oneye_dev_link_prov_report_status()` → `oneye_dev_link_broadcast()` → 信道 sender
@@ -790,6 +790,12 @@ static void cloud_start_task(void *arg)
  *   ④ **失败不置位**：链路还没 init/start（例如本机型未启用 BLE ⇒ 本工程不 init link）时
  *      `wifi_prov_ble_report_prov_connected()` 返回非 `ESP_OK` ⇒ 保持"未报过"，
  *      下一次 GOT_IP 再试；⛔ 不假装成功、⛔ 不静默（两处都有 WARN 行）。
+ *   ⑤ 🔴 **2026-10-12〔本批〕会话边界复位**：Wi-Fi 断开（= 这一次配网会话结束，由
+ *      `wifi_prov.c` 的 DISCONNECTED 分支经 `wifi_prov_set_disconnected_cb()` 通告）
+ *      ⇒ 复位"已报过"（`prov_status_reset_after_disconnect()`，判据本体 = `wifi_prov_status.h` 的 ④）
+ *      ⇒ **重新配网后可以再报一次**。② 的"只报一次"因此是"**同一段会话内**只报一次"：
+ *      ⛔ 不是"永远只报一次"（那正是本批修掉的真机缺陷：第二轮配网报不出 ⇒ App 卡在"配网中"），
+ *      ⛔ 也不是"每次 GOT_IP 都报"（刷屏；门禁 A16c 机械拒绝把复位挪进本函数）。
  *
  * ⚠️ 与既有 `failed` / `idle` 的关系（⛔ 本批一个字都没改）：
  *   `connect` 失败 ⇒ `failed{err=auth_failed}`、队列满 ⇒ `failed{err=busy}`、
@@ -797,14 +803,49 @@ static void cloud_start_task(void *arg)
  *   （`oneye_dev_link.c` 的 `link_prov_execute()` / `link_handle_prov()`）。本函数不碰它们，
  *   只在"Wi-Fi 真的拿到 IP"这一刻补上同一个状态机里**缺的那一个**状态。
  */
+
+/* ★ 幂等位（`prov.status{connected}` 的"只报一次"）：**本文件作用域**（不是函数内静态）——
+ *   因为它的**复位**来自 `wifi_prov.c` 的"会话结束"通告（见下面 `prov_status_reset_after_disconnect()`）。
+ *   ① 置位：只有**真的发出**（`wifi_prov_ble_report_prov_connected()` 返回 `ESP_OK`）才置位；
+ *   ② 复位：Wi-Fi 断开（**这一次配网会话结束**）⇒ 下一段会话拿到 IP 可以再报一次。 */
+static bool reported;
+
+/* 🔴 2026-10-12〔本批〕**会话结束 ⇒ 复位**"已报过 connected"这一位
+ *   （判据本体 = `wifi_prov_status.h` 的 ④ `wifi_prov_connected_reported_after_disconnect()`）。
+ *
+ * 真机证据（⛔ 不重复采集，2026-10-12 两轮）：15:25 第一轮 `GOT_IP 192.168.110.90` ⇒ 报过一次
+ *   `prov.status{state=connected}`；15:36 第二轮（App 走 `[prov-switch]` 断旧连新 → `GOT_IP` 1.3 s、
+ *   provider 返回 `ESP_OK`）之后**再也没有报** `connected` ⇒ App 一直停在"配网中"直到超时。
+ *   成因 = 幂等位**跨会话不复位**（旧形态：`static bool reported` 在函数内、只被置位、无人复位）。
+ *
+ * 为什么复位边 = **Wi-Fi 断开**（"这一次配网是新的一次"的语义点，逐字理由）：
+ *   · 这一位回答的是"**这一段连接会话**里报过没有"；断开之后这一段的 `connected` 已不成立
+ *     （`wifi_prov_ip()` 清空、`wifi_prov_is_connected()` 转 false）⇒ 位必须随之作废；
+ *   · 三条重新配网路径**都物理经过断开边**：App/权威通道 `[prov-switch]` 的
+ *     `esp_wifi_disconnect()`（`wifi_prov.c:73` 逐字：它会派发 `WIFI_EVENT_STA_DISCONNECTED`）、
+ *     台面改配（`wifi_prov_release_held()` + submit）、`prov.reset`（`wifi_prov_forget()` 内断链）
+ *     ⇒ **一个复位边覆盖三者**，⛔ 不必在三处各写一遍（也就不会漏掉其中一条）；
+ *   · ⛔ 不会退化成"每次都报"：复位只发生在**真实断开**时；同一段连接里的重复 GOT_IP
+ *     （DHCP 续租等）**不经过**这条边 ⇒ ② 的"不刷屏"在本会话内原样成立。
+ *   ⛔ 判据本体（ip 非空 / 只报一次）一字未改 —— 本函数只复位**状态**。
+ *   ⛔ 不许把它挪进 `prov_status_report_connected_once()`（那等于每次 GOT_IP 都复位 ⇒ 每次都报；
+ *      门禁 A16c 机械拒绝这种退化）。 */
+static void prov_status_reset_after_disconnect(void)
+{
+    if (reported) {
+        ESP_LOGW(TAG, "[diag] Wi-Fi 会话结束 ⇒ 复位 connected 幂等位"
+                      "（这一次配网到此为止；下一次 GOT_IP 可以再报一次）");
+    }
+    reported = wifi_prov_connected_reported_after_disconnect(reported);
+}
+
 static void prov_status_report_connected_once(void)
 {
-    static bool reported;      /* ★ 幂等位：只报一次（⛔ 不刷屏）；未发出**不**置位（见 ④） */
     const char *ip = wifi_prov_ip();
     esp_err_t rc;
 
     if (!wifi_prov_connected_should_report(wifi_prov_is_connected(), ip, reported)) {
-        /* 没拿到 IP，或已经报过（多为掉线重连路径的重复触发）⇒ 什么都不做，⛔ 不刷屏 */
+        /* 没拿到 IP，或**本次会话**已经报过（多为同一段连接里的重复 GOT_IP）⇒ 什么都不做，⛔ 不刷屏 */
         ESP_LOGI(TAG, "[diag] connected 上报判据=否：wifi_connected=%d ip=%s already_reported=%d"
                       "（前者为 0 ⇒ 还没拿到 IP，如实停在「配网中」）",
                  wifi_prov_is_connected() ? 1 : 0, (ip != NULL) ? ip : "(空)", reported ? 1 : 0);
@@ -820,7 +861,8 @@ static void prov_status_report_connected_once(void)
                  ip, esp_err_to_name(rc));
         return;
     }
-    ESP_LOGI(TAG, "★ prov.status{state=connected, ip=%s, ssid=%s, source=%s} 已发出（只报一次）",
+    ESP_LOGI(TAG, "★ prov.status{state=connected, ip=%s, ssid=%s, source=%s} 已发出"
+                  "（本次配网会话内只报一次；Wi-Fi 断开后复位 ⇒ 重新配网可再报一次）",
              ip, wifi_prov_ssid(), wifi_prov_source());
 }
 
@@ -855,7 +897,8 @@ static void on_wifi_ready(void)
 
     /* ★ 2026-10-10：向 App 上报 `prov.status{state=connected, ip=…}`（契约 §4.1 的既有状态，本批落实）。
      *   ⚠️ 位置**故意在下面那次「一次性守卫」之前**：本行是**每次 GOT_IP 都要考虑**的事件级动作
-     *   （幂等由它自己的静态位保证 ⇒ 全局仍然只报一次），与"上云链路只启动一次"的那把守卫**不是**同一件事。
+     *   （幂等由它自己的静态位保证 ⇒ **同一段配网会话内**只报一次；会话边界复位见
+     *   `prov_status_reset_after_disconnect()`），与"上云链路只启动一次"的那把守卫**不是**同一件事。
      *   为什么不能挪到守卫之后：守卫之后还有 `net_probe`/`sntp`/`cloud_start_task`，其中
      *   `xTaskCreate(cloud_start_task, …)` **在内存不足时会失败**（本板实测过 `largest_internal_block`
      *   只有 2.2 KB 的历史读数）—— 那一刻若把上报一起跳过，App 会**明明设备已联网却收不到 connected**，
@@ -1931,6 +1974,10 @@ void app_main(void)
      * 无凭据/连不上 ⇒ 不中止：板级自检、按键、AEC 录音、板上回放、串口日志仍可用；
      * 本地验证面板需设备 IP，故仅在联网成功时启动（见 panel_start_if_enabled）。 */
     wifi_prov_set_ready_cb(on_wifi_ready);
+    /* 🔴 2026-10-12〔本批〕会话结束边（Wi-Fi 断开）⇒ 复位 `prov.status{connected}` 的幂等位：
+     *   注册点与 ready 回调**同一处**（应用生命周期的唯一注册点）。⛔ 不复位就报不出第二轮 connected
+     *   ⇒ App 卡在"配网中"（真机 2026-10-12 15:36 第二轮）；置位/复位语义见上面两个函数。 */
+    wifi_prov_set_disconnected_cb(prov_status_reset_after_disconnect);
     wifi_prov_boot();
 
     while (1) {

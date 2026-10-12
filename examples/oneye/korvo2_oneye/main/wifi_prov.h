@@ -181,6 +181,25 @@ void wifi_prov_forget(void);
 typedef void (*wifi_prov_ready_cb_t)(void);
 void wifi_prov_set_ready_cb(wifi_prov_ready_cb_t cb);
 
+/**
+ * 🔴 2026-10-12〔本批〕**会话结束通知**：`WIFI_EVENT_STA_DISCONNECTED` 到达时被调用
+ * （在系统事件任务上下文；本模块已经把 `s_connected=false`、`s_ip[0]='\0'` 落好之后才通知）。
+ *
+ * 为什么需要这条边（真机证据 + 逐字理由）：
+ *   · `connected` 上报的幂等位（`wifi_prov_status.h` 的 ②）此前**跨会话永不复位** ⇒
+ *     第二轮配网（App 走 `[prov-switch]` 断旧连新 → GOT_IP）**再也报不出** `connected`
+ *     ⇒ App 卡在"配网中"（2026-10-12 15:36 真机第二轮就是这样失败的）；
+ *   · 复位点是"**这一次配网会话结束**"，而它的唯一权威边就是本回调 ——
+ *     Wi-Fi 生命周期归本模块持有（门禁 A15f），⛔ 应用层不得自己去注册 Wi-Fi 事件。
+ *
+ * ⚠️ 本模块**只通告"会话结束了"这一件事**，⛔ 不解释它在应用层的含义（要不要复位幂等位、
+ *    要不要补发/清理别的状态，由注册方决定）；⛔ 本回调**不改**连接行为：
+ *     `s_scan_only` / `s_reprovision` 两个抑制位与"是否自动重连"的既有语义**一字未改**。
+ * ⚠️ 回调体必须"有界"：它在系统事件任务上执行（与 ready 回调同一类约束）。
+ */
+typedef void (*wifi_prov_disconnected_cb_t)(void);
+void wifi_prov_set_disconnected_cb(wifi_prov_disconnected_cb_t cb);
+
 bool wifi_prov_is_connected(void);
 const char *wifi_prov_ip(void);        /* "" = 未连接 */
 const char *wifi_prov_ssid(void);      /* 当前/最近使用的 SSID */

@@ -81,6 +81,11 @@ static char s_ip[20];
 static char s_ssid[WIFI_PROV_SSID_MAX];
 static char s_source[48];
 static wifi_prov_ready_cb_t s_ready_cb;
+/* 🔴 2026-10-12〔本批〕**会话结束**通知位（见 wifi_prov.h 的同名 API 注释）：
+ *   置位者 = 应用侧（`korvo2_oneye_main.c` 的 `app_main()`，与 ready 回调同一处生命周期注册）；
+ *   调用者 = 下面 `on_wifi_event()` 的 `WIFI_EVENT_STA_DISCONNECTED` 分支。
+ *   ⛔ 本模块不解释它的应用层含义；⛔ 它不参与任何"要不要重连"的判断。 */
+static wifi_prov_disconnected_cb_t s_disconnected_cb;
 
 /* ★ 采信槽（ADR-0017 D2/D4）：**当前被采信的那一份凭据来自哪条通道**。
  * 同一时刻只有一份被采信；`wifi_prov_policy_decide()` 用它做优先级比较。
@@ -113,6 +118,7 @@ const char *wifi_prov_channel_source(wifi_prov_channel_t ch)
 }
 
 void wifi_prov_set_ready_cb(wifi_prov_ready_cb_t cb) { s_ready_cb = cb; }
+void wifi_prov_set_disconnected_cb(wifi_prov_disconnected_cb_t cb) { s_disconnected_cb = cb; }
 
 static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -134,6 +140,17 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
         int reason = (data != NULL) ? (int)((wifi_event_sta_disconnected_t *)data)->reason : -1;
         s_connected = false;
         s_ip[0] = '\0';
+        /* 🔴 2026-10-12〔本批〕**会话结束**：这一次配网会话到此为止 ⇒ 通告应用侧
+         *   （应用侧据此复位 `prov.status{connected}` 的"只报一次"幂等位；本体 = wifi_prov_status.h 的 ④）。
+         * ⛔ 位置**故意在**下面那个 `s_scan_only || s_reprovision` 分支**之前**：
+         *   权威通道"断旧连新"产生的这一次断开**正是**要复位的场景（`s_reprovision` 为真、下面直接
+         *   `return` 不重连）—— 若把通知挂在"会重连"的那条路上，本批要修的第二轮配网**恰好被漏掉**。
+         * ⛔ 只通告，不改行为：下面两个抑制位与"是否自动重连"的判断一字未动。 */
+        ESP_LOGI(TAG, "[diag] Wi-Fi 会话结束（DISCONNECTED reason=%d）⇒ 通告应用侧复位本次配网的 "
+                      "connected 幂等位（下一次 GOT_IP 可以再报一次）", reason);
+        if (s_disconnected_cb) {
+            s_disconnected_cb();
+        }
         if (s_scan_only || s_reprovision) {
             ESP_LOGI(TAG, "[diag] WIFI_EVENT_STA_DISCONNECTED reason=%d ⇒ %s，不自动重连",
                      reason,

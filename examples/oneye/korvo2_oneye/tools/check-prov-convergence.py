@@ -67,6 +67,19 @@ check-prov-convergence.py —— 结构性门禁：证明 korvo2_oneye 的「入
          A15f ⛔ 通道模块（`wifi_prov_ble.c`）自己**不得**碰 `esp_wifi_disconnect()`
               （Wi-Fi 生命周期归 `wifi_prov.c`；通道只交凭据）
          ⛔ 本组**不新增帧 / 不新增状态 / 不动 Kconfig 与机读契约**：它只断言既有枚举与既有 API 的用法。
+  A16    🔴 2026-10-12（本批 · 真机证据）：**`prov.status{connected}` 幂等位的「会话边界复位」**——
+         15:25 第一轮报过一次 connected；15:36 第二轮（App 走 `[prov-switch]` 断旧连新）拿到 IP 之后
+         **再也没有报** ⇒ App 一直停在"配网中"到超时。成因 = 幂等位**跨会话不复位**。
+         A16a 复位跃迁本体在 `wifi_prov_status.h`（`wifi_prov_connected_reported_after_disconnect()`），
+              且**真复位**（`return false`；⛔ `return already_reported` = 永不复位 = 旧行为）
+         A16b 复位边锚在 `wifi_prov.c` 的 `WIFI_EVENT_STA_DISCONNECTED` 分支（**会话边界**）：
+              会话结束通告 `s_disconnected_cb()` 恰好 1 处、且落在该分支内（未越过 GOT_IP 分支）
+         A16c 复位**只**由会话结束边推进：`wifi_prov_connected_reported_after_disconnect()` 在 main/ 下
+              恰好 1 处调用，且⛔ **不在** `prov_status_report_connected_once()` 内
+              （塞进上报函数 = 每次 GOT_IP 都复位 ⇒ 退化成"每次都报"）
+         A16d 会话结束回调注册点唯一，且在 `app_main()` 内（与 ready 回调同一处生命周期注册点）
+         ⛔ 本组**不放宽判据**：① ip 非空 / ② 只报一次 仍由 A14e/A14f 断言；复位的是**状态**。
+         ⛔ 不新增帧 / 不新增状态 / 不新增错误码：`prov.status{connected}` 的 payload 与取值沿用。
 
 退出码：0 = 全部断言通过；1 = 有断言失败（逐条打出）。
 **自带负向对照**：把 `main/` 与夹具复制到临时目录后逐条注入已知缺陷，同一套检查**必须逐条报红**
@@ -75,6 +88,7 @@ A10b 的判据抄件、**A11 的"通道模块里再调一次 sntp_boot_sync()/ne
 **A12 的"把 sntp 挪到 cloud_start_task 之后"**、**A13 的"删掉 NimBLE 起栈后那一处资源读数"**）。
 **A14 的「丢掉 ip 非空判据 / 丢掉幂等判据 / 发送失败也置位 / 第二个上报点 / 改报别的状态」**。
 **A15 的「把 REJECT_ALREADY_UP 放回 / 删掉断旧前置段 / 抹掉抑制位」。**
+**A16 的「断开边不复位（旧行为）/ 复位跃迁改成恒等 / 把复位挪进上报函数（每次都报）」。**
 任一条注入没有被对应断言抓住 ⇒ 本脚本自己的判据是空转的 ⇒ exit 1。
 """
 
@@ -136,6 +150,15 @@ AUTH_CHAN_HELPER = "wifi_prov_channel_is_authoritative"
 AUTH_GUARD = "if (onboarded && !authoritative)"
 DISCONNECT_CALL = "esp_wifi_disconnect()"
 REPROVISION_FLAG = "s_reprovision"
+# A16（🔴 2026-10-12 本批 · 真机证据）：`prov.status{connected}` 幂等位的**会话边界复位** ——
+#   15:25 第一轮报过一次 connected；15:36 第二轮（App 走 [prov-switch] 断旧连新）拿到 IP 之后
+#   **再也没有报** ⇒ App 一直停在"配网中"到超时。成因 = 幂等位跨会话不复位。
+#   形状：wifi_prov.c 的 WIFI_EVENT_STA_DISCONNECTED 分支（会话边界）
+#         → s_disconnected_cb() → main.c:prov_status_reset_after_disconnect()
+#         → 判据本体 wifi_prov_status.h:wifi_prov_connected_reported_after_disconnect()
+STATUS_RESET_FN = "wifi_prov_connected_reported_after_disconnect"
+DISC_CB_CALL = "s_disconnected_cb();"
+DISC_CB_REG = re.compile(r"wifi_prov_set_disconnected_cb\s*\(\s*prov_status_reset_after_disconnect\s*\)")
 SUBMIT_SIG = r"esp_err_t\s+wifi_prov_submit_credentials_src\s*\("
 DECISION_ENUM = [
     "WIFI_PROV_DECISION_ACCEPT_FIRST",
@@ -465,10 +488,10 @@ def run_checks(sources, headers, test_lines):
         dup = [n for n in defined_functions(test_lines) if n in JUDGE_NAMES]
         need(not dup, "A10b 夹具自定义了判据函数（抄件）：{}".format(",".join(sorted(set(dup)))),
              "夹具只能引用固件判据，不得自备一份")
-        for tag in ("[夹具①]", "[夹具②]", "[夹具③]", "[夹具④]", "[夹具⑤]"):
+        for tag in ("[夹具①]", "[夹具②]", "[夹具③]", "[夹具④]", "[夹具⑤]", "[夹具⑥]"):
             need(tag in t, "A10c 夹具缺少 {}".format(tag),
-                 "五个夹具：SD 胜出 / BLE 胜出 / 重复入网被拒 / prov.status{connected} 上报判据 / "
-                 "权威通道断旧连新（2026-10-12）")
+                 "六个夹具：SD 胜出 / BLE 胜出 / 重复入网被拒 / prov.status{connected} 上报判据 / "
+                 "权威通道断旧连新（2026-10-12）/ 会话边界复位（2026-10-12 本批）")
         need("mutant_decide" in t and "负向对照" in t,
              "A10d 夹具缺少变异负向对照（mutant_decide / 负向对照）",
              "没有负向对照 ⇒ 夹具可能空转")
@@ -738,6 +761,63 @@ def run_checks(sources, headers, test_lines):
                 fails.append("A15f {}:{} 直接调了 esp_wifi_disconnect()"
                              "（通道只交凭据；Wi-Fi 生命周期归 wifi_prov.c）".format(fn, i + 1))
 
+    # ------------------------------------------- A16 connected 幂等位的**会话边界复位**（🔴 2026-10-12 本批）
+    # 真机证据（⛔ 不重复采集）：2026-10-12 15:25 第一轮报过一次 connected；15:36 第二轮
+    #   （App 走 [prov-switch] 断旧连新 → GOT_IP 1.3 s、provider 返回 ESP_OK）之后**没有再报**
+    #   ⇒ App 一直停在"配网中"到超时。成因 = 幂等位跨会话不复位。
+    # 形状（复位点 = **会话边界**，逐字理由见 wifi_prov.h 的 API 注释与 wifi_prov_status.h 的 ④）：
+    #   wifi_prov.c:WIFI_EVENT_STA_DISCONNECTED 分支
+    #     → s_disconnected_cb() → main.c:prov_status_reset_after_disconnect()
+    #     → wifi_prov_status.h:wifi_prov_connected_reported_after_disconnect()
+    #   ⛔ 只复位**状态**：判据本体（① ip 非空 / ② 本会话只报一次）一字未改 —— A14e/A14f 仍然断言；
+    #   ⛔ 不许把复位挪进上报函数（那等于每次 GOT_IP 都复位 ⇒ 退化成"每次都报"）。
+    need(STATUS_RESET_FN in status_text,
+         "A16a {}() 的复位跃迁不在 {}".format(STATUS_RESET_FN, STATUS_HEADER),
+         "会话边界的复位必须是纯逻辑头里的显式跃迁（固件与主机夹具编译同一份源）")
+    reset_body = func_body(status_text, r"bool\s+" + STATUS_RESET_FN + r"\s*\(") or ""
+    if not reset_body:
+        fails.append("A16a 找不到 {}() 的函数体（复位不可判定）".format(STATUS_RESET_FN))
+    else:
+        need("return false" in reset_body,
+             "A16a {}() 不是真复位（函数体内未见 `return false`）".format(STATUS_RESET_FN),
+             "⛔ `return already_reported;` = 永不复位 = 本批要修掉的旧行为（App 卡在配网中）")
+        need("return already_reported" not in reset_body,
+             "A16a {}() 把入参当返回值（恒等跃迁 = 永不复位）".format(STATUS_RESET_FN),
+             "复位与\"之前报没报过\"无关：断开之后一律回到\"未报过\"")
+
+    # A16b 复位边锚在 wifi_prov.c 的 DISCONNECTED 分支（**会话边界**），且只在那里通告一次
+    n_cb = prov_c_code.count(DISC_CB_CALL)
+    need(n_cb == 1, "A16b wifi_prov.c 里 `{}` 的调用点".format(DISC_CB_CALL),
+         "期望恰好 1 处（会话结束的唯一通告点），实测 {} 处".format(n_cb))
+    i_disc = prov_c_code.find("WIFI_EVENT_STA_DISCONNECTED")
+    i_cb = prov_c_code.find(DISC_CB_CALL)
+    i_gotip = prov_c_code.find("IP_EVENT_STA_GOT_IP", i_disc + 1) if i_disc >= 0 else -1
+    if i_disc < 0 or i_cb < 0:
+        fails.append("A16b 找不到 DISCONNECTED 分支或会话结束通告（复位边不可判定）")
+    elif not (i_disc < i_cb):
+        fails.append("A16b 会话结束通告不在 WIFI_EVENT_STA_DISCONNECTED 分支内"
+                     "（偏移 disc={} cb={}）".format(i_disc, i_cb))
+    elif i_gotip >= 0 and not (i_cb < i_gotip):
+        fails.append("A16b 会话结束通告越出 DISCONNECTED 分支（已越过 GOT_IP 分支）")
+
+    # A16c 复位**只**由会话结束边推进：⛔ 不许出现在 connected 上报函数里（那会退化成每次都报）
+    rc_hits = find_calls(sources, re.compile(STATUS_RESET_FN + r"\s*\("))
+    need(len(rc_hits) == 1, "A16c {}() 在 main/ 下的调用点".format(STATUS_RESET_FN),
+         "期望恰好 1 处（会话结束回调里复位状态），实测 {} 处".format(len(rc_hits)))
+    for fn, ln, func in rc_hits:
+        need(func != STATUS_HELPER,
+             "A16c {}() 被放进 {}()（{}:{}）".format(STATUS_RESET_FN, STATUS_HELPER, fn, ln),
+             "⛔ 每次 GOT_IP 都复位 = 每次都报（刷屏）；复位只能挂在**会话结束**边上")
+
+    # A16d 注册点唯一且在 app_main（与 ready 回调同一处生命周期注册点）
+    reg = find_calls(sources, DISC_CB_REG)
+    need(len(reg) == 1, "A16d wifi_prov_set_disconnected_cb() 注册点",
+         "期望恰好 1 处（会话结束回调），实测 {} 处".format(len(reg)))
+    if reg:
+        need(reg[0][2] == "app_main",
+             "A16d 会话结束回调的注册点不在 app_main() 内（实测在 {}）".format(reg[0][2]),
+             "回调注册与 ready 回调同在应用生命周期的唯一注册点")
+
     return (not fails), fails
 
 
@@ -858,6 +938,21 @@ INJECTIONS = [
     ("抹掉旧采信态作废（旧 SSID 仍被采信）", "wifi_prov.c", "A15e",
      lambda ls: _replace_in(ls, "        s_held_valid = false;",
                             "        /* 注入：不丢旧采信态 */")),
+    # A16（🔴 2026-10-12 本批）：会话边界复位 —— 断开边不复位（旧行为）/ 复位被塞进"每次都报"的退化位置。
+    ("删掉断开边的会话复位通告（幂等位跨会话永不复位 ⇒ 第二轮配网报不出 connected）",
+     "wifi_prov.c", "A16b",
+     lambda ls: _replace_in(ls, "            s_disconnected_cb();",
+                            "            /* 注入：断开不复位（旧行为） */")),
+    ("把复位挪进 connected 上报函数（每次 GOT_IP 都复位 ⇒ 退化成每次都报）",
+     "korvo2_oneye_main.c", "A16c",
+     lambda ls: _replace_in(
+         ls,
+         "    if (!wifi_prov_connected_should_report(wifi_prov_is_connected(), ip, reported)) {",
+         "    reported = wifi_prov_connected_reported_after_disconnect(reported);\n"
+         "    if (!wifi_prov_connected_should_report(wifi_prov_is_connected(), ip, reported)) {")),
+    ("把复位跃迁改成恒等（`return already_reported` = 永不复位）", "wifi_prov_status.h", "A16a",
+     lambda ls: _replace_in(ls, "    (void)already_reported;",
+                            "    return already_reported;   /* 注入：永不复位（旧行为） */")),
 ]
 
 
@@ -917,7 +1012,7 @@ def main():
     ok, fails = run_checks(src, headers, test_lines)
     for f in fails:
         print("  ✗ " + f)
-    print("正向断言（A1–A15）：{}".format("PASS" if ok else "FAIL"))
+    print("正向断言（A1–A16）：{}".format("PASS" if ok else "FAIL"))
 
     status, detail = run_host_test(EXAMPLE)
     if status == "pass":
@@ -956,7 +1051,8 @@ def main():
     print("RESULT=PASS 单一收敛点 + 优先级（SD>BLE>其他）+ 只入网一次（权威通道 BLE/App 除外）"
           "+ 权威通道断旧连新（A15：恰好一次断链 / 抑制旧配置重连 / 旧 SSID 不再被采信）"
           "+ 自检/授时全通道必经（ADR-0017 D2/D4）+ 资源读数未入网可见（A13，带阶段标签）"
-          "+ prov.status{connected,ip} 落地既有契约状态（A14，ip 非空 / 只报一次 / 失败不置位）")
+          "+ prov.status{connected,ip} 落地既有契约状态（A14，ip 非空 / 只报一次 / 失败不置位）"
+          "+ 会话边界复位（A16：Wi-Fi 断开 ⇒ 重新配网可再报一次；⛔ 不放宽判据、⛔ 不新增帧）")
     return 0
 
 

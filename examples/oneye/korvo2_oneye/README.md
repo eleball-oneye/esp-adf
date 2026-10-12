@@ -494,11 +494,12 @@ cd embedded/esp-adf/examples/oneye/korvo2_oneye
 python3 tools/check-prov-convergence.py          # RESULT=PASS ⇒ exit 0
 ```
 
-它机械断言 A1–A14（`oneye_start()` 调用点唯一且在 `cloud_start_task` 内、`cloud_start_task`
+它机械断言 A1–A15（`oneye_start()` 调用点唯一且在 `cloud_start_task` 内、`cloud_start_task`
 创建点唯一且在 `on_wifi_ready` 内、ready 回调注册点/触发点各唯一、BLE 通道只经唯一入口且
 自己不调 `oneye_start()`/`esp_wifi_connect()`、**SD 凭据在启动期先于 BLE 被递上去**、
 **非 `wifi_prov.c` 不得直连 `wifi_prov_connect()`/不得写 `wifi_prov_set_source()`**、
-**只入网一次**（一次性守卫 + 判据 `onboarded = s_connected && s_held_valid` + 判据顺序）、
+**只入网一次**（一次性守卫 + 判据 `onboarded = s_connected && s_held_valid` + 判据顺序；
+🔴 **2026-10-12：该条对权威通道 BLE/App 开例外**，见 A15）、
 **夹具与判据同源**、**A11**`net_probe_report()`/`sntp_boot_sync()` 各只 1 处调用点且都在
 `on_wifi_ready()` 内（通道模块里不得出现）、**A12** 顺序 `net_probe → sntp → 面板 →
 cloud_start_task`（授时必须先于建链）、**A13** 资源读数 `[res]` 由**同一个** helper 在 3 个
@@ -513,13 +514,19 @@ wifi_prov_ble_report_prov_connected()` 内、该包装只被 `korvo2_oneye_main.
 prov_status_report_connected_once()` 调 1 次、后者只被收敛点下游 `on_wifi_ready()` 调 1 次、
 上报状态必须是 `ONEYE_DEV_LINK_PROV_CONNECTED`、判据本体只在 `main/wifi_prov_status.h`
 （固件与夹具同源）、判据里必须有「ip 非空」与「只报一次」两条、幂等位只由发送结果推进、
-且 main/ 下不得出现 `prov.status` 帧名字面量），
-并**自带 15 条注入负向对照**（第二条入网后逻辑 / 直连连接层 / 丢掉"只入网一次" / 抹掉留痕 /
+且 main/ 下不得出现 `prov.status` 帧名字面量）、
+🔴 **A15**（2026-10-12 本批：**权威通道（BLE/App）"断旧连新"** —— 判据按通道分派
+`wifi_prov_channel_is_authoritative()` 且**只**认 BLE、`REJECT_ALREADY_UP` 在 BLE 通路**不可达**、
+`wifi_prov_submit_credentials_src()` 内**恰好一次** `esp_wifi_disconnect()` 且受 `if (s_connected)`
+约束、且在 `wifi_prov_connect(` **之前**、断链**之前**置 `s_reprovision` 且 `on_wifi_event()` 的
+断开分支认它、同一段里旧采信态作废 + 新通道落槽、⛔ 通道模块不得出现 `esp_wifi_disconnect`），
+并**自带 20 条注入负向对照**（第二条入网后逻辑 / 直连连接层 / 丢掉"只入网一次" / 抹掉留痕 /
 夹具自备判据 / **通道模块里再调一次 `sntp_boot_sync()`** / **通道模块里再调一次
 `net_probe_report()`** / **把 `sntp_boot_sync()` 挪到 `cloud_start_task` 之后** /
 **删掉 NimBLE 起栈后那一处资源读数** / **丢掉 ip 非空判据** / **丢掉幂等判据** /
 **发送失败也置位** / **第二个 connected 上报点** / **再开一个绕过判据的直发点** /
-**把 connected 改报成别的状态**），
+**把 connected 改报成别的状态** / 🔴 **把 `REJECT_ALREADY_UP` 放回（权威通道分派被抹掉）** /
+**删掉断旧前置段** / **抹掉抑制位** / **抹掉旧采信态作废**），
 断言同一套检查**必须逐条报红**。
 任一条注入没被抓住 ⇒ 脚本自己判据空转 ⇒ 同样 `exit 1`。
 它还会**实跑主机侧夹具**（`tools/test-prov-priority.c`，有 `cc`/`gcc` 时）并要求
@@ -596,9 +603,20 @@ idf.py -B /tmp/korvo2-mp-neg -DSDKCONFIG=/tmp/korvo2-mp-neg/sdkconfig \
 裁决顺序（`wifi_prov_policy_decide()`，⛔ 不可重排）：
 
 1. **已入网且采信槽未被显式释放 ⇒ 一律拒绝**（`REJECT_ALREADY_UP`，**只入网一次**；入网后连更高优先级也不抢占）；
+   🔴 **2026-10-12 就地订正（用户裁定「**已有app发起配网时设备要断现有wifi重新连接目标wifi**，
+   否则app会卡在配网中这个流程。」）**：本条**只对非权威通道成立** ⇒
+   **权威通道 = C1/C2 BLE（App / 另一台嵌入式设备当场发起）**：`REJECT_ALREADY_UP` 对它**不可达**，
+   设备**先 `esp_wifi_disconnect()`（在线才断，恰好一次）**、丢弃旧配置的采信态，
+   再 `esp_wifi_set_config(新凭据)` → `esp_wifi_connect()`（**断旧连新**，串口前缀 `[prov-switch]`）；
+   判据分派 = `wifi_prov_policy.h:wifi_prov_channel_is_authoritative()`。
+   ⛔ **非权威通道**（C3 凭据文件 / C4 台面 API / C5 兜底 / R1、R2 预留）**逐字不变**；
+   ⛔ **rank 表一字未改**（未入网时 BLE 仍让位：SD 已采信且未入网 ⇒ BLE 仍是 `REJECT_LOWER`）。
+   ⛔ **旧字逐字留痕（⛔ 不抹）**：本条旧口径逐字为「**已入网且采信槽未被显式释放 ⇒ 一律拒绝**
+   （`REJECT_ALREADY_UP`，**只入网一次**；入网后连更高优先级也不抢占）；」
 2. 槽为空（含被显式释放）⇒ **采信**（`ACCEPT_FIRST`）；
 3. 同一通道再次提交 ⇒ **采信**（`ACCEPT_SAME`，改配/重试）；
-4. 严格更高优先级且尚未入网 ⇒ **抢占**（`ACCEPT_PREEMPT`）；
+4. 权威通道（BLE/App）接管已被占用的槽且**设备已入网** ⇒ **抢占**（`ACCEPT_PREEMPT`，"断旧连新"），
+   或严格更高优先级且尚未入网 ⇒ **抢占**（`ACCEPT_PREEMPT`）；
 5. 其余 ⇒ **拒绝**（`REJECT_LOWER`）。
 
 **看优先级，不看到达顺序**：BLE 先到、SD 后到 ⇒ SD 仍然胜出（`ACCEPT_PREEMPT`）。
@@ -612,7 +630,9 @@ C3  SD 卡  korvo2_oneye_main.c:821  wifi_prov_submit_credentials_src(..., WIFI_
 C4  台面    media_api.c:395-396      wifi_prov_release_held("api-reprovision") + submit(..., CHAN_API)
 C5  兜底    korvo2_oneye_main.c:857  wifi_prov_submit_credentials_src(..., WIFI_PROV_CHAN_KCONFIG, "kconfig")
                     ↓  全部进入
-wifi_prov.c:329  wifi_prov_submit_credentials_src()  →  :343 唯一判据 → :276 wifi_prov_connect()（**static**）
+wifi_prov.c  wifi_prov_submit_credentials_src()  →  唯一判据（按通道分派）→ wifi_prov_connect()（**static**）
+                    ↓  ★ 权威通道（BLE/App）在采信之后、连新之前**先断旧**
+wifi_prov.c  [prov-switch] esp_wifi_disconnect()（在线才断，恰好一次）→ 丢旧采信态 → set_config + connect
                     ↓ 采信并入网
 wifi_prov.c:102  IP_EVENT_STA_GOT_IP  →  :113 s_ready_cb()  →  main.c:674 on_wifi_ready()  →  :643 oneye_start()
 ```
@@ -620,30 +640,40 @@ wifi_prov.c:102  IP_EVENT_STA_GOT_IP  →  :113 s_ready_cb()  →  main.c:674 on
 - **判据不可旁路**：连接层 `wifi_prov_connect()` 已收为 `wifi_prov.c` 内部 `static`、**不出现在头文件**，
   ⇒ 模块外没有任何路径能绕过优先级（门禁 A8b/A8c 断言）。
 - **留痕**：拒绝/抢占都打 `[prov-priority] <决策 token>`（`wifi_prov_decision_str()`）+ 累计计数；
+  **权威通道的"断旧连新"另打 `[prov-switch]`**（原 ssid + disconnect 返回码）；
   BLE 侧把拒绝以 `-1` 回给 SDK ⇒ 对端收到 `PROV_FAILED`（`oneye-dev-sdk/src/oneye_dev_link.c:317-320`），⛔ 不静默丢弃。
+- **抑制旧配置重连**：断链前先置 `s_reprovision` ⇒ `WIFI_EVENT_STA_DISCONNECTED` 分支**不**自动重连
+  （否则那一刻 STA 里还是旧配置 ⇒ "换网"退化成"重连旧网"）；`esp_wifi_set_config(新凭据)` 成功之后清位。
 - **启动期顺序 = 优先级顺序**：C3 → BLE → C5 兜底（`korvo2_oneye_main.c:808-887`）。
   **C3 能解析但本次入网失败** ⇒ `:829` 显式 `wifi_prov_release_held("file-connect-failed")` 再降级，
   否则 rank 0 会永久占位、把后面的通道全挡住（配网死锁）。
 - **显式改配/重置**走「先释放采信槽再提交」（台面 `wifi_set` / `prov.reset`），允许在已入网设备上换网；
   ⛔ 但上云链路**仍只启动一次**（`on_wifi_ready()` 的一次性守卫 + 唯一 `oneye_start()` 调用点）。
+  🔴 **2026-10-12**：**BLE（App）不需要这条"先释放"链** —— 权威通道一经受理即断旧连新（见夹具⑤与 A15）；
+  台面 `wifi_set`（C4）与 `prov.reset` 的口径**逐字未变**。
 
 ### 5.12.3 自证（非空转）
 
 ```bash
 cd embedded/esp-adf/examples/oneye/korvo2_oneye
-python3 tools/check-prov-convergence.py     # A1–A10 + 5 条注入负向对照 + 实跑夹具 ⇒ RESULT=PASS / exit 0
+python3 tools/check-prov-convergence.py     # A1–A15 + 20 条注入负向对照 + 实跑夹具 ⇒ RESULT=PASS / exit 0
 cc -std=c99 -Wall -Wextra -Werror -I main tools/test-prov-priority.c -o /tmp/tpp && /tmp/tpp
+# 本批（App 发起配网 = 断旧连新）专用机械判据：
+python3 build-alpha-switch/.scratch/check-switch-semantics.py   # 行为 P1–P7 + 源码 S1–S6 + 5 条变异 ⇒ RESULT=PASS
 ```
 
-[`tools/test-prov-priority.c`](tools/test-prov-priority.c) 的三个夹具（对应任务口径，⛔ 不是空转）：
+[`tools/test-prov-priority.c`](tools/test-prov-priority.c) 的五个夹具（对应任务口径，⛔ 不是空转）：
 
 | 夹具 | 内容 | 断言 |
 | --- | --- | --- |
 | **①** | **SD 凭据在 + BLE 也提交了 ⇒ SD 胜出** | SD 先（未入网）⇒ BLE 被 `REJECT_LOWER`；到达顺序反过来 ⇒ SD `ACCEPT_PREEMPT` 抢下采信槽；掉线不影响"谁被采信" |
 | **②** | **SD 不在 + BLE 提交 ⇒ BLE 胜出** | 空槽 + BLE ⇒ `ACCEPT_FIRST`；随后「其他」层（API/Kconfig/声波/二维码）一律 `REJECT_LOWER`（不越权） |
-| **③** | **重复入网被拒（只入网一次）** | 已入网后 SD/BLE/API/预留通道全部 `REJECT_ALREADY_UP`（含更高优先级也不抢占）；显式 `release_held` 是唯一换网路径；`prov.reset` 后仍需重新入网 |
+| **③** | **重复入网被拒（只入网一次）** | 已入网后 **SD/API/预留通道** 一律 `REJECT_ALREADY_UP`（含更高优先级也不抢占）；⚠️ **BLE 是例外**（权威通道 ⇒ `ACCEPT_PREEMPT`/`ACCEPT_SAME`，见夹具⑤）；显式 `release_held` 仍是**非权威通道**换网的唯一路径；`prov.reset` 后仍需重新入网 |
+| **④** | **`prov.status{connected}` 上报判据** | 非空 ip 才报 / 只报一次 / 发送失败不置位（2026-10-10 批） |
+| **⑤** | **权威通道（BLE/App）断旧连新** | 已在线 + 新 `prov.connect`（BLE）⇒ **采信** + **恰好一次** `esp_wifi_disconnect()`（宿主计数桩）+ 断链前抑制位已在位（"用旧配置重连"次数 = 0）+ 旧 SSID 不再被采信 + 新通道落槽；**负向**：未入网且槽被 SD 占用 ⇒ 仍 `REJECT_LOWER`、0 次断链；已入网 + 台面 API ⇒ 仍 `REJECT_ALREADY_UP`、0 次断链 |
 
 **负向对照（变异测试）**：同一组夹具再跑一遍「变异判据」（rank 反向 + 忽略"只入网一次"），**必须报红**；
+另有一条**专项**负向对照 —— 把 `REJECT_ALREADY_UP` **放回**（不看通道）⇒ 夹具⑤ 必须报红；
 不报红 ⇒ 夹具对本判据没有区分力 ⇒ 退出码 1。
 
 ### 5.12.4 本轮读数（受控构建三配置；`-DSDKCONFIG` + 显式叠加 defaults，全新目录）

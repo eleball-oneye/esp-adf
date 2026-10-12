@@ -8,13 +8,26 @@
  * ★ 自带负向对照（变异测试，证明夹具不是空转）：
  *   同一组夹具会**再跑一遍**「变异判据」（优先级反向 + 忽略"只入网一次"），
  *   要求它**必须报红**。变异判据也全绿 ⇒ 夹具对本判据没有区分力 ⇒ 退出码 1。
+ *   ★ 2026-10-12 追加**专项**负向对照（夹具⑤）：把「已入网一律拒绝」**放回**（不看通道）
+ *   ⇒ 夹具⑤ 必须报红 —— 这是"App 发起配网 ⇒ 断旧连新"这条裁定的可判定性证明。
  *
  * 夹具（对应用户口径「优先级 = SD 卡 WiFi 凭据 > 蓝牙配网 > 其他」）：
  *   ① SD 凭据在 + BLE 也提交了 ⇒ **SD 胜出**（旧形态下无法判定：两条通道各自入网）
  *      ①a SD 先、BLE 后   ①b 到达顺序反过来（BLE 先、SD 后）   ①c 掉线不影响"谁被采信"
  *   ② SD 不在 + BLE 提交 ⇒ **BLE 胜出**；且「其他」层（台面 API / Kconfig / 预留通道）不越权
- *   ③ **只入网一次**：入网后任何通道（含更高优先级）的提交一律被拒；
+ *   ③ **只入网一次**：入网后**非权威通道**（SD/台面 API/预留）的提交一律被拒；
  *      唯一能重新配网的路径是**显式释放采信槽**（台面改配）或 prov.reset
+ *   ⑤ **★ 2026-10-12 新增：权威通道（BLE/App）"断旧连新"**（用户裁定逐字：
+ *      「已有app发起配网时设备要断现有wifi重新连接目标wifi，否则app会卡在配网中这个流程。」）：
+ *      ⑤a 已在线（采信槽 = SD，已入网）+ 新 `prov.connect`（BLE）⇒ **采信** + **恰好一次**
+ *          `esp_wifi_disconnect()`（且断链时抑制位已在位 ⇒ 不会"用旧配置重连"）+ 旧 SSID 不再被采信
+ *          + 新凭据落槽（BLE）+ 重连成功；
+ *      ⑤b **每次提交恰好一次**断开（第二次提交同样只断一次）；
+ *      ⑤c **负向**：未入网且槽被 SD 占用 ⇒ BLE 提交**仍**按 rank 判（`REJECT_LOWER`）⇒ 0 次断链
+ *          （⛔ C3 的优先级语义未放宽）；
+ *      ⑤d **负向**：已入网 + **非权威通道**（台面 API）⇒ 仍是 `REJECT_ALREADY_UP` ⇒ 0 次断链
+ *          （⛔ "只入网一次"只对 BLE 开了口子）；
+ *      ⑤e ⑤a 之后：采信槽 = BLE（SD 那份**已作废**），台面 API 提交仍被拒。
  *   ④ **★ 2026-10-10 新增：`prov.status{state=connected}` 上报判据**（`wifi_prov_status.h`，
  *      契约 `contracts/local/link-frames.json` 的 `prov_states` 里 `connected` 是**既有**状态、
  *      且同文件 `prov.status` 的 `desc` 写明「connected 时 ip 必填」）：
@@ -100,6 +113,18 @@ static void expect_bool(const char *what, bool got, bool want)
                want ? "true" : "false", got ? "true" : "false");
     } else {
         printf("  \xe2\x9c\x93 %s ⇒ %s\n", what, got ? "true" : "false");
+    }
+}
+
+/* 夹具⑤用：计数桩的读数断言（"恰好一次"必须可数，不是注释声称） */
+static void expect_int(const char *what, int got, int want)
+{
+    g_checks++;
+    if (got != want) {
+        g_fail++;
+        printf("  \xe2\x9c\x97 %s：期望 %d，实测 %d\n", what, want, got);
+    } else {
+        printf("  \xe2\x9c\x93 %s ⇒ %d\n", what, got);
     }
 }
 
@@ -203,30 +228,35 @@ static void fixture_2(const policy_t *p)
 
 static void fixture_3(const policy_t *p)
 {
-    printf("[夹具③] 重复入网被拒（**只入网一次**）\n");
+    printf("[夹具③] 重复入网被拒（**只入网一次**；权威通道 BLE/App 除外，见夹具⑤）\n");
 
     slot_t a = { false, WIFI_PROV_CHAN_UNKNOWN, false };
     expect("③a 空槽 + SD 提交并入网", submit(p, &a, WIFI_PROV_CHAN_FILE, true),
            WIFI_PROV_DECISION_ACCEPT_FIRST);
     expect("③b 已入网 + SD 再提交（同通道重试）⇒ 拒绝",
            submit(p, &a, WIFI_PROV_CHAN_FILE, false), WIFI_PROV_DECISION_REJECT_ALREADY_UP);
-    expect("③c 已入网 + BLE 提交 ⇒ 拒绝",
-           submit(p, &a, WIFI_PROV_CHAN_BLE, false), WIFI_PROV_DECISION_REJECT_ALREADY_UP);
-    expect("③d 已入网 + 台面 API 提交 ⇒ 拒绝",
+    /* 🔴 2026-10-12 就地订正（用户裁定「App 发起配网 = 断旧连新」）：
+     *  旧字逐字留痕（⛔ 不抹）：「③c 已入网 + BLE 提交 ⇒ 拒绝」（`REJECT_ALREADY_UP`）。
+     *  新判据：BLE（权威通道）**不再**因已入网被拒 ⇒ 采信（抢占 SD 那份），由调用方断旧连新。 */
+    expect("③c 已入网 + BLE 提交 ⇒ **采信**（权威通道接管；旧字逐字留痕见源码注释）",
+           submit(p, &a, WIFI_PROV_CHAN_BLE, false), WIFI_PROV_DECISION_ACCEPT_PREEMPT);
+    expect_held("③c 被采信的变成 BLE（SD 那份作废）", a.held, WIFI_PROV_CHAN_BLE);
+    expect("③d 已入网 + 台面 API 提交 ⇒ 拒绝（非权威通道，语义未放宽）",
            submit(p, &a, WIFI_PROV_CHAN_API, false), WIFI_PROV_DECISION_REJECT_ALREADY_UP);
     expect("③e 已入网 + 预留通道（二维码）提交 ⇒ 拒绝",
            submit(p, &a, WIFI_PROV_CHAN_QRCODE, false), WIFI_PROV_DECISION_REJECT_ALREADY_UP);
 
-    /* ③f 已入网后**连更高优先级也不能抢占** */
+    /* ③f 已入网后**非权威通道**连更高优先级也不能抢占（SD 是 rank 0，已是最高） */
     slot_t b = { false, WIFI_PROV_CHAN_UNKNOWN, false };
     expect("③f 空槽 + BLE 提交并入网", submit(p, &b, WIFI_PROV_CHAN_BLE, true),
            WIFI_PROV_DECISION_ACCEPT_FIRST);
     expect("③f 已入网 + 更高优先级的 SD 提交 ⇒ 仍拒绝（入网后不抢占）",
            submit(p, &b, WIFI_PROV_CHAN_FILE, false), WIFI_PROV_DECISION_REJECT_ALREADY_UP);
 
-    /* ③g 显式释放是**唯一**让已入网设备重新配网的路径（台面改配口径） */
-    expect("③g 未释放时不放行（对照：证明「释放」是必要条件）",
-           submit(p, &b, WIFI_PROV_CHAN_BLE, false), WIFI_PROV_DECISION_REJECT_ALREADY_UP);
+    /* ③g 显式释放仍是**非权威通道**换网的唯一路径（台面改配口径）；
+     *    ⚠️ 对 BLE 而言，「无需释放也能重配」由夹具⑤判定（断旧连新）。 */
+    expect("③g 未释放时非权威通道不放行（对照：证明「释放」是必要条件）",
+           submit(p, &b, WIFI_PROV_CHAN_API, false), WIFI_PROV_DECISION_REJECT_ALREADY_UP);
     release_held(&b);
     expect("③g 显式释放采信槽后（仍在线上）+ SD 提交 ⇒ 采信",
            submit(p, &b, WIFI_PROV_CHAN_FILE, true), WIFI_PROV_DECISION_ACCEPT_FIRST);
@@ -235,11 +265,105 @@ static void fixture_3(const policy_t *p)
     slot_t c = { false, WIFI_PROV_CHAN_UNKNOWN, false };
     expect("③h prov.reset 之后 + BLE 提交 ⇒ 采信",
            submit(p, &c, WIFI_PROV_CHAN_BLE, true), WIFI_PROV_DECISION_ACCEPT_FIRST);
-    expect("③h 重新入网后 + 台面 API 提交 ⇒ 拒绝（只入网一次对所有通道一致）",
+    expect("③h 重新入网后 + 台面 API 提交 ⇒ 拒绝（只入网一次对非权威通道一致）",
            submit(p, &c, WIFI_PROV_CHAN_API, false), WIFI_PROV_DECISION_REJECT_ALREADY_UP);
     prov_reset(&c);   /* 与 forget() 同形，供下一条断言使用 */
     expect("③h prov.reset 之后再提交（槽空、已断连）⇒ 采信",
            submit(p, &c, WIFI_PROV_CHAN_BLE, true), WIFI_PROV_DECISION_ACCEPT_FIRST);
+}
+
+/* --------------------------------------------------- 夹具⑤：权威通道（BLE/App）**断旧连新**
+ *
+ * 🔴 2026-10-12（用户裁定，最高依据）逐字：
+ *    「**已有app发起配网时设备要断现有wifi重新连接目标wifi**，否则app会卡在配网中这个流程。」
+ *
+ * 被断言的形状（与 `wifi_prov.c` 的 `wifi_prov_submit_credentials_src()` **同形**：
+ * 判据 → [权威通道：在线才断 **恰好一次** → 置抑制位 → 丢旧采信态] → 落新槽 → connect）：
+ *   · **恰好一次** `esp_wifi_disconnect()`（宿主侧用计数桩，不是"注释声称"）；
+ *   · 断链**之前**抑制位必须在位（否则 `WIFI_EVENT_STA_DISCONNECTED` 分支会用**旧配置**
+ *     自动重连 ⇒ "换网"退化成"重连旧网"；宿主侧同样以计数桩判定）；
+ *   · 旧 SSID **不再被采信**（旧采信态作废、新通道落槽）；
+ *   · ⛔ 非权威通道（SD / 台面 API / 预留）**不经过**这一段：0 次断链、语义逐字不变。
+ */
+typedef struct {
+    slot_t slot;            /* 采信槽 + 在线位（与 fixture ①–③ 同一份语义） */
+    int    disconnects;     /* 桩：`esp_wifi_disconnect()` 调用次数 */
+    int    old_ssid_connects; /* 桩：断链时抑制位**不在位** ⇒ "用旧配置重连"发生次数 */
+    bool   suppress;        /* 对应 `wifi_prov.c` 的 `s_reprovision` */
+} switch_slot_t;
+
+/* 与 `wifi_prov.c:submit` 的权威前置段同形（**只**是这三行状态推进，不是复制业务判据） */
+static wifi_prov_decision_t submit_switch(const policy_t *p, switch_slot_t *s,
+                                          wifi_prov_channel_t ch, bool connects_ok)
+{
+    wifi_prov_decision_t d = p->decide(s->slot.held_valid, s->slot.held, ch,
+                                       s->slot.connected && s->slot.held_valid);
+    if (!wifi_prov_decision_is_accept(d)) {
+        return d;                       /* 拒绝 ⇒ 不采信、**不断链**（旧行为逐字） */
+    }
+    if (wifi_prov_channel_is_authoritative(ch)) {          /* ⇐ BLE/App = 权威通道 */
+        if (s->slot.connected) {
+            s->suppress = true;                            /* ⇐ wifi_prov.c 先置 s_reprovision */
+            s->disconnects++;                              /* ⇐ esp_wifi_disconnect() 恰好一次 */
+            if (!s->suppress) {
+                s->old_ssid_connects++;                    /* 抑制失效 ⇒ 旧配置重连 */
+            }
+        }
+        s->slot.connected = false;
+        s->slot.held_valid = false;                        /* ⇐ 旧 SSID 不再被采信 */
+        s->slot.held = WIFI_PROV_CHAN_UNKNOWN;
+    }
+    s->slot.held_valid = true;
+    s->slot.held = ch;
+    if (connects_ok) {
+        s->slot.connected = true;
+    }
+    s->suppress = false;   /* 对应 `wifi_prov_connect()` 在 set_config 之后清零 */
+    return d;
+}
+
+static void fixture_5(const policy_t *p)
+{
+    printf("[夹具⑤] 权威通道（BLE/App）**断旧连新**：恰好一次断开 + 旧 SSID 不再被采信\n");
+
+    /* ⑤a 已在线（采信槽 = SD，已入网）+ 新 prov.connect（BLE）⇒ 采信 + 断一次 + 换槽 */
+    switch_slot_t a = { { false, WIFI_PROV_CHAN_UNKNOWN, false }, 0, 0, false };
+    expect("⑤a 空槽 + SD 提交并入网", submit_switch(p, &a, WIFI_PROV_CHAN_FILE, true),
+           WIFI_PROV_DECISION_ACCEPT_FIRST);
+    expect("⑤a 已在线 + BLE 提交 ⇒ **采信**（不再 REJECT_ALREADY_UP）",
+           submit_switch(p, &a, WIFI_PROV_CHAN_BLE, true), WIFI_PROV_DECISION_ACCEPT_PREEMPT);
+    expect_int("⑤a esp_wifi_disconnect() 调用次数（已在线，恰好一次）", a.disconnects, 1);
+    expect_int("⑤a 断链前抑制位必须在位 ⇒ 用旧配置重连次数", a.old_ssid_connects, 0);
+    expect_held("⑤a 新凭据落槽（BLE）；SD 那份作废", a.slot.held, WIFI_PROV_CHAN_BLE);
+    expect_bool("⑤a 重连成功后在线上", a.slot.connected, true);
+
+    /* ⑤b 每次提交**各自**恰好断一次（第二次同样只断一次，不是 0 次也不是 2 次） */
+    expect("⑤b 再次 BLE 提交（同通道改配）⇒ 采信",
+           submit_switch(p, &a, WIFI_PROV_CHAN_BLE, true), WIFI_PROV_DECISION_ACCEPT_SAME);
+    expect_int("⑤b 累计断开次数（每次提交恰好一次 ⇒ 2）", a.disconnects, 2);
+
+    /* ⑤e ⑤a 之后：SD 那份已作废 ⇒ 非权威通道的提交仍被"只入网一次"挡住 */
+    expect("⑤e 换网之后 + 台面 API 提交 ⇒ 拒绝（非权威通道语义未变）",
+           submit_switch(p, &a, WIFI_PROV_CHAN_API, true), WIFI_PROV_DECISION_REJECT_ALREADY_UP);
+    expect_int("⑤e 被拒 ⇒ 不断链（累计仍是 2）", a.disconnects, 2);
+
+    /* ⑤c **负向**：未入网且槽被 SD 占用 ⇒ BLE 提交**仍**按 rank 判 ⇒ 拒绝 + 0 次断链
+     *    （⛔ C3 凭据文件的优先级语义没有被本次裁定放宽） */
+    switch_slot_t c = { { false, WIFI_PROV_CHAN_UNKNOWN, false }, 0, 0, false };
+    expect("⑤c 空槽 + SD 提交（本次未连上）", submit_switch(p, &c, WIFI_PROV_CHAN_FILE, false),
+           WIFI_PROV_DECISION_ACCEPT_FIRST);
+    expect("⑤c 未入网 + BLE 提交 ⇒ 仍是 REJECT_LOWER（⛔ C3 优先级不放宽）",
+           submit_switch(p, &c, WIFI_PROV_CHAN_BLE, false), WIFI_PROV_DECISION_REJECT_LOWER);
+    expect_int("⑤c 被拒 ⇒ 0 次断链", c.disconnects, 0);
+    expect_held("⑤c 被采信的仍是 SD", c.slot.held, WIFI_PROV_CHAN_FILE);
+
+    /* ⑤d **负向**：已入网 + **非权威通道**（台面 API）⇒ 仍是 REJECT_ALREADY_UP + 0 次断链 */
+    switch_slot_t d = { { false, WIFI_PROV_CHAN_UNKNOWN, false }, 0, 0, false };
+    expect("⑤d 空槽 + SD 提交并入网", submit_switch(p, &d, WIFI_PROV_CHAN_FILE, true),
+           WIFI_PROV_DECISION_ACCEPT_FIRST);
+    expect("⑤d 已入网 + 台面 API 提交 ⇒ 仍是 REJECT_ALREADY_UP（只对 BLE 开口子）",
+           submit_switch(p, &d, WIFI_PROV_CHAN_API, true), WIFI_PROV_DECISION_REJECT_ALREADY_UP);
+    expect_int("⑤d 被拒 ⇒ 0 次断链", d.disconnects, 0);
 }
 
 /* --------------------------------------------------- 夹具④：prov.status{connected} 上报判据
@@ -332,6 +456,7 @@ static int run_fixtures(const policy_t *p)
     fixture_1(p);
     fixture_2(p);
     fixture_3(p);
+    fixture_5(p);
     printf("  小计：%d 条断言，%d 条不符\n", g_checks, g_fail);
     return g_fail;
 }
@@ -381,12 +506,37 @@ static bool mutant_reported_after(bool already_reported, bool send_ok)
     return true;
 }
 
+/* 变异⑤（针对夹具⑤，= **本批要修掉的旧行为**）：把"已入网一律拒绝"放回
+ *   —— 不看通道、不放行权威通道 ⇒ 夹具⑤ 的 ⑤a/⑤b 必须报红（"App 卡在配网中"的原形态）。
+ *   ⛔ 这条负向对照存在的意义：万一有人把 `onboarded && !authoritative` 的按通道分派改回
+ *      `if (onboarded)`，夹具必须立刻红，而不是继续全绿。 */
+static wifi_prov_decision_t mutant_decide_reject_up_all(bool held_valid, wifi_prov_channel_t held,
+                                                        wifi_prov_channel_t incoming, bool onboarded)
+{
+    if (onboarded) {
+        return WIFI_PROV_DECISION_REJECT_ALREADY_UP;   /* 旧行为：任何通道都拒 */
+    }
+    if (!held_valid) {
+        return WIFI_PROV_DECISION_ACCEPT_FIRST;
+    }
+    if (incoming == held) {
+        return WIFI_PROV_DECISION_ACCEPT_SAME;
+    }
+    if (wifi_prov_channel_rank(incoming) < wifi_prov_channel_rank(held)) {
+        return WIFI_PROV_DECISION_ACCEPT_PREEMPT;
+    }
+    return WIFI_PROV_DECISION_REJECT_LOWER;
+}
+
 int main(void)
 {
     const policy_t real = { "固件判据 wifi_prov_policy_decide()（wifi_prov_policy.h）",
                             wifi_prov_policy_decide, wifi_prov_channel_rank };
     const policy_t mutant = { "变异判据（rank 反向 + 忽略只入网一次）",
                               mutant_decide, mutant_rank };
+    /* 变异⑤（夹具⑤专用的负向对照）= **本批要修掉的旧行为**：已入网一律拒绝（不看通道） */
+    const policy_t mutant_old_up = { "变异判据（把「已入网一律拒绝」放回：不看通道）",
+                                     mutant_decide_reject_up_all, wifi_prov_channel_rank };
     const status_policy_t real_status = {
         "固件判据 wifi_prov_connected_should_report()（wifi_prov_status.h）",
         wifi_prov_connected_should_report, wifi_prov_connected_reported_after };
@@ -406,12 +556,25 @@ int main(void)
     }
     printf("\xe2\x9c\x93 负向对照通过：变异判据被夹具抓出 %d 条不符（夹具非空转）\n", mutant_fail);
 
-    if (real_fail != 0) {
-        printf("\xe2\x9c\x97 RESULT=FAIL 固件判据有 %d 条断言不符（ADR-0017 优先级/只入网一次"
-               " ＋ prov.status{connected} 上报）\n", real_fail);
+    /* ★ 2026-10-12 专项负向对照：把 `REJECT_ALREADY_UP` **放回**（不看通道）⇒ 夹具⑤ 必须红。
+     *   它证明"App 每次发起配网都直接生效"这条裁定**是可判定的**，而不是注释声称。 */
+    printf("=== 负向对照（变异⑤：把「已入网一律拒绝」放回 ⇒ 夹具⑤ 必须报红）===\n");
+    int mutant_up_fail = run_fixtures(&mutant_old_up);
+    if (mutant_up_fail == 0) {
+        printf("\xe2\x9c\x97 负向对照失败：把 REJECT_ALREADY_UP 放回（不看通道）后夹具⑤ 仍全绿"
+               " ⇒ 「断旧连新」判据没有区分力（空转）\n");
         return 1;
     }
-    printf("RESULT=PASS 优先级（SD>BLE>其他）＋「只入网一次」＋ prov.status{connected} 上报判据"
-           "（非空 ip / 只报一次 / 失败不置位）成立（ADR-0017 D2/D4）\n");
+    printf("\xe2\x9c\x93 负向对照通过：把 REJECT_ALREADY_UP 放回后被夹具抓出 %d 条不符"
+           "（断旧连新可判定）\n", mutant_up_fail);
+
+    if (real_fail != 0) {
+        printf("\xe2\x9c\x97 RESULT=FAIL 固件判据有 %d 条断言不符（ADR-0017 优先级/只入网一次"
+               " ＋ 权威通道断旧连新 ＋ prov.status{connected} 上报）\n", real_fail);
+        return 1;
+    }
+    printf("RESULT=PASS 优先级（SD>BLE>其他）＋「只入网一次（权威通道 BLE/App 除外）」"
+           "＋ 权威通道**断旧连新**（恰好一次断链 / 旧 SSID 不再被采信）"
+           "＋ prov.status{connected} 上报判据（非空 ip / 只报一次 / 失败不置位）成立（ADR-0017 D2/D4）\n");
     return 0;
 }

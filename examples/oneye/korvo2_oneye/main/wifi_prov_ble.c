@@ -175,6 +175,13 @@ static int ble_prov_scan(char *json_out, size_t cap, void *ctx)
  *   本函数返回 **-1**，立刻返回、**不阻塞**；SDK 据此向对端报 `PROV_FAILED`
  *   （`oneye_dev_link.c` 的 `link_prov_execute()` 里 connect 失败分支）⇒ 手机侧能立刻知道
  *   "这一次没被采信"，而不是静默超时。
+ *   🔴 **2026-10-12 就地订正（用户裁定）**：**"或设备已入网"这一半对 BLE 通道已作废** ——
+ *     App 发起的配网是**权威通道**，"已入网"不再拦它：设备会在同一次提交里
+ *     **先断旧连新**（`wifi_prov.c` 的 `[prov-switch]` 段）⇒ App **不再**需要"先 `prov.reset`
+ *     再重发"那条有界重配链（该链当年正是为绕开 `REJECT_ALREADY_UP` 而设计的）。
+ *     ⛔ 旧字逐字留痕（⛔ 不抹）：本行旧口径逐字为
+ *     「（`ESP_ERR_INVALID_STATE`：槽里已有 SD 卡凭据，或设备已入网 ⇒ 只入网一次）」。
+ *     ⚠️ 现在能拿到 `ESP_ERR_INVALID_STATE` 的情形只剩"**未入网**且槽被更高优先级的 C3 凭据占用"。
  */
 static int ble_prov_connect(const char *ssid, const char *password, const char *token, void *ctx)
 {
@@ -223,6 +230,11 @@ static int ble_prov_connect(const char *ssid, const char *password, const char *
  *   ⛔ **回归锚（本函数路径内不得再出现）**：`oneye_dev_ble_unpair` / `oneye_ble_plat_disconnect` /
  *     `ble_gap_terminate` —— 机械判据见
  *     `build-alpha-reset/.scratch/check-reset-semantics.py`（含"把断链调用放回 ⇒ 必须报红"的负向对照）。
+ *   🔴 **2026-10-12 追加（用户裁定「App 发起配网 = 断旧连新」）**：上一条"有界重配链"如今是
+ *     **可选路径、不再是唯一出路** —— BLE（App）提交**一经受理即权威生效**，
+ *     `REJECT_ALREADY_UP` 对它不可达（判据分派见 `wifi_prov_policy.h`；
+ *     断旧连新的落码见 `wifi_prov.c` 的 `[prov-switch]` 段）。本函数（`prov.reset`）
+ *     语义**不变**，仍只"释放采信槽 + 清 Wi-Fi 配置"，⛔ 不断链。
  * ★ 2026-10-09（逐字保留，⛔ 未改）：它把通道**重新开成可配网态** ⇒ 按配网模式口径处理：置 s_pairing
  *   并重启超时窗口，⛔ 否则会出现"在广播但不在配网模式"的第三种状态（超时回调与退出逻辑都判不准）。
  *   ⚠️ 链路未断时 `oneye_dev_ble_advertise(true)` 在平台层是 **no-op**

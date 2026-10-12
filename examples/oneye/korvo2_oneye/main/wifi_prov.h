@@ -32,6 +32,17 @@
  *       显式改配（台面 `wifi_set`）与 `prov.reset` 走「先 `wifi_prov_release_held()` /
  *       `wifi_prov_forget()` 再提交」的**显式**路径 —— 那是操作者声明的"重新配网"意图，
  *       ⛔ 但**上云链路只启动一次**这一点不变（`oneye_start()` 仍只有收敛点下游一个调用点）。
+ *    ★ 2026-10-12 就地订正（用户裁定，最高依据）：上面这条**多了一个例外** ——
+ *       **App（BLE 通道 C1/C2）发起的配网 = 权威通道，一经受理即权威生效**：
+ *       设备**先 `esp_wifi_disconnect()` 断开现有连接**、丢弃旧配置的采信态，
+ *       再 `esp_wifi_set_config(新凭据)` → `esp_wifi_connect()`（"断旧连新"）。
+ *       用户裁定逐字：「**已有app发起配网时设备要断现有wifi重新连接目标wifi**，否则app会卡在配网中这个流程。」
+ *       ⇒ `REJECT_ALREADY_UP` 在 **BLE 通路上不可达**（`wifi_prov_channel_is_authoritative()`）。
+ *       ⛔ **只对 BLE 通道**放宽：C3 凭据文件 / C4 台面改配 / C5 兜底 / 预留通道的
+ *       优先级与"只入网一次"语义**一字未改**（参 `wifi_prov_policy.h` 的 rank 与判据分派）。
+ *       ⛔ 旧字逐字留痕（⛔ 不抹）：本段此前逐字为
+ *       「⚠️ **已入网（拿到 IP）且采信槽未被释放时，任何通道的提交一律被拒**（只入网一次）；」
+ *       —— 该口径对"任何通道"的表述**已被本次裁定收窄**为"任何**非权威**通道"。
  *    判据本体 = `wifi_prov_policy.h`（纯逻辑，与主机侧单测 `tools/test-prov-priority.c`
  *    编译**同一份源**），落码在 `wifi_prov_submit_credentials*()`。
  *
@@ -114,6 +125,8 @@ esp_err_t wifi_prov_load_file(char *ssid, size_t ssid_cap, char *pass, size_t pa
  *   - `ESP_ERR_TIMEOUT` —— 采信了但没连上（可再试/换凭据）；
  *   - `ESP_ERR_INVALID_STATE` —— **被优先级判据拒绝**：未采信、未发起入网，
  *     串口有 `[prov-priority]` 留痕（槽里已有更高/同级优先级的凭据，或设备已入网）；
+ *     ⚠️ 2026-10-12 起：**权威通道（BLE/App）拿不到"已入网"这一种拒绝**（见上）；
+ *     它能拿到本错误码的情形只剩「未入网且槽被更高优先级的 C3 凭据占用」。
  *   - `ESP_ERR_INVALID_ARG` —— ssid 为空。
  *
  * ⚠️ 本函数**阻塞**至获得 IP 或超时（缺省 20 s）。C1/C2 的 provider 在

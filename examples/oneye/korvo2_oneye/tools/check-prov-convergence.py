@@ -24,6 +24,7 @@ check-prov-convergence.py —— 结构性门禁：证明 korvo2_oneye 的「入
   A8     优先级可判定：SD 先于 BLE 被递上去、连接层不可旁路、通道全部经唯一入口、五种决策都有落点
   A9     只入网一次：on_wifi_ready 一次性守卫、判据 `onboarded = s_connected && s_held_valid`、
          判据顺序（onboarded 先于 held_valid）、释放/重置都会清采信槽
+         ⚠️ 2026-10-12 起：「已入网一律拒绝」**只对非权威通道**成立（权威通道 = BLE/App，见 A15）
   A10    夹具与判据**同源**（不抄件）且**自带变异负向对照**，并实跑一次（有 cc 时）
   A11    入网后的**启动期自检与授时**（net_probe_report / sntp_boot_sync）各只有 1 处调用点，
          且都在 korvo2_oneye_main.c 的 on_wifi_ready() 内（= 收敛点下游）⇒ **所有通道**都经过它们；
@@ -51,6 +52,21 @@ check-prov-convergence.py —— 结构性门禁：证明 korvo2_oneye 的「入
          A14g 幂等位**只在发送成功后**置位（失败 ⇒ 下一次 GOT_IP 仍补报，⛔ 不把发失败写成已上报）
          A14h ⛔ 不新增帧 / 不新增状态：main/ 下 `ONEYE_DEV_LINK_PROV_CONNECTED` 恰好 1 处、
               且**不得**出现 `prov.status` 帧名字面量（帧名由 SDK 组，设备侧不自造帧）
+  A15    🔴 2026-10-12（本批 · 用户裁定「**已有app发起配网时设备要断现有wifi重新连接目标wifi**，
+         否则app会卡在配网中这个流程。」）：**权威通道（BLE/App）"断旧连新"** ——
+         A15a 判据**按通道分派**：`wifi_prov_policy.h` 有 `wifi_prov_channel_is_authoritative()`，
+              且**只**对 `WIFI_PROV_CHAN_BLE` 为真（⛔ 不是把别的通道一起放进来）
+         A15b 「已入网一律拒绝」被权威通道排除 ⇒ `REJECT_ALREADY_UP` 在 **BLE 通路不可达**
+              （若改回 `if (onboarded)` ⇒ 本组必须报红）
+         A15c `wifi_prov.c` 的 `wifi_prov_submit_credentials_src()` 内**恰好一次**
+              `esp_wifi_disconnect()`，且受"在线才断"约束（`if (s_connected)` 段内），
+              且在 `wifi_prov_connect(` 调用**之前**（"断旧"在"连新"之前）
+         A15d 断链**之前**先置抑制位 `s_reprovision`，且 `on_wifi_event()` 的 DISCONNECTED 分支
+              认这个位 —— 否则断链事件会用**旧配置**自动重连（"换网"退化成"重连旧网"）
+         A15e 同一段里旧采信态作废（`s_held_valid = false`）且新通道随后落槽（`s_held_chan = ch`）
+         A15f ⛔ 通道模块（`wifi_prov_ble.c`）自己**不得**碰 `esp_wifi_disconnect()`
+              （Wi-Fi 生命周期归 `wifi_prov.c`；通道只交凭据）
+         ⛔ 本组**不新增帧 / 不新增状态 / 不动 Kconfig 与机读契约**：它只断言既有枚举与既有 API 的用法。
 
 退出码：0 = 全部断言通过；1 = 有断言失败（逐条打出）。
 **自带负向对照**：把 `main/` 与夹具复制到临时目录后逐条注入已知缺陷，同一套检查**必须逐条报红**
@@ -58,6 +74,7 @@ check-prov-convergence.py —— 结构性门禁：证明 korvo2_oneye 的「入
 A10b 的判据抄件、**A11 的"通道模块里再调一次 sntp_boot_sync()/net_probe_report()"**、
 **A12 的"把 sntp 挪到 cloud_start_task 之后"**、**A13 的"删掉 NimBLE 起栈后那一处资源读数"**）。
 **A14 的「丢掉 ip 非空判据 / 丢掉幂等判据 / 发送失败也置位 / 第二个上报点 / 改报别的状态」**。
+**A15 的「把 REJECT_ALREADY_UP 放回 / 删掉断旧前置段 / 抹掉抑制位」。**
 任一条注入没有被对应断言抓住 ⇒ 本脚本自己的判据是空转的 ⇒ exit 1。
 """
 
@@ -113,6 +130,13 @@ STATUS_ONCE_GUARD = re.compile(r"if\s*\(\s*already_reported\s*\)")
 # 通道模块（判据侧只允许"交凭据"；出现上面两个符号即第二条入网后路径）
 CHANNEL_MODULES = ("wifi_prov_ble.c", "media_api.c", "wifi_prov.c", "panel_api.c",
                    "wifi_prov_file.c", "wifi_prov_sonic.c", "wifi_prov_qrcode.c")
+# A15（2026-10-12 本批）：权威通道（BLE/App）"断旧连新"
+#   ⚠️ 用 strip_comments 之后的**代码面**判定（注释里的旧字留痕不得被当实现或漏判）
+AUTH_CHAN_HELPER = "wifi_prov_channel_is_authoritative"
+AUTH_GUARD = "if (onboarded && !authoritative)"
+DISCONNECT_CALL = "esp_wifi_disconnect()"
+REPROVISION_FLAG = "s_reprovision"
+SUBMIT_SIG = r"esp_err_t\s+wifi_prov_submit_credentials_src\s*\("
 DECISION_ENUM = [
     "WIFI_PROV_DECISION_ACCEPT_FIRST",
     "WIFI_PROV_DECISION_ACCEPT_SAME",
@@ -188,6 +212,70 @@ def find_calls(sources, pattern, skip_defs=True):
             if pattern.search(line):
                 hits.append((fn, i + 1, enclosing_function(lines, i)))
     return hits
+
+
+def strip_comments_keep_newlines(text):
+    """去注释（`//` 与块注释）、**保留字符串字面量**、保留换行 ⇒ 行号仍可用。
+
+    ⚠️ A15 必须判定"**代码面**有没有这个锚"：本批在注释里写了旧字逐字留痕
+    （`REJECT_ALREADY_UP` / `esp_wifi_disconnect` 等符号名会出现在注释与日志串里），
+    不 strip 就会把留痕当实现（诈报）或把日志串当实现（漏判）。
+    """
+    out = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '"' or c == "'":
+            q = c
+            out.append(c)
+            i += 1
+            while i < n:
+                out.append(text[i])
+                if text[i] == "\\":
+                    if i + 1 < n:
+                        out.append(text[i + 1])
+                        i += 2
+                        continue
+                elif text[i] == q:
+                    i += 1
+                    break
+                i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            i += 2
+            while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+                if text[i] == "\n":
+                    out.append("\n")
+                i += 1
+            i += 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def func_body(text, sig_re):
+    """按签名正则取函数的**括号配对体**（含两侧花括号）；找不到返回 None。
+    ⚠️ 必须带返回类型：注释里也提到过同名函数（只按名字会锚到注释上）。"""
+    m = re.search(sig_re, text)
+    if m is None:
+        return None
+    i = text.find("{", m.end())
+    if i < 0:
+        return None
+    depth = 0
+    for j in range(i, len(text)):
+        if text[j] == "{":
+            depth += 1
+        elif text[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[i:j + 1]
+    return None
 
 
 def run_checks(sources, headers, test_lines):
@@ -353,9 +441,10 @@ def run_checks(sources, headers, test_lines):
          "A9b wifi_prov.c 传给判据的 onboarded 不是 `s_connected && s_held_valid`",
          "「只入网一次」必须由「已入网且采信槽未被显式释放」决定")
 
-    i_onboarded = policy_text.find("if (onboarded)")
+    i_onboarded = policy_text.find("if (onboarded")
     i_held = policy_text.find("if (!held_valid)")
-    need(i_onboarded >= 0, "A9c 判据里没有 `if (onboarded)` 分支（只入网一次缺失）", "见 wifi_prov_policy.h")
+    need(i_onboarded >= 0, "A9c 判据里没有 `if (onboarded` 分支（只入网一次缺失）",
+         "见 wifi_prov_policy.h（⚠️ 2026-10-12 起该分支带权威通道排除，见 A15b）")
     need(i_held >= 0, "A9c 判据里没有 `if (!held_valid)` 分支（首次有效缺失）", "见 wifi_prov_policy.h")
     if i_onboarded >= 0 and i_held >= 0:
         need(i_onboarded < i_held, "A9c 判据顺序错：`onboarded` 必须在 `!held_valid` 之前",
@@ -376,12 +465,16 @@ def run_checks(sources, headers, test_lines):
         dup = [n for n in defined_functions(test_lines) if n in JUDGE_NAMES]
         need(not dup, "A10b 夹具自定义了判据函数（抄件）：{}".format(",".join(sorted(set(dup)))),
              "夹具只能引用固件判据，不得自备一份")
-        for tag in ("[夹具①]", "[夹具②]", "[夹具③]", "[夹具④]"):
+        for tag in ("[夹具①]", "[夹具②]", "[夹具③]", "[夹具④]", "[夹具⑤]"):
             need(tag in t, "A10c 夹具缺少 {}".format(tag),
-                 "四个夹具：SD 胜出 / BLE 胜出 / 重复入网被拒 / prov.status{connected} 上报判据")
+                 "五个夹具：SD 胜出 / BLE 胜出 / 重复入网被拒 / prov.status{connected} 上报判据 / "
+                 "权威通道断旧连新（2026-10-12）")
         need("mutant_decide" in t and "负向对照" in t,
              "A10d 夹具缺少变异负向对照（mutant_decide / 负向对照）",
              "没有负向对照 ⇒ 夹具可能空转")
+        need("mutant_decide_reject_up_all" in t,
+             "A10f 夹具缺少「把 REJECT_ALREADY_UP 放回」的**专项**负向对照",
+             "断旧连新这条裁定必须有可判定的负向对照（变异⑤）")
 
     # ------------------------------------------- A11 自检/授时只能从收敛点下游调用（所有通道共用）
     # 形状（2026-10-07 起）：on_wifi_ready() 内 入网日志 → net_probe → sntp → 面板 → cloud_start_task。
@@ -558,6 +651,93 @@ def run_checks(sources, headers, test_lines):
                 fails.append("A14h {}:{} 出现了 prov.status 帧名字面量 —— 帧名由 SDK 组，"
                              "设备侧自造帧名就是新增协议面".format(fn, i + 1))
 
+    # ------------------------------------------- A15 权威通道（BLE/App）"断旧连新"（2026-10-12 本批）
+    # ⚠️ 全部在 **strip 注释后的代码面** 上判定（注释里的旧字留痕不算实现，日志串也不算）。
+    policy_code = strip_comments_keep_newlines(policy_text)
+    prov_c_code = strip_comments_keep_newlines(prov_c_text)
+
+    # A15a 判据按通道分派：有权威通道谓词，且**只**对 BLE 为真
+    need(AUTH_CHAN_HELPER in policy_code,
+         "A15a 缺失 {}".format(AUTH_CHAN_HELPER),
+         "权威通道（BLE/App）必须是判据头里的一个显式谓词（按通道分派）")
+    auth_body = func_body(policy_code, r"bool\s+" + AUTH_CHAN_HELPER + r"\s*\(") or ""
+    if not auth_body:
+        fails.append("A15a 找不到 {}() 的函数体（判据不可判定）".format(AUTH_CHAN_HELPER))
+    else:
+        if "WIFI_PROV_CHAN_BLE" not in auth_body:
+            fails.append("A15a {}() 不认 WIFI_PROV_CHAN_BLE ⇒ 权威通道不成立".format(AUTH_CHAN_HELPER))
+        others = [c for c in ("WIFI_PROV_CHAN_FILE", "WIFI_PROV_CHAN_API",
+                              "WIFI_PROV_CHAN_KCONFIG", "WIFI_PROV_CHAN_SONIC",
+                              "WIFI_PROV_CHAN_QRCODE") if c in auth_body]
+        if others:
+            fails.append("A15a {}() 把非 BLE 通道也算成权威通道（{}）—— ⛔ 只许放宽 C1/C2"
+                         .format(AUTH_CHAN_HELPER, ",".join(others)))
+
+    # A15b 「已入网一律拒绝」被权威通道排除 ⇒ REJECT_ALREADY_UP 在 BLE 通路上不可达
+    need(AUTH_GUARD in policy_code,
+         "A15b 判据里没有 `{}` ⇒ 权威通道仍被「已入网一律拒绝」闸掉（App 卡在配网中的原形态）"
+         .format(AUTH_GUARD),
+         "`REJECT_ALREADY_UP` 必须**只对非权威通道**可达")
+    i_guard = policy_code.find(AUTH_GUARD)
+    if i_guard >= 0 and policy_code.find("WIFI_PROV_DECISION_REJECT_ALREADY_UP", i_guard) < 0:
+        fails.append("A15b `{}` 之后找不到 `WIFI_PROV_DECISION_REJECT_ALREADY_UP`"
+                     .format(AUTH_GUARD))
+
+    # A15c `wifi_prov.c` 的 submit 体内：**恰好一次** esp_wifi_disconnect()，受"在线才断"约束，
+    #       且在 `wifi_prov_connect(` 调用**之前**（断旧 ⇒ 连新）
+    submit_body = func_body(prov_c_code, SUBMIT_SIG) or ""
+    if not submit_body:
+        fails.append("A15c 找不到 wifi_prov_submit_credentials_src() 的函数体")
+    else:
+        i_disc = submit_body.find(DISCONNECT_CALL)
+        i_conn = submit_body.find("wifi_prov_connect(")
+        i_flag = submit_body.find(REPROVISION_FLAG + " = true")
+        ndisc = submit_body.count(DISCONNECT_CALL)
+        if ndisc != 1:
+            fails.append("A15c submit 路径内 `esp_wifi_disconnect()` 次数 = {}（要求**恰好 1**："
+                         "在线才断）".format(ndisc))
+        if "if (s_connected)" not in submit_body:
+            fails.append("A15c submit 路径内的断链不在 `if (s_connected)` 约束下"
+                         "（⚠️ 未在线也会断 ⇒ 不满足「若在线」）")
+        if i_disc < 0 or i_conn < 0:
+            fails.append("A15c submit 体内缺 `esp_wifi_disconnect()` 或 `wifi_prov_connect(`")
+        elif not (i_disc < i_conn):
+            fails.append("A15c 顺序错：`esp_wifi_disconnect()` 必须在 `wifi_prov_connect(` "
+                         "**之前**（先断旧，再 set_config + connect 连新）")
+        # A15d 断链**之前**先置抑制位
+        if i_flag < 0:
+            fails.append("A15d submit 路径内没有 `{} = true` ⇒ 断链事件会用**旧配置**自动重连"
+                         "（换网退化成重连旧网）".format(REPROVISION_FLAG))
+        elif i_disc >= 0 and not (i_flag < i_disc):
+            fails.append("A15d 顺序错：`{} = true` 必须在 `esp_wifi_disconnect()` **之前**"
+                         "（断链事件是异步派发的）".format(REPROVISION_FLAG))
+        # A15e 旧采信态作废 + 新通道落槽
+        if "s_held_valid = false" not in submit_body:
+            fails.append("A15e submit 路径内没有作废旧采信态（缺 `s_held_valid = false`）"
+                         "⇒ 旧 SSID 仍被采信")
+        if "s_held_chan = ch" not in submit_body:
+            fails.append("A15e submit 路径内没有把新通道落槽（缺 `s_held_chan = ch`）")
+
+    # A15d（续）DISCONNECTED 分支必须认抑制位（否则断链即"用旧配置重连"）
+    prov_c_lines = sources.get("wifi_prov.c", [])
+    ev_body = func_body(strip_comments_keep_newlines("\n".join(prov_c_lines)),
+                        r"static\s+void\s+on_wifi_event\s*\(") or ""
+    if REPROVISION_FLAG not in ev_body:
+        fails.append("A15d on_wifi_event() 的断开分支不认 `{}` ⇒ 断链时仍会用旧配置重连"
+                     .format(REPROVISION_FLAG))
+
+    # A15f 通道模块自己不得碰 Wi-Fi 生命周期（esp_wifi_disconnect）
+    #   ⚠️ 判定在 **strip 注释后** 的代码面：本批在注释里逐字留痕了旧行为/契约口径，
+    #      不 strip 会把留痕当实现（诈报）。
+    for fn in CHANNEL_MODULES:
+        if fn == "wifi_prov.c":
+            continue        # 连接/断链归唯一持有者 wifi_prov.c
+        code_lines = strip_comments_keep_newlines("\n".join(sources.get(fn, []))).splitlines()
+        for i, line in enumerate(code_lines):
+            if "esp_wifi_disconnect" in line:
+                fails.append("A15f {}:{} 直接调了 esp_wifi_disconnect()"
+                             "（通道只交凭据；Wi-Fi 生命周期归 wifi_prov.c）".format(fn, i + 1))
+
     return (not fails), fails
 
 
@@ -667,6 +847,17 @@ INJECTIONS = [
                             "ONEYE_DEV_LINK_PROV_CONNECTED, NULL, \"1.2.3.4\", NULL, NULL); }")),
     ("把 connected 改报成别的状态", "wifi_prov_ble.c", "A14b",
      lambda ls: _replace_in(ls, "ONEYE_DEV_LINK_PROV_CONNECTED", "ONEYE_DEV_LINK_PROV_SCAN_DONE")),
+    # A15（2026-10-12 本批）：权威通道（BLE/App）"断旧连新"的三条硬口径 + 分派本身。
+    ("把「已入网一律拒绝」放回（权威通道分派被抹掉）", "wifi_prov_policy.h", "A15b",
+     lambda ls: _replace_in(ls, "if (onboarded && !authoritative)", "if (onboarded)")),
+    ("删掉断旧前置段（不再 esp_wifi_disconnect()）", "wifi_prov.c", "A15c",
+     lambda ls: _replace_in(ls, "esp_err_t drc = esp_wifi_disconnect();",
+                            "esp_err_t drc = ESP_OK;")),
+    ("抹掉抑制位（断链时会用旧配置自动重连）", "wifi_prov.c", "A15d",
+     lambda ls: _replace_in(ls, "if (s_scan_only || s_reprovision)", "if (s_scan_only)")),
+    ("抹掉旧采信态作废（旧 SSID 仍被采信）", "wifi_prov.c", "A15e",
+     lambda ls: _replace_in(ls, "        s_held_valid = false;",
+                            "        /* 注入：不丢旧采信态 */")),
 ]
 
 
@@ -726,7 +917,7 @@ def main():
     ok, fails = run_checks(src, headers, test_lines)
     for f in fails:
         print("  ✗ " + f)
-    print("正向断言（A1–A14）：{}".format("PASS" if ok else "FAIL"))
+    print("正向断言（A1–A15）：{}".format("PASS" if ok else "FAIL"))
 
     status, detail = run_host_test(EXAMPLE)
     if status == "pass":
@@ -762,8 +953,9 @@ def main():
         return 1
     if not ok:
         return 1
-    print("RESULT=PASS 单一收敛点 + 优先级（SD>BLE>其他）+ 只入网一次 + 自检/授时全通道必经"
-          "（ADR-0017 D2/D4）+ 资源读数未入网可见（A13，带阶段标签）"
+    print("RESULT=PASS 单一收敛点 + 优先级（SD>BLE>其他）+ 只入网一次（权威通道 BLE/App 除外）"
+          "+ 权威通道断旧连新（A15：恰好一次断链 / 抑制旧配置重连 / 旧 SSID 不再被采信）"
+          "+ 自检/授时全通道必经（ADR-0017 D2/D4）+ 资源读数未入网可见（A13，带阶段标签）"
           "+ prov.status{connected,ip} 落地既有契约状态（A14，ip 非空 / 只报一次 / 失败不置位）")
     return 0
 

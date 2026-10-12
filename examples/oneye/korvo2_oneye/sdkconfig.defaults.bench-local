@@ -1,0 +1,84 @@
+# =============================================================================
+# sdkconfig.defaults.bench-local —— **仅本机台面（bench）**的云端接入档
+#
+# 用途：把 ALPHA 诊断固件的云端接入地址从真云（mqtt.oneye.me:18886）改指到
+#       **本机 bench 栈**，使设备"在本平台上在线"可被服务端读到
+#       （Redis oneye:dev:{tenantId}:online:{deviceId} 由接入层在该设备已认证上行时写入）。
+#
+# 用法（**必须显式叠加、且排在最后**；IDF 后叠加者胜）：
+#   idf.py -B <build> \
+#     -DSDKCONFIG=<build>/sdkconfig \
+#     -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32s3;\
+#       sdkconfig.defaults.production;sdkconfig.defaults.ble;sdkconfig.defaults.ble-key;\
+#       sdkconfig.defaults.diag;sdkconfig.defaults.bench-local" \
+#     -DONEYE_FW_CERT_DIR=<空目录> -DONEYE_SDK_LIB_OUT_DIR=<不存在目录> build
+#
+# -----------------------------------------------------------------------------
+# 本档不污染量产默认的证据（可机械复核）
+# -----------------------------------------------------------------------------
+#   1) 本文件**不在**任何既有构建命令的 SDKCONFIG_DEFAULTS 列表里：
+#      grep -rn "SDKCONFIG_DEFAULTS" --include=*.sh --include=*.ps1 --include=*.md .
+#      ⇒ 旧口径列出的 6 份 defaults（含 diag）逐字不变；本文件只出现在台面构建脚本里。
+#   2) 本文件与 sdkconfig.defaults.production **无任何交集符号**
+#      （production 管身份/承载/台面能力/体积；本文件只改 host/port 与一条"仅本档"的放宽）。
+#   3) 本文件写的每一项都能在**台面构建产物的 sdkconfig** 里看到（见下"自证"），
+#      而用量产 6 份 defaults 构建时这四项**不是**这些值。
+#   4) 构建脚本 tools/build-bench-local.sh 内置守卫：若本文件名出现在
+#      sdkconfig.defaults.production 里，构建**直接非 0 退出**。
+#
+# 自证（构建后对产物 sdkconfig 跑，预期逐行见注释）：
+#   grep -E "^CONFIG_(ONEYE_FW_CLOUD_HOST|ONEYE_FW_CLOUD_PORT|ONEYE_FW_TRANSPORT_TLS|ONEYE_FW_TLS_INSECURE)" <build>/sdkconfig
+#     => CONFIG_ONEYE_FW_CLOUD_HOST="192.168.110.208"
+#        CONFIG_ONEYE_FW_CLOUD_PORT=18830
+#        CONFIG_ONEYE_FW_TRANSPORT_TLS=y
+#        CONFIG_ONEYE_FW_TLS_INSECURE=y
+# =============================================================================
+
+# ---- 云端端点：指向本机 bench 栈 -------------------------------------------------
+# 依据 = cloud/deploy/local/04-emqx.md §1.1 的"板子（korvo2_oneye）要用的最终值"表：
+#   | CONFIG_ONEYE_FW_CLOUD_HOST | 本机 WLAN 地址（192.168.110.208） |
+#   | CONFIG_ONEYE_FW_CLOUD_PORT | 18830（用户态转发 18830 -> 127.0.0.1:18883 -> 容器 8885）|
+#
+# 为什么必须经 18830 这一跳（不是直接连 18883）：EMQX 的 ssl:deviceface 监听器在 WSL
+# Docker 内（容器 8885 = 宿主 18883），而 WSL 的端口中继在 Windows 侧**只绑 loopback**
+#   （本机实测 Get-NetTCPConnection：18883/1883/18083 的 LocalAddress 是 127.0.0.1 / ::1）
+# ⇒ 局域网里的板子够不到；必须经**用户态 TCP 转发**把它抬到 WLAN 地址上。
+# 转发脚本（本批随档交付，⛔ 不替 lead 执行）：
+#   tools/bench-mqtt-fwd.js  —— 见 usage。
+CONFIG_ONEYE_FW_CLOUD_HOST="192.168.110.208"
+CONFIG_ONEYE_FW_CLOUD_PORT=18830
+
+# ---- 承载：仍是 TLS（本档**不降级为明文**）---------------------------------------
+# 本机栈的设备面就是 mTLS（ssl:deviceface），明文口 1883 走的是账号口令面
+# （password_based + built_in_database），设备证书在那条路上没有位置。
+CONFIG_ONEYE_FW_TRANSPORT_TLS=y
+
+# ---- 🔴 本档唯一一处放宽：跳过对端证书校验（显式、可审计、仅本档）------------------
+# 为什么本机**必须**如此（两条独立理由，任一成立即失败）：
+#   ① 信任锚不同源：设备的信任锚是 creds 分区里的 ca_pem（现役签发 CA
+#      deviceface-realca.crt），而本机 EMQX 的服务端证书是 local-pki/deviceface-server.crt
+#      —— 由 cloud/deploy/local/init/emqx/certs/gen-deviceface-server.sh 用 openssl 自签，
+#      与那张设备 CA **无签发关系** ⇒ 严格校验必然
+#      "self-signed certificate in certificate chain"。
+#   ② 主机名不匹配：本机服务端证书的 SAN 逐字为
+#      `DNS:mqtt.oneye.me,DNS:localhost,IP:127.0.0.1`（local-pki/deviceface-server.cnf），
+#      **不含** 192.168.110.208 ⇒ 即便 ① 解决，主机名校验仍会失败。
+#      （两条的权威说明 = cloud/deploy/local/04-emqx.md:171 那一行：
+#        "CONFIG_ONEYE_FW_TLS_INSECURE | y（本机必须）| 板子的信任锚是它 creds 里的 fleet CA，
+#         而本机没有该 CA 的私钥 ⇒ 本机自签的服务端证书严格校验必然失败。⚠️ 生产 n"）
+#
+# ⛔ 生产默认**一字未动**：sdkconfig.defaults.production:60 仍是
+#    `# CONFIG_ONEYE_FW_TLS_INSECURE is not set`，且本文件不在其列表里。
+# ⚠️ 代价如实登记：本档下**设备无法识别服务端真伪**（中间人可读可改）。它只允许在
+#    本机台面（WLAN 内、白盒）使用；⛔ 不得用于任何交付/隧道/公网场景。
+CONFIG_ONEYE_FW_TLS_INSECURE=y
+
+# ---- 身份来源：**保持**分区凭据（本档不改，显式写出来是为了可审计）-----------------
+# 本机 EMQX 的设备面按 mTLS 认人：peer_cert_as_username=cn ⇒ CONNECT 的 username 由
+# **客户端证书 CN** 覆盖（CONNECT 里自述的 -u 无效），ACL 用 ${client_attrs.node}。
+# 而证书来自 creds 分区（KORVO2-0003 由现役 deviceface-realca.crt 签发，已在
+# ssl:deviceface 的 cacertfile bundle 里）⇒ 本档**必须**继续用分区凭据。
+# ⛔ 不要为了"能连上"改成内嵌证书（那会退化成公用身份，且与 REQUIRED 守卫冲突）。
+# ⚠️ 这一行与 sdkconfig.defaults.production:34 同值 —— 写在这里只是"本档显式可见"，
+#    不是新增语义。
+CONFIG_ONEYE_DEV_CREDS_REQUIRED=y

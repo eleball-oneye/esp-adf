@@ -82,3 +82,39 @@ CONFIG_ONEYE_FW_TLS_INSECURE=y
 # ⚠️ 这一行与 sdkconfig.defaults.production:34 同值 —— 写在这里只是"本档显式可见"，
 #    不是新增语义。
 CONFIG_ONEYE_DEV_CREDS_REQUIRED=y
+
+# =============================================================================
+# 🔴 台面档第二处、也是**唯一**一处与"云端接入"有关的资源类修复
+#    （2026-10-12 · 病因 = mbedTLS 堆只在内部 RAM ⇒ TLS 会话建不起来）
+# -----------------------------------------------------------------------------
+# 现场：串口逐字
+#   `W oneye_tls: TLS failed at mbedtls_ssl_setup: ret=-32512 (0x7f00)`
+#   → `[W] connect 192.168.110.208:18830 (mqtt-tls) failed: rc=-6 (0xfffffffa)`
+#   → `cloud_link_up=0`，反复重试。
+# 逐条依据：
+#   ① `-32512` = `-0x7F00` = `MBEDTLS_ERR_SSL_ALLOC_FAILED`（IDF 5.5.5
+#      `components/mbedtls/mbedtls/include/mbedtls/ssl.h:109` 逐字
+#      `#define MBEDTLS_ERR_SSL_ALLOC_FAILED  -0x7F00`）；
+#   ② `mbedtls_ssl_setup()` 只在**建会话**时一次性 `calloc` 收/发缓冲，**不重试、不降级** ⇒
+#      分配不到就直接返回该码，连 ClientHello 都发不出去（所以 EMQX 的 clients list 里
+#      从来没有本设备 —— 不是握手被拒，是**根本没开始握手**）；
+#   ③ 缺的内存 = `CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384`（收缓冲），而台面固件跑到上云那一刻
+#      内部 RAM 实测 `free_internal=18451 B / largest_internal_block=10240 B` ⇒ 连续块
+#      **必然**取不到 16 KiB。台面固件同时跑 Wi-Fi + BLE(NimBLE) + ADF 音频 + 按键 + 配网，
+#      内部 RAM 高度碎片化。
+# 改法：把 mbedTLS 的堆从内部 RAM 换成 PSRAM（PSRAM 侧实测 free=7.7 MB）。
+#   IDF 的取值落点（逐字）`components/mbedtls/port/esp_mem.c`：
+#     `#elif CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC`
+#         `return heap_caps_calloc(n, size, MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);`
+#   ⇒ 开这一项之后 mbedTLS 的收/发缓冲与上下文全部落 PSRAM。
+# 为什么**不**选"调小收缓冲"：那会压低单帧 TLS 记录上限（云端大下行会被截），
+#   属于拿协议能力换内存；本档选 PSRAM 是为保住 16384 B 的标准口径。
+# 依赖：该符号 `depends on SPIRAM_USE_CAPS_ALLOC || SPIRAM_USE_MALLOC` —— 本工程
+#   `sdkconfig.defaults.esp32s3` 已 `CONFIG_SPIRAM_USE_MALLOC=y`（产物 sdkconfig 可见）。
+# ⛔ 生产默认**一字未动**：`sdkconfig.defaults.production` 既不含本项、也不引用本文件
+#   （构建脚本守卫 2 会拒构建）。
+# ⚠️ 代价如实登记：TLS 缓冲落 PSRAM 只影响**内存访问延迟**（性能），**不触碰任何安全语义**
+#   —— mTLS 的客户端证书出示、CA 校验、主机名/SNI 校验全部照旧；本档唯一的安全放宽仍是
+#   上面那条 `CONFIG_ONEYE_FW_TLS_INSECURE=y`（跳过**对端**校验），与内存无关、互不代替。
+# =============================================================================
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y

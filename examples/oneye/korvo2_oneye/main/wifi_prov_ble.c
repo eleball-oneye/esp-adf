@@ -202,16 +202,40 @@ static int ble_prov_connect(const char *ssid, const char *password, const char *
     return (rc == ESP_OK) ? 0 : -1;
 }
 
-/* 清除凭据：只断开并清 Wi-Fi 配置，然后重新广播（不重启、不擦 NVS）。
- * ★ 2026-10-09：它把通道**重新开成可配网态** ⇒ 按配网模式口径处理：置 s_pairing 并重启超时窗口，
- *   ⛔ 否则会出现"在广播但不在配网模式"的第三种状态（超时回调与退出逻辑都判不准）。 */
+/* 清除凭据：**只**释放"已入网采信槽" + 清 Wi-Fi 配置（不重启、不擦 NVS），
+ * ⛔ **不断 BLE 链路、⛔ 不作废 BLE 会话密钥**。
+ *
+ * ★ 2026-10-12（本批 · `prov.reset` 语义订正，裁定 = 选项 C，⛔ 不自行改成别的方案）：
+ *   🔴 **旧行为（已删除；旧字逐字留痕，⛔ 不抹）**：本函数在 `wifi_prov_forget()` 之后调
+ *     `(void)oneye_dev_ble_unpair();` ⇒ 它经 `oneye_dev_ble.c:1517` 的
+ *     `oneye_ble_plat_disconnect()` 执行 `ble_gap_terminate()`（`oneye_ble_plat_nimble.c:611-616`）
+ *     ⇒ **链路当场断开**；而 SDK 是在 **provider 返回之后**才上报 `prov.status{state=idle}`
+ *     （`oneye_dev_link.c:648-659`，上报点 `:658`）⇒ 那一帧**没有链路可送**，
+ *     App 的「被 `[prov-priority] REJECT_ALREADY_UP` 闸掉 ⇒ 先 `prov.reset` ⇒ 等
+ *     `prov.status{state=idle}` ⇒ 再用内存里的同一份凭据重发 `prov.connect.req`（≤1 次）」
+ *     这条**有界重配链**就断在这里。
+ *   ✅ **新行为** = 只"释放采信槽 + 清 Wi-Fi 配置"，二者都在 `wifi_prov_forget()` 里：
+ *     · 释放采信槽 `s_held_valid = false` —— `wifi_prov.c:484-485`；
+ *     · 清 Wi-Fi 配置 `esp_wifi_disconnect()` + `esp_wifi_set_config(WIFI_IF_STA, &sta)` +
+ *       清 `s_connected/s_ip/s_ssid/s_source` —— `wifi_prov.c:489-495`。
+ *     ⇒ BLE 会话与配对密钥**保持有效** ⇒ 上面那条 `idle` 回执能在**同一条已建立的会话**上送达 App
+ *     （App 零改动即可重发凭据）。
+ *   ⛔ **回归锚（本函数路径内不得再出现）**：`oneye_dev_ble_unpair` / `oneye_ble_plat_disconnect` /
+ *     `ble_gap_terminate` —— 机械判据见
+ *     `build-alpha-reset/.scratch/check-reset-semantics.py`（含"把断链调用放回 ⇒ 必须报红"的负向对照）。
+ * ★ 2026-10-09（逐字保留，⛔ 未改）：它把通道**重新开成可配网态** ⇒ 按配网模式口径处理：置 s_pairing
+ *   并重启超时窗口，⛔ 否则会出现"在广播但不在配网模式"的第三种状态（超时回调与退出逻辑都判不准）。
+ *   ⚠️ 链路未断时 `oneye_dev_ble_advertise(true)` 在平台层是 **no-op**
+ *     （`oneye_ble_plat_nimble.c:518-521`：`if (!s_plat.conn_active) start_advertising();`
+ *      —— 已连接就不重开广播）；对端断开后平台在 DISCONNECT 事件里自行回落广播（`:371-378`）
+ *     ⇒ 本行留下的 `s_advertising` 簿记在断开后与事实重新一致（⛔ 本批不另改簿记口径）。 */
 static int ble_prov_reset(void *ctx)
 {
     (void)ctx;
-    ESP_LOGW(TAG, "BLE 通道请求清除凭据 ⇒ 断开并回到未配网态（重新广播）");
+    ESP_LOGW(TAG, "BLE 通道请求清除凭据 ⇒ 只释放采信槽 + 清 Wi-Fi 配置（回到未配网态）；"
+                  "**不断 BLE 链路、不作废会话密钥** ⇒ 本帧的 prov.status{state=idle} 能原路回 App");
     wifi_prov_forget();
     if (s_started) {
-        (void)oneye_dev_ble_unpair();
         if (oneye_dev_ble_advertise(true) == ONEYE_DEV_SDK_OK) {
             s_advertising = true;
         }

@@ -1,3 +1,9 @@
 # oneye 集成新增：统一编译脚本为 shell 脚本，必须保持 LF
 # （Windows 检出若转成 CRLF，在 WSL/Linux 下会报 "/bin/bash^M: bad interpreter"）
 build-all.sh text eol=lf
+
+# oneye 集成新增：C/头文件统一 LF
+# （换机/换平台检出若被转成 CRLF，会产生无意义的整文件行尾 diff 噪声；
+#   规范要求 UTF-8 无 BOM、LF，见总控仓 AGENTS.md §3 编码节）
+*.c text eol=lf
+*.h text eol=lf

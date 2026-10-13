@@ -39,3 +39,13 @@ CONFIG_ONEYE_DEV_CREDS_REQUIRED=n
 # 长按 BOOT(GPIO0) 仍可退出 / 重新进入配网模式（见 main/devkitc_oneye_main.c 的按键段）。
 # CONFIG_ONEYE_FW_BLE_PROV_KEY_GATE is not set      # = Kconfig 缺省 n
 CONFIG_ONEYE_FW_BLE_PROV_PAIRING_WINDOW_S=300
+
+# ---- 机型码（产品品类 productKey）：★ 2026-10-13 用户裁定**逐字** -----------------
+#   「甲 `OY-SPK-01`、乙 `OY-SPK-02`、丙 `OY-SPK-03`」
+# ★ 就地订正（⛔ 旧字不抹）：本工程此前**两档共用** Kconfig 缺省 `OY-SPK-01`，
+#   理由是"没有为 DevKitC-1 新造机型码"；该口径**已被本次裁定取代** ⇒ 乙 = `OY-SPK-02`。
+#   ⛔ 甲（`OY-SPK-01`）仍是 Kconfig 缺省、由 korvo2_oneye 使用，**未改**。
+# ⚠️ 因此"乙/丙 靠 product_key 就分得开"（`main/Kconfig.projbuild` 的 help 已同步订正）。
+# ⚠️ **需 cloud 侧配合**：`OY-SPK-02` 必须在 cloud 机型表里有登记（TSL / 凭据策略），
+#   否则设备上线会在准入处被判为未知品类 —— 属需 cloud 侧落地的项（见交付报告"未做/需裁定"）。
+CONFIG_ONEYE_FW_PRODUCT_KEY="OY-SPK-02"

@@ -202,7 +202,7 @@ I2S0(CODEC_ADC_I2S_PORT) 16 kHz / 32 bit / ONLY_LEFT        ← 单麦口径：i
 | 面板可见 | `GET /api/status` → `wifi{connected,ip,ssid,source}`；面板「Wi-Fi 配网」卡片显示**凭据来源** |
 | 运行期改配 | `POST /api/action {"op":"wifi_set","ssid":"…","password":"…"}`（面板表单同款）：只改**本次运行**、**不写文件**，用于换网/排障；持久化仍以 SD 文件（或 Kconfig）为准 |
 | 开关 | `CONFIG_ONEYE_FW_ENABLE_WIFI_FILE`（缺省 y）同时控制凭据文件读取与 `wifi_set`。★ **这是机型能力位**（有卡槽机型 y / 无卡槽机型 n），⛔ **不是**「量产 vs 台面」开关 —— 见 §5.11 与 [ADR-0017](../../../../../docs/adr/0017-多通道配网与入网后收敛点.md) |
-| 安全口径 | 凭据文件在 SD 卡上是**明文** Wi-Fi 密码 ⇒ 有加密通道（BLE）的机型应以 **BLE 配网（§5.11）为首选通道**。该残余风险按 ADR-0017 D3 归属「配网凭据落盘形态」另行决策；⛔ 旧的"量产必须置 n"口径已废弃（它会让生产件**一个通道都不剩**） |
+| 安全口径 | 凭据文件在 SD 卡上是**明文** Wi-Fi 密码 ⇒ 有加密通道（BLE）的机型应以 **BLE 配网（§5.11）为首选通道**（安全增强，不是前提）。🔴 **2026-10-13 订正（用户裁定「B1.量产支持且凭据明文」）**：本通道是**量产品类形态**（量产**支持**它），明文密码这一后果**已由用户裁定接受** ⇒ ⛔ 不再写成"残余风险/另行决策"，也⛔ 不再写成"仅台面"；⛔ 旧的"量产必须置 n"口径已废弃（它会让生产件**一个通道都不剩**）。**旧字逐字留痕（⛔ 不抹）**：本格此前逐字为「该残余风险按 ADR-0017 D3 归属「配网凭据落盘形态」另行决策」 |
 
 连接超时为 20 s（`wifi_prov_connect(…, 0)` 取缺省）；失败只降级、不重启、不阻塞板级自检，
 串口给出 `Wi-Fi 连接失败（来源 …，ssid=…）→ 跳过上云` 与改配建议。
@@ -402,7 +402,10 @@ grep -aE 'CONFIG_ONEYE_FW_(CLOUD_HOST|CLOUD_PORT|TLS_INSECURE|TRANSPORT_TLS|ENAB
 grep -aE 'ONEYE_FW_(CLOUD_HOST|CLOUD_PORT|TLS_INSECURE|ENABLE_PANEL_API|LOG_PROBE|CLOUD_TOKEN)' "$B/config/sdkconfig.h"
 
 # ② defaults/预设"每一项都存在且已生效"
-python tools/check-sdkconfig-defaults.py --sdkconfig "$B/sdkconfig" --require sdkconfig.defaults.production
+#    ⚠️ **必须带 IDF_PATH**（符号全集的第三个来源就是 `$IDF_PATH/components` 的 Kconfig）：
+#       缺了它，预设里那些 IDF 声明的符号（`CONFIG_BT_NIMBLE_*`、`CONFIG_ESP_COEX_*` …）会被判
+#       "本工程不存在" —— 2026-10-13 集成验收实测**多出 13 条结构性误报**（⛔ 别据此删预设里的行）。
+IDF_PATH=<esp-idf 根> python tools/check-sdkconfig-defaults.py --sdkconfig "$B/sdkconfig" --require sdkconfig.defaults.production
 
 # ③ 字面量：生产端点在 bin 里在场；台面端点/token 反证为 0
 strings -a "$B/korvo2_oneye.bin" | grep -c 'mqtt.oneye.me'
@@ -644,9 +647,14 @@ wifi_prov.c:102  IP_EVENT_STA_GOT_IP  →  :113 s_ready_cb()  →  main.c:674 on
   BLE 侧把拒绝以 `-1` 回给 SDK ⇒ 对端收到 `PROV_FAILED`（`oneye-dev-sdk/src/oneye_dev_link.c:317-320`），⛔ 不静默丢弃。
 - **抑制旧配置重连**：断链前先置 `s_reprovision` ⇒ `WIFI_EVENT_STA_DISCONNECTED` 分支**不**自动重连
   （否则那一刻 STA 里还是旧配置 ⇒ "换网"退化成"重连旧网"）；`esp_wifi_set_config(新凭据)` 成功之后清位。
-- **启动期顺序 = 优先级顺序**：C3 → BLE → C5 兜底（`korvo2_oneye_main.c:808-887`）。
-  **C3 能解析但本次入网失败** ⇒ `:829` 显式 `wifi_prov_release_held("file-connect-failed")` 再降级，
+- **启动期顺序 = 优先级顺序**：C3 → BLE → C5 兜底（`korvo2_oneye_main.c` 的 `wifi_prov_boot()`）。
+  **C3 能解析但本次入网失败** ⇒ 显式 `wifi_prov_release_held("file-connect-failed")` 再降级，
   否则 rank 0 会永久占位、把后面的通道全挡住（配网死锁）。
+  🔴 **2026-10-13（用户裁定「D2.SD卡配网失败回落BLE 配网模式」）**：释放采信槽之后**自动**进入
+  BLE 配网模式（`wifi_prov_ble_pairing_enter()`，等价「长按 SET」；300 s 窗口一致），
+  **无需用户再按键**；旧行为（"需再按一次 SET 或复位"）已修掉，旧字逐字留痕见 `ALPHA-SDCARD.md` §3.4/§3.5。
+  ⛔ 保留：`KEY_GATE=y` 且**无文件**时仍待机、长按进入（⛔ 非"开机即广播"）；回落**只发生一次**；
+  rank / `channel_is_authoritative()` **逐字未改**（门禁 A18a–A18d 机械断言，含 4 条注入负向对照）。
 - **显式改配/重置**走「先释放采信槽再提交」（台面 `wifi_set` / `prov.reset`），允许在已入网设备上换网；
   ⛔ 但上云链路**仍只启动一次**（`on_wifi_ready()` 的一次性守卫 + 唯一 `oneye_start()` 调用点）。
   🔴 **2026-10-12**：**BLE（App）不需要这条"先释放"链** —— 权威通道一经受理即断旧连新（见夹具⑤与 A15）；
@@ -656,7 +664,7 @@ wifi_prov.c:102  IP_EVENT_STA_GOT_IP  →  :113 s_ready_cb()  →  main.c:674 on
 
 ```bash
 cd embedded/esp-adf/examples/oneye/korvo2_oneye
-python3 tools/check-prov-convergence.py     # A1–A15 + 20 条注入负向对照 + 实跑夹具 ⇒ RESULT=PASS / exit 0
+python3 tools/check-prov-convergence.py     # A1–A18 + 30 条注入负向对照 + 实跑夹具 ⇒ RESULT=PASS / exit 0
 cc -std=c99 -Wall -Wextra -Werror -I main tools/test-prov-priority.c -o /tmp/tpp && /tmp/tpp
 # 本批（App 发起配网 = 断旧连新）专用机械判据：
 python3 build-alpha-switch/.scratch/check-switch-semantics.py   # 行为 P1–P7 + 源码 S1–S6 + 5 条变异 ⇒ RESULT=PASS
@@ -1316,3 +1324,12 @@ LCD 状态屏与摄像头抓帧见 §5.7/§5.8（**已真机闭环**），`video
 > 差异说明：删除 `pop` / `pop_compat_path_unchanged` 两用例（−2），`pair_key_derivation` 改写为 `ikm = node_id‖chal` 口径（保留，⛔ 不是删用例）。
 > `abi-check.sh`（宿主 `lib/x86_64-linux-gnu-gcc-13.3.0`）：**OK——公共 API 与 `abi/*.symbols` 一致**（`oneye_dev_ble` 公共 API 24 → **22**，删掉的正是 `oneye_dev_ble_set_pop` / `oneye_dev_ble_get_pop`）。
 > 固件读数见本文件 §6 的构建行（`sdkconfig.defaults.ble-key` 叠加序）。
+
+> 🔴 **2026-10-13 追加读数（本批「ABI 门禁限定规范档」，依据 = 用户 2026-10-13 裁定「门禁限定规范档」）**：
+> 规范档 = `components/oneye-dev-sdk/lib/x86_64-linux-gnu-gcc-13.3.0/`（宿主轨，`tools/build-linux.sh` 按当前源码重建后）⇒
+> `bash components/oneye-dev-sdk/tools/abi-check.sh`（**不传参**即查规范档）**EXIT 0**：`oneye_dev_ble` **23**、`oneye_dev_link` **34**
+> （另 base 56 / mpp 16 / event 10 / log 15），6 库公共 API 与 `abi/*.symbols` 一致、内嵌件零外泄；
+> `output/` 下三档交叉归档（`xtensa-esp32s3-elf-gcc-14.2.0` / `xtensa-esp32s3-elf-gcc-15.2.0` / `riscv32-esp-elf-gcc-15.2.0`）
+> **早于源码重建** ⇒ 按登记表**跳过**并各打印一行 `⏭ 已跳过（原因）：…`（⛔ 不静默，⛔ 未重建这三档）；口径见
+> `components/oneye-dev-sdk/docs/INTEGRATION.md` §5.1。
+> ⚠️ 上一行「`oneye_dev_ble` 22」是 2026-10-09 那批的**当时读数**（⛔ 不改写）；23 是 2026-10-13 重建后的读数。

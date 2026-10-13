@@ -21,6 +21,15 @@
  *      显式改配（台面 `wifi_set`）与 `prov.reset` 走「先释放采信槽再提交」的显式路径，
  *      不是本判据的例外，而是调用方明确表达的"重新配网"意图。
  *
+ *   🔴 **2026-10-12 就地订正（用户裁定，最高依据）** —— 上面这条「已入网一律被拒」**多了一个例外**：
+ *       **App（BLE 通道 C1/C2）发起的配网** = **权威通道**，**一经受理即权威生效**：
+ *       设备必须**断开现有 Wi-Fi 并重连到目标 Wi-Fi**，⛔ **不得**因"已入网"而拒绝
+ *       ⇒ `REJECT_ALREADY_UP` 在 BLE 通路上**不可达**（详见 `wifi_prov_channel_is_authoritative()`）。
+ *       **旧字逐字留痕（⛔ 不抹）**：本行上述旧口径逐字为
+ *       「⚠️ 已入网（拿到 IP）之后，任何通道的提交一律被拒 —— **只入网一次**（上云链路只启动一次）。」
+ *       —— 该口径对 **C3 凭据文件 / C4 台面改配 / C5 兜底 / 预留通道** **继续逐字有效**（⛔ 不放宽），
+ *       只对 **C1/C2 BLE（App 发起）** 失效；订正成因见 ADR-0017「决策记录」2026-10-12 条。
+ *
  * ★ 预留通道（R1 声波 / R2 二维码）只有枚举，**没有**任何扫描/解码/协议实现，
  *   落在 rank 2（「其他」层）。⛔ 不要为它们写假实现或假分支。
  *
@@ -75,17 +84,42 @@ static inline int wifi_prov_channel_rank(wifi_prov_channel_t ch)
     }
 }
 
+/**
+ * ★ **权威通道**（2026-10-12 用户裁定 · 本处是唯一落码点）★
+ *
+ * 用户裁定逐字（最高依据，2026-10-12）：
+ *   「**已有app发起配网时设备要断现有wifi重新连接目标wifi**，否则app会卡在配网中这个流程。」
+ *
+ * 定义：**由 App / BLE 对端当场发起**的凭据提交（`WIFI_PROV_CHAN_BLE`，即 C1/C2）。
+ * 语义（**只**对这个入参通道生效 —— ⛔ 不改 C3 凭据文件 / C4 台面改配的优先级语义）：
+ *   · 权威通道的提交**一经受理即权威生效** ⇒ 「已入网 ⇒ 一律拒绝」对它**不适用**
+ *     （`REJECT_ALREADY_UP` 在 BLE 通路上**不可达**）；
+ *   · 设备已在线时，"断开现有连接 + 丢弃旧配置的采信态 + `esp_wifi_set_config(新凭据)`
+ *     + `esp_wifi_connect()`" 这一串动作由本判据的**调用方**（`wifi_prov.c` 的
+ *     `wifi_prov_submit_credentials_src()`）在同一提交里完成（"断旧连新"）。
+ *   ⚠️ 它**不是**"把 BLE 的 rank 改成 0"：`wifi_prov_channel_rank()` **逐字不变**
+ *     （SD 0 > BLE 1 > 其他 2）⇒ **未入网时**的抢占/让位语义**一字未改**
+ *     （SD 已采信且未入网时，BLE 提交**仍**是 `REJECT_LOWER`）。
+ */
+static inline bool wifi_prov_channel_is_authoritative(wifi_prov_channel_t ch)
+{
+    return ch == WIFI_PROV_CHAN_BLE;   /* C1/C2：App / 另一台嵌入式设备当场发起 */
+}
+
 /** 一次「凭据提交」的裁决结果。 */
 typedef enum {
     /** 采信槽为空 ⇒ 采信（首次有效凭据）。 */
     WIFI_PROV_DECISION_ACCEPT_FIRST      = 0,
     /** 同一通道再次提交 ⇒ 采信（改配/重试，如 App 重发同一通道的新密码）。 */
     WIFI_PROV_DECISION_ACCEPT_SAME       = 1,
-    /** 更高优先级且尚未入网 ⇒ 采信（抢占：低优先级那份作废）。 */
+    /** 采信（抢占）：被抢占的那份作废 —— 两种触发：① 更高优先级且尚未入网；
+     *  ② **权威通道（BLE/App）在已入网时的接管**（"断旧连新"，见
+     *     `wifi_prov_channel_is_authoritative()`）。 */
     WIFI_PROV_DECISION_ACCEPT_PREEMPT    = 2,
     /** 优先级更低 ⇒ **拒绝**（不采信、不入网；必须留痕）。 */
     WIFI_PROV_DECISION_REJECT_LOWER      = 3,
-    /** 已入网 ⇒ **拒绝**（只入网一次；必须留痕）。 */
+    /** 已入网且**非权威通道** ⇒ **拒绝**（只入网一次；必须留痕）。
+     *  ⚠️ 2026-10-12 起：**权威通道（BLE/App）永远不会拿到这个裁决**（见下）。 */
     WIFI_PROV_DECISION_REJECT_ALREADY_UP = 4,
 } wifi_prov_decision_t;
 
@@ -102,18 +136,26 @@ typedef enum {
  *                   ⛔ 但**上云链路的唯一性不受影响**：`oneye_start()` 仍只有收敛点下游一个调用点。
  *
  * 判据顺序有语义，⛔ 不要重排：
- *   ① 已入网且采信槽仍被占用 ⇒ 一律拒绝（**只入网一次**，与优先级无关：入网后连更高优先级也不抢占）；
+ *   ① 已入网且采信槽仍被占用，**且本次提交不是权威通道** ⇒ 一律拒绝
+ *      （**只入网一次**，与优先级无关：入网后连更高优先级也不抢占）；
+ *      ⚠️ 2026-10-12：**权威通道（BLE/App）不在这一条里** —— 它穿透到 ②–④ 落成"采信"
+ *      （这就是"App 每次发起配网都必须直接生效"的判据形态；`REJECT_ALREADY_UP` 因此
+ *      在 BLE 通路上**不可达**）；
  *   ② 槽为空（含被显式释放）⇒ 采信（首次有效）；
  *   ③ 同通道 ⇒ 采信（改配/重试）；
- *   ④ 严格更高优先级 ⇒ 抢占（低优先级那份作废）；
- *   ⑤ 其余 ⇒ 拒绝（留痕）。
+ *   ④ 权威通道（BLE/App）接管一个**已被别人占用**的槽且设备已入网 ⇒ 抢占（"断旧连新"：
+ *      调用方随后断链 + 丢旧采信态 + 用新凭据重连）—— ⚠️ 这一条**只在 ① 之后**才有机会命中：
+ *      未入网时权威通道**仍**按 rank 判（见 ⑤）；
+ *   ⑤ 严格更高优先级 ⇒ 抢占（低优先级那份作废）；
+ *   ⑥ 其余 ⇒ 拒绝（留痕）。
  */
 static inline wifi_prov_decision_t
 wifi_prov_policy_decide(bool held_valid, wifi_prov_channel_t held,
                         wifi_prov_channel_t incoming, bool onboarded)
 {
-    if (onboarded) {
-        return WIFI_PROV_DECISION_REJECT_ALREADY_UP;      /* ① 只入网一次 */
+    const bool authoritative = wifi_prov_channel_is_authoritative(incoming);
+    if (onboarded && !authoritative) {
+        return WIFI_PROV_DECISION_REJECT_ALREADY_UP;      /* ① 只入网一次（权威通道除外） */
     }
     if (!held_valid) {
         return WIFI_PROV_DECISION_ACCEPT_FIRST;           /* ② 首次有效（或被显式释放后重新采信） */
@@ -121,10 +163,13 @@ wifi_prov_policy_decide(bool held_valid, wifi_prov_channel_t held,
     if (incoming == held) {
         return WIFI_PROV_DECISION_ACCEPT_SAME;            /* ③ 同通道改配/重试 */
     }
-    if (wifi_prov_channel_rank(incoming) < wifi_prov_channel_rank(held)) {
-        return WIFI_PROV_DECISION_ACCEPT_PREEMPT;         /* ④ 高优先级抢占 */
+    if (onboarded && authoritative) {
+        return WIFI_PROV_DECISION_ACCEPT_PREEMPT;         /* ④ 权威通道在已入网时的接管（断旧连新） */
     }
-    return WIFI_PROV_DECISION_REJECT_LOWER;               /* ⑤ 低优先级拒绝 */
+    if (wifi_prov_channel_rank(incoming) < wifi_prov_channel_rank(held)) {
+        return WIFI_PROV_DECISION_ACCEPT_PREEMPT;         /* ⑤ 高优先级抢占 */
+    }
+    return WIFI_PROV_DECISION_REJECT_LOWER;               /* ⑥ 低优先级拒绝 */
 }
 
 /** 该决策是否"采信"（会被交给连接层）。 */

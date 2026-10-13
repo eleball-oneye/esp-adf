@@ -50,6 +50,9 @@
 #include "wifi_prov.h"
 #include "wifi_prov_ble.h"
 #include "wifi_prov_status.h"
+/* ★ 2026-10-13〔本批 ③b〕启动期授时（乙档严格 TLS 的"先有钟再建链"）——
+ *   与 korvo2_oneye/main/sntp_boot.c **同源复制**（逐字节），接入点见 `on_wifi_ready()`。 */
+#include "sntp_boot.h"
 
 static const char *TAG = "devkitc_oneye";
 
@@ -196,13 +199,48 @@ static void boot_identity_report(void)
  *   → `oneye_dev_link_prov_report_status()`），天然经过它的 TX 串行化锁。
  * ⛔ 失败不置位 ⇒ 下一次 GOT_IP 会再试；⛔ 不假装成功（App 会一直等 connected）。
  * ============================================================================ */
+
+/* ★ 2026-10-13〔本批 ③a · 从 korvo2_oneye 同步 e00aa9c9〕**幂等位提到文件作用域**（不是函数内静态）
+ *   —— 因为它的**复位**来自 `wifi_prov.c` 的"会话结束"通告（见下面 `prov_status_reset_after_disconnect()`）。
+ *   ① 置位：只有**真的发出**（`wifi_prov_ble_report_prov_connected()` 返回 `ESP_OK`）才置位；
+ *   ② 复位：Wi-Fi 断开（**这一次配网会话结束**）⇒ 下一段会话拿到 IP 可以再报一次。
+ *   ⛔ 判据本体（`wifi_prov_status.h`）一个字都没改：本批只把"复位状态"这件事接上。 */
+static bool reported;
+
+/* ★ 2026-10-13〔本批 ③a〕**会话结束 ⇒ 复位"已报过 connected"这一位**
+ *   （判据本体 = `wifi_prov_status.h` 的 ④ `wifi_prov_connected_reported_after_disconnect()`）。
+ *
+ * 真机证据在 korvo2_oneye 侧（⛔ 不重复采集，2026-10-12 两轮）：第一轮 GOT_IP 报过一次 connected，
+ *   第二轮（App 走 `[prov-switch]` 断旧连新 → GOT_IP、provider 返回 OK）之后**再也没有报**
+ *   ⇒ App 一直停在"配网中"直到超时。成因 = 幂等位**跨会话不复位**（旧形态：函数内静态、只置位、无人复位）。
+ *
+ * 为什么复位边 = **Wi-Fi 断开**（"这一次配网是新的一次"的语义点）：
+ *   · 这一位回答的是"**这一段连接会话**里报过没有"；断开之后这一段的 `connected` 已不成立
+ *     （`wifi_prov_ip()` 清空、`wifi_prov_is_connected()` 转 false）⇒ 位必须随之作废；
+ *   · 三条重新配网路径**都物理经过断开边**（App/权威通道的断旧连新、`prov.reset`、
+ *     重新配网后再 GOT_IP）⇒ **一个复位边覆盖三者**，⛔ 不必在各处各写一遍；
+ *   · ⛔ 不会退化成"每次都报"：复位只发生在**真实断开**时；同一段连接里的重复 GOT_IP
+ *     （DHCP 续租等）**不经过**这条边 ⇒ "本会话只报一次"原样成立。
+ *   ⛔ 不许把它挪进 `prov_status_report_connected_once()`（那等于每次 GOT_IP 都复位 ⇒ 每次都报）。 */
+static void prov_status_reset_after_disconnect(void)
+{
+    if (reported) {
+        ESP_LOGW(TAG, "[diag] Wi-Fi 会话结束 ⇒ 复位 connected 幂等位"
+                      "（这一次配网到此为止；下一次 GOT_IP 可以再报一次）");
+    }
+    reported = wifi_prov_connected_reported_after_disconnect(reported);
+}
+
 static void prov_status_report_connected_once(void)
 {
-    static bool reported;      /* 幂等位：只报一次（⛔ 不刷屏） */
     const char *ip = wifi_prov_ip();
     esp_err_t rc;
 
     if (!wifi_prov_connected_should_report(wifi_prov_is_connected(), ip, reported)) {
+        /* 没拿到 IP，或**本次会话**已经报过（多为同一段连接里的重复 GOT_IP）⇒ 什么都不做，⛔ 不刷屏 */
+        ESP_LOGI(TAG, "[diag] connected 上报判据=否：wifi_connected=%d ip=%s already_reported=%d"
+                      "（前者为 0 ⇒ 还没拿到 IP，如实停在「配网中」）",
+                 wifi_prov_is_connected() ? 1 : 0, (ip != NULL) ? ip : "(空)", reported ? 1 : 0);
         return;
     }
     rc = wifi_prov_ble_report_prov_connected(wifi_prov_ssid(), ip, wifi_prov_source());
@@ -213,7 +251,8 @@ static void prov_status_report_connected_once(void)
                  ip, esp_err_to_name(rc));
         return;
     }
-    ESP_LOGI(TAG, "★ prov.status{state=connected, ip=%s, ssid=%s, source=%s} 已发出（只报一次）",
+    ESP_LOGI(TAG, "★ prov.status{state=connected, ip=%s, ssid=%s, source=%s} 已发出"
+                  "（本次配网会话内只报一次；Wi-Fi 断开后复位 ⇒ 重新配网可再报一次）",
              ip, wifi_prov_ssid(), wifi_prov_source());
 }
 
@@ -508,6 +547,16 @@ static void on_wifi_ready(void)
                   "绑定由 **App 代发** `POST /api/v1/bindings`（设备侧不参与）");
     return;
 #else
+    /* ★ 2026-10-13〔本批 ③b〕**启动期授时**：乙档是**严格 TLS**（`CONFIG_ONEYE_FW_TLS_INSECURE`
+     *   在台面档为 y、量产为 n），而板子**没有 RTC** ⇒ 未授时时系统时间是 1970、服务端证书的
+     *   notBefore 落在未来 ⇒ mbedtls 必然报 `BADCERT_FUTURE`。故"**先有钟、再建链**"是硬顺序：
+     *   本行必须在下面 `xTaskCreate*`（→ `oneye_start()`）**之前**（与 korvo2_oneye 的
+     *   `on_wifi_ready()` 同一口径；那边的门禁 A11/A12 断言这条顺序）。
+     *   ⚠️ 本调用在**系统事件任务**上下文，是有界的同步等待：最多 2×10 s（两台服务器各 10 s；
+     *   真机正常路径实测 ≈1 s）。失败**不阻塞**上云（见 `sntp_boot.h:9-11`：那是**故意**的可见失败）。
+     *   ⛔ 丙（GAMMA）档不调用它：丙按契约**不建云链路**（设备侧零 TLS）⇒ 不需要钟。 */
+    (void)sntp_boot_sync();
+
     if (xTaskCreate(cloud_start_task, "cloud_start", 6144, NULL, 4, NULL) != pdPASS) {
         started = false;
         ESP_LOGE(TAG, "上云任务创建失败（内存不足）—— 设备已联网但不会上平台");
@@ -726,6 +775,11 @@ void app_main(void)
     key_gate_start();            /* 长按 BOOT(GPIO0) 切换配网模式 */
 
     wifi_prov_set_ready_cb(on_wifi_ready);   /* **唯一**收敛点注册点 */
+    /* ★ 2026-10-13〔本批 ③a · 同步 korvo2 e00aa9c9〕**会话结束边**（Wi-Fi 断开）⇒ 复位
+     *   `prov.status{connected}` 的幂等位：注册点与 ready 回调**同一处**（应用生命周期的唯一注册点）。
+     *   ⛔ 不复位就报不出第二轮 connected ⇒ App 卡在"配网中"（korvo2 真机 2026-10-12 第二轮）；
+     *   置位/复位语义见上面 `prov_status_reset_after_disconnect()`。 */
+    wifi_prov_set_disconnected_cb(prov_status_reset_after_disconnect);
     wifi_prov_boot();                        /* 起 BLE 通道（或按键盘控待机） */
 
     for (;;) {

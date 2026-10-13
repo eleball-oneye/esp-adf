@@ -41,6 +41,23 @@ menu "devkitc_oneye 板级固件配置（ESP32-S3-DevKitC-1 · 零音频依赖�
                理由与字节布局见 contracts/local/ble-gatt.md 与 include/oneye_dev_ble.h）。
                空串 ⇒ 只带 SN、不带品类（App 侧 `pk_present=0`），⛔ 不填默认值。
 
+            ★★ 2026-10-13 **就地订正**（用户裁定，最高依据）★★
+              裁定逐字：「**甲 `OY-SPK-01`、乙 `OY-SPK-02`、丙 `OY-SPK-03`**」。
+              ⇒ 乙 / 丙 **不再共用**本项的缺省值：
+                · 乙（BETA）  = `OY-SPK-02`（由 `sdkconfig.defaults.beta` 显式给出）
+                · 丙（GAMMA） = `OY-SPK-03`（由 `sdkconfig.defaults.gamma` 显式给出）
+                · 甲（ALPHA） = `OY-SPK-01`（= **本项缺省值**，仍由 `korvo2_oneye` 使用，⛔ 未改）
+              ⛔ 旧字逐字留痕（⛔ 不抹）：上面那段此前逐字为
+                「⚠️ **本工程没有为 DevKitC-1 新造机型码**（⛔ 不自行增删判据）：乙 / 丙 两档
+                  **共用** `OY-SPK-01` —— 因此 cloud 侧**不能**靠 product_key 区分乙与丙，
+                  区分乙 / 丙 的**唯一**载体是 `dev_product_credential_policy.onboarding_actor`
+                  ＋ 设备侧的 `ONEYE_FW_ONBOARDING_ROLE`」，
+                以及「⚠️ 这意味着**同一 product_key 上不能同时登记乙与丙**」。
+              ⇒ 该两条口径**已被本次裁定取代**：三机型各有码，product_key 即可区分乙 / 丙。
+              ⚠️ 待办（属 cloud 侧，⛔ 本工程不代做）：`OY-SPK-02` / `OY-SPK-03` 需在 cloud 的
+                机型表（TSL / `dev_product_credential_policy`）里有登记，否则准入会判未知品类。
+              ⛔ 本项**不是**身份：`node_id` 仍只来自 creds 分区（本工程两档都没有）或占位串。
+
     config ONEYE_FW_VERSION
         string "固件版本字符串（进 caps/up 与影子 firmwareVersion）"
         default "0.1.0-devkitc"

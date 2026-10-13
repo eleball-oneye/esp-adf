@@ -61,7 +61,7 @@
 | `audio_board_init()` / `board_expect.h` 编译期断言 / `SELFTEST_STRICT` 死等 | **无** | 就是"不能直接跑在 DevKitC-1"的三条成因（已登记结论） |
 | `panel_api.c` 本地 HTTP 验证面 | **无** | DevKitC-1 场景的证据面 = **串口 ＋ App**；引 httpd 会多一份依赖，与"最小"相反 |
 | `lcd_ui.c` / `camera_api.c` / `player.c` / `aec_capture.c` / `media_api.c` | **无** | 板上没有这些外设 |
-| `net_probe.c` / `sntp_boot.c` | **无** | ⚠️ **如实登记**：本工程因此**没有** net_probe 自检与启动期 SNTP 授时。乙档是**严格 TLS**（生产口径）⇒ 缺 SNTP 会让"先有钟、再建链"这条顺序**只能靠 SDK 的 `cloud_ts` 授时**（`caps/down.cloud_ts`）；而 `cloud_ts` 要等 `CLOUD_LINK_UP` ⇒ **存在 bootstrap 死锁风险**（korvo2 专门为它把 SNTP 搬到收敛点）。**本工程按不引入 ADF 的取舍优先**，把它登记为缺口（见 §7） |
+| `net_probe.c` / `sntp_boot.c` | `sntp_boot.c` **有**（★ 2026-10-13 同源复制）／`net_probe.c` **仍无** | ★ **2026-10-13 就地订正**（⛔ 旧字不抹，本行旧口径逐字为「**无**…本工程因此**没有** net_probe 自检与启动期 SNTP 授时…登记为缺口」）：`sntp_boot.c`/`sntp_boot.h` 已从 `korvo2_oneye/main/` **逐字节复制**进来（sha256 `1b02e891…`/`00cc3fd6…`），进 `main/CMakeLists.txt` 的 `SRCS`，接入点 = `main/devkitc_oneye_main.c` 的 `on_wifi_ready()`、**在**建上云任务**之前**（先有钟、再建链）；⛔ 丙档不调它。⚠️ `net_probe.c` **仍未引入**（纯诊断，不构成 TLS 阻断）—— 如实登记为**未做**（见 §5-④） |
 | `sd-root/` / `tools/provision-device.ps1` | **无** | 无 SD 卡、无 `creds` 分区灌注（乙/丙 量产形态**不需要** `creds`） |
 | `tools/check-prov-convergence.py` / `tools/test-prov-priority.c` | **无（有意删）** | 那两个门禁**硬编码** `korvo2_oneye_main.c` 的文件名与 A6（`wifi_prov_load_file` 调用 ×2）/ A7（`oneye_start` 调用点）/ A13（`[res]` 三处含 `app_main`、`wifi_prov_boot`、`cloud_start_task` 与 `phase=` 取值）/ A14a 判据。本工程**结构性不同**（无 C3 文件通道、`cloud_start_task` 在丙档不编、`[res]` 有 diag 第四次调用）⇒ 直接跑会**假红**（把"机型不同"报成"收敛点被破坏"）。⇒ 本工程改为**逐条语义复核**（读数见 §6.4），⛔ 不是"少做了一道门禁" |
 | `CONFIG_FREERTOS_ENABLE_BACKWARD_COMPATIBILITY` | ⛔ **不设** | 那条是给 ADF 的 FreeRTOS 补丁用的；本工程不链接 ADF |
@@ -136,7 +136,7 @@
 
 | 项 | Kconfig 符号 | **当前值（逐字）** | 取处 |
 | --- | --- | --- | --- |
-| 产品品类 | `CONFIG_ONEYE_FW_PRODUCT_KEY` | **`OY-SPK-01`** | 取值出处 = [`korvo2_oneye/main/Kconfig.projbuild:14-20`](../korvo2_oneye/main/Kconfig.projbuild)（其 help 逐字指向 `cloud/docs/00-naming-convention.md:4604-4607` 的机型清单）；本工程逐字沿用 |
+| 产品品类 | `CONFIG_ONEYE_FW_PRODUCT_KEY` | **甲 `OY-SPK-01`（Kconfig 缺省）／乙 `OY-SPK-02`／丙 `OY-SPK-03`**（★ 2026-10-13 订正，见下） | 取值出处 = [`korvo2_oneye/main/Kconfig.projbuild:14-20`](../korvo2_oneye/main/Kconfig.projbuild)（其 help 逐字指向 `cloud/docs/00-naming-convention.md:4604-4607` 的机型清单） |
 | 节点标识 | `CONFIG_ONEYE_FW_DEVICE_ID` | **`devkitc-0001`** | 本工程 `main/Kconfig.projbuild`（**台面占位**；乙/丙 的实例身份在绑定后由 App↔cloud 赋予，⛔ 本值不是身份） |
 | 固件版本 | `CONFIG_ONEYE_FW_VERSION` | **`0.1.0-devkitc`** | 本工程 `main/Kconfig.projbuild` |
 
@@ -151,6 +151,17 @@
 区分乙与丙，而机型表是**按 `product_key` 一行**登记的 ⇒ **同一 `product_key` 上不能同时登记
 乙与丙**（两者 `onboarding_actor` 不同）。**这是需要 cloud 侧裁定的缺口**（见 §7-⑤），
 本工程⛔ 不自行新造机型码。
+
+★ **2026-10-13 就地订正（用户裁定，最高依据；⛔ 旧字不抹，上面那段是当时的原文）**：
+
+> 裁定逐字：「**甲 `OY-SPK-01`、乙 `OY-SPK-02`、丙 `OY-SPK-03`**」
+
+⇒ 三机型**各有码**：乙 = `OY-SPK-02`（`sdkconfig.defaults.beta` 显式给出）、
+丙 = `OY-SPK-03`（`sdkconfig.defaults.gamma` 显式给出）、甲 = `OY-SPK-01`（= Kconfig 缺省，仍由
+`korvo2_oneye` 使用，⠐ 未改）。上面那段"两档共用 ⇒ 无法区分 / 同码不能同时登记"的**口径已被取代**
+（`main/Kconfig.projbuild` 的 `help` 里也做了同一处订正与留痕）。
+⚠️ **待办（属 cloud 侧）**：`OY-SPK-02` / `OY-SPK-03` 需在 cloud 机型表（TSL ＋
+`dev_product_credential_policy`）里有登记，否则准入会判未知品类。
 
 ---
 
@@ -230,6 +241,50 @@ python -m esptool --chip esp32s3 -b 460800 \
 
 ---
 
+## 4.3 ★ 2026-10-13〔本批〕**台面档**（`sdkconfig.defaults.bench-local`）—— 把板子接到**本机栈**
+
+> 用途：乙/丙 在**本机 bench 栈**上跑通"配对 → 上云/绑定"闭环时，端点必须指本机
+> （`192.168.110.208:18830`），并且 **mbedTLS 的堆要走 PSRAM**（甲型台面实测的
+> `MBEDTLS_ERR_SSL_ALLOC_FAILED` 根因，esp-adf `55ebdeec`）。
+
+```bash
+# WSL —— ⚠️ 台面档的前提是**本板模组带 PSRAM**（见 sdkconfig.defaults.bench-local 文件头）
+source ~/esp/esp-idf-5.5.5/export.sh
+export ADF_PATH=/mnt/e/workspace/rainmaker-oneye/embedded/esp-adf
+cd $ADF_PATH/examples/oneye/devkitc_oneye
+
+bash tools/build-devkitc.sh beta  <证书目录> bench   # → build-beta-bench/
+bash tools/build-devkitc.sh gamma <空目录>   bench   # → build-gamma-bench/
+```
+
+* 第 3 个参数 `bench` **只在末尾追加**一份预设；⛔ 不传时命令与从前**逐字相同**（4 份）⇒ 量产档零污染。
+* 本档新增/改写的项：`ONEYE_FW_CLOUD_HOST/PORT`（本机栈）、`SPIRAM*`、
+  `CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y`、唯一一处安全放宽 `CONFIG_ONEYE_FW_TLS_INSECURE=y`
+  （理由与代价逐字见文件头）。
+  🔴 **2026-10-13 订正（旧字逐字留痕）**：旧列本条时写的是
+  「`SPIRAM*`（含 `SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY`）」—— 该行**已从本档删除**：
+  它是 `CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM` 的**已弃用别名**（不在任何 Kconfig 的
+  `config` 声明里），而 IDF 在 PSRAM 打开时对该符号 `default y` ⇒ 删掉**取值不变**；
+  旧字留痕与逐条取证见 `sdkconfig.defaults.bench-local` 文件头。⇒ **本档赋值项 15 → 14 项**。
+* 机械自证（**2026-10-13 复核实跑，PASS**）：
+  `IDF_PATH=<esp-idf 根> python3 tools/check-sdkconfig-defaults.py --sdkconfig build-<档>-bench/sdkconfig --require sdkconfig.defaults.bench-local`
+  ⇒ `14 项全部存在且已生效`（`build-beta-bench` / `build-gamma-bench` 两档 `EXIT=0`；
+  量产两档 `build-beta` / `build-gamma` 同次亦 `EXIT=0`）。
+  ⚠️ `IDF_PATH` **不可省**：符号全集的第三个来源 = `$IDF_PATH/components` 的 Kconfig，
+  缺了它 IDF 自有符号会被判"本工程不存在"⇒ 实测**多出 13 条结构性误报**（⛔ 别据此删预设里的行）。
+
+| 台面档产物（2026-10-13 实跑，`IDF_EXIT=0`） | 大小（B） | sha256 |
+| --- | ---: | --- |
+| `build-beta-bench/devkitc_oneye.bin` | 1 285 840 | `24ebaeb11661ca145e4f3d1cb2824f28232cc8b98029c4b88ac4f476c6a959c5` |
+| `build-gamma-bench/devkitc_oneye.bin` | 1 225 056 | `94dfd9395eacd9e3b3e97de617ecb1d59f1a126d9023365667297ac5d63a2d43` |
+| 两档 `bootloader/bootloader.bin` | 20 832 | `5f7844448f224fee684bead98eb67986e821002f65704a2d296f92e930765433` |
+| 两档 `partition_table/partition-table.bin` | 3 072 | `447a2fbaeb35db4fd34ebee0edbd9c689810d24f4581a17bd02915b3be71267d` |
+
+烧写偏移与 §4.2 **逐字相同**（只是把 `build-beta` 换成 `build-beta-bench`）；
+⚠️ 台面档固件**不得**用于任何交付/公网场景（跳过对端证书校验）。
+
+---
+
 ## 5. 缺口与占位（⛔ **如实登记，⛔ 不静默省略**）
 
 ① 🔴 **乙档的内嵌证书 = 测试件，不是品类级认证件**。
@@ -254,6 +309,10 @@ python -m esptool --chip esp32s3 -b 460800 \
    或 ② 接受"同一 `product_key` 只登记一档，另一档用另一块板/另一个 `product_key`"；
    或 ③ 机型表扩第三根轴（⚠️ §4.4.12（三）已论证**不需要**第三根轴）。
 
+   ★ **2026-10-13 已裁定（方案 ① 的落地形态）**：用户逐字「甲 `OY-SPK-01`、乙 `OY-SPK-02`、
+   丙 `OY-SPK-03`」⇒ 本工程按 `sdkconfig.defaults.{beta,gamma}` 分别给出 `OY-SPK-02` / `OY-SPK-03`。
+   ⚠️ **剩余**：cloud 侧机型表要登记这两个码（属 cloud 侧待办，⛔ 本工程不代做）。
+
 ③ ✅ **乙档 `prov.pair.ok.sig` 的产出路径在本工程被补齐**（源目录缺 `sig_cert_pem`/`sig_key_pem` 赋值）。
    ⚠️ 如实登记：**这是本工程对复制件的唯一功能性改动**（§2-1）。
    ⚠️ 另一条登记：`sig` 只有当 `ONEYE_DEV_TIER_B_CERT_DEVICE` **显式**声明时才产出
@@ -266,12 +325,28 @@ python -m esptool --chip esp32s3 -b 460800 \
    **bootstrap 死锁风险**。⚠️ 这是"零音频依赖 + 不引 ADF"取舍的**直接代价**，如实登记；
    若要闭合，需把 `sntp_boot.c`（2 154 B、只依赖 IDF `esp_sntp`）搬进收窄点 —— 属**下一批**。
 
+   ★ **2026-10-13〔本批〕已闭合"授时"这一半**：`main/sntp_boot.c` / `sntp_boot.h` 从
+   `korvo2_oneye/main/` **同源复制**（逐字节，sha256 `1b02e891…` / `00cc3fd6…`），已进
+   `main/CMakeLists.txt` 的 `SRCS`，接入点 = `main/devkitc_oneye_main.c` 的 `on_wifi_ready()`
+   **在**建上云任务**之前**（硬顺序：先有钟、再建链）；⛔ 丙档不调它（丙不建云链路）。
+   ⚠️ **`net_probe` 仍未搬**（它只是诊断，不构成 TLS 阻断）—— 如实登记为**未做**。
+
 ⑤ ⚠️ **`managed_components`**：本工程 `main/idf_component.yml` 为**空依赖**，
    构建前 `managed_components/` **不存在** ⇒ 构建后仍不存在（空集合 = 空集合）。读数见 §6.3。
 
 ⑥ ⚠️ **本工程不做 NVS 写**（乙档的 W1/W2 两段写在 SDK 内）。
    ⇒ 本工程能给的是「**媒介前提成立**」（启动打印 `NVS：可用`），
    ⛔ **不能**给"`commit` 位真的置上了"的证据 —— 那要等真机跑 App 侧 W1/W2。
+
+⑦ 🔴 **2026-10-13 本批台面档所用的乙档证书材料 = `korvo2_oneye/main/certs`（借件，需裁定）**。
+   用户裁定逐字：「乙类证书「**本机测试可用真的已签发证书**」」⇒ 本批台面构建
+   `-DONEYE_FW_CERT_DIR=<repo>/embedded/esp-adf/examples/oneye/korvo2_oneye/main/certs`，
+   即**甲型那台机器**的材料（`subject=CN=korvo2-0001`、`issuer=CN=oneye-iot-device-ca`，
+   即本机 `ssl:deviceface` 的 `cacertfile` bundle 里那张真 CA 签发件 —— 因此**能被本机栈接受**）。
+   ⚠️ **代价（如实登记，⛔ 不静默）**：这与 `main/CMakeLists.txt:22-25` 那条纪律（"korvo2 的 certs
+   是一机一密材料，拿它当品类级证书会把两台机器混成一份凭据"）**冲突**；本批是**台面借件**，
+   仅用于把乙档的"配对 → 上云"在**本机**跑通。⇒ **需裁定**：是否要求为乙档单独签发一份
+   （仓内**没有** CA 私钥，本工程签不出来，须由持 CA 的一方出件）。
 
 ---
 

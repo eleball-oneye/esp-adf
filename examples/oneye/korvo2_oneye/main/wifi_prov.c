@@ -27,6 +27,28 @@
  *      C3 凭据文件 / C4 台面改配 / C5 兜底的优先级语义**一字未改**。
  *   所有拒绝/抢占都在串口留痕（统一前缀 `[prov-priority]`；"断旧连新"用 `[prov-switch]`），
  *   不是静默丢弃。
+ *
+ * ★ 🔴 2026-10-13〔本批 · 真机证据〕**AP 扫描（`prov.scan.req`）的两条硬口径** ★
+ *   真机症状（2026-10-13 14:16–14:17，⛔ 未重复采集）：
+ *     · 14:16 第一轮用**错误密码** ⇒ `DISCONNECTED reason=15`（4WAY_HANDSHAKE_TIMEOUT）被断开分支
+ *       **自动重连**成循环，20 s 后 provider 超时（`prov.status{failed, err=auth_failed}`）；
+ *     · 14:17:03 用户随即重试配对 ⇒ `prov.scan.req` ⇒ provider **48 ms 就返回 rc=0 且 `aps=[]`（2 B）**
+ *       ⇒ App 判「未获取到设备可用网络列表」。
+ *   根因（两条，都在本文件的扫描路径里）：
+ *     ① **扫前没有把 STA 收回空闲态**：那一刻 STA 仍在 connecting，`esp_wifi_scan_start()` 按 IDF
+ *        文档返回 `ESP_ERR_WIFI_STATE`（"WiFi still connecting when invoke esp_wifi_scan_start"）；
+ *     ② **失败被抹成"0 个 AP"**：旧码写成 `if (rc != ESP_OK && rc != ESP_ERR_WIFI_STATE) return rc;`
+ *        —— 把上面这个错误码**当成可继续** ⇒ 继续 `esp_wifi_scan_get_ap_records()`（本次没有扫描
+ *        结果，num=0）⇒ 组出 `[]` 并以 `ESP_OK` 回给 link 层 ⇒ App 把它读成"设备周围没有网络"。
+ *   本批修法（两处，machine-checkable，⛔ 不改协议面：不新增帧 / 字段 / 错误码，⛔ 不放宽 `ApListGate`）：
+ *     a. 扫描前**主动 `esp_wifi_disconnect()`**（connecting / connected 都断）并**等会话结束边**
+ *        `WIFI_PROV_SESSION_ENDED_BIT` 到达（`wifi_prov_quiet_sta_for_scan()`）；抑制位
+ *        `s_scan_only` 必须**先于**断开置位（断开事件异步派发，否则会用旧配置自动重连）；
+ *     b. 扫描改为**非阻塞发起 + 等 `WIFI_EVENT_SCAN_DONE`**：`esp_wifi_scan_start` 失败 /
+ *        `SCAN_DONE.status != 0` / 等 `SCAN_DONE` 超时 ⇒ **如实返回错误码**
+ *        （link 层既有映射 = `error{code:"internal"}`，见 `oneye_dev_link.c`），⛔ **不回空列表**；
+ *        只有"扫描成功且真的 0 个 AP"才允许回 `[]`（App 侧"空列表一律拦住"的口径**一字未改**）。
+ *   门禁：`tools/check-prov-convergence.py` 的 **A17**（含"把扫前不断开造回去 ⇒ 必须红"的负向对照）。
  */
 
 #include <stdio.h>
@@ -49,7 +71,22 @@
 static const char *TAG = "wifi_prov";
 
 #define WIFI_CONNECTED_BIT BIT0
+/* 🔴 2026-10-13〔本批〕**会话结束边**：`WIFI_EVENT_STA_DISCONNECTED` 已被本模块处理完。
+ * 为什么需要它（真机证据见文件头与本文件 `wifi_prov_quiet_sta_for_scan()` 的注释）：
+ *   扫描前断开 STA 之后**必须等这一次断开真的落地**（STA 退出 connecting/connected）才能发起扫描；
+ *   否则 `esp_wifi_scan_start()` 会返回 `ESP_ERR_WIFI_STATE`（"WiFi still connecting"）。
+ * ⛔ 它不是协议面状态：只在本进程内表达"上一次连接尝试已终止"，不进任何帧 / 字段 / 错误码。 */
+#define WIFI_PROV_SESSION_ENDED_BIT BIT1
 #define WIFI_PROV_DEFAULT_TIMEOUT_MS 20000
+/* 扫前等"会话结束边"的上限：断开 → 事件派发通常数十毫秒内完成，这里给足余量但仍有界。 */
+#define WIFI_PROV_QUIET_WAIT_MS 2000
+/* 等 `WIFI_EVENT_SCAN_DONE` 的上限。App 侧扫描窗口 = 20 s（SDK 侧留痕逐字：
+ * "20 s 后 失败成因：扫描窗口到期仍未见 prov.scan.rsp"），本值必须显著小于它，
+ * 给组帧 + BLE 回传留余量（超时 ⇒ 如实回错，⛔ 不回空列表）。 */
+#define WIFI_PROV_SCAN_DONE_TIMEOUT_MS 12000
+/* 兜底重试次数（仅针对 `ESP_ERR_WIFI_STATE`：STA 仍在 connecting 的极窄竞态窗口）。
+ * ⛔ 这不是"容忍错误码"：重试耗尽后仍由 `wifi_prov_scan_json()` **如实返回**该错误码。 */
+#define WIFI_PROV_SCAN_RETRY 2
 
 static EventGroupHandle_t s_eg;
 static bool s_inited;
@@ -66,9 +103,26 @@ static volatile bool s_connected;
  *   ⇒ C3/C5 通道（未扫描过、start 会派发 STA_START）行为**逐字不变**；
  *      BLE 通道则补上这一次显式发起（这正是缺陷本体）。 */
 static volatile bool s_sta_start_connect_issued;
+/* 🔴 2026-10-13〔本批〕**STA 是否正处于"连接尝试中"（connecting）**。
+ * 为什么需要这个位：IDF 到 5.5.5 都**没有**公开的"是否 connecting"查询 API
+ * （`esp_wifi_sta_get_ap_info()` 只在**已连接**时返回 ESP_OK，connecting 态它也给不出答案），
+ * 所以本模块自己记：
+ *   置位者 = 三处 `esp_wifi_connect()` 调用点（STA_START 分支 / 断开分支的自动重连 /
+ *            `wifi_prov_connect()` 的 FIX-D1 显式发起）；
+ *   清零者 = `WIFI_EVENT_STA_DISCONNECTED`（本次连接尝试终止）与 `IP_EVENT_STA_GOT_IP`（已连上）。
+ * 用途 = `wifi_prov_quiet_sta_for_scan()` 判断"扫前要不要等会话结束边"。
+ * ⛔ 只影响扫描前的收尾等待；⛔ 不参与"要不要自动重连"的任何判断（两个抑制位一字未改）。 */
+static volatile bool s_sta_connecting;
 /* 扫描态：为 C1/C2 的 AP 扫描把 Wi-Fi 起起来，但**不**自动重连（否则无凭据时空转刷屏）。
  * 一旦某通道提交了凭据（wifi_prov_submit_credentials*），本标志清零。 */
 static volatile bool s_scan_only;
+/* 🔴 2026-10-13〔本批〕**扫描结果到达边**：`WIFI_EVENT_SCAN_DONE` 是否已到达 + 其 `status`。
+ * 为什么必须记它（本批缺陷本体之一）：阻塞式 `esp_wifi_scan_start(&sc, true)` 只回一个 rc，
+ *   **无法**区分「扫描成功、周围真的 0 个 AP（合法空列表）」与「扫描本身失败（`status != 0`）」；
+ *   旧码因此把后者也组成了 `aps:[]` 回给 App。
+ * 写值者 = `on_wifi_event()` 的 SCAN_DONE 分支；清零者 = `wifi_prov_scan_json()` 发起扫描之前。 */
+static volatile bool s_scan_done_seen;
+static volatile int s_scan_done_status;
 /* 🔴 2026-10-12〔本批：App 发起配网 = 断旧连新〕**权威通道重新配网进行中**。
  * 为什么需要它：`esp_wifi_disconnect()` 会派发 `WIFI_EVENT_STA_DISCONNECTED`，而
  * `on_wifi_event()` 的断开分支**默认立刻 `esp_wifi_connect()` 重连**；那一刻 STA 里
@@ -133,12 +187,22 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
         if (!s_scan_only) {
             esp_err_t crc = esp_wifi_connect();
             s_sta_start_connect_issued = (crc == ESP_OK);
+            /* 🔴 2026-10-13〔本批〕记"连接尝试中"（口径同 `wifi_prov_connect()` 的 FIX-D1：
+             *   `ESP_ERR_WIFI_CONN` = 已经在连 ⇒ 同样算"连接尝试中"）。 */
+            s_sta_connecting = (crc == ESP_OK || crc == ESP_ERR_WIFI_CONN);
             ESP_LOGI(TAG, "[diag] STA_START 分支 esp_wifi_connect() rc=%d(%s)",
                      (int)crc, esp_err_to_name(crc));
         }
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         int reason = (data != NULL) ? (int)((wifi_event_sta_disconnected_t *)data)->reason : -1;
         s_connected = false;
+        /* 🔴 2026-10-13〔本批〕**会话结束边**：这一次连接尝试到此终止 ⇒ 通知扫前的等待者
+         *   （`wifi_prov_quiet_sta_for_scan()`）。⛔ 位置必须在下面那个
+         *   `s_scan_only || s_reprovision` 提前 `return` **之前** —— 扫描态断开正是本批要等的那一次。 */
+        s_sta_connecting = false;
+        if (s_eg) {
+            xEventGroupSetBits(s_eg, WIFI_PROV_SESSION_ENDED_BIT);
+        }
         s_ip[0] = '\0';
         /* 🔴 2026-10-12〔本批〕**会话结束**：这一次配网会话到此为止 ⇒ 通告应用侧
          *   （应用侧据此复位 `prov.status{connected}` 的"只报一次"幂等位；本体 = wifi_prov_status.h 的 ④）。
@@ -159,11 +223,14 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
         }
         ESP_LOGW(TAG, "Wi-Fi 断开，重连…（reason=%d）", reason);
         esp_err_t crc = esp_wifi_connect();
+        /* 🔴 2026-10-13〔本批〕自动重连 = 又一次"连接尝试中"（`s_sta_connecting` 的置位口径）。 */
+        s_sta_connecting = (crc == ESP_OK || crc == ESP_ERR_WIFI_CONN);
         ESP_LOGI(TAG, "[diag] 断开后 esp_wifi_connect() rc=%d(%s)", (int)crc, esp_err_to_name(crc));
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *evt = (ip_event_got_ip_t *)data;
         esp_ip4addr_ntoa(&evt->ip_info.ip, s_ip, sizeof(s_ip));
         s_connected = true;
+        s_sta_connecting = false;       /* 🔴 2026-10-13〔本批〕已连上 ⇒ 不再是"连接尝试中" */
         ESP_LOGI(TAG, "Wi-Fi 已获取 IP：%s（ssid=%s，来源=%s）", s_ip, s_ssid, s_source);
         /* ★ 诊断关键行：GOT_IP 是否真的到达、以及事件组位是否置上（worker 正等在这一位上）。 */
         ESP_LOGI(TAG, "[diag] GOT_IP 已到达并置 WIFI_CONNECTED_BIT：s_eg=%s（这一步之后才轮到上报 connected）",
@@ -178,6 +245,15 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
         } else {
             ESP_LOGW(TAG, "[diag] s_ready_cb 为空 ⇒ 本次 GOT_IP **不会**走上云链路（也不会上报 connected）");
         }
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_SCAN_DONE) {
+        /* 🔴 2026-10-13〔本批〕**扫描结果到达边**（`s_scan_done_*` 的唯一写值点）。
+         * 为什么必须收这个事件：只有它带 `status`（0 = 成功；非 0 = 扫描失败），
+         * 而"扫描失败"绝不能被读成"周围 0 个 AP"（本批要修的伤害本体）。 */
+        int st = (data != NULL) ? (int)((wifi_event_sta_scan_done_t *)data)->status : -1;
+        s_scan_done_status = st;
+        s_scan_done_seen = true;
+        ESP_LOGI(TAG, "[diag] WIFI_EVENT_SCAN_DONE：status=%d（0=成功；非 0 = 扫描失败 ⇒ 由 "
+                      "wifi_prov_scan_json() 如实上报，⛔ 不回空列表）", st);
     } else {
         ESP_LOGD(TAG, "[diag] 其它 Wi-Fi 事件 base=%p id=%d", (const void *)base, (int)id);
     }
@@ -209,6 +285,57 @@ esp_err_t wifi_prov_init(void)
 
 /* ------------------------------------------------------------------ AP 扫描（供 BLE 通道的 prov.scan.req） */
 
+/* 🔴 2026-10-13〔本批〕**扫描前把 STA 收回空闲态**（`wifi_prov_prepare_scan()` 与扫描兜底重试共用）。
+ *
+ * 为什么必须做（真机取证，⛔ 未重复采集）：
+ *   2026-10-13 14:16 第一轮配网用**错误密码** ⇒ `DISCONNECTED reason=15`（4WAY_HANDSHAKE_TIMEOUT）
+ *   被 `on_wifi_event()` 的断开分支**自动重连**成循环；14:17:03.930 用户重试配对、App 发
+ *   `prov.scan.req` 时 STA **仍在 connecting** ⇒ `esp_wifi_scan_start()` 按 IDF 文档返回
+ *   `ESP_ERR_WIFI_STATE`（"WiFi still connecting when invoke esp_wifi_scan_start"）。
+ * 本函数做两件事（这就是"扫前 STA 状态"的机械落点）：
+ *   ① **断开**：`connecting` / `connected` 都断 —— `esp_wifi_disconnect()` 会中止进行中的连接尝试；
+ *   ② **等会话结束边**：`WIFI_PROV_SESSION_ENDED_BIT` 由断开分支置位，等到它才认为 STA 空闲。
+ * ⚠️ 抑制位 `s_scan_only` 必须由调用方在**断开之前**置位：断开事件是**异步**派发的，置位晚于断开
+ *    的话，断开分支会用**旧配置**自动重连（`reason=15` 循环继续）⇒ 扫描照旧被挡。
+ * ⚠️ 断开**无条件**做（用 `s_connected` 去决定"要不要断"会漏掉正是本批要修的那条路：
+ *    `reason=15` 循环里 `s_connected` 一直是 false、但 STA 确实在 connecting —— IDF 到 5.5.5 都
+ *    没有公开的"是否 connecting"查询 API）；"要不要**等**"才取决于 `s_connected || s_sta_connecting`。
+ * ⚠️ 断开自身的返回码**不**在这里升级为"扫描失败"：`esp_wifi_disconnect()` 的文档返回值只有
+ *    OK / NOT_INIT / NOT_STARTED / FAIL（**没有** NOT_CONNECT）⇒ 空闲态调用是 OK；万一它报错，
+ *    本函数只留痕并继续 —— STA 到底空不空闲由 `esp_wifi_scan_start()` 的返回码定夺，
+ *    而那条失败**一律如实上报**（⛔ 不回空列表）。⛔ 不新增帧 / 字段 / 错误码。
+ */
+static void wifi_prov_quiet_sta_for_scan(void)
+{
+    bool was_busy = s_connected || s_sta_connecting;
+
+    if (s_eg != NULL) {
+        xEventGroupClearBits(s_eg, WIFI_PROV_SESSION_ENDED_BIT);
+    }
+    esp_err_t qrc = esp_wifi_disconnect();
+    ESP_LOGW(TAG, "[diag] 扫前收回 STA：已在线=%d 连接尝试中=%d ⇒ esp_wifi_disconnect() rc=%d(%s)",
+             s_connected ? 1 : 0, s_sta_connecting ? 1 : 0, (int)qrc, esp_err_to_name(qrc));
+    if (qrc != ESP_OK) {
+        ESP_LOGW(TAG, "[diag] 扫前断开返回非 OK（%s）⇒ 仍继续尝试扫描："
+                      "若 STA 仍非空闲，scan_start 会返回 ESP_ERR_WIFI_STATE 并被**如实上报**"
+                      "（⛔ 不回空列表）", esp_err_to_name(qrc));
+    }
+    if (!was_busy) {
+        ESP_LOGI(TAG, "[diag] 扫前 STA 本就空闲（未在线、无进行中的连接尝试）⇒ 无会话结束边可等，直接扫");
+        return;
+    }
+    if (s_eg != NULL) {
+        EventBits_t bits = xEventGroupWaitBits(s_eg, WIFI_PROV_SESSION_ENDED_BIT, pdTRUE, pdTRUE,
+                                               pdMS_TO_TICKS(WIFI_PROV_QUIET_WAIT_MS));
+        if ((bits & WIFI_PROV_SESSION_ENDED_BIT) == 0) {
+            ESP_LOGW(TAG, "[diag] 等会话结束边超时（%d ms）⇒ 未能确认 STA 空闲"
+                          "（若随后扫描失败，将如实上报，⛔ 不回空列表）", WIFI_PROV_QUIET_WAIT_MS);
+        } else {
+            ESP_LOGI(TAG, "[diag] 会话结束边已到达 ⇒ STA 空闲，允许发起扫描");
+        }
+    }
+}
+
 esp_err_t wifi_prov_prepare_scan(void)
 {
     esp_err_t rc = wifi_prov_init();
@@ -219,12 +346,20 @@ esp_err_t wifi_prov_prepare_scan(void)
     /* 先置扫描态再 start：STA_START / DISCONNECTED 两个事件都不会去 connect（见 on_wifi_event）。
      * 顺序不能反 —— esp_wifi_start() 会同步派发 STA_START。
      * 🔴 诊断版在此显式留痕：**这一步会把 Wi-Fi 拉起来**（后续 connect 路径的 esp_wifi_start()
-     *    因此是幂等的、不会再派发 STA_START）—— 这正是 FIX-D1 的成因现场。 */
+     *    因此是幂等的、不会再派发 STA_START）—— 这正是 FIX-D1 的成因现场。
+     * 🔴 2026-10-13〔本批〕`s_scan_only = true` 现在还多一个职责：它必须在**扫前断开之前**置位，
+     *    否则断开事件会用旧配置自动重连（见 `wifi_prov_quiet_sta_for_scan()` 的注释）。 */
     s_scan_only = true;
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     esp_err_t src = esp_wifi_start();       /* 已在跑则为幂等 */
     ESP_LOGI(TAG, "[diag] prepare_scan：s_scan_only=true；esp_wifi_start() rc=%d(%s)（首次 start 会派发 STA_START）",
              (int)src, esp_err_to_name(src));
+    /* ★ 2026-10-13〔本批〕**扫前把 STA 收回空闲态**（A17 锚）。
+     *   旧行为（本批修掉的）：这里**不断开** ⇒ 若 STA 正在 connecting，扫描必被
+     *   `ESP_ERR_WIFI_STATE` 拒绝（真机 14:17:03 就是这样，48 ms 返回）。
+     *   ⛔ 这里**不**把"断开返回码"升级为扫描失败：STA 是否真的空闲由 `scan_start()` 定夺，
+     *   而那条失败**一律如实上报**（见 `wifi_prov_scan_json()`）。 */
+    wifi_prov_quiet_sta_for_scan();
     return src;
 }
 
@@ -236,16 +371,52 @@ esp_err_t wifi_prov_scan_json(char *out, size_t cap)
     out[0] = '\0';
     esp_err_t rc = wifi_prov_prepare_scan();
     if (rc != ESP_OK) {
-        ESP_LOGE(TAG, "[diag] 扫描未开始：prepare_scan 失败 rc=%d(%s)", (int)rc, esp_err_to_name(rc));
+        ESP_LOGE(TAG, "[diag] 扫描未开始：prepare_scan 失败 rc=%d(%s)"
+                      "（含扫前未能把 STA 收回空闲态的情形）", (int)rc, esp_err_to_name(rc));
         return rc;
     }
     wifi_scan_config_t sc = { 0 };
-    ESP_LOGI(TAG, "[diag] 开始 AP 扫描（阻塞式，esp_wifi_scan_start wait=true）…");
-    rc = esp_wifi_scan_start(&sc, true);
-    ESP_LOGI(TAG, "[diag] esp_wifi_scan_start rc=%d(%s)", (int)rc, esp_err_to_name(rc));
-    if (rc != ESP_OK && rc != ESP_ERR_WIFI_STATE) {
+    /* ★ 2026-10-13〔本批〕**非阻塞发起 + 等 SCAN_DONE**（旧行为 = `esp_wifi_scan_start(&sc, true)`）：
+     *   只有拿到事件里的 `status` 才能区分「扫描成功、周围真的 0 个 AP」与「扫描本身失败」——
+     *   旧码把二者都组成了 `aps:[]` 回给 App（本批的伤害本体）。 */
+    s_scan_done_seen = false;
+    s_scan_done_status = -1;
+    ESP_LOGI(TAG, "[diag] 开始 AP 扫描（非阻塞发起 + 等 SCAN_DONE，超时 %d ms）…",
+             WIFI_PROV_SCAN_DONE_TIMEOUT_MS);
+    rc = esp_wifi_scan_start(&sc, false);
+    for (int attempt = 0; rc == ESP_ERR_WIFI_STATE && attempt < WIFI_PROV_SCAN_RETRY; attempt++) {
+        /* 极窄竞态窗口的**兜底**（⛔ 不是"容忍错误码"）：STA 仍在收尾 ⇒ 再收一次、再发一次；
+         * 重试耗尽后仍由下面的判据**如实返回**该错误码。 */
+        ESP_LOGW(TAG, "[diag] 扫描被拒：STA 仍在 connecting（ESP_ERR_WIFI_STATE）⇒ 再收一次 STA 后重试 %d/%d",
+                 attempt + 1, WIFI_PROV_SCAN_RETRY);
+        vTaskDelay(pdMS_TO_TICKS(100));     /* 给 Wi-Fi 任务一点时间把"中止连接"处理完 */
+        (void)wifi_prov_quiet_sta_for_scan();
+        rc = esp_wifi_scan_start(&sc, false);
+    }
+    ESP_LOGI(TAG, "[diag] esp_wifi_scan_start(block=false) rc=%d(%s)", (int)rc, esp_err_to_name(rc));
+    if (rc != ESP_OK) {   /* A17c 锚：扫描失败就是失败（⛔ 旧行为容忍 ESP_ERR_WIFI_STATE ⇒ 空列表） */
+        ESP_LOGE(TAG, "[diag] 扫描失败 rc=%d(%s) ⇒ **如实上报**（⛔ 不回 prov.scan.rsp 空列表）",
+                 (int)rc, esp_err_to_name(rc));
         return rc;
     }
+    /* 等扫描真的结束：超时同样**如实上报**（⛔ 不得当成"0 个 AP"）。 */
+    uint32_t waited = 0;
+    while (!s_scan_done_seen && waited < WIFI_PROV_SCAN_DONE_TIMEOUT_MS) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        waited += 50;
+    }
+    if (!s_scan_done_seen) {
+        ESP_LOGE(TAG, "[diag] 等 WIFI_EVENT_SCAN_DONE 超时（%u ms）⇒ **如实上报** ESP_ERR_TIMEOUT"
+                      "（⛔ 不回空列表）", (unsigned)waited);
+        return ESP_ERR_TIMEOUT;
+    }
+    if (s_scan_done_status != 0) {   /* A17d 锚：SCAN_DONE.status != 0 = 扫描失败（不是"0 个 AP"） */
+        ESP_LOGE(TAG, "[diag] SCAN_DONE.status=%d（非 0 = 扫描失败）⇒ **如实上报** ESP_FAIL"
+                      "（⛔ 不回空列表）", s_scan_done_status);
+        return ESP_FAIL;
+    }
+    /* ---- 到这里 = 扫描**成功**结束；此后 num==0 才是"周围真的没有 AP"（合法的空列表，
+     *      App 侧"空列表一律拦住"的口径一字未改，⛔ 不放宽 ApListGate） ---- */
     uint16_t num = 12;
     wifi_ap_record_t *recs = calloc(num, sizeof(wifi_ap_record_t));
     if (recs == NULL) {
@@ -554,6 +725,9 @@ void wifi_prov_release_held(const char *reason)
 
 /**
  * 清除当前凭据并回到未配网态（通道的 `prov.reset` 用）。
+ * 🔴 2026-10-13 口径订正（⛔ 旧字逐字留痕 = 「只清 RAM、不写 flash」/ 日志串「仅 RAM」）：
+ *    **只清当前 RAM 采信态 / STA 配置；flash/NVS 里的凭据保留** —— 说清"清的是什么、留的是什么"：
+ *    被清 = `s_held_valid` 采信槽 + RAM 里那份 STA 配置；保留 = flash/NVS 里的凭据（本函数一字未写）。
  * ⚠️ 本函数**不清 NVS/flash**（那会与「凭据分区是身份来源」的另一条线打架），
  *    只断开连接并清掉 RAM 里的 STA 配置 ⇒ 复位后 Kconfig/凭据文件仍会重新生效。
  * ★ 同时清空**采信槽**（ADR-0017 D4）：`prov.reset` 是操作者的显式动作，
@@ -573,5 +747,8 @@ void wifi_prov_forget(void)
     s_ip[0] = '\0';
     s_ssid[0] = '\0';
     s_source[0] = '\0';
-    ESP_LOGW(TAG, "已清除当前 Wi-Fi 凭据（仅 RAM）⇒ 回到未配网态，可经任一通道重新配网");
+    // 🔴 2026-10-13 口径订正（⛔ 旧日志串逐字留痕 = 「已清除当前 Wi-Fi 凭据（仅 RAM）⇒ 回到未配网态，可经任一通道重新配网」）：
+    //    本串把"仅 RAM"说全 = 只清当前 RAM 采信态/STA 配置；flash/NVS 里的凭据保留。
+    ESP_LOGW(TAG, "已清除当前 Wi-Fi 凭据（只清当前 RAM 采信态/STA 配置；flash/NVS 里的凭据保留）"
+                  "⇒ 回到未配网态，可经任一通道重新配网");
 }

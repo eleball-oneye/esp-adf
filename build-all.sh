@@ -33,6 +33,10 @@
 # 门禁（默认开启，可用 --no-gates 关闭）：
 #   * 契约一致性   tools/check-topics.py   —— SDK topic 字面量 ↔ backend asyncapi 通道双向比对
 #   * 符号白名单   tools/abi-check.sh      —— 定义符号全为 oneye_*；cJSON_* 零外泄
+#   * 内嵌 cJSON 别名完整性  tools/check-cjson-alias.py —— 源码回落路径下 cJSON_* 全量改名（防重复定义）
+#   * 网络线程无 flash 写    tools/check-net-thread-flash.py —— 🔴 2026-10-13：
+#       `oneye_net` / `oneye_link` / `oneye_prov` 三条线程的可达闭包内不得出现
+#       `nvs_commit`/`nvs_set_blob`/`nvs_erase_key`/`esp_partition_write`/`esp_partition_erase`/`esp_ota_`
 #   * 宿主单测     oneye_dev_tests         —— 零依赖框架（tests/）
 #
 # ESP 轨的编译口径（v0.2 起，勿改回手工枚举）：ESP 目标用 **IDF 自身的编译参数**
@@ -1032,6 +1036,22 @@ run_gates() { # $1=host out dir
     else
         warn "缺少 python3 或 tools/check-cjson-alias.py —— 跳过内嵌 cJSON 别名门禁"
     fi
+
+    # 🔴 2026-10-13（本批 · 用户裁定「落 SDK 侧"网络线程不得含 flash 写"机械判据」）：
+    # 三条网络线程（`oneye_net` / `oneye_link` / `oneye_prov`）的**可达闭包内不得出现**
+    # `nvs_commit` / `nvs_set_blob` / `nvs_erase_key` / `esp_partition_write` / `esp_partition_erase` / `esp_ota_`。
+    # 动机（同类回归是崩溃级的）：栈落 PSRAM 的任务一旦做 flash 访问，IDF 的
+    # `esp_task_stack_is_sane_cache_disabled()` 断言即复位设备（见 ALPHA-INTERNAL-RAM.md）。
+    # 判据强度 / 残余（预编译 blob、跨 TU 运行期装填的分派不可见）与自带负向对照见该脚本文件头。
+    if command -v python3 >/dev/null 2>&1 && [ -f "$SDK_DIR/tools/check-net-thread-flash.py" ]; then
+        if python3 "$SDK_DIR/tools/check-net-thread-flash.py" --sdk "$SDK_DIR" 2>&1 | sed 's/^/    /'; then
+            ok "网络线程无 flash 写门禁：通过"
+        else
+            err "网络线程无 flash 写门禁失败"; rc=1
+        fi
+    else
+        warn "缺少 python3 或 tools/check-net-thread-flash.py —— 跳过网络线程无 flash 写门禁"
+    fi
     return $rc
 }
 
@@ -1273,13 +1293,18 @@ build_firmware_esp() { # $1=idf 版本, $2=target —— Korvo-2 板级固件（
     fi
 
     if [ -f "$ex/tools/check-sdkconfig-defaults.py" ]; then
+        # ⚠️ **必须传 IDF_PATH**（= 本次构建实际用的 IDF 根，即上面的 `$idf`）：
+        #    该门禁的符号全集有**三个来源**（例程 Kconfig ＋ esp-adf/components ＋ `$IDF_PATH/components`），
+        #    缺了 IDF_PATH ⇒ 预设里那些 IDF 声明的符号（`CONFIG_BT_NIMBLE_*`、`CONFIG_ESP_COEX_*` …）
+        #    会被判成"本工程不存在"——2026-10-13 集成验收实测**多出 13 条结构性误报**。
+        #    ⛔ 这不是"放宽判据"，而是把符号全集补全（判据一字未动）；⛔ 也别据此去删预设里的行。
         if [ "$preset" = "production" ]; then
-            python3 "$ex/tools/check-sdkconfig-defaults.py" --sdkconfig "$out/sdkconfig.txt" \
+            IDF_PATH="$idf" python3 "$ex/tools/check-sdkconfig-defaults.py" --sdkconfig "$out/sdkconfig.txt" \
                 --require sdkconfig.defaults.production > "$out/preset-check.txt" 2>&1 \
                 && ok "量产预设逐项核对通过（见 preset-check.txt）" \
                 || { warn "量产预设核对**未通过**（见 firmware/$tcid/korvo2_oneye-$preset/preset-check.txt）"; }
         else
-            python3 "$ex/tools/check-sdkconfig-defaults.py" --sdkconfig "$out/sdkconfig.txt" \
+            IDF_PATH="$idf" python3 "$ex/tools/check-sdkconfig-defaults.py" --sdkconfig "$out/sdkconfig.txt" \
                 > "$out/preset-check.txt" 2>&1 || true
         fi
     fi

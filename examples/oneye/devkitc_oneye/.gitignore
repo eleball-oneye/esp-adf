@@ -10,3 +10,12 @@ build/
 build-beta/
 build-gamma/
 build-diag/
+# ★ 2026-10-13〔本批〕台面档（bench）用**独立构建目录**（见 tools/build-devkitc.sh 的第 3 个参数）
+build-beta-bench/
+build-gamma-bench/
+
+# ★ 2026-10-13〔本批〕乙档台面专用**真件**目录（由现役签发 CA 签出的独立设备身份）。
+# ⚠️ 它含**设备私钥**（client.key）⇒ 按仓库纪律「私钥不入库」，这里整目录忽略，⛔ 永不提交。
+#    它只是构建入参（`-DONEYE_FW_CERT_DIR=` 显式指向），量产档缺省取 `main/certs`（不存在）
+#    ⇒ 与量产出货档**无关**（机械证据见 README「量产档不内嵌」条）。
+certs-bench-beta/

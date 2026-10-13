@@ -51,9 +51,16 @@
  *    `oneye_start()` 永不调用、设备上不了云（2026-10-07 真机实测）。构建期门禁
  *    （main/CMakeLists.txt）保证「一个可用通道都没有」的配置**编不过**。
  *
- * 5) ⚠️ 安全口径（未消除的残余风险，如实登记）：C3 在 SD 卡上是**明文** Wi-Fi 密码。
- *    解法是让有加密通道（C1/C2）的机型以 BLE 为首选，**不是**关掉唯一通道；
- *    剩余部分按 ADR-0017 D3 归属「配网凭据落盘形态」单独决策。
+ * 5) 🔴 **2026-10-13 就地订正（用户裁定，最高依据）** —— 安全口径的**正名**：
+ *    用户逐字口径「**B1.量产支持且凭据明文**」⇒ C3（SD 卡/SPIFFS 凭据文件）是**量产品类形态**：
+ *    **量产支持该通道 ＋ 卡上凭据为明文**；明文 Wi-Fi 密码这一后果**已由用户裁定接受**
+ *    （⛔ **不再**记为"未消除的残余风险"，也⛔ **不再**写"仅台面可用"）。
+ *    ⛔ 行为/判据未改：rank 仍是 FILE 0 > BLE 1 > default 2；"有加密通道（C1/C2）的机型优先用
+ *    BLE"仍是有益的首选顺序（安全增强，不是前提）。
+ *    旧字逐字留痕（⛔ 不抹）—— 本段此前逐字为：
+ *    「5) ⚠️ 安全口径（未消除的残余风险，如实登记）：C3 在 SD 卡上是**明文** Wi-Fi 密码。
+ *      解法是让有加密通道（C1/C2）的机型以 BLE 为首选，**不是**关掉唯一通道；
+ *      剩余部分按 ADR-0017 D3 归属「配网凭据落盘形态」单独决策。」
  *
  * 凭据文件格式（密钥=值，逐行；`#` 注释；两侧空白与 CR 自动去除）：
  *   ssid=MyWiFi
@@ -98,13 +105,41 @@ const char *wifi_prov_channel_source(wifi_prov_channel_t ch);
 esp_err_t wifi_prov_init(void);
 
 /**
- * 为 **AP 扫描**准备好 Wi-Fi（幂等）：置扫描态后 `esp_wifi_start()`。
+ * 为 **AP 扫描**准备好 Wi-Fi（幂等）：置扫描态后 `esp_wifi_start()`，**并把 STA 收回空闲态**。
  * 扫描态下**不**自动 `esp_wifi_connect()`（否则拿不到凭据时会空转重连，
  * 在串口上刷屏且白耗电）。C1/C2 的 `prov.scan.req` 需要它在先。
+ *
+ * 🔴 2026-10-13〔本批 · 真机证据〕新增第二件事 —— **扫前把 STA 收回空闲态**：
+ *   旧行为（本批修掉的）只置位 + `esp_wifi_start()`，**不断开**。真机后果（2026-10-13 14:17:03）：
+ *   上一轮用**错误密码** ⇒ `DISCONNECTED reason=15` 被自动重连成循环 ⇒ 重试配网时的 `prov.scan.req`
+ *   落在 STA **仍在 connecting** 的时刻上 ⇒ `esp_wifi_scan_start()` 返回 `ESP_ERR_WIFI_STATE`
+ *   （IDF 文档逐字："WiFi still connecting when invoke esp_wifi_scan_start"）。
+ *   现在：先置抑制位 `s_scan_only`（**必须先于断开**：断开事件异步派发，否则会用旧配置自动重连），
+ *   再 `esp_wifi_disconnect()`（connecting / connected 都断，中止旧凭据的连接尝试），
+ *   然后**等会话结束边** `WIFI_PROV_SESSION_ENDED_BIT`（有界，`WIFI_PROV_QUIET_WAIT_MS`）。
+ *
+ * 返回：`ESP_OK` = 已置扫描态、Wi-Fi 已起、**并且已经把 STA 收回空闲态**（断开 + 等会话结束边）；
+ * 非 `ESP_OK` = 初始化 / `esp_wifi_start()` 失败（调用方**如实**上报，⛔ 不假装"0 个 AP"）。
+ *   ⚠️ 断开自身的返回码**不**升级为失败（`esp_wifi_disconnect()` 空闲态调用是 OK；万一报错，
+ *     只留痕并继续）—— STA 到底空不空闲由 `wifi_prov_scan_json()` 里的 `scan_start()` 定夺。
  */
 esp_err_t wifi_prov_prepare_scan(void);
 
-/** 扫描周边 AP → JSON 数组（`[{"ssid":…,"rssi":…,"auth":…}]`，只含 SSID/RSSI/加密类型） */
+/**
+ * 扫描周边 AP → JSON 数组（`[{"ssid":…,"rssi":…,"auth":…}]`，只含 SSID/RSSI/加密类型）。
+ *
+ * 🔴 2026-10-13〔本批 · 真机证据〕**失败不得被抹成"0 个 AP"**：
+ *   旧行为把 `esp_wifi_scan_start()` 的 `ESP_ERR_WIFI_STATE` 当成"可以继续" ⇒ 继续
+ *   `esp_wifi_scan_get_ap_records()`（本次根本没有扫描结果，条数 0）⇒ 组出 `[]` 并以 `ESP_OK`
+ *   返回，link 层遂回 `prov.scan.rsp{aps:[]}`（真机 payload = 10 B）⇒ App 判
+ *   「未获取到设备可用网络列表」（`ApListGate` 对空列表一律拦住，该口径**一字未改**）。
+ *   现在：扫描改为**非阻塞发起 + 等 `WIFI_EVENT_SCAN_DONE`**，三种失败都**如实返回错误码**：
+ *     · `esp_wifi_scan_start()` 返回非 `ESP_OK`（含 `ESP_ERR_WIFI_STATE` / `ESP_ERR_WIFI_TIMEOUT`）；
+ *     · 等 `WIFI_EVENT_SCAN_DONE` 超时（> `WIFI_PROV_SCAN_DONE_TIMEOUT_MS`）⇒ `ESP_ERR_TIMEOUT`；
+ *     · `SCAN_DONE.status != 0`（扫描本身失败）⇒ `ESP_FAIL`。
+ *   ⇒ link 层既有映射把它变成 `error{code:"internal", msg:"prov scan failed"}`（⛔ 不新增错误码、
+ *     ⛔ 不新增帧/字段）。**只有**「扫描成功且周围真的 0 个 AP」才会返回 `[]` + `ESP_OK`。
+ */
 esp_err_t wifi_prov_scan_json(char *out, size_t cap);
 
 /* ------------------------------------------------------------------ 凭据来源与入网（唯一入口） */
@@ -160,7 +195,9 @@ void wifi_prov_release_held(const char *reason);
  *  ⚠️ 只改标签，**不**改采信槽 —— 采信槽只由 `submit` / `release_held` / `forget` 改。 */
 esp_err_t wifi_prov_set_source(const char *src);
 
-/** 清除当前凭据并回到未配网态（供通道的 `prov.reset` 用；**只清 RAM、不写 flash**）。
+/** 清除当前凭据并回到未配网态（供通道的 `prov.reset` 用；**只清当前 RAM 采信态/STA 配置；flash/NVS 里的凭据保留**）。
+ *  🔴 2026-10-13 口径订正（⛔ 旧字逐字留痕 = 「只清 RAM、不写 flash」）：说的就是上面这句 —— 清的只有 RAM
+ *  里的采信槽与 STA 配置，flash/NVS 里的凭据**一字未写**。
  *  同时清空采信槽 ⇒ 恢复"任一通道都可被重新采信"的状态。 */
 void wifi_prov_forget(void);
 

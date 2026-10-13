@@ -80,6 +80,48 @@ check-prov-convergence.py —— 结构性门禁：证明 korvo2_oneye 的「入
          A16d 会话结束回调注册点唯一，且在 `app_main()` 内（与 ready 回调同一处生命周期注册点）
          ⛔ 本组**不放宽判据**：① ip 非空 / ② 只报一次 仍由 A14e/A14f 断言；复位的是**状态**。
          ⛔ 不新增帧 / 不新增状态 / 不新增错误码：`prov.status{connected}` 的 payload 与取值沿用。
+  A17    🔴 2026-10-13（本批 · 真机证据）：**AP 扫描（`prov.scan.req`）的两条硬口径** ——
+         真机（14:17:03）：上一轮错误密码 ⇒ `reason=15` 自动重连循环仍在 connecting ⇒ `prov.scan.req`
+         的 `esp_wifi_scan_start()` 返回 `ESP_ERR_WIFI_STATE`，而旧码把它**当成可继续** ⇒
+         `esp_wifi_scan_get_ap_records()` 拿到 0 条（本次根本没扫）⇒ 组出 `aps:[]`（payload 10 B）+
+         `ESP_OK` 回给 link 层 ⇒ App 判「未获取到设备可用网络列表」（`ApListGate` 口径**一字未改**）。
+         A17a 扫描前**主动收回 STA**：`wifi_prov.c` 的扫前段（`wifi_prov_quiet_sta_for_scan()`）里
+              **有且仅有 1 处** `esp_wifi_disconnect()`（connecting / connected 都断 —— 用"是否已连上"
+              决定断不断会漏掉本批现场），且 `wifi_prov_prepare_scan()` 里 `s_scan_only = true`
+              **先于**该断开（断开事件异步派发；置位晚于断开 ⇒ 断开分支用旧配置自动重连）
+         A17b 断开后**等会话结束边**：`WIFI_PROV_SESSION_ENDED_BIT` 由 `WIFI_EVENT_STA_DISCONNECTED`
+              分支置位，且扫前段用 `xEventGroupWaitBits(...)` 等它（有界）—— 不等就可能"断开了但还没落地"
+         A17c ⛔ **失败不得被抹成"0 个 AP"**：`wifi_prov_scan_json()` 内**不得**出现任何
+              `!= ESP_ERR_WIFI_STATE` 形式的"容忍"比较（旧形态 `rc != ESP_OK && rc != ESP_ERR_WIFI_STATE`
+              = 本批缺陷本体）；`esp_wifi_scan_start(` 之后必须有 `if (rc != ESP_OK)` ⇒ `return rc;`
+              （该失败由 link 层既有映射变成 `error{code:"internal"}`，⛔ 不新增错误码）
+         A17d `WIFI_EVENT_SCAN_DONE` 的 `status` 必须被检查：`on_wifi_event()` 有 SCAN_DONE 分支
+              （写 `s_scan_done_status`），且 `wifi_prov_scan_json()` 里有 `s_scan_done_status != 0` ⇒ `return`
+              （→ `ESP_FAIL`）；等 SCAN_DONE 超时同样 `return`（→ `ESP_ERR_TIMEOUT`）
+         A17e 顺序（"空列表只能来自**扫描成功**"）：`esp_wifi_scan_start(` < `s_scan_done_status != 0` 判据
+              < 最后的 `if (rc != ESP_OK)` 判据 < `esp_wifi_scan_get_ap_records(` < 组帧 `"["`
+         ⛔ 本组**不改协议面**：不新增帧 / 字段 / 错误码；⛔ **不放宽 `ApListGate`**（"扫描为空一律拦住"
+              是用户裁定，保留）；⛔ 不改 `SCAN_DONE` 之外的事件语义。
+  A18    🔴 2026-10-13（本批 · 用户逐字裁定「**SD卡配网失败回落BLE 配网模式**」）：文件通道
+         （C3，rank 0，启动期自动读）**命中但本次入网失败** ⇒ **自动**进入 BLE 配网模式。
+         旧行为：只 `wifi_prov_release_held("file-connect-failed")` 降级 ⇒ 落到 BLE 段仍按 KEY_GATE
+         **待机** ⇒ 必须**再按一次 SET（或复位）**才进 BLE 配网模式（`ALPHA-SDCARD.md` §3.4 登记）。
+         A18a 回落起点：`wifi_prov_boot()` 内 `release_held("file-connect-failed")` **之后**的
+              `file_fell_back = true;` **恰好 1 处**（顺序有语义：先释放采信槽，再据「本次已用掉
+              文件通道」回落）
+         A18b 回落终点 = **与「长按 SET」同一条路径**：`wifi_prov_ble_pairing_enter()` 在
+              `wifi_prov_boot()` 内**恰好 1 处**、且在 `wifi_prov_ble_start()` **之后**；
+              整份 main/ 下该调用点**恰好 2 处**、所在函数恰为
+              {长按 SET 入口 `ble_prov_key_toggle`, `wifi_prov_boot`} ⇒ ⛔ 无第三条进入路径
+         A18c **只回落一次**：标志是 `wifi_prov_boot()` 的**局部量**、`wifi_prov_boot()` 在 main/ 下
+              **恰好 1 个调用点**、`wifi_prov_load_file()` **恰好 1 处** ⇒ ⛔ 不反复重启广播、
+              ⛔ 不循环重连文件通道
+         A18d **`KEY_GATE` 原有语义逐字保留**：`wifi_prov_ble_set_autostart(!key_gate)` 与
+              `#ifdef CONFIG_ONEYE_FW_BLE_PROV_KEY_GATE` 仍在，且回落**受 `if (file_fell_back)` 门控**
+              ⇒ 开机且**无文件**时仍待机、长按进入（⛔ 不是「开机即广播」）
+         ⛔ 本组**不放宽任何既有判据**、⛔ 不新增通道 / 帧 / 字段 / 错误码：`wifi_prov_policy.h` 的 rank
+              与 `wifi_prov_channel_is_authoritative()` **逐字未改**；`oneye_start()` 仍只有收敛点下游
+              一个调用点（A1）。
 
 退出码：0 = 全部断言通过；1 = 有断言失败（逐条打出）。
 **自带负向对照**：把 `main/` 与夹具复制到临时目录后逐条注入已知缺陷，同一套检查**必须逐条报红**
@@ -89,6 +131,8 @@ A10b 的判据抄件、**A11 的"通道模块里再调一次 sntp_boot_sync()/ne
 **A14 的「丢掉 ip 非空判据 / 丢掉幂等判据 / 发送失败也置位 / 第二个上报点 / 改报别的状态」**。
 **A15 的「把 REJECT_ALREADY_UP 放回 / 删掉断旧前置段 / 抹掉抑制位」。**
 **A16 的「断开边不复位（旧行为）/ 复位跃迁改成恒等 / 把复位挪进上报函数（每次都报）」。**
+**A17 的「把扫前不断开造回去 / 恢复旧行为（容忍 ESP_ERR_WIFI_STATE 继续组空列表）/ 不查 SCAN_DONE.status」。**
+**A18 的「删掉 D2 自动回落 / 不置回落标志 / 把回落门控改成无条件（= 开机即广播）/ 让 wifi_prov_boot() 被调第二遍」。**
 任一条注入没有被对应断言抓住 ⇒ 本脚本自己的判据是空转的 ⇒ exit 1。
 """
 
@@ -159,7 +203,42 @@ REPROVISION_FLAG = "s_reprovision"
 STATUS_RESET_FN = "wifi_prov_connected_reported_after_disconnect"
 DISC_CB_CALL = "s_disconnected_cb();"
 DISC_CB_REG = re.compile(r"wifi_prov_set_disconnected_cb\s*\(\s*prov_status_reset_after_disconnect\s*\)")
+# A17（🔴 2026-10-13 本批 · 真机证据）：AP 扫描「扫前收 STA」与「失败不得抹成 0 个 AP」
+#   真机：14:17:03 `prov.scan.req` 落在 `reason=15` 自动重连循环（STA 仍 connecting）时 ⇒
+#   `esp_wifi_scan_start()` 返回 `ESP_ERR_WIFI_STATE`，旧码容忍它 ⇒ 空列表 + rc=0 ⇒ App 判"未获取到列表"。
+SCAN_QUIET_FN = "wifi_prov_quiet_sta_for_scan"          # 扫前收 STA 的唯一落点
+# ⚠️ 计数用**带分号的语句形态**：日志串里会写到 `esp_wifi_disconnect()` 这个 API 名
+#    （`strip_comments_keep_newlines()` 保留字符串字面量）⇒ 不带分号会把日志串也数进去。
+DISCONNECT_CALL_STMT = "esp_wifi_disconnect();"
+PREPARE_SCAN_SIG = r"esp_err_t\s+wifi_prov_prepare_scan\s*\("
+SCAN_JSON_SIG = r"esp_err_t\s+wifi_prov_scan_json\s*\("
+SCAN_JSON_SIG_STR = "wifi_prov_scan_json("                # 纯文本形态（注入里定位函数用）
+QUIET_HELPER_SIG = r"static\s+void\s+" + SCAN_QUIET_FN + r"\s*\("
+SESSION_ENDED_BIT = "WIFI_PROV_SESSION_ENDED_BIT"
+SCAN_ONLY_SET = "s_scan_only = true"
+SCAN_START_CALL = "esp_wifi_scan_start("
+SCAN_GET_RECORDS_CALL = "esp_wifi_scan_get_ap_records("
+WAIT_BITS_CALL = "xEventGroupWaitBits("
+SCAN_DONE_EVENT = "WIFI_EVENT_SCAN_DONE"
+SCAN_DONE_STATUS_VAR = "s_scan_done_status"
+SCAN_DONE_TIMEOUT_VAR = "WIFI_PROV_SCAN_DONE_TIMEOUT_MS"
 SUBMIT_SIG = r"esp_err_t\s+wifi_prov_submit_credentials_src\s*\("
+# A18（🔴 2026-10-13 本批 · 用户裁定「SD卡配网失败回落BLE 配网模式」）：**文件通道失败 ⇒ 自动回落**
+#   现场：文件通道 rank 0 启动期自动读；「卡上有凭据但本次入网失败」旧行为只释放采信槽 ⇒ 落到 BLE 段
+#   仍按 KEY_GATE 待机 ⇒ 用户必须**再按一次 SET（或复位）**才进 BLE 配网模式（ALPHA-SDCARD.md §3.4）。
+#   形状（本批）：wifi_prov_boot() 的 C3 失败分支置**局部**一次性标志 file_fell_back ⇒ BLE 段
+#     `if (file_fell_back) { wifi_prov_ble_pairing_enter(); }`（= 与「长按 SET」同一条路径）。
+FALLBACK_FLAG_SET = "file_fell_back = true;"
+FALLBACK_FLAG_DECL = "bool file_fell_back = false;"
+FALLBACK_GUARD = "if (file_fell_back) {"
+PAIRING_ENTER_CALL = "wifi_prov_ble_pairing_enter()"
+PAIRING_ENTER_RE = re.compile(r"wifi_prov_ble_pairing_enter\s*\(")
+BLE_START_CALL_STR = "wifi_prov_ble_start()"
+FALLBACK_BOOT_CALL = re.compile(r"wifi_prov_boot\s*\(\s*\)\s*;")
+RELEASE_HELD_FILE = 'wifi_prov_release_held("file-connect-failed")'
+AUTOSTART_CALL = "wifi_prov_ble_set_autostart(!key_gate)"
+KEY_GATE_IFDEF = "#ifdef CONFIG_ONEYE_FW_BLE_PROV_KEY_GATE"
+BOOT_SIG = r"static\s+void\s+wifi_prov_boot\s*\("
 DECISION_ENUM = [
     "WIFI_PROV_DECISION_ACCEPT_FIRST",
     "WIFI_PROV_DECISION_ACCEPT_SAME",
@@ -818,6 +897,203 @@ def run_checks(sources, headers, test_lines):
              "A16d 会话结束回调的注册点不在 app_main() 内（实测在 {}）".format(reg[0][2]),
              "回调注册与 ready 回调同在应用生命周期的唯一注册点")
 
+    # ------------------------------------------- A17 AP 扫描：扫前收 STA ＋ 失败不得抹成"0 个 AP"（🔴 2026-10-13 本批）
+    # 真机证据（⛔ 不重复采集）：2026-10-13 14:16 第一轮用错误密码 ⇒ `DISCONNECTED reason=15` 被
+    #   断开分支自动重连成循环；14:17:03 用户重试配对发 `prov.scan.req` 时 STA **仍在 connecting**
+    #   ⇒ `esp_wifi_scan_start()` 返回 `ESP_ERR_WIFI_STATE`（IDF 文档逐字：
+    #   "ESP_ERR_WIFI_STATE: WiFi still connecting when invoke esp_wifi_scan_start"）；
+    #   旧码 `if (rc != ESP_OK && rc != ESP_ERR_WIFI_STATE) return rc;` **容忍**该码 ⇒ 继续
+    #   `esp_wifi_scan_get_ap_records()`（本次没有扫描结果，条数 0）⇒ 组出 `aps:[]`（payload 10 B）
+    #   并以 rc=0 回给 link 层 ⇒ App 判「未获取到设备可用网络列表」。
+    # 形状（修法，两处）：
+    #   ① `wifi_prov.c:wifi_prov_quiet_sta_for_scan()`（扫前收 STA）：先由 prepare_scan 置
+    #      `s_scan_only = true`（抑制旧配置自动重连）→ `esp_wifi_disconnect()` → 等
+    #      `WIFI_PROV_SESSION_ENDED_BIT`（由 DISCONNECTED 分支置位）；
+    #   ② `wifi_prov_scan_json()` 非阻塞发起 + 等 SCAN_DONE：`esp_wifi_scan_start` 失败 /
+    #      `SCAN_DONE.status != 0` / 等 SCAN_DONE 超时 ⇒ **如实 return**（link 层 = `error{internal}`）。
+    # ⛔ 不放宽 `ApListGate`（"扫描为空一律拦住"是用户裁定）；⛔ 不新增帧 / 字段 / 错误码。
+    quiet_body = func_body(prov_c_code, QUIET_HELPER_SIG) or ""
+    if not quiet_body:
+        fails.append("A17a 找不到 {}() 的函数体（扫前 STA 状态不可判定）".format(SCAN_QUIET_FN))
+    else:
+        n_disc = quiet_body.count(DISCONNECT_CALL_STMT)
+        need(n_disc == 1, "A17a {}() 内 `esp_wifi_disconnect();` 次数".format(SCAN_QUIET_FN),
+             "期望恰好 1 处（扫前主动收回 STA：connecting / connected 都断），实测 {} 处".format(n_disc))
+        need(SCAN_ONLY_SET not in quiet_body,
+             "A17a {}() 内自己置 `{}`".format(SCAN_QUIET_FN, SCAN_ONLY_SET),
+             "抑制位必须由 prepare_scan 在**调用本函数之前**置位（顺序断言见下）")
+
+    prep_body = func_body(prov_c_code, PREPARE_SCAN_SIG) or ""
+    scan_body = func_body(prov_c_code, SCAN_JSON_SIG) or ""
+    if not prep_body:
+        fails.append("A17a 找不到 wifi_prov_prepare_scan() 的函数体")
+    else:
+        i_flag = prep_body.find(SCAN_ONLY_SET)
+        i_quiet = prep_body.find(SCAN_QUIET_FN + "(")
+        need(i_flag >= 0, "A17a wifi_prov_prepare_scan() 内没有 `{}`".format(SCAN_ONLY_SET),
+             "扫描态抑制位是本模块「扫描态不自动重连」的唯一开关")
+        need(i_quiet >= 0, "A17a wifi_prov_prepare_scan() 未调用 {}()".format(SCAN_QUIET_FN),
+             "扫前必须把 STA 收回空闲态（真机 14:17:03 就是缺这一步）")
+        if i_flag >= 0 and i_quiet >= 0 and not (i_flag < i_quiet):
+            fails.append("A17a 顺序错：`{}` 必须在 {}() **之前**（断开事件异步派发；置位晚于断开 ⇒ "
+                         "断开分支会用旧配置自动重连，扫描照旧被挡）".format(SCAN_ONLY_SET, SCAN_QUIET_FN))
+
+    # A17b 断开后必须等"会话结束边"：置位在 DISCONNECTED 分支，等待在扫前段（有界）
+    if quiet_body:
+        need(SESSION_ENDED_BIT in quiet_body,
+             "A17b {}() 没有等 {}".format(SCAN_QUIET_FN, SESSION_ENDED_BIT),
+             "断开是异步的：不等会话结束边就可能「断开了但还没落地」⇒ scan 仍被 ESP_ERR_WIFI_STATE 挡")
+    need(WAIT_BITS_CALL in quiet_body and SESSION_ENDED_BIT in quiet_body,
+         "A17b {}() 未用 xEventGroupWaitBits 等会话结束边".format(SCAN_QUIET_FN),
+         "等待必须有界（超时后不确认空闲，交由扫描如实报错）")
+    ev_disc_body = ""
+    i_disc_ev = prov_c_code.find("WIFI_EVENT_STA_DISCONNECTED")
+    if i_disc_ev >= 0:
+        ev_disc_body = prov_c_code[i_disc_ev:i_disc_ev + 1800]
+    need(SESSION_ENDED_BIT in ev_disc_body,
+         "A17b {} 分支未置位 {}".format("WIFI_EVENT_STA_DISCONNECTED", SESSION_ENDED_BIT),
+         "会话结束边的唯一置位点必须在该分支内，且在 `s_scan_only || s_reprovision` 提前 return 之前")
+
+    # A17c ⛔ 失败不得被抹成"0 个 AP"：不许容忍 ESP_ERR_WIFI_STATE，且失败必须 return
+    if not scan_body:
+        fails.append("A17c 找不到 wifi_prov_scan_json() 的函数体（失败是否如实上报不可判定）")
+    else:
+        need("!= ESP_ERR_WIFI_STATE" not in scan_body,
+             "A17c wifi_prov_scan_json() 里仍有 `!= ESP_ERR_WIFI_STATE` 形式的容忍比较",
+             "旧形态 `rc != ESP_OK && rc != ESP_ERR_WIFI_STATE` = 把「扫描没做成」当成「可以继续」⇒ 空列表")
+        i_start = scan_body.find(SCAN_START_CALL)
+        # ⚠️ 从扫描调用点**往后**找第一处失败判据：scan_json 开头还有一个
+        #    `if (rc != ESP_OK)`（prepare_scan 的失败判据），按首个匹配会张冠李戴。
+        i_guard = scan_body.find("if (rc != ESP_OK) {", i_start if i_start >= 0 else 0)
+        i_get = scan_body.find(SCAN_GET_RECORDS_CALL)
+        if i_start < 0:
+            fails.append("A17c wifi_prov_scan_json() 内找不到 esp_wifi_scan_start(")
+        if i_guard < 0:
+            fails.append("A17c wifi_prov_scan_json() 内扫描调用之后找不到 `if (rc != ESP_OK) {`"
+                         "（失败未被拦下）")
+        elif i_start >= 0 and not (i_start < i_guard):
+            fails.append("A17c 顺序错：扫描失败判据必须在 esp_wifi_scan_start( **之后**")
+        if i_guard >= 0 and i_get >= 0 and not (i_guard < i_get):
+            fails.append("A17c 顺序错：取 AP 记录（esp_wifi_scan_get_ap_records）跑在失败判据**之前**"
+                         "（= 扫描失败也会组空列表）")
+        if i_guard >= 0:
+            need("return" in scan_body[i_guard:i_guard + 400],
+                 "A17c 扫描失败判据之后没有 return（失败被继续执行抹掉）",
+                 "失败必须如实返回错误码 ⇒ link 层既有映射 = error{code:\"internal\"}（⛔ 不新增码）")
+        # A17d SCAN_DONE.status 必须被检查（含等 SCAN_DONE 超时）
+        need(SCAN_DONE_STATUS_VAR in scan_body, "A17d {} 未被检查".format(SCAN_DONE_STATUS_VAR),
+             "只有 SCAN_DONE.status 能区分「扫描成功但 0 个 AP」与「扫描本身失败」")
+        need(SCAN_DONE_TIMEOUT_VAR in scan_body, "A17d 等 SCAN_DONE 未设超时".format(),
+             "等 SCAN_DONE 必须有界（超时 ⇒ 如实回错，⛔ 不回空列表）")
+        i_status = scan_body.find(SCAN_DONE_STATUS_VAR + " != 0")
+        if i_status < 0:
+            fails.append("A17d wifi_prov_scan_json() 内没有 `{} != 0` 判据".format(SCAN_DONE_STATUS_VAR))
+        else:
+            need("return" in scan_body[i_status:i_status + 400],
+                 "A17d `{} != 0` 之后没有 return（扫描失败被当成 0 个 AP）".format(SCAN_DONE_STATUS_VAR),
+                 "SCAN_DONE.status != 0 = 扫描失败 ⇒ 必须如实回错")
+            # A17e 顺序：只有扫描**成功**之后的 num==0 才允许组空列表
+            i_frame = scan_body.find('snprintf(out + off, cap - off, "[")')
+            if i_get < 0:
+                fails.append("A17e wifi_prov_scan_json() 内找不到 esp_wifi_scan_get_ap_records(")
+            elif not (i_status < i_get):
+                fails.append("A17e 顺序错：取 AP 记录跑在 `{} != 0` 判据之前".format(SCAN_DONE_STATUS_VAR))
+            if i_frame < 0:
+                fails.append("A17e wifi_prov_scan_json() 内找不到组帧起点（空列表来源不可判定）")
+            elif i_get >= 0 and not (i_get < i_frame):
+                fails.append("A17e 顺序错：组帧跑在取 AP 记录之前（空列表来源不可判定）")
+    # A17d（续）SCAN_DONE 分支必须在 on_wifi_event 内、且写的是 status（不是只置"到达"位）
+    ev_full = func_body(prov_c_code, r"static\s+void\s+on_wifi_event\s*\(") or ""
+    need(SCAN_DONE_EVENT in ev_full,
+         "A17d {} 分支不在 on_wifi_event() 内（扫描结果到达边缺失）".format(SCAN_DONE_EVENT),
+         "阻塞式 scan_start 拿不到 status ⇒ 必须在本模块的事件处理器里收 SCAN_DONE")
+    i_scan_done_ev = ev_full.find(SCAN_DONE_EVENT)
+    if i_scan_done_ev >= 0:
+        seg = ev_full[i_scan_done_ev:i_scan_done_ev + 900]
+        need(SCAN_DONE_STATUS_VAR in seg and "status" in seg,
+             "A17d {} 分支没有取 status 写进 {}".format(SCAN_DONE_EVENT, SCAN_DONE_STATUS_VAR),
+             "该分支必须把 status 记下来供 scan_json 判定")
+        need("s_scan_done_seen = true" in seg,
+             "A17d {} 分支没有置「到达」位（s_scan_done_seen）".format(SCAN_DONE_EVENT),
+             "等待方要有一个可判定的到达边（否则只能靠超时）")
+
+    # ------------------------------------------- A18 D2 文件通道失败 ⇒ 自动回落 BLE 配网模式（🔴 2026-10-13 本批）
+    # 现场（⛔ 不重复发现，只在此处锚定判据）：文件通道 rank 0、启动期自动读；「卡上有凭据但本次入网
+    #   失败」旧行为只 `wifi_prov_release_held("file-connect-failed")` 降级 ⇒ 落到 BLE 段仍按 KEY_GATE
+    #   **待机** ⇒ 必须**再按一次 SET（或复位）**才进 BLE 配网模式（`ALPHA-SDCARD.md` §3.4 已登记）。
+    # 本批（用户逐字裁定「SD卡配网失败回落BLE 配网模式」）：这条回落**自动**发生，并且
+    #   ① 只发生一次（局部标志 + `wifi_prov_boot()` 唯一调用点 + 文件通道只读一次）；
+    #   ② 回落走的是**与「长按 SET」同一条**路径（`wifi_prov_ble_pairing_enter()`）⇒ 300 s 窗口语义一致；
+    #   ③ `KEY_GATE` 的原有语义**逐字保留**（开机且无文件 ⇒ 仍待机、长按进入；⛔ 不是"开机即广播"）；
+    #   ④ 唯一判据/收敛点不变：⛔ 不新增通道、⛔ 不新增 `oneye_start()` 调用点（A1 仍断言唯一）。
+    main_code = strip_comments_keep_newlines("\n".join(main_lines))
+    boot_body = func_body(main_code, BOOT_SIG) or ""
+    if not boot_body:
+        fails.append("A18a 找不到 wifi_prov_boot() 的函数体（D2 回落不可判定）")
+    else:
+        # A18a 文件通道失败分支：release_held("file-connect-failed") **之后**置一次性回落标志，且恰好 1 处
+        n_set = boot_body.count(FALLBACK_FLAG_SET)
+        i_rel = boot_body.find(RELEASE_HELD_FILE)
+        i_set = boot_body.find(FALLBACK_FLAG_SET)
+        need(n_set == 1, "A18a wifi_prov_boot() 内 `{}` 的次数".format(FALLBACK_FLAG_SET),
+             "期望恰好 1 处（文件通道命中但本次入网失败 ⇒ 置回落标志），实测 {} 处".format(n_set))
+        if i_rel < 0:
+            fails.append("A18a wifi_prov_boot() 内找不到 `{}`（D2 回落的起点缺失）".format(RELEASE_HELD_FILE))
+        elif i_set >= 0 and not (i_rel < i_set):
+            fails.append("A18a 顺序错：回落标志必须在 `{}` **之后**置位"
+                         "（先释放采信槽，再据「本次已用掉文件通道」回落）".format(RELEASE_HELD_FILE))
+        # A18c（判据的一半，另一半是调用点唯一）：标志必须是**本函数局部量**（跨调用残留 ⇒ 会反复广播）
+        need(FALLBACK_FLAG_DECL in boot_body,
+             "A18c 回落标志不是 wifi_prov_boot() 的局部量（缺 `{}`）".format(FALLBACK_FLAG_DECL),
+             "局部量 + 本函数唯一调用点 ⇒ 每次上电最多回落一次（⛔ 不反复重启广播）")
+
+        # A18b 该标志必须真的驱动「进入配网模式」：boot 内 `wifi_prov_ble_pairing_enter()` 恰好 1 处，
+        #      且必须在 `wifi_prov_ble_start()` **之后**（通道未起栈就 enter 会白跑一次）
+        n_enter = boot_body.count(PAIRING_ENTER_CALL)
+        i_start = boot_body.find(BLE_START_CALL_STR)
+        i_enter = boot_body.find(PAIRING_ENTER_CALL)
+        need(n_enter == 1, "A18b wifi_prov_boot() 内 `{}` 的调用点".format(PAIRING_ENTER_CALL),
+             "期望恰好 1 处（自动回落到「长按 SET」的同一条路径），实测 {} 处".format(n_enter))
+        if i_start < 0:
+            fails.append("A18b wifi_prov_boot() 内找不到 `{}`（BLE 通道启动点缺失）".format(BLE_START_CALL_STR))
+        elif i_enter >= 0 and not (i_start < i_enter):
+            fails.append("A18b 顺序错：`{}` 必须在 `{}` **之后**（先起栈，再进配网模式）"
+                         .format(PAIRING_ENTER_CALL, BLE_START_CALL_STR))
+
+        # A18d `KEY_GATE` 原有语义逐字保留 + 回落**受门控**
+        need(AUTOSTART_CALL in boot_body,
+             "A18d wifi_prov_boot() 内缺 `{}`（KEY_GATE 的机型开关被改动）".format(AUTOSTART_CALL),
+             "开机是否自动广播仍必须由 KEY_GATE 决定；回落只是**多一个**进入配网模式的触发条件")
+        need(KEY_GATE_IFDEF in boot_body,
+             "A18d wifi_prov_boot() 内缺 `{}`（KEY_GATE 的保守解析被改动）".format(KEY_GATE_IFDEF),
+             "宏缺失 ⇒ gate=false 的既有语义（见该段注释）")
+        if FALLBACK_GUARD not in boot_body:
+            fails.append("A18d 缺门控 `{}` ⇒ 会变成**无条件**进入配网模式"
+                         "（=「开机即广播」，KEY_GATE 的「开机且无文件时待机」语义被改）".format(FALLBACK_GUARD))
+        elif i_enter >= 0 and not (boot_body.find(FALLBACK_GUARD) < i_enter):
+            fails.append("A18d 顺序错：`{}` 不在 `{}` 门控之内".format(PAIRING_ENTER_CALL, FALLBACK_GUARD))
+
+    # A18b/A18d（续）「回落只发生一次」与「只有两条进入配网模式的路径」——在**整份 main/** 上判：
+    #   ① `wifi_prov_boot()` 恰好 1 个调用点（多于 1 处 ⇒ 通道分派/回落会被跑第二遍）；
+    #   ② `wifi_prov_load_file()` 恰好 1 处（⛔ 不许循环重连文件通道）；
+    #   ③ `wifi_prov_ble_pairing_enter()` 在 main/ 下**恰好 2 处**、且所在函数恰为
+    #      {长按 SET 的既有入口 ble_prov_key_toggle, wifi_prov_boot} ⇒ 回落复用既有路径，⛔ 无第三条。
+    expect(find_calls({"korvo2_oneye_main.c": main_lines}, FALLBACK_BOOT_CALL), 1,
+           "A18c wifi_prov_boot() 的调用点",
+           "多于 1 处 = 通道分派（含 D2 回落）会被跑第二遍 ⇒ 反复重启广播")
+    expect(find_calls({"korvo2_oneye_main.c": main_lines}, LOAD_FILE_CALL), 1,
+           "A18c wifi_prov_load_file() 的调用点",
+           "多于 1 处 = 文件通道被循环重连（⛔ 只允许启动期读一次）")
+    enter_hits = find_calls({"korvo2_oneye_main.c": main_lines}, PAIRING_ENTER_RE)
+    need(len(enter_hits) == 2,
+         "A18b `{}` 在 main/ 下的调用点总数".format(PAIRING_ENTER_CALL),
+         "期望恰好 2 处：① 长按 SET 的既有入口 ② wifi_prov_boot() 的 D2 自动回落；实测 {} 处"
+         .format(len(enter_hits)))
+    enter_funcs = sorted(set(f for _fn, _ln, f in enter_hits))
+    if len(enter_hits) == 2 and enter_funcs != ["ble_prov_key_toggle", "wifi_prov_boot"]:
+        fails.append("A18b `{}` 的 2 个调用点所在函数是 {}（期望 = 长按 SET 入口 + wifi_prov_boot）"
+                     .format(PAIRING_ENTER_CALL, enter_funcs))
+
     return (not fails), fails
 
 
@@ -870,6 +1146,49 @@ def _replace_in(lines, old, new, expect_count=None):
 
 def _append(lines, payload):
     return list(lines) + payload.splitlines()
+
+
+def _move_scan_only_after_quiet(lines):
+    """注入：把 `s_scan_only = true;` 从 prepare_scan 里挪到**扫前断开之后**（= 抑制位晚于断开）。
+    旧口径（本批要防的时序）：断开事件是异步派发的 ⇒ 断开分支会用**旧配置**自动重连
+    （`reason=15` 循环继续）⇒ STA 一直 connecting ⇒ 扫描仍被 `ESP_ERR_WIFI_STATE` 挡住。
+    调用点总数仍为 1，只有**顺序**变坏 ⇒ 只有 A17a 的顺序断言能抓住它（证明顺序判据不是空转）。"""
+    idx = [i for i, l in enumerate(lines) if l.strip() == "s_scan_only = true;"]
+    if len(idx) != 1:
+        raise RuntimeError("注入失败：期望命中 1 处 's_scan_only = true;'，实测 {} 处".format(len(idx)))
+    quiet = [i for i, l in enumerate(lines) if SCAN_QUIET_FN + "()" in l and i > idx[0]]
+    if not quiet:
+        raise RuntimeError("注入失败：{}() 的调用点不在 s_scan_only 之后（锚点缺失）".format(SCAN_QUIET_FN))
+    moved = lines[idx[0]]
+    out = [l for i, l in enumerate(lines) if i != idx[0]]
+    anchor = [i for i, l in enumerate(out) if SCAN_QUIET_FN + "()" in l and i > idx[0] - 1]
+    if not anchor:
+        raise RuntimeError("注入失败：挪位后找不到锚点")
+    out.insert(anchor[0] + 1, moved)
+    return out
+
+
+def _tolerate_scan_start_failure(lines):
+    """注入（负向对照）：把 `wifi_prov_scan_json()` 里**扫描调用之后的第一处**失败判据改回旧形态
+    `if (rc != ESP_OK && rc != ESP_ERR_WIFI_STATE)`（= 容忍"仍在 connecting"，继续组空列表）。
+    只改这一处（不回改 prepare_scan 的那一处）⇒ 只有 A17c 会因此报红，证明该判据不是空转。"""
+    fn = [i for i, l in enumerate(lines) if l.strip().startswith("esp_err_t wifi_prov_scan_json(")]
+    if not fn:
+        raise RuntimeError("注入失败：文件里找不到 wifi_prov_scan_json() 的定义")
+    starts = [i for i, l in enumerate(lines) if SCAN_START_CALL in l and i > fn[0]]
+    if not starts:
+        raise RuntimeError("注入失败：wifi_prov_scan_json() 里找不到 '{}'".format(SCAN_START_CALL))
+    target = None
+    for i in range(starts[0], len(lines)):
+        if lines[i].strip().startswith("if (rc != ESP_OK) {"):
+            target = i
+            break
+    if target is None:
+        raise RuntimeError("注入失败：扫描调用之后找不到 `if (rc != ESP_OK) {{`")
+    out = list(lines)
+    out[target] = out[target].replace("if (rc != ESP_OK) {",
+                                      "if (rc != ESP_OK && rc != ESP_ERR_WIFI_STATE) {")
+    return out
 
 
 def _move_sntp_after_cloud_start(lines):
@@ -953,6 +1272,38 @@ INJECTIONS = [
     ("把复位跃迁改成恒等（`return already_reported` = 永不复位）", "wifi_prov_status.h", "A16a",
      lambda ls: _replace_in(ls, "    (void)already_reported;",
                             "    return already_reported;   /* 注入：永不复位（旧行为） */")),
+    # A17（🔴 2026-10-13 本批）：AP 扫描 —— 扫前收 STA / 失败不得抹成"0 个 AP" / 查 SCAN_DONE.status。
+    ("把扫前不断开造回去（扫描时 STA 仍在 connecting ⇒ 真机 14:17:03 旧缺陷现场）",
+     "wifi_prov.c", "A17a",
+     lambda ls: _replace_in(ls, "    esp_err_t qrc = esp_wifi_disconnect();",
+                            "    esp_err_t qrc = ESP_OK;   /* 注入：扫前不断开（旧行为） */",
+                            expect_count=1)),
+    ("把抑制位挪到扫前断开之后（断开事件会用旧配置自动重连 ⇒ STA 一直 connecting）",
+     "wifi_prov.c", "A17a", _move_scan_only_after_quiet),
+    ("恢复旧行为：容忍 ESP_ERR_WIFI_STATE 后继续组空列表（失败被抹成 0 个 AP）",
+     "wifi_prov.c", "A17c", _tolerate_scan_start_failure),
+    ("不查 SCAN_DONE.status（把「扫描本身失败」当成「0 个 AP」）",
+     "wifi_prov.c", "A17d",
+     lambda ls: _replace_in(ls, SCAN_DONE_STATUS_VAR + " != 0) {   /* A17d 锚",
+                            "false) {   /* A17d 锚", expect_count=1)),
+    # A18（🔴 2026-10-13 本批 · 用户裁定「SD卡配网失败回落BLE 配网模式」）：D2 自动回落的四条硬口径。
+    ("删掉 D2 自动回落（文件通道失败后不再自动进 BLE 配网模式 ⇒ 回到「需再按 SET」的旧行为）",
+     "korvo2_oneye_main.c", "A18b",
+     lambda ls: _replace_in(ls, "esp_err_t prc = wifi_prov_ble_pairing_enter();",
+                            "esp_err_t prc = ESP_OK;   /* 注入：删掉自动回落（旧行为） */",
+                            expect_count=1)),
+    ("卡上凭据失败后不再置回落标志（回落不可达）",
+     "korvo2_oneye_main.c", "A18a",
+     lambda ls: _replace_in(ls, FALLBACK_FLAG_SET,
+                            "file_fell_back = false;   /* 注入：不置回落标志 */",
+                            expect_count=1)),
+    ("把回落门控改成无条件进入配网模式（=「开机即广播」，KEY_GATE 语义被改）",
+     "korvo2_oneye_main.c", "A18d",
+     lambda ls: _replace_in(ls, FALLBACK_GUARD, "if (true) {   /* 注入：无条件回落 */",
+                            expect_count=1)),
+    ("让 wifi_prov_boot() 被调用第二遍（通道分派/回落会跑两次 ⇒ 反复重启广播）",
+     "korvo2_oneye_main.c", "A18c",
+     lambda ls: _append(ls, "\nstatic void injected_second_prov_boot(void) { wifi_prov_boot(); }")),
 ]
 
 
@@ -1012,7 +1363,7 @@ def main():
     ok, fails = run_checks(src, headers, test_lines)
     for f in fails:
         print("  ✗ " + f)
-    print("正向断言（A1–A16）：{}".format("PASS" if ok else "FAIL"))
+    print("正向断言（A1–A18）：{}".format("PASS" if ok else "FAIL"))
 
     status, detail = run_host_test(EXAMPLE)
     if status == "pass":
@@ -1052,7 +1403,11 @@ def main():
           "+ 权威通道断旧连新（A15：恰好一次断链 / 抑制旧配置重连 / 旧 SSID 不再被采信）"
           "+ 自检/授时全通道必经（ADR-0017 D2/D4）+ 资源读数未入网可见（A13，带阶段标签）"
           "+ prov.status{connected,ip} 落地既有契约状态（A14，ip 非空 / 只报一次 / 失败不置位）"
-          "+ 会话边界复位（A16：Wi-Fi 断开 ⇒ 重新配网可再报一次；⛔ 不放宽判据、⛔ 不新增帧）")
+          "+ 会话边界复位（A16：Wi-Fi 断开 ⇒ 重新配网可再报一次；⛔ 不放宽判据、⛔ 不新增帧）"
+          "+ AP 扫描的两条硬口径（A17：扫前主动断开并等会话结束边 ⇒ 在空闲态发起扫描；"
+          "scan_start 失败 / SCAN_DONE.status!=0 / 等 SCAN_DONE 超时 ⇒ 如实回 error{internal}，"
+          "⛔ 不把失败抹成 0 个 AP、⛔ 不放宽 ApListGate）"
+          "+ D2 文件通道失败自动回落 BLE 配网模式（A18：回落起点/终点/只回落一次/KEY_GATE 语义未改）")
     return 0
 
 

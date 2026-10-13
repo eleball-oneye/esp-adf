@@ -1,0 +1,108 @@
+# =============================================================================
+# devkitc_oneye · sdkconfig.defaults.bench-local —— **仅本机台面（bench）**的接入档
+#
+# 用法：**必须显式叠加、且排在最后**（IDF 后叠加者胜）：
+#   idf.py -B <build> \
+#     -DSDKCONFIG=<build>/sdkconfig \
+#     -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32s3;\
+#       sdkconfig.defaults.ble;sdkconfig.defaults.<beta|gamma>;sdkconfig.defaults.bench-local" \
+#     -DONEYE_FW_CERT_DIR=<证书目录> -DONEYE_SDK_LIB_OUT_DIR=<不存在目录> build
+#   （受控入口：`bash tools/build-devkitc.sh <beta|gamma> <证书目录> bench`）
+#
+# ★ 本文件回答的**唯一**问题：「这台板子怎么连**本机**那套栈」——与 korvo2_oneye 的
+#   `sdkconfig.defaults.bench-local`（esp-adf `55ebdeec`）**同一口径、逐项对齐**：
+#     ① 云端端点指本机栈（`192.168.110.208` + 用户态转发端口 `18830`）；
+#     ② 承载仍是 **TLS**（⛔ 本档不降级为明文：本机栈的设备面就是 mTLS）；
+#     ③ 🔴 mbedTLS 缓冲改走 **PSRAM**（`CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y`）——
+#        甲型台面实测的成因逐字：`TLS failed at mbedtls_ssl_setup: ret=-32512 (0x7f00)`
+#        = `MBEDTLS_ERR_SSL_ALLOC_FAILED`（16 KiB 收缓冲由 `mbedtls_calloc` **只从内部 RAM** 取，
+#        而当时 `largest_internal_block=10240 B`）⇒ TLS 会话**从未建立**（ClientHello 都没发出，
+#        故 EMQX 侧看不到该客户端）。修法 = 把 mbedTLS 的堆换成 PSRAM
+#        （IDF 取处：`components/mbedtls/port/esp_mem.c` 的
+#        `#elif CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC` ⇒ `heap_caps_calloc(n, size, MALLOC_CAP_SPIRAM)`）。
+#        ⛔ 不选"调小收缓冲"：那会压低单帧 TLS 记录上限（拿协议能力换内存）。
+#
+# ⚠️⚠️ **本档的前提 = 本板模组带 PSRAM**（`devkitc_oneye/sdkconfig.defaults.esp32s3` 里
+#   本工程原本**显式关**PSRAM，理由是"DevKitC-1 模组 PSRAM 随批次不同 ⇒ 不假定有"）。
+#   本文件把它**只在台面档**打开（N8R8 / N16R8 这类带 PSRAM 的模组），并保留
+#   `CONFIG_SPIRAM_IGNORE_NOTFOUND=y`（来自 .esp32s3）⇒ 模组没 PSRAM 时**能开机**，
+#   但此时 `CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y` 会让 mbedTLS 的每次 calloc 拿到 NULL
+#   ⇒ **TLS 建不起来**（症状与甲型那个 bug 同形）。⇒ 板子若不是带 PSRAM 的模组：
+#   **必须**去掉本文件里的 `CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y`（或换模组），⛔ 不要"反正编得过"。
+#
+# ★ 为什么 PSRAM 那几项要写在这里而不是 `.esp32s3`：`.esp32s3` 是**两档共用**的板级预设，
+#   而"这台板子有没有 PSRAM"是**台面事实**（同一份量产预设要能覆盖两种模组）⇒ 只落本档。
+#
+# -----------------------------------------------------------------------------
+# 本档**不污染量产默认**的机械证据（可复核）
+# -----------------------------------------------------------------------------
+#   1) 本文件**不在**任何量产构建命令的 `SDKCONFIG_DEFAULTS` 列表里：
+#      grep -rn "SDKCONFIG_DEFAULTS" --include=*.sh --include=*.md examples/oneye/devkitc_oneye
+#      ⇒ 量产档（beta / gamma）列出的是 4 份 defaults（不含本文件）；
+#      本文件只出现在台面构建（`tools/build-devkitc.sh … bench`）里。
+#   2) 既有 5 份 defaults（sdkconfig.defaults / .esp32s3 / .ble / .beta / .gamma）
+#      的 sha256 在本批**未被改动**（除 .beta/.gamma 各新增一行机型码，见那两份文件的注释）。
+#   3) 同一工程的量产档与台面档 sdkconfig 逐项 diff = **恰好本文件的赋值项**（见交付报告）。
+#   4) 送机器读门禁（以台面产物 sdkconfig 为符号全集，断言本文件逐项**真的生效**）：
+#      IDF_PATH=<esp-idf 根> python tools/check-sdkconfig-defaults.py --sdkconfig <build-bench>/sdkconfig \
+#             --require sdkconfig.defaults.bench-local
+#      ⚠️ `IDF_PATH` **不可省**（2026-10-13 集成验收登记）：符号全集的第三个来源 = `$IDF_PATH/components`
+#         的 Kconfig；缺了它，IDF 自有符号会被判"本工程不存在"⇒ 实测**多出 13 条结构性误报**
+#         （⛔ 别据此删本文件里的行）。
+# =============================================================================
+
+# ---- 云端端点：指向**本机 bench 栈** ---------------------------------------------
+# 依据 = cloud/deploy/local/04-emqx.md 的取值表：
+#   host = 本机 WLAN 地址（192.168.110.208）；
+#   port = 18830（用户态转发 18830 → 127.0.0.1:18883 → 容器 8885）。
+# 为什么必须经 18830（不是直连 18883）：EMQX 的 `ssl:deviceface` 监听器在 WSL Docker 里，
+#   而 WSL 的端口中继在 Windows 侧**只绑 loopback**（127.0.0.1 / ::1）⇒ 局域网里的板子够不到；
+#   必须经**用户态 TCP 转发**把它抬到 WLAN 地址上（脚本：`korvo2_oneye/tools/bench-mqtt-fwd.js`）。
+CONFIG_ONEYE_FW_CLOUD_HOST="192.168.110.208"
+CONFIG_ONEYE_FW_CLOUD_PORT=18830
+
+# ---- 承载：仍是 TLS（⛔ 本档不降级为明文）----------------------------------------
+CONFIG_ONEYE_FW_TRANSPORT_TLS=y
+
+# ---- PSRAM：**仅本档打开**（理由与代价见文件头）---------------------------------
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_BOOT_INIT=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_TYPE_AUTO=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+# ⚠️ 「放行外部栈」这一条（`xPortcheckValidStackMem` 不再要求 `esp_ptr_internal`）**由 IDF 自己给**：
+#   现行符号 = `CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM`（`components/freertos/Kconfig`：
+#   `depends on SPIRAM`，SPIRAM 打开时 `default y`）⇒ 本档**不需要**再写一行。
+#   ⛔ 它不会让缺省的 `xTaskCreate*PinnedToCore()` 去 PSRAM 取栈 —— 取栈位置仍由调用方决定：
+#   SDK 网络线程栈（`oneye_osal_idf.c`，甲型修复 ①②之一）与本工程的上云任务栈都自己按 caps 申请。
+# 🔴 2026-10-13 删除此处旧写法（**已弃用别名**，门禁按"Kconfig 里有没有 `config` 声明"判它"符号不存在"）
+#   ——旧行逐字留痕：CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
+#   为什么删了取值不变（取证）：
+#     · 旧名在 IDF v6.0 里**不是** `config` 声明，只出现在两处：① `components/bt/esp_ble_mesh/Kconfig.in`
+#       的**帮助文本**；② `components/freertos/sdkconfig.rename` 里作为**弃用别名**映射到
+#       `CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM`；
+#     · 生成体里旧名只出现在 `# Deprecated options for backward compatibility` 段（IDF/kconfgen
+#       **自动回填**——同段的 `CONFIG_TIMER_TASK_PRIORITY` 等**没人在任何预设里写**也一样出现）：
+#         `build-beta-bench/sdkconfig`：新符号 `CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=y` 与
+#           弃用段 `CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y` **同时存在**；
+#         `build-beta/sdkconfig`（不带本档、SPIRAM 关）：**两者都不存在**。
+#     ⇒ 本档开着 `CONFIG_SPIRAM=y` 时，新符号按 `default y` 即为 y ⇒ 删掉旧行**取值不变**。
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+
+# ---- 🔴 本档的核心修复：mbedTLS 堆走 PSRAM（成因见文件头）------------------------
+# 依赖：该符号 `depends on SPIRAM_USE_CAPS_ALLOC || SPIRAM_USE_MALLOC` ⇒ 上面 PSRAM 段必须先生效。
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+
+# ---- 🔴 本档唯一一处**安全**放宽：跳过对端证书校验（显式、可审计、仅本档）---------
+# 两条独立理由（任一成立即失败），逐字沿用 korvo2_oneye/sdkconfig.defaults.bench-local：
+#   ① 信任锚不同源：设备信任锚是 creds 分区里的 ca_pem，而本机 EMQX 的服务端证书是
+#      local-pki/deviceface-server.crt（openssl 自签）——与那张设备 CA **无签发关系**；
+#   ② 主机名不匹配：本机服务端证书 SAN 逐字为 `DNS:mqtt.oneye.me,DNS:localhost,IP:127.0.0.1`，
+#      **不含** 192.168.110.208 ⇒ 即便 ① 解决，主机名校验仍会失败。
+# ⚠️ 代价如实登记：本档下**设备无法识别服务端真伪**（中间人可读可改）。只允许在本机台面
+#   （WLAN 内、白盒）使用；⛔ 不得用于任何交付/隧道/公网场景。
+# ⛔ 量产默认**一字未动**：`sdkconfig.defaults` 不带本项、也不引用本文件（出厂态为 n）。
+CONFIG_ONEYE_FW_TLS_INSECURE=y

@@ -54,7 +54,11 @@ CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=12288
 # NimBLE MSYS 内存池是**内部 RAM 里的静态数组**，默认 24/24 会在 BLE 打开后吃紧并挤掉音频管线
 # （真机取证 2026-09-17：`I2S 读元素创建失败` → `采集任务创建失败`）。本机型 BLE 只跑配网
 # （帧 ≤600 B 分片），12/12 足够。
-CONFIG_BT_NIMBLE_MSYS1_BLOCK_COUNT=12
+# 🔴 2026-10-13 删除一行**死配置**（旧行逐字留痕如下）：IDF 里没有 `CONFIG_BT_NIMBLE_MSYS1_BLOCK_COUNT`
+#    这个符号 —— 真实符号名是 `CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT`（`MSYS` 与 `1` 之间有下划线），
+#    所以旧行**写了等于没写**（`tools/check-sdkconfig-defaults.py` 报"符号不存在"）。
+#    本文件紧邻的下一行（旧 :58）**已写同值 12** ⇒ 删除旧行不改变任何取值。
+#    旧行逐字：CONFIG_BT_NIMBLE_MSYS1_BLOCK_COUNT=12
 CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=12
 CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=12
 # NimBLE **主机侧**分配改走 PSRAM（控制器侧仍在内部 RAM），给音频管线腾内部 RAM。

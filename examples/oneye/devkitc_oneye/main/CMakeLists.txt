@@ -54,6 +54,12 @@ idf_component_register(
          # `oneye_dev_base.h:164` 与 `oneye_dev_link.h:163` 同名不同构
          # （`oneye_dev_link_status_t`）⇒ 同一 TU 同时包含两者必编译失败。
          "adv_identity.c"
+         # ★ 2026-10-13〔本批 ③b〕启动期授时（SNTP）—— 从 `korvo2_oneye/main/sntp_boot.c`
+         # **同源复制**（逐字节，sha256 `1b02e891…`）。为什么 devkitc 也需要：
+         # 乙档是**严格 TLS**（量产档 `CONFIG_ONEYE_FW_TLS_INSECURE=n`），而板子无 RTC
+         # ⇒ 不先取钟，服务端证书 notBefore 校验必然 `BADCERT_FUTURE`。
+         # 接入点 = `devkitc_oneye_main.c` 的 `on_wifi_ready()`（**在**建上云任务之前）。
+         "sntp_boot.c"
     INCLUDE_DIRS "."
     EMBED_FILES ${_oneye_cert_files}
     REQUIRES oneye-dev-sdk

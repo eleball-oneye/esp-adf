@@ -4,7 +4,7 @@
  * ★ 本模块是「入网后收敛点」的**唯一持有者**（ADR-0017 D2）★
  *   所有配网通道（C1/C2 BLE、C3 凭据文件、C4 台面 API、C5 Kconfig）都只是**把凭据交进来**；
  *   「入网成功 ⇒ 触发上云」这件事**只**发生在下面 `on_wifi_event()` 的 GOT_IP 分支里
- *   （→ `s_ready_cb()` → `korvo2_oneye_main.c:on_wifi_ready()` → `oneye_start()`）。
+ *   （→ `s_ready_cb()` → `devkitc_oneye_main.c:on_wifi_ready()` → `oneye_start()`）。
  *   ⛔ 新增通道时不要在本文件之外复制这段逻辑；也不要在这里按通道分叉「入网后做什么」——
  *      下游（面板/授时/net_probe/影子/埋点）对**所有**通道是同一条路径，这正是本设计的价值。
  *      ★ 2026-10-07：`net_probe` 与 `sntp` 原先只挂在 C3/C5 的启动路径上（BLE 通道会跳过），
@@ -18,7 +18,15 @@
  *   ⛔ 连接层 `wifi_prov_connect()` 已收为 `static`：**模块外没有任何路径能绕过判据发起入网**。
  *   ⛔ 已入网（拿到 IP）之后一律拒绝 —— **只入网一次**；显式改配 / `prov.reset` 走
  *      `wifi_prov_release_held()` 这条**显式**路径（调用方自己声明"这是重新配网"）。
- *   所有拒绝/抢占都在串口留痕（统一前缀 `[prov-priority]`），不是静默丢弃。
+ *   ★ 2026-10-12（用户裁定，最高依据）：上面这条"已入网一律拒绝"**多了一个例外** ——
+ *      **App（BLE 通道 C1/C2）发起的配网是权威通道，一经受理即权威生效**：
+ *      设备**先 `esp_wifi_disconnect()` 断开现有连接**、丢弃旧配置的采信态，
+ *      再 `esp_wifi_set_config(新凭据)` → `esp_wifi_connect()`（"断旧连新"）。
+ *      用户裁定逐字：「**已有app发起配网时设备要断现有wifi重新连接目标wifi**，否则app会卡在配网中这个流程。」
+ *      ⛔ 该放宽**只对 BLE 通道**（`wifi_prov_channel_is_authoritative()`），
+ *      C3 凭据文件 / C4 台面改配 / C5 兜底的优先级语义**一字未改**。
+ *   所有拒绝/抢占都在串口留痕（统一前缀 `[prov-priority]`；"断旧连新"用 `[prov-switch]`），
+ *   不是静默丢弃。
  */
 
 #include <stdio.h>
@@ -61,10 +69,23 @@ static volatile bool s_sta_start_connect_issued;
 /* 扫描态：为 C1/C2 的 AP 扫描把 Wi-Fi 起起来，但**不**自动重连（否则无凭据时空转刷屏）。
  * 一旦某通道提交了凭据（wifi_prov_submit_credentials*），本标志清零。 */
 static volatile bool s_scan_only;
+/* 🔴 2026-10-12〔本批：App 发起配网 = 断旧连新〕**权威通道重新配网进行中**。
+ * 为什么需要它：`esp_wifi_disconnect()` 会派发 `WIFI_EVENT_STA_DISCONNECTED`，而
+ * `on_wifi_event()` 的断开分支**默认立刻 `esp_wifi_connect()` 重连**；那一刻 STA 里
+ * 还是**旧配置** ⇒ "换网"会退化成"重连旧网"（旧 SSID 仍被使用，App 仍卡在配网中）。
+ * 置位者 = `wifi_prov_submit_credentials_src()` 的权威重配前置段（断链之前）；
+ * 清零者 = `wifi_prov_connect()` 内 `esp_wifi_set_config()` **成功之后**
+ * （新配置已落到 STA ⇒ 之后的自动重连都用新配置），并在提交路径末尾兜底清零。 */
+static volatile bool s_reprovision;
 static char s_ip[20];
 static char s_ssid[WIFI_PROV_SSID_MAX];
 static char s_source[48];
 static wifi_prov_ready_cb_t s_ready_cb;
+/* 🔴 2026-10-12〔本批〕**会话结束**通知位（见 wifi_prov.h 的同名 API 注释）：
+ *   置位者 = 应用侧（`devkitc_oneye_main.c` 的 `app_main()`，与 ready 回调同一处生命周期注册）；
+ *   调用者 = 下面 `on_wifi_event()` 的 `WIFI_EVENT_STA_DISCONNECTED` 分支。
+ *   ⛔ 本模块不解释它的应用层含义；⛔ 它不参与任何"要不要重连"的判断。 */
+static wifi_prov_disconnected_cb_t s_disconnected_cb;
 
 /* ★ 采信槽（ADR-0017 D2/D4）：**当前被采信的那一份凭据来自哪条通道**。
  * 同一时刻只有一份被采信；`wifi_prov_policy_decide()` 用它做优先级比较。
@@ -97,6 +118,7 @@ const char *wifi_prov_channel_source(wifi_prov_channel_t ch)
 }
 
 void wifi_prov_set_ready_cb(wifi_prov_ready_cb_t cb) { s_ready_cb = cb; }
+void wifi_prov_set_disconnected_cb(wifi_prov_disconnected_cb_t cb) { s_disconnected_cb = cb; }
 
 static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -118,9 +140,22 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
         int reason = (data != NULL) ? (int)((wifi_event_sta_disconnected_t *)data)->reason : -1;
         s_connected = false;
         s_ip[0] = '\0';
-        if (s_scan_only) {
-            ESP_LOGI(TAG, "[diag] WIFI_EVENT_STA_DISCONNECTED reason=%d ⇒ 扫描态，不自动重连", reason);
-            return;                 /* 扫描态：不自动重连（见 s_scan_only 注释） */
+        /* 🔴 2026-10-12〔本批〕**会话结束**：这一次配网会话到此为止 ⇒ 通告应用侧
+         *   （应用侧据此复位 `prov.status{connected}` 的"只报一次"幂等位；本体 = wifi_prov_status.h 的 ④）。
+         * ⛔ 位置**故意在**下面那个 `s_scan_only || s_reprovision` 分支**之前**：
+         *   权威通道"断旧连新"产生的这一次断开**正是**要复位的场景（`s_reprovision` 为真、下面直接
+         *   `return` 不重连）—— 若把通知挂在"会重连"的那条路上，本批要修的第二轮配网**恰好被漏掉**。
+         * ⛔ 只通告，不改行为：下面两个抑制位与"是否自动重连"的判断一字未动。 */
+        ESP_LOGI(TAG, "[diag] Wi-Fi 会话结束（DISCONNECTED reason=%d）⇒ 通告应用侧复位本次配网的 "
+                      "connected 幂等位（下一次 GOT_IP 可以再报一次）", reason);
+        if (s_disconnected_cb) {
+            s_disconnected_cb();
+        }
+        if (s_scan_only || s_reprovision) {
+            ESP_LOGI(TAG, "[diag] WIFI_EVENT_STA_DISCONNECTED reason=%d ⇒ %s，不自动重连",
+                     reason,
+                     s_scan_only ? "扫描态" : "权威通道重新配网进行中（旧配置已作废，等新凭据连接）");
+            return;                 /* 扫描态 / 权威重配：不自动重连（见 s_scan_only、s_reprovision 注释） */
         }
         ESP_LOGW(TAG, "Wi-Fi 断开，重连…（reason=%d）", reason);
         esp_err_t crc = esp_wifi_connect();
@@ -342,6 +377,9 @@ static esp_err_t wifi_prov_connect(const char *ssid, const char *pass, uint32_t 
         ESP_LOGE(TAG, "[diag] esp_wifi_set_config 失败 rc=%d(%s)", (int)cfg_rc, esp_err_to_name(cfg_rc));
     }
     ESP_ERROR_CHECK(cfg_rc);
+    /* ★ 新配置**已经**落到 STA ⇒ 恢复事件驱动的自动重连语义（让"断旧连新"不至于连
+     *   "连不上时的自动重试"也一起被抑制）。见 `s_reprovision` 的注释。 */
+    s_reprovision = false;
     /* ★ 清位：本次 set_config 之后，先看 STA_START 是否会替我们发起连接（C3/C5 路径会，BLE 路径不会）。 */
     s_sta_start_connect_issued = false;
     esp_err_t st_rc = esp_wifi_start();      /* 已在跑则为幂等（**不再派发 STA_START**） */
@@ -409,6 +447,9 @@ esp_err_t wifi_prov_set_source(const char *src)
  * ① 过**唯一判据** `wifi_prov_policy_decide()`（本体在 `wifi_prov_policy.h`，与主机侧单测同源）；
  * ② 采信 ⇒ 记来源 + 交给 **static** 的 `wifi_prov_connect()`（由它触发 GOT_IP → s_ready_cb 收敛点）；
  * ③ 拒绝 ⇒ 留痕（`[prov-priority]`）+ 返回 `ESP_ERR_INVALID_STATE`，**不发起入网**。
+ * ④ ★ 2026-10-12：**权威通道（BLE/App）** 采信之后、交给连接层之前，**先断旧**：
+ *    `esp_wifi_disconnect()`（在线才断，恰好一次）+ 丢弃旧配置的采信态 ⇒ 再 `set_config` + `connect`
+ *    （"断旧连新"，用户裁定逐字见本文件头与 `wifi_prov_channel_is_authoritative()`）。
  * ⛔ 这里**不**做任何「入网后」动作 —— 那是收敛点下游（on_wifi_ready → oneye_start）的事。
  */
 esp_err_t wifi_prov_submit_credentials_src(const char *ssid, const char *pass,
@@ -423,7 +464,9 @@ esp_err_t wifi_prov_submit_credentials_src(const char *ssid, const char *pass,
     /* ★ 唯一判据 ★ —— 决策 token 与主机侧单测用的是同一个 `wifi_prov_decision_str()`。
      * `onboarded` = 「已用**当前被采信**的那份凭据入网」（`s_connected && s_held_valid`）：
      * 采信槽被**显式释放**（台面改配 / prov.reset）后即视为"可重新配网"，
-     * ⛔ 但上云链路仍只启动一次（唯一调用点在收敛点下游，见门禁 A1/A9）。 */
+     * ⛔ 但上云链路仍只启动一次（唯一调用点在收敛点下游，见门禁 A1/A9）。
+     * ⚠️ 2026-10-12：判据**按通道分派** —— 权威通道（BLE/App）不会被"已入网"闸掉
+     *    （`wifi_prov_channel_is_authoritative()`，本体在 `wifi_prov_policy.h`）。 */
     const wifi_prov_decision_t d =
         wifi_prov_policy_decide(s_held_valid, s_held_chan, ch, s_connected && s_held_valid);
 
@@ -448,10 +491,47 @@ esp_err_t wifi_prov_submit_credentials_src(const char *ssid, const char *pass,
     ESP_LOGI(TAG, "[prov-priority] %s：channel=%s(rank %d)（ssid=%s，密码%s）",
              wifi_prov_decision_str(d), src, wifi_prov_channel_rank(ch),
              ssid, (pass && pass[0]) ? "已提供" : "为空（开放网络）");
+
+    /* ---------------- ★ 2026-10-12：权威通道（BLE/App）= 断旧连新 ★ ----------------
+     * 用户裁定逐字：「**已有app发起配网时设备要断现有wifi重新连接目标wifi**，否则app会卡在配网中这个流程。」
+     * 判据已保证权威通道**不会被"已入网"闸掉**（`REJECT_ALREADY_UP` 对它不可达）；
+     * 这里补上"断旧"这半件事，"连新"由紧随其后的 `wifi_prov_connect()`
+     * （`esp_wifi_set_config` → `esp_wifi_connect`）完成：
+     *   ① **在线才断** —— 未在线不必断；正因如此，本路径的 `esp_wifi_disconnect()` **恰好一次**；
+     *   ② 断之前先置 `s_reprovision` —— 抑制 `WIFI_EVENT_STA_DISCONNECTED` 分支
+     *      "用**旧配置**自动重连"（否则"换网"会退化成"重连旧网"）；
+     *   ③ 旧配置的**采信态作废**（`s_held_valid=false` + 清 `s_connected/s_ip`）——
+     *      即"旧 SSID 不再被采信"；新凭据在这段之后重新落槽、再连新网。
+     * ⛔ 只对权威通道（BLE/App）生效：C3 凭据文件 / C4 台面改配 / C5 兜底的提交
+     *    **不经过**这一段（它们的优先级语义一字未改）。
+     * ⛔ 旧值逐字留痕（⛔ 不抹）：本段此前**不存在** —— 旧行为 = 已入网 ⇒ 判据给
+     *    `WIFI_PROV_DECISION_REJECT_ALREADY_UP` ⇒ 直接 `return ESP_ERR_INVALID_STATE`
+     *    （不采信、不发起入网、**不断链**）⇒ App 卡在"配网中"。 */
+    if (wifi_prov_channel_is_authoritative(ch)) {
+        if (s_connected) {
+            s_reprovision = true;               /* ⇐ 必须先置位：断链事件是异步派发的 */
+            esp_err_t drc = esp_wifi_disconnect();
+            ESP_LOGW(TAG, "[prov-switch] 权威通道（%s）发起重新配网：**先断开现有连接**"
+                          "（原 ssid=%s）rc=%d(%s) ⇒ 随后 set_config(新凭据) + connect",
+                     src, s_ssid, (int)drc, esp_err_to_name(drc));
+        } else {
+            ESP_LOGI(TAG, "[prov-switch] 权威通道（%s）：当前未在线 ⇒ 无需断开，直接按新凭据重连",
+                     src);
+        }
+        s_connected = false;
+        s_ip[0] = '\0';
+        s_held_valid = false;                   /* ⇐ 丢弃旧配置的采信态（旧 SSID 不再被采信） */
+        s_held_chan = WIFI_PROV_CHAN_UNKNOWN;
+    }
+
     s_held_valid = true;
     s_held_chan = ch;
     (void)wifi_prov_set_source(src);
-    return wifi_prov_connect(ssid, pass, 0);
+    esp_err_t crc = wifi_prov_connect(ssid, pass, 0);
+    /* 兜底：`wifi_prov_connect()` 若在 `esp_wifi_set_config()` 之前就返回（初始化失败等），
+     * 抑制位不得残留（否则后续掉线再也不会自动重连）。正常路径上它在 set_config 之后已清零。 */
+    s_reprovision = false;
+    return crc;
 }
 
 esp_err_t wifi_prov_submit_credentials(const char *ssid, const char *pass, wifi_prov_channel_t ch)
@@ -474,6 +554,9 @@ void wifi_prov_release_held(const char *reason)
 
 /**
  * 清除当前凭据并回到未配网态（通道的 `prov.reset` 用）。
+ * 🔴 2026-10-13 口径订正（⛔ 旧字逐字留痕 = 「只清 RAM、不写 flash」/ 日志串「仅 RAM」）：
+ *    **只清当前 RAM 采信态 / STA 配置；flash/NVS 里的凭据保留** —— 说清"清的是什么、留的是什么"：
+ *    被清 = `s_held_valid` 采信槽 + RAM 里那份 STA 配置；保留 = flash/NVS 里的凭据（本函数一字未写）。
  * ⚠️ 本函数**不清 NVS/flash**（那会与「凭据分区是身份来源」的另一条线打架），
  *    只断开连接并清掉 RAM 里的 STA 配置 ⇒ 复位后 Kconfig/凭据文件仍会重新生效。
  * ★ 同时清空**采信槽**（ADR-0017 D4）：`prov.reset` 是操作者的显式动作，
@@ -493,5 +576,8 @@ void wifi_prov_forget(void)
     s_ip[0] = '\0';
     s_ssid[0] = '\0';
     s_source[0] = '\0';
-    ESP_LOGW(TAG, "已清除当前 Wi-Fi 凭据（仅 RAM）⇒ 回到未配网态，可经任一通道重新配网");
+    // 🔴 2026-10-13 口径订正（⛔ 旧日志串逐字留痕 = 「已清除当前 Wi-Fi 凭据（仅 RAM）⇒ 回到未配网态，可经任一通道重新配网」）：
+    //    本串把"仅 RAM"说全 = 只清当前 RAM 采信态/STA 配置；flash/NVS 里的凭据保留。
+    ESP_LOGW(TAG, "已清除当前 Wi-Fi 凭据（只清当前 RAM 采信态/STA 配置；flash/NVS 里的凭据保留）"
+                  "⇒ 回到未配网态，可经任一通道重新配网");
 }

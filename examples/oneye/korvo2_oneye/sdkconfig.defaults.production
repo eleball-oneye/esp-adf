@@ -21,8 +21,11 @@
 #      与 docs/ops/产线凭证灌注作业指导.md §1.1
 #
 # ⚠️ 本文件里**每一项**都必须能被验证，而不是"写在文件里就算钉住了"：
-#   门禁 `python tools/check-sdkconfig-defaults.py --sdkconfig <构建产物>/sdkconfig \
+#   门禁 `IDF_PATH=<esp-idf 根> python tools/check-sdkconfig-defaults.py --sdkconfig <构建产物>/sdkconfig \
 #          --require sdkconfig.defaults.production`
+#   ⚠️ `IDF_PATH` **不可省**（2026-10-13 集成验收登记）：符号全集的第三个来源 = `$IDF_PATH/components`
+#      的 Kconfig；缺了它，本文件里 IDF 声明的符号会被判"本工程不存在"⇒ 实测**多出 13 条结构性误报**
+#      （⛔ 别据此删本文件里的行）。
 #   2026-09-23 真构建抓到的教训：曾经这里写的是 `CONFIG_ONEYE_FW_TRANSPORT_MQTT_TLS=y`，
 #   而 Kconfig 里的符号叫 `CONFIG_ONEYE_FW_TRANSPORT_TLS`（本工程从来没有 `_MQTT_TLS`）
 #   ⇒ 这一行**什么都没做**，整条"显式钉住承载"是安慰剂；同一天真机实测到的正是承载掉回 TCP
@@ -74,6 +77,13 @@ CONFIG_ONEYE_FW_CLOUD_PORT=18886
 #        这条由 `main/CMakeLists.txt` 的构建期门禁强制（三条件同时成立即 `FATAL_ERROR`，编不过）。
 #      · 明文 Wi-Fi 密码的**残余风险仍在**，但归属改为「配网凭据落盘形态」单独决策
 #        （ADR-0017 D3），⛔ 不用"关掉唯一通道"来假装解决。
+#      · 🔴 **2026-10-13 就地订正（用户裁定「B1.量产支持且凭据明文」）**：本档下 C3 文件通道是
+#        **量产品类形态**（量产**支持**该通道），卡上凭据**明文**这一后果**已由用户裁定接受**
+#        ⇒ ⛔ 不再写成"残余风险 / 另外决策"，也⛔ 不再写成"仅台面"。
+#        **旧字逐字留痕（⛔ 不抹）**：本两行此前逐字为
+#        「· 明文 Wi-Fi 密码的**残余风险仍在**，但归属改为「配网凭据落盘形态」单独决策
+#          （ADR-0017 D3），⛔ 不用"关掉唯一通道"来假装解决。」
+#        ⛔ 本文件**未增删任何配置符号**（只订正注释口径），故产物 sdkconfig 逐项不变。
 # 设备侧本地 HTTP 验证面不是云端设备面契约
 # CONFIG_ONEYE_FW_ENABLE_PANEL_API is not set
 # 取证插桩（周期性 INFO + 长批量间隔）只用于取证
@@ -110,6 +120,11 @@ CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 #       `oneye_start()` 永不调用 ⇒ 上不了云**（2026-10-07 真机实测）。
 #     ⇒ **本文件不写这一行**；由机型 defaults 决定，并由 main/CMakeLists.txt 的构建期门禁
 #       「无任何可用通道 ⇒ FATAL_ERROR」兜底。SD 卡明文密码的残余风险按 ADR-0017 D3 另行决策。
+#       🔴 **2026-10-13 就地订正（用户裁定「B1.量产支持且凭据明文」）**：末句作废 ——
+#       量产**支持** C3 文件通道，卡上凭据**明文**的后果**已由用户裁定接受**（⛔ 不再"另行决策"）。
+#       **旧字逐字留痕（⛔ 不抹）**：本句此前逐字为
+#       「SD 卡明文密码的残余风险按 ADR-0017 D3 另行决策。」
+#       ⛔ 本文件**未增删任何配置符号**（只订正注释口径）。
 #  ② 设备侧本地验证 HTTP 面（非云端契约）
 #     · README.md:210 / :373    「量产应置 CONFIG_ONEYE_FW_ENABLE_PANEL_API=n」
 #     · main/Kconfig.projbuild:147「量产固件应置 n」

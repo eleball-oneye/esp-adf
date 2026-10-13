@@ -36,6 +36,14 @@ CONFIG_ONEYE_DEV_CREDS_REQUIRED=n
 # CONFIG_ONEYE_FW_BLE_PROV_KEY_GATE is not set      # = Kconfig 缺省 n
 CONFIG_ONEYE_FW_BLE_PROV_PAIRING_WINDOW_S=300
 
+# ---- 机型码（产品品类 productKey）：★ 2026-10-13 用户裁定**逐字** -----------------
+#   「甲 `OY-SPK-01`、乙 `OY-SPK-02`、丙 `OY-SPK-03`」
+# ★ 就地订正（⛔ 旧字不抹）：本工程此前**两档共用** Kconfig 缺省 `OY-SPK-01`；本次裁定
+#   取代该口径 ⇒ 丙 = `OY-SPK-03`。⛔ 甲（`OY-SPK-01`）未改（仍由 korvo2_oneye 使用）。
+# ⚠️ 丙**不连云**（设备侧零 TLS）⇒ 这个码在本档的实际作用面是**空口厂商字段的品类段**
+#   （`OY-<FAMILY>-<NN>` 中间的 `SPK`）与**云端按机型登记的策略**（App 代发起绑定时的机型）。
+CONFIG_ONEYE_FW_PRODUCT_KEY="OY-SPK-03"
+
 # ⚠️ 如实登记（⛔ 不静默）：本档**仍然**把 `CONFIG_ONEYE_FW_CLOUD_HOST/_PORT` 编进固件
 #    （它们来自通用预设，是"钉死端点"的纪律）。丙**不调用** `oneye_dev_base_start()`
 #    ⇒ 这两个串只是**未被使用**的常量，⛔ 不代表丙"会连云"。

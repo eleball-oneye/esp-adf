@@ -32,6 +32,17 @@
  *       显式改配（台面 `wifi_set`）与 `prov.reset` 走「先 `wifi_prov_release_held()` /
  *       `wifi_prov_forget()` 再提交」的**显式**路径 —— 那是操作者声明的"重新配网"意图，
  *       ⛔ 但**上云链路只启动一次**这一点不变（`oneye_start()` 仍只有收敛点下游一个调用点）。
+ *    ★ 2026-10-12 就地订正（用户裁定，最高依据）：上面这条**多了一个例外** ——
+ *       **App（BLE 通道 C1/C2）发起的配网 = 权威通道，一经受理即权威生效**：
+ *       设备**先 `esp_wifi_disconnect()` 断开现有连接**、丢弃旧配置的采信态，
+ *       再 `esp_wifi_set_config(新凭据)` → `esp_wifi_connect()`（"断旧连新"）。
+ *       用户裁定逐字：「**已有app发起配网时设备要断现有wifi重新连接目标wifi**，否则app会卡在配网中这个流程。」
+ *       ⇒ `REJECT_ALREADY_UP` 在 **BLE 通路上不可达**（`wifi_prov_channel_is_authoritative()`）。
+ *       ⛔ **只对 BLE 通道**放宽：C3 凭据文件 / C4 台面改配 / C5 兜底 / 预留通道的
+ *       优先级与"只入网一次"语义**一字未改**（参 `wifi_prov_policy.h` 的 rank 与判据分派）。
+ *       ⛔ 旧字逐字留痕（⛔ 不抹）：本段此前逐字为
+ *       「⚠️ **已入网（拿到 IP）且采信槽未被释放时，任何通道的提交一律被拒**（只入网一次）；」
+ *       —— 该口径对"任何通道"的表述**已被本次裁定收窄**为"任何**非权威**通道"。
  *    判据本体 = `wifi_prov_policy.h`（纯逻辑，与主机侧单测 `tools/test-prov-priority.c`
  *    编译**同一份源**），落码在 `wifi_prov_submit_credentials*()`。
  *
@@ -114,6 +125,8 @@ esp_err_t wifi_prov_load_file(char *ssid, size_t ssid_cap, char *pass, size_t pa
  *   - `ESP_ERR_TIMEOUT` —— 采信了但没连上（可再试/换凭据）；
  *   - `ESP_ERR_INVALID_STATE` —— **被优先级判据拒绝**：未采信、未发起入网，
  *     串口有 `[prov-priority]` 留痕（槽里已有更高/同级优先级的凭据，或设备已入网）；
+ *     ⚠️ 2026-10-12 起：**权威通道（BLE/App）拿不到"已入网"这一种拒绝**（见上）；
+ *     它能拿到本错误码的情形只剩「未入网且槽被更高优先级的 C3 凭据占用」。
  *   - `ESP_ERR_INVALID_ARG` —— ssid 为空。
  *
  * ⚠️ 本函数**阻塞**至获得 IP 或超时（缺省 20 s）。C1/C2 的 provider 在
@@ -147,7 +160,9 @@ void wifi_prov_release_held(const char *reason);
  *  ⚠️ 只改标签，**不**改采信槽 —— 采信槽只由 `submit` / `release_held` / `forget` 改。 */
 esp_err_t wifi_prov_set_source(const char *src);
 
-/** 清除当前凭据并回到未配网态（供通道的 `prov.reset` 用；**只清 RAM、不写 flash**）。
+/** 清除当前凭据并回到未配网态（供通道的 `prov.reset` 用；**只清当前 RAM 采信态/STA 配置；flash/NVS 里的凭据保留**）。
+ *  🔴 2026-10-13 口径订正（⛔ 旧字逐字留痕 = 「只清 RAM、不写 flash」）：说的就是上面这句 —— 清的只有 RAM
+ *  里的采信槽与 STA 配置，flash/NVS 里的凭据**一字未写**。
  *  同时清空采信槽 ⇒ 恢复"任一通道都可被重新采信"的状态。 */
 void wifi_prov_forget(void);
 
@@ -167,6 +182,25 @@ void wifi_prov_forget(void);
  */
 typedef void (*wifi_prov_ready_cb_t)(void);
 void wifi_prov_set_ready_cb(wifi_prov_ready_cb_t cb);
+
+/**
+ * 🔴 2026-10-12〔本批〕**会话结束通知**：`WIFI_EVENT_STA_DISCONNECTED` 到达时被调用
+ * （在系统事件任务上下文；本模块已经把 `s_connected=false`、`s_ip[0]='\0'` 落好之后才通知）。
+ *
+ * 为什么需要这条边（真机证据 + 逐字理由）：
+ *   · `connected` 上报的幂等位（`wifi_prov_status.h` 的 ②）此前**跨会话永不复位** ⇒
+ *     第二轮配网（App 走 `[prov-switch]` 断旧连新 → GOT_IP）**再也报不出** `connected`
+ *     ⇒ App 卡在"配网中"（2026-10-12 15:36 真机第二轮就是这样失败的）；
+ *   · 复位点是"**这一次配网会话结束**"，而它的唯一权威边就是本回调 ——
+ *     Wi-Fi 生命周期归本模块持有（门禁 A15f），⛔ 应用层不得自己去注册 Wi-Fi 事件。
+ *
+ * ⚠️ 本模块**只通告"会话结束了"这一件事**，⛔ 不解释它在应用层的含义（要不要复位幂等位、
+ *    要不要补发/清理别的状态，由注册方决定）；⛔ 本回调**不改**连接行为：
+ *     `s_scan_only` / `s_reprovision` 两个抑制位与"是否自动重连"的既有语义**一字未改**。
+ * ⚠️ 回调体必须"有界"：它在系统事件任务上执行（与 ready 回调同一类约束）。
+ */
+typedef void (*wifi_prov_disconnected_cb_t)(void);
+void wifi_prov_set_disconnected_cb(wifi_prov_disconnected_cb_t cb);
 
 bool wifi_prov_is_connected(void);
 const char *wifi_prov_ip(void);        /* "" = 未连接 */

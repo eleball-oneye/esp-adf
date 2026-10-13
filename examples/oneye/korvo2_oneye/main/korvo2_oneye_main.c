@@ -721,12 +721,160 @@ static void res_report(const char *phase)
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 }
 
+/* ------------------------------------------------------------------ 上云任务的**静态栈**（**内部 RAM**）
+ *
+ * 🔴 2026-10-13〔本批 ① · 阻塞级回归修复〕「`cloud_start` 任务的栈**一律内部 RAM**」。
+ *
+ * 前批（同日）曾把本任务的栈**优先从 PSRAM 取**（与 SDK 网络线程栈同法）。真机后果：**每次上云即
+ *   assert 复位**，之后每 ≈3 s 一轮（GOT_IP → net-probe OK → sntp 已同步 → 启动上云 → assert）。
+ *
+ * ★ 根因（真机证据 + addr2line 解栈，⛔ 不是推断）：`build-alpha-sdcard/korvo2_oneye.elf`
+ *   对上真机 backtrace（`E:\workspace\_oneye-logs\serial-sdcard.txt` 15:27:30 / 15:32:31）解出：
+ *     cloud_start_task          main/korvo2_oneye_main.c:840
+ *       → oneye_start           main/korvo2_oneye_main.c:1408
+ *         → oneye_dev_creds_load  src/oneye_dev_creds.c:551
+ *           → oneye_creds_plat_read src/oneye_creds_plat_idf.c:78
+ *             → esp_partition_read  partition_target.c:38
+ *               → esp_flash_read    esp_flash_api.c:981
+ *                 → spiflash_start_core / spiflash_start_default  esp_flash_api.c:238 / :249
+ *                   → spi1_start    spi_flash_os_func_app.c:133  → cache_disable  :75
+ *                     → spi_flash_disable_interrupts_caches_and_other_cpu  cache_utils.c:135
+ *                       → assert(esp_task_stack_is_sane_cache_disabled())     cache_utils.c:127
+ *   即：本任务在 `oneye_start()` 里**读 creds 分区**（`esp_partition_read` → `esp_flash_read`）⇒
+ *   flash 驱动进入"关 cache"窗口 ⇒ 该 assert 要求**当前任务的栈在内部 RAM**。
+ *   assert 的逐字实现（cache_utils.c:56-59）：
+ *     `const void *sp = (const void *)esp_cpu_get_sp();`
+ *     `return esp_ptr_in_dram(sp)`（`|| esp_ptr_in_rtc_dram_fast(sp)`）⇒ `esp_ptr_in_dram` 为假即崩。
+ *   ⚠️ `CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y` **只放行**外部栈（令 `xPortcheckValidStackMem`
+ *   不再要求 `esp_ptr_internal`），⛔ **不豁免**这条 assert —— 放行 ≠ 安全。
+ *
+ * 旧值逐字留痕（⛔ 不抹；本批**作废**的就是下面这两路，顺序 = PSRAM 优先、失败回落内部）：
+ *   `s_cloud_start_stack = (StackType_t *)heap_caps_calloc(1u, CLOUD_START_STACK_BYTES,`
+ *   `                                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);`
+ *   与之配套的日志串逐字为「上云任务栈：已从 **PSRAM** 取到 %u B（旧实现走内部 RAM，见本段注释）」
+ *   ——⛔ 该串**不得**再出现在 ELF 里（门禁 A17a 负向对照 + 交付时 `strings` 计数正负对照）。
+ *
+ * 现状（本批）：
+ *   · 栈缓冲**只有一路**：`heap_caps_calloc(…, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)`；
+ *   · 仍用 `xTaskCreateStaticPinnedToCore()`（栈缓冲由我们给出，落点可判）；
+ *   · 静态栈取不到 ⇒ 回落**旧行为** `xTaskCreate()`：它的栈走 `pvPortMalloc()`，而 IDF 的 FreeRTOS 堆
+ *     只从内部 RAM 取（`components/freertos/heap_idf.c:43` 逐字
+ *     `#define portFREERTOS_HEAP_CAPS ( MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT )`）⇒ **两条路都在内部 RAM**。
+ *   · TCB 仍只能内部 RAM（`xPortCheckValidTCBMem` 只接受内部可字节访问内存）。
+ *   ⛔ **不改栈量语义**：第 3 实参仍是 `CLOUD_START_STACK_BYTES` = 6144（与旧 `xTaskCreate` 的
+ *   第 3 实参**逐字相同**）；⛔ 不改优先级（4）、⛔ 不改 `pvParameters`（NULL）、⛔ 不新增行为。
+ *   ⚠️ 单位口径：IDF 的 `xTaskCreate*Static*` 与 `xTaskCreate` 的栈深参数**同为字节**
+ *   （`freertos/task.h` 的 static 示例逐字："NOTE: This is the number of bytes the stack will
+ *   hold, not the number of words as found in vanilla FreeRTOS."）⇒ 传同一个数值 = 同一栈量。
+ */
+#define CLOUD_START_STACK_BYTES  6144u   /* ⛔ 与旧 `xTaskCreate(..., 6144, ...)` 的第 3 实参逐字相同 */
+#define CLOUD_START_TASK_PRIO    4       /* ⛔ 与旧值逐字相同 */
+#define CLOUD_START_RETRY_WAIT_MS 60000u /* ② 的兜底重试节拍（见下；就绪事件会**提前**唤醒） */
+
+/* 静态任务的栈与 TCB：**常驻**（本任务在成功路径上永不退出 ⇒ 不释放；失败重试同一任务复用同一块）。
+ * 只在**创建失败**时释放，避免白占内存。 */
+static StackType_t  *s_cloud_start_stack;
+static StaticTask_t *s_cloud_start_tcb;
+static TaskHandle_t  s_cloud_start_handle;    /* ② 的唤醒句柄（`xTaskNotifyGive`） */
+
+/* ② 的判据位：`oneye_start()` 这一次调用**是否把 SDK 起起来了**（base init+start 都成功）。
+ * 写入点 = `oneye_start()` 的**唯一成功出口**（函数末尾）；清零点 = 每次尝试之前。
+ * ⛔ 它**不**表达"云链路暂时断开"（那是 SDK 自己的重连语义，链路掉线**不**置位）。 */
+static volatile bool s_cloud_start_sdk_up;
+
+/** 取静态栈缓冲：**只在内部 RAM**（PSRAM 一路已由本批作废，见上段根因）。
+ *
+ * ⛔ 不许在这里再出现 `MALLOC_CAP_SPIRAM`：`cloud_start` 的执行路径里必然有 flash 访问
+ *   （`oneye_start()` → `oneye_dev_creds_load()` → `esp_partition_read()`，真机调用链见上段），
+ *   关 cache 期间内核要求当前任务栈在内部 RAM（`cache_utils.c:127` 的 assert）。
+ *   门禁 A17a 现断言"必须内部 RAM"，其负向对照会把 PSRAM 一路造回去并**必须报红**。 */
+static bool cloud_start_stack_alloc(void)
+{
+    if (s_cloud_start_stack == NULL) {
+        s_cloud_start_stack = (StackType_t *)heap_caps_calloc(1u, CLOUD_START_STACK_BYTES,
+                                                             MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (s_cloud_start_stack != NULL) {
+            ESP_LOGI(TAG, "上云任务栈：已从 内部 RAM 取到 %u B（本任务要读 creds 分区，"
+                          "栈落 PSRAM 会在 flash 关 cache 时命中 assert，见本段注释）",
+                     (unsigned)CLOUD_START_STACK_BYTES);
+        } else {
+            ESP_LOGW(TAG, "上云任务栈：内部 RAM 连续块不足 %u B ⇒ 交回旧行为 `xTaskCreate`"
+                          "（其栈同样只从内部 RAM 取，见 freertos/heap_idf.c 的 "
+                          "portFREERTOS_HEAP_CAPS）",
+                     (unsigned)CLOUD_START_STACK_BYTES);
+        }
+    }
+    if (s_cloud_start_tcb == NULL) {
+        s_cloud_start_tcb = (StaticTask_t *)heap_caps_calloc(1u, sizeof(StaticTask_t),
+                                                            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    return (s_cloud_start_stack != NULL) && (s_cloud_start_tcb != NULL);
+}
+
+/** 释放静态缓冲：**只在创建失败**时调用（成功路径上本任务常驻，栈随任务活到重启）。 */
+static void cloud_start_stack_release(void)
+{
+    if (s_cloud_start_stack != NULL) {
+        heap_caps_free(s_cloud_start_stack);
+        s_cloud_start_stack = NULL;
+    }
+    if (s_cloud_start_tcb != NULL) {
+        heap_caps_free(s_cloud_start_tcb);
+        s_cloud_start_tcb = NULL;
+    }
+}
+
 /* 联网就绪 → 启动上云。放在独立任务里跑（oneye_start 需较大栈；事件任务只置位）。
- * 回调会随重连反复触发，故用一次性标志保证 SDK 只启动一次；面板启动本身幂等。 */
+ * 回调会随重连反复触发，故用一次性标志保证 SDK 只启动一次；面板启动本身幂等。
+ *
+ * ★★ 2026-10-13〔本批 · 用户裁定 ②〕**启动失败 ⇒ 就地重试，不再要求重启设备** ★★
+ *
+ * 🔴 旧行为（旧字逐字留痕，⛔ 不抹）：`oneye_start()` 的三条失败出口（无身份 / `base init 失败` /
+ *   `base start 失败` —— 真机 2026-10-12 逐字为 `E korvo2_oneye: base start 失败：out of memory`）
+ *   只是 `return;`；本任务随后**无条件**进入常驻上行维护循环 ⇒ 链路没人去建、而任务与守卫
+ *   都不再回头 ⇒ 唯一的出路是**重启设备**。
+ * ✅ 新行为 = 本任务在"SDK 没起来"时就地等下一次触发，**同一个任务、同一块静态栈**里再走一遍
+ *   `oneye_start()`：
+ *     · 触发边 ①（主）：下一次**就绪事件**（`on_wifi_ready()`，即 GOT_IP / 重新配网拿到 IP）——
+ *       它用 `xTaskNotifyGive()` 唤醒本任务（见那里的 ② 注释）；
+ *     · 触发边 ②（兜底）：`CLOUD_START_RETRY_WAIT_MS` 超时 —— Wi-Fi 一直没掉线、再也不来
+ *       新就绪事件时，仍能按这个节拍自愈（⛔ 这不是"每次心跳都重跑"：**只有启动失败**才进这个
+ *       循环；成功之后本函数**一次都不会**再调 `oneye_start()`）。
+ *   ⛔ 不新建第二个任务（那会是**第二条链路**）：任务与静态栈都只有一份。
+ *   ⛔ 不改 `oneye_start()` 的语义/顺序：本循环只是把"再调一次"这件事变得可达。 */
 static void cloud_start_task(void *arg)
 {
     (void)arg;
-    oneye_start();
+    bool retry = false;
+
+    for (;;) {
+        s_cloud_start_sdk_up = false;
+
+        /* ★ 重试前置：上一轮可能已经 `base_init` 成功、只是 `base_start` 失败（真机 2026-10-12 的
+         *   `base start 失败：out of memory` 正是这一种）⇒ 直接再调 `oneye_start()` 会在
+         *   `oneye_dev_base_init()` 处拿到 `ONEYE_DEV_SDK_ERR_STATE`
+         *   （`internal/oneye_internal.c:1554-1556` 逐字：`if (s.initialized) return
+         *   ONEYE_DEV_SDK_ERR_STATE;`）⇒ **永远起不来**。故重试前先把半初始化的 base 收干净
+         *   （`deinit` 内部会先 `stop`；未初始化时不调用）。⛔ 首次路径一字未改。 */
+        if (retry && oneye_dev_base_is_initialized()) {
+            oneye_dev_sdk_err_t drc = oneye_dev_base_deinit();
+            ESP_LOGW(TAG, "上云重试前置：释放上一轮半初始化的 base ⇒ deinit=%s",
+                     oneye_dev_strerror(drc));
+        }
+
+        oneye_start();
+
+        if (s_cloud_start_sdk_up) {
+            break;                      /* ✅ SDK 起来了 ⇒ 退出重试循环（之后掉线重连由 SDK 负责） */
+        }
+
+        retry = true;
+        ESP_LOGW(TAG, "上云启动**失败**（SDK init/start 未成功）⇒ 就地等下一次触发再试："
+                      "下一次就绪事件（GOT_IP）会立即唤醒，最长 %u s 兜底一次；"
+                      "⛔ 不需要重启设备，⛔ 不会新建第二个任务/第二条链路",
+                 (unsigned)(CLOUD_START_RETRY_WAIT_MS / 1000u));
+        (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(CLOUD_START_RETRY_WAIT_MS));
+    }
 
     /* ⚠️ 这一处原来是 `(void)xTaskCreate(...)` —— 创建失败时**零告警**，串口上"没跑"与"没写"完全同形。
      * 2026-09-30 真机实测就是被这一点掩盖的：`log_probe_task`（3072 words）根本没起来，
@@ -905,8 +1053,42 @@ static void on_wifi_ready(void)
      *   正是本批要修的那条失败路径。⛔ 也不在这里做任何阻塞动作（只发一帧，见函数注释 ③）。 */
     prov_status_report_connected_once();
 
+    /* ★★ 2026-10-13〔本批 · 用户裁定 ②〕**一次性守卫改成"可重试"** ★★
+     *
+     * 🔴 旧行为（旧字逐字留痕，⛔ 不抹）：`if (started) { return; }` —— 一旦置位就**永不回头**
+     *   （除了下面"任务创建失败"那一处会把 `started` 撤掉），而 `oneye_start()` 的三条失败出口
+     *   （无身份 / `base init 失败` / `base start 失败`）**不撤守卫** ⇒ 设备首次上云失败之后
+     *   **只能重启设备**再试。
+     * ✅ 新口径（**两件事，缺一不可**）：
+     *   ① 守卫本身**仍然只置一次**（`oneye_start()` 仍只有一个调用点、`cloud_start_task` 仍只被
+     *      创建一次 —— 门禁 A1/A2/A9a 一字未改）⇒ **成功之后绝不会出现第二条链路**；
+     *   ② "可重试"落在**下一次就绪事件**上：守卫命中时不再直接返回，而是判断
+     *      `s_cloud_start_sdk_up`（= `oneye_start()` 是否真的把 SDK 起来了）——
+     *      **没起来 ⇒ 用 `xTaskNotifyGive()` 唤醒那个已在跑的 `cloud_start_task` 再走一遍**
+     *      （同一个任务、同一块静态栈 ⇒ ⛔ 不是第二条链路、⛔ 不需要重启设备）。
+     *
+     * 为什么用"通知 + 同一任务重试"而不是"再建一个任务"：`oneye_start()` 里失败的那一半
+     *   （`base start 失败：out of memory`，真机 2026-10-12 逐字）会让 SDK 处于**半初始化**态，
+     *   而"再建一个任务"就要把上一块的静态栈（PSRAM/内部 RAM，24 KB）判死并释放 —— 那是一块
+     *   **可能仍被执行中的栈**（任务自删与释放之间没有可靠握手）。因此本批让任务**只建一次、
+     *   失败就地重试**：栈的所有权、释放时机都不存在竞态（本工程已按同一思路把 track/影子/log
+     *   三条产出方并入本任务，见 `cloud_start_task()` 与 `uplink_maintain_run()` 的注释）。
+     *
+     * 机械判据（本批的口径落地成可复核的两条）：
+     *   正 —— 首次失败（`oneye_start()` 早退 ⇒ `s_cloud_start_sdk_up == false`）⇒ 下一次
+     *         **GOT_IP / 任何就绪事件**都会走到本函数并给出通知 ⇒ 任务再试（串口有
+     *         `收到新的就绪事件 ⇒ 上云启动重试`，或 `上云启动失败 ⇒ 就地等下一次触发再试`）。
+     *   负向 —— 成功之后 `s_cloud_start_sdk_up` 恒为 `true` ⇒ 本分支**什么都不做**
+     *         （既不通知、也不可能再建任务）⇒ **不得**重复启动第二条链路。
+     * ⛔ 也**不是**"每次心跳都重跑"：通知只在**就绪事件**上发（不是周期心跳），且任务侧
+     *   `oneye_start()` **只有"上一轮没起来"才会被再调**。 */
     static bool started;
     if (started) {
+        if (!s_cloud_start_sdk_up && s_cloud_start_handle != NULL) {
+            ESP_LOGW(TAG, "上一次上云启动未成功（SDK 未起来）⇒ 本次就绪事件唤醒 cloud_start_task 重试"
+                          "（⛔ 不新建任务、⛔ 不建第二条链路、⛔ 不需要重启设备）");
+            xTaskNotifyGive(s_cloud_start_handle);
+        }
         return;
     }
     started = true;
@@ -927,11 +1109,36 @@ static void on_wifi_ready(void)
     /* ④ 本地验证面与云端链路解耦：拿到 IP 就起（幂等；掉线重连后拿到 IP 也能补起） */
     panel_start_if_enabled();
 
-    /* ⑤ 上云：**唯一**那个任务仍只在这里建（门禁 A2） */
-    if (xTaskCreate(cloud_start_task, "cloud_start", 6144, NULL, 4, NULL) != pdPASS) {
-        started = false;
-        ESP_LOGE(TAG, "上云任务创建失败（内存不足）");
-        return;
+    /* ⑤ 上云：**唯一**那个任务仍只在这里建（门禁 A2）★ 2026-10-13（本批 ① · 阻塞级回归修复）：
+     *    改**静态栈 + 一律内部 RAM**（前批"PSRAM 优先、失败回落"已作废 —— 真机每次上云 assert 复位，
+     *    根因与调用链见 `cloud_start_stack_alloc()` 的注释）。
+     *    ⛔ 栈量（6144）、优先级（4）、`pvParameters`（NULL）与旧 `xTaskCreate` 逐字相同。 */
+    s_cloud_start_handle = NULL;
+    if (cloud_start_stack_alloc()) {
+        s_cloud_start_handle = xTaskCreateStaticPinnedToCore(cloud_start_task, "cloud_start",
+                                                            CLOUD_START_STACK_BYTES, NULL,
+                                                            CLOUD_START_TASK_PRIO,
+                                                            s_cloud_start_stack, s_cloud_start_tcb,
+                                                            tskNO_AFFINITY);
+    }
+    if (s_cloud_start_handle == NULL) {
+        /* 静态缓冲没用上（内部 RAM 连续块不足，或 TCB 取不到）⇒ 立刻还回去（别白占内存），
+         * 再按**旧行为**建一次：`xTaskCreate()` —— 它的栈走 `pvPortMalloc()`
+         * （`portFREERTOS_HEAP_CAPS = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT` ⇒ **也是内部 RAM**）。
+         * ⚠️ 这里刻意保留**旧调用形式**（而不是 `xTaskCreatePinnedToCore(..., tskNO_AFFINITY)`，
+         *   二者语义等价）：门禁 A2/A9a 以 `xTaskCreate(cloud_start_task` 为"唯一创建点"锚点，
+         *   保留旧形式即 **0 处改动**地继续满足它；① 的新形状另由
+         *   `tools/check-cloud-start-psram-retry.py`（A17）机械断言。 */
+        cloud_start_stack_release();
+        if (xTaskCreate(cloud_start_task, "cloud_start", CLOUD_START_STACK_BYTES, NULL,
+                        CLOUD_START_TASK_PRIO, &s_cloud_start_handle) != pdPASS) {
+            started = false;
+            s_cloud_start_handle = NULL;
+            ESP_LOGE(TAG, "上云任务创建失败（内存不足）—— 设备已联网但不会上平台；"
+                          "★ 可重试：下一次就绪事件（GOT_IP）会再建一次（⛔ 不需要重启设备）");
+            return;
+        }
+        ESP_LOGW(TAG, "上云任务：静态栈不可用 ⇒ 已回落 `xTaskCreate`（内部 RAM，旧行为）");
     }
     ESP_LOGI(TAG, "已联网 → 启动上云（oneye-dev-sdk）");
 }
@@ -1060,6 +1267,34 @@ static void wifi_prov_boot(void)
     char pass[WIFI_PROV_PASS_MAX] = { 0 };
     char src[64] = { 0 };
 
+    /* 🔴 2026-10-13〔本批 D2 · 用户逐字裁定「**SD卡配网失败回落BLE 配网模式**」〕
+     *   「文件通道**命中、但本次入网失败**」的一次性回落标志。
+     *
+     * 为什么它是一次性的（⛔ 不循环、⛔ 不反复重启广播）：本标志是**本函数的局部量**，而本函数在
+     *   `app_main()` 里**只有 1 个调用点**（门禁 A18c 断言"恰好 1 处"）⇒ 每次上电最多回落一次。
+     *
+     * 旧行为（本批修掉的；旧字逐字留痕，⛔ 不抹）：文件通道失败只做
+     *   `wifi_prov_release_held("file-connect-failed")` 降级 ⇒ 落到下面 BLE 段时仍按 KEY_GATE **待机**
+     *   ⇒ **需要再按一次 SET（或复位）**才能进 BLE 配网模式（`ALPHA-SDCARD.md` §3.4 已登记该边界）。
+     * 新行为：本次**已经**用掉文件通道且失败 ⇒ 进 BLE 段后**自动**走
+     *   `wifi_prov_ble_pairing_enter()` —— 它与「长按 SET 进入配网模式」是**同一条**路径
+     *   （起栈/重开广播 + 起 `ONEYE_FW_BLE_PROV_PAIRING_WINDOW_S` 窗口计时；见
+     *   `korvo2_oneye_main.c` 的 `ble_prov_key_toggle()`），**无需用户再按键**。
+     *
+     * ⛔ 两侧边界（本批不许动，门禁 A18d 断言）：
+     *   ① `key_gate=y` 且**卡不在位 / 文件未命中 / 解析失败** ⇒ 语义**逐字不变**（开机只待机、
+     *      长按 SET 进入）；本标志为 `false` 时下面 `wifi_prov_ble_set_autostart(!key_gate)` 与既有
+     *      "下一步：长按 SET 键"日志**一字未改**（⛔ 不是"开机即广播"）。
+     *   ② 唯一判据 / 通道收敛点**不变**：`wifi_prov_policy.h` 的 rank 与
+     *      `wifi_prov_channel_is_authoritative()` 逐字未改；本回落只用**既有**公开 API
+     *      （`wifi_prov_release_held()` + `wifi_prov_ble_pairing_enter()`）⇒ ⛔ 不新增通道、
+     *      ⛔ 不改判据、⛔ 不自建第二条入网/入网后路径（`oneye_start()` 仍只有收敛点下游一个调用点）。
+     *   ⚠️ 声明在 `#if CONFIG_ONEYE_FW_ENABLE_BLE_PROV` 内：只有 BLE 段会**读**它；无 BLE 的机型
+     *      连变量都不存在（⛔ 不留"设了没人读"的未用变量，`-Wall` 下会报）。 */
+#if CONFIG_ONEYE_FW_ENABLE_BLE_PROV
+    bool file_fell_back = false;
+#endif
+
 #if CONFIG_ONEYE_FW_ENABLE_WIFI_FILE
     /* C3（**rank 0，最高**）：SD 卡根目录 oneye-wifi.txt（用户投放）；SD 未挂载时自动试 SPIFFS 同名文件。
      * ★ `ONEYE_FW_ENABLE_WIFI_FILE` 是**机型能力位**：有卡槽机型 y / 无卡槽机型 n。
@@ -1074,9 +1309,14 @@ static void wifi_prov_boot(void)
         }
         /* ★ 卡上有凭据、但**本次入网失败** ⇒ 显式释放采信槽再降级。理由：优先级判据管的是
          *   "多通道都可得时谁先被采信"，不是"已经失败的通道继续霸位"；不释放的话 rank 0 会一直占着
-         *   槽位，把 BLE 与兜底通道全部拒掉，设备只能反复重试那份连不上的旧凭据（配网体验死锁）。 */
+         *   槽位，把 BLE 与兜底通道全部拒掉，设备只能反复重试那份连不上的旧凭据（配网体验死锁）。
+         * ★ 2026-10-13〔本批 D2〕：释放之后**置一次性回落标志** ⇒ 下面 BLE 段会**自动**进入配网模式
+         *   （等价「长按 SET」），不再要求用户"再按一次 SET 或复位"（旧行为见本函数头的留痕块）。 */
         ESP_LOGW(TAG, "SD 卡凭据未能入网（来源 %s，ssid=%s）⇒ 释放采信槽，降级到其它通道", src, ssid);
         wifi_prov_release_held("file-connect-failed");
+#if CONFIG_ONEYE_FW_ENABLE_BLE_PROV
+        file_fell_back = true;   /* ⇐ 本批 D2：本次已用掉文件通道 ⇒ 进 BLE 段后自动进配网模式 */
+#endif
         ssid[0] = '\0';
         pass[0] = '\0';
         src[0] = '\0';
@@ -1114,7 +1354,30 @@ static void wifi_prov_boot(void)
                  ? "按键门控模式 —— 开机不广播（待机），长按 SET 键进入配网模式"
                  : "开机即广播（gate=n 的旧语义；长按 SET 可退出/重新进入配网模式）");
     if (wifi_prov_ble_start() == ESP_OK) {
-        if (key_gate) {
+        if (file_fell_back) {
+            /* 🔴 2026-10-13〔本批 D2〕**自动**进入 BLE 配网模式 —— 等价「长按 SET」后的状态：
+             *   走的就是按键那一条路径 `wifi_prov_ble_pairing_enter()`（内部 = 起栈/重开广播 +
+             *   `window_restart()` 起 `ONEYE_FW_BLE_PROV_PAIRING_WINDOW_S` 窗口计时），
+             *   ⛔ **不是**第二条进入路径；也⛔ 不改 `wifi_prov_ble_start()` 的语义
+             *   （`set_autostart(!key_gate)` 仍按 KEY_GATE 设置，见上）。
+             *   ⚠️ 为什么不改成"把 autostart 置 true"：那只覆盖 gate=y 一种机型，且**不起窗口计时**
+             *   ⇒ 与长按 SET 的语义**不等价**（窗口超时自动退出会缺失）。 */
+            esp_err_t prc = wifi_prov_ble_pairing_enter();
+
+            if (prc == ESP_OK) {
+                ESP_LOGW(TAG, "SD 卡凭据未能入网 ⇒ **已自动进入 BLE 配网模式**（等价长按 SET，"
+                              "**无需再按键**）；配网窗口 %d s，超时自动退出"
+                              "（长按 SET 可退出/重新进入）",
+                         (int)CONFIG_ONEYE_FW_BLE_PROV_PAIRING_WINDOW_S);
+            } else {
+                /* ⛔ 不静默：自动回落失败必须把"下一步怎么做"讲清（退回按键口径） */
+                ESP_LOGE(TAG, "SD 卡凭据未能入网，且**自动进入 BLE 配网模式失败**（%s）"
+                              "⇒ 下一步：**长按 SET 键**进入 BLE 配网模式", esp_err_to_name(prc));
+            }
+            /* ⚠️ 此刻【已经在广播】⇒ 这里⛔ **不能**再说"长按 SET 进入"（日志不许说假话）。 */
+            ESP_LOGW(TAG, "下一步：**无需按键** —— 手机 App 连接 ONEYE-<设备 id 后 4 位>，"
+                          "输入**机身贴码（激活码＝node_id）**后下发新的 Wi-Fi 凭据");
+        } else if (key_gate) {   /* D2：无文件/文件未命中时的**原有待机语义**，逐字保留（⛔ 非"开机即广播"） */
             /* ★ 待机形态的"下一步"必须写清**怎么离开待机**，否则串口只说了"没广播"，
              *   现场只能猜（2026-10-07 那批踩过的正是"指引做不到/没说"这一类）。 */
             ESP_LOGW(TAG, "下一步：**长按 SET 键**进入 BLE 配网模式（串口会打印本机型是否需要激活凭证"
@@ -1132,7 +1395,7 @@ static void wifi_prov_boot(void)
          *   `phase=pre-prov…`（同一块板、外设已就绪、NimBLE 之前）相减即 NimBLE 的净代价。
          * ⚠️ 2026-10-09：gate=y 时此刻**未广播**，但"NimBLE 主机栈已起栈"这一点不变 ⇒ 读数同义
          *   （它就是"起栈后、入网前"的量），故这一处**不动**（门禁 A13b 亦要求它在 start() 之后）。 */
-        res_report("ble-ready（NimBLE 已起栈；gate=y 时未广播、入网前）");
+        res_report("ble-ready（NimBLE 已起栈；入网前；gate=y 且文件通道未回落时未广播）");
         panel_start_if_enabled();     /* 无 IP ⇒ 提示并直接返回 */
         return;                       /* 等通道提交凭据；入网后由收敛点统一触发上云 */
     }
@@ -1497,6 +1760,13 @@ static void oneye_start(void)
         ESP_LOGW(TAG, "mpp 域已初始化（不发起会话：媒体数据面未在真机验证）");
     }
 #endif
+
+    /* ★ 2026-10-13〔本批 ②〕**唯一成功出口标记**：走到这里 = `oneye_dev_base_init()` 与
+     *   `oneye_dev_base_start()` 都返回了 OK（本函数前面三条失败出口都是早退 `return;`）。
+     *   `cloud_start_task()` 据此判断"要不要就地重试"（见那里的 ② 注释）。
+     *   ⛔ 它**不**等价于"云链路已 UP"（链路建立/重连是 SDK 内部的事），
+     *   也⛔ **不**参与任何"要不要重连 / 等多久"的决策。 */
+    s_cloud_start_sdk_up = true;
 }
 
 #if CONFIG_ONEYE_FW_LOG_PROBE

@@ -1,0 +1,83 @@
+# =============================================================================
+# sdkconfig.defaults.bench-sdcard —— **仅本机台面（bench）**的「SD 凭据文件通道」档
+#
+# 用途：本档**唯一**新增的语义 = 把机型能力位 `ONEYE_FW_ENABLE_WIFI_FILE` 打开，
+#       使「插卡（卡根目录 oneye-wifi.txt）+ 复位」这条**启动即自动配网（自动回连）**通路成立。
+#
+# 用户裁定（逐字，最高依据）：
+#   「**打开 `ENABLE_WIFI_FILE` 的固件才是支持 SD 卡的，这种情况下才需要自动回连。
+#     其他情况都是靠按键重新触发配网**」
+#   ⇒ 本档就是那个"打开 ENABLE_WIFI_FILE 的固件"；BLE 仍保留（回落通道 = 按键配网），
+#     但**不再**是唯一通道。
+#
+# 用法（**必须显式叠加、且排在最后**；IDF 后叠加者胜）：
+#   idf.py -B <build> \
+#     -DSDKCONFIG=<build>/sdkconfig \
+#     -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32s3;\
+#       sdkconfig.defaults.production;sdkconfig.defaults.ble;sdkconfig.defaults.ble-key;\
+#       sdkconfig.defaults.diag;sdkconfig.defaults.bench-local;sdkconfig.defaults.bench-sdcard" \
+#     -DONEYE_FW_CERT_DIR=<空目录> -DONEYE_SDK_LIB_OUT_DIR=<不存在目录> build
+#
+# -----------------------------------------------------------------------------
+# ★ 为什么必须单独一份、且必须排最后（旧 → 新，机械可复核）★
+# -----------------------------------------------------------------------------
+#   叠加链上对这个符号的**既有**两次落点（叠加顺序即 IDF 的施加顺序）：
+#     · `sdkconfig.defaults:101`  `CONFIG_ONEYE_FW_ENABLE_WIFI_FILE=y`   ← 机型能力位（有卡槽 y）
+#     · `sdkconfig.defaults.ble:23` `# CONFIG_ONEYE_FW_ENABLE_WIFI_FILE is not set`  ← **覆盖成 n**
+#   ⇒ 台面件（`build-alpha-tlsram` / `build-alpha-scanfix`）产物 sdkconfig 实测：
+#       `# CONFIG_ONEYE_FW_ENABLE_WIFI_FILE is not set`
+#       （`ble:23` 的设计意图是"无卡槽机型"：关 SD 通道的**同时**开 BLE 通道，见 ADR-0017 D3；
+#        它在本档不适用 —— 本机型 korvo2_oneye **有**卡槽。）
+#   ⇒ 新：本文件排在 `sdkconfig.defaults.ble` **之后**（且排在 `diag` / `bench-local` 之后，即最后一份）
+#       ⇒ 同一符号被**重新赋 y**，后写覆盖。
+#   ⛔ 本档**不改** `sdkconfig.defaults.ble` 的既有值（`ble:23` 逐字不变）——
+#      那条 n 对**无卡槽机型**仍然正确；也⛔ 不碰 `sdkconfig.defaults.production`
+#      （量产三份 defaults 的清单逐字不变）。
+#   ⛔ 本档**不新增任何"量产/台面"语义的开关**：只把已有能力位翻回 y，并把回落通道的对齐项显式写出。
+#
+# -----------------------------------------------------------------------------
+# 自证（构建后对**产物 sdkconfig** 跑，预期逐行见注释）
+# -----------------------------------------------------------------------------
+#   grep -E "^CONFIG_ONEYE_FW_(ENABLE_WIFI_FILE|ENABLE_BLE_PROV|ENABLE_SDCARD|BLE_PROV_KEY_GATE)" \
+#        <build>/sdkconfig
+#     => CONFIG_ONEYE_FW_ENABLE_WIFI_FILE=y      ← 本档的唯一新增语义（旧值 = 「is not set」）
+#        CONFIG_ONEYE_FW_ENABLE_BLE_PROV=y
+#        CONFIG_ONEYE_FW_ENABLE_SDCARD=y
+#        CONFIG_ONEYE_FW_BLE_PROV_KEY_GATE=y
+#   defaults 门禁（两档一并核；⚠️ **必须带 IDF_PATH**，理由见 tools/check-sdkconfig-defaults.py 头注）：
+#     IDF_PATH=<esp-idf 根> python3 tools/check-sdkconfig-defaults.py --sdkconfig <build>/sdkconfig \
+#       --require sdkconfig.defaults.bench-local --require sdkconfig.defaults.bench-sdcard
+# =============================================================================
+
+# ---- 配网通道 C3：SD 卡 / SPIFFS 凭据文件（**rank 0，最高**）----------------------
+# 语义（`main/wifi_prov_boot()` + `main/wifi_prov.c:wifi_prov_load_file()`，本档⛔不改代码）：
+#   启动时按候选序读 `/sdcard/oneye-wifi.txt` → `/spiffs/oneye-wifi.txt`；命中即
+#   `wifi_prov_submit_credentials_src(..., WIFI_PROV_CHAN_FILE)` 采信（rank 0）
+#   → 阻塞等 IP（上限 20 s）→ 拿到 IP 走**唯一收敛点**（GOT_IP → `on_wifi_ready()` → `oneye_start()`）。
+#   ⇒ 这就是用户要的「插卡 + 复位即自动入网（自动回连）」。
+# ⚠️ 顺序：本行必须在下面 `ONEYE_FW_BLE_PROV` 之前被施加也无所谓（两者互不 depend），
+#    但**整份文件必须排在 `sdkconfig.defaults.ble` 之后**才有覆盖效果（见文件头）。
+CONFIG_ONEYE_FW_ENABLE_WIFI_FILE=y
+
+# ---- 回落通道 C1/C2：BLE 交互式配网（**rank 1**）---------------------------------
+# 为什么这里要显式再写一次（值同 `sdkconfig.defaults.ble`，**不是**新增语义）：
+#   `main/korvo2_oneye_main.c:wifi_prov_boot()` 的分派是「文件通道**未命中/未入网** ⇒ 继续往下走」
+#   ⇒ 卡不在位 / 文件不存在 / 解析不出 ssid ⇒ 落到 BLE。
+#   ⛔ 因此**回落通道必须在同一份产物里也在**，否则"文件解析失败"会退化成"一个通道都没有"。
+#   写成本档显式可见，是为了让"本档 = 文件通道 + 按键配网回落"这件事在 sdkconfig 里读得出来。
+# ⚠️ 依赖顺序有语义（`sdkconfig.defaults.ble:25-31` 的教训）：`ENABLE_BLE_PROV` 的
+#    `depends on ONEYE_DEV_SDK_ENABLE_BLE` 由**前面**的 `sdkconfig.defaults.ble` 打开 ⇒ 此处可安全赋值。
+CONFIG_ONEYE_FW_ENABLE_BLE_PROV=y
+
+# ---- 按键门控：**保持**上一批台面件的既有行为（⛔ 不因本档而改）-------------------
+# `=y` = 开机**不广播**，待机；**长按 SET 键**才进 BLE 配网模式。
+#   · 上一批产物（`build-alpha-scanfix/sdkconfig:629`）就是 `=y`
+#     ⇒ 本档逐字保持，避免"因为加了文件通道而顺带把 BLE 广播形态改了"（那是另一件事，需另裁定）。
+#   · 与用户裁定一致：**只有**文件通道命中时才是"开机即自动入网（自动回连）"；
+#     其余情形（卡不在位/解析失败）仍是**靠按键重新触发配网**。
+CONFIG_ONEYE_FW_BLE_PROV_KEY_GATE=y
+
+# ---- microSD 本身：机型有卡槽（值同 `sdkconfig.defaults:106`，显式写出仅为可审计）----
+# 文件通道的物理前提 = SD 已挂载（`main/korvo2_oneye_main.c:208-219` 走 ADF 的
+# `audio_board_sdcard_init()`；未插卡只告警、不阻塞启动）。
+CONFIG_ONEYE_FW_ENABLE_SDCARD=y

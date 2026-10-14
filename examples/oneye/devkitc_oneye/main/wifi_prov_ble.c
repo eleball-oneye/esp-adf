@@ -682,6 +682,13 @@ esp_err_t wifi_prov_ble_start(void)
      * ⛔ 两者都⛔ **不得**回落 `CONFIG_ONEYE_FW_DEVICE_ID`。 */
     bcfg.device_id = (s_ids.node_id[0] != '\0') ? s_ids.node_id : "";
     bcfg.adv_sn = (s_ids.sn[0] != '\0') ? s_ids.sn : NULL;
+    /* 🔴 2026-10-14：**机型 `productKey`** 直通（契约 §1.1 v3 ⇒ 空口 off 25 的 `pk_code`）。
+     * ⛔ 它是**机型属性、不是身份**（同一机型的设备共用一个值）；载体 = 本工程 Kconfig
+     * `ONEYE_FW_PRODUCT_KEY`（缺省 `OY-SPK-01`；乙 / 丙 两档由各自 `sdkconfig.defaults.*`
+     * 显式给 `OY-SPK-02` / `OY-SPK-03` —— ⚠️ 后两者是否已登记见 `cloud/docs/00-naming-convention.md`
+     * §5.1：**未登记的串由编码器取 `0x00`（未知 / 无品类），⛔ 不猜号**）。
+     * ⛔ 本处**不做**映射（映射点只有一处 = `oneye_dev_ble_adv_mfg_pk_code_of()`）。 */
+    bcfg.product_key = CONFIG_ONEYE_FW_PRODUCT_KEY;
     /* 机型级「是否要求激活凭证」⇒ `prov.pair.ok.cred_req`（可选字段，台账 #7 / #9）。
      * 载体 = 本工程 Kconfig（编译期）：配网期无网 + 厂商字段里已无 `pk_family`（台账 #3）
      * ⇒ 设备侧拿不到 cloud 机型表，只能由机型位承载；缺省 y（与 cloud 的 fail-closed 同向）。 */

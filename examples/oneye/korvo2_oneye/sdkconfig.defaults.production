@@ -93,6 +93,76 @@ CONFIG_ONEYE_FW_CLOUD_PORT=18886
 # （否则它只存在于"没人往里填过"这一无法核对的假设里）。
 CONFIG_ONEYE_FW_CLOUD_TOKEN=""
 
+# =============================================================================
+# 配网通道（🔴 2026-10-20 用户裁定）：**SD 卡凭据优先 ＋ 拔出 SD 卡时 BLE 回退**
+#
+# 用户口径（逐字，最高依据，⛔ 不得改写）：
+#   「com12 甲型需要支持蓝牙配网使能，**拔出 SD 卡的时候用蓝牙配网，有 SD 卡时用 SD 卡凭据配网**」
+#
+# 🔴 旧行为（逐字留痕，⛔ 不抹）：本预设此前**不含任何 BLE 符号** ⇒ 本机的量产链
+#   （`sdkconfig.defaults` → `.esp32s3` → `.production`）上 `CONFIG_ONEYE_FW_ENABLE_BLE_PROV`
+#   未定义、NimBLE 关；有卡槽机型**只有一条** SD 通道 ⇒ 拔出 SD 卡（或卡上没有
+#   `oneye-wifi.txt`）后串口止于「未找到可用的 Wi-Fi 凭据 → 本次启动不会上云」，
+#   设备**没有任何配网通道**（2026-10-20 14:44 真机取证：
+#   `E:\workspace\_oneye-logs\COM12-ALPHA-READINESS-20261020.md` §1.3 与 §4 缺口 #6）。
+#
+# ✅ 现行为（**只加配置**；判据 / 帧协议 / 收敛点 / 身份来源一字未改）：
+#   · 启动顺序与采信 rank **逐字不变**（ADR-0017 D2.1）：C3 文件（rank 0）→ C1/C2 BLE（rank 1）
+#     → C5 Kconfig 兜底（rank 2）；`wifi_prov_policy.h` 未动。
+#   · **有卡且解析成功** ⇒ `wifi_prov_boot()`（`main/korvo2_oneye_main.c:1303-1309`）在 BLE 段
+#     **之前** `return` ⇒ NimBLE **根本不起栈**（"有 SD 时不启 BLE"是**代码结构**保证的，
+#     ⛔ 不是靠日志或运行期开关）。
+#   · **卡缺失 / 文件缺失或解析失败 / 卡上凭据本次入网失败** ⇒ 落到 BLE 段并**开机即广播**
+#     （下面 `ONEYE_FW_BLE_PROV_KEY_GATE` 保持 n ⇒ `set_autostart(true)`；
+#     ⛔ 不要求用户先长按 SET 才看得到设备）。文件通道"命中但连不上"的那条另有
+#     2026-10-13 D2 的**自动**进入配网模式（`file_fell_back` → `pairing_enter()`）。
+#   · **甲型身份不变**：`oneye_start()` 只从 **creds 分区**取 node / 证书 / 私钥
+#     （`main/korvo2_oneye_main.c:1491` 的 `oneye_dev_creds_load()`），BLE 通道只下发
+#     **Wi-Fi 凭据**；⛔ 不得用激活码顶替甲型 creds 身份（激活码仅作 BLE 配对/核验基准）。
+#   · **运行期不热切换**：SD 只在上电时挂载/读取一次 ⇒ 插卡/拔卡都**在下一次复位生效**。
+#
+# ⚠️ 顺序有语义（2026-10-07 实测，⛔ 不要重排）：`ONEYE_FW_ENABLE_BLE_PROV` 有
+#   `depends on ONEYE_DEV_SDK_ENABLE_BLE`，后者又 `depends on ONEYE_DEV_SDK_ENABLE_LINK`、
+#   再上还有 `ONEYE_DEV_SDK_ENABLE`；defaults 是**按文件顺序**逐条施加的，给"当前不可见"的
+#   符号赋值会被**静默丢弃** ⇒ 被依赖者必须写在依赖者**之前**（下面就是这个次序）。
+# =============================================================================
+CONFIG_ONEYE_DEV_SDK_ENABLE=y
+CONFIG_ONEYE_DEV_SDK_ENABLE_LINK=y
+CONFIG_ONEYE_DEV_SDK_ENABLE_BLE=y
+CONFIG_ONEYE_FW_ENABLE_BLE_PROV=y
+# 档位 = **甲 ALPHA**（choice 缺省即甲，这里**显式**钉住）：与 cloud 侧
+# `dev_product_credential_policy(OY-SPK-01)` 的 `credential_required=1` /
+# `onboarding_actor=DEVICE` 同源（契约 `ble-gatt.md` §4.4.2；`cred_req=1`、`prov.verify.req` 必经）。
+CONFIG_ONEYE_FW_ONBOARDING_ROLE_ALPHA=y
+# 按键门控保持 **n**（`# CONFIG_…_KEY_GATE is not set`）：拔卡即广播。
+# ⛔ 若把它置 y，拔卡后设备会停在"待机不广播"，必须长按 SET 才出现在 App 里 ——
+#    那与用户口径「拔出 SD 卡的时候用蓝牙配网」不符（旧 `sdkconfig.defaults.ble-key` 档不受影响）。
+# CONFIG_ONEYE_FW_BLE_PROV_KEY_GATE is not set
+# 配网窗口 300 s = SDK 一次性 chal TTL（`CONFIG_ONEYE_DEV_SDK_BLE_CHAL_TTL_S`）；
+# ⚠️ 本档 gate=n（开机即广播）时**开机那段不记窗口**；本值在两条路径上生效：
+#    ① 长按 SET 进入配网模式；② 卡上凭据"命中但连不上"时的 D2 自动回落（2026-10-13）。
+CONFIG_ONEYE_FW_BLE_PROV_PAIRING_WINDOW_S=300
+
+# ---- Wi-Fi + BLE 共存 / NimBLE 取值 ---------------------------------------------
+# 逐项照抄**已真机打通**的 `sdkconfig.defaults.ble`（真机取证 2026-09-17：korvo2 上 BLE 配网
+# 与音频管线共存）；⛔ 不要在这里"按需精简" —— 每一条都对应一次真机踩出来的崩溃/饥饿
+# （主机栈 12 KB、MSYS 12/12、NimBLE 主机侧走 PSRAM、Wi-Fi 缓冲下调）。
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=517
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=12288
+CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=12
+CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=12
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
+
 # ---- 自检与体积 ---------------------------------------------------------------
 # 板级自检失败即中止上云（量产要的是"坏的别上网"，不是"坏的也上网")
 CONFIG_ONEYE_FW_SELFTEST_STRICT=y
@@ -156,6 +226,11 @@ CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 #    要落地必须改 SDK 并重跑 `build-all.sh --toolchains`，属**另一个仓的改动**，本轮未做。
 #    ⚠️ 2026-10-07 补充：BLE 机型（`sdkconfig.defaults.ble`）**会**启用该代码路径 ⇒
 #    这项欠账在 BLE 机型上从"管不到"变成"实际存在"（协议正文可能落串口），如实登记、未修。
+#    🔴 **2026-10-20 订正（⛔ 旧字逐字留痕，不抹）**：上面两句里"本预设未启用 BLE"的前提**已作废** ——
+#    用户裁定「拔出 SD 卡的时候用蓝牙配网」后，**本预设自己**就打开了 BLE 通道（见上面
+#    「配网通道（2026-10-20 用户裁定）」段）⇒ 该 PIPL 欠账从"只有 `.ble` 机型存在"升级为
+#    "**甲型量产件同样存在**"（协议正文可能落串口）。本批⛔ 未改 SDK（红线）⇒ 本条如实登记为
+#    **量产出厂前必须关闭的欠账**，不再是"管不到"。
 #  · 另一例程 `examples/oneye/korvo2_llm_chat`（自述 `ONEYE_LLM_ENABLE_WIFI_FILE` /
 #    `ONEYE_LLM_ENABLE_LAN_LINK` 量产置 n）是**另一份固件**，不在本轮写区，未动。
 # =============================================================================

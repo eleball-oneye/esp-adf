@@ -58,3 +58,27 @@ list(APPEND EXTRA_COMPONENT_DIRS "${_oneye_sdk_dir}")
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
 project(devkitc_oneye)
+
+# =============================================================================
+# 🔴 2026-10-20〔`mqtt client alloc failed` 批〕MQTT 收发缓冲注入（⛔ 不改 SDK 源码）
+#
+# 判据与成因：`components/oneye-dev-sdk/src/internal/oneye_mqtt.c:58-65` 里两处 `#ifndef` 守卫
+#   缺省 RX = `ONEYE_MQTT_PAYLOAD_MAX + 32u` = **65568 B**、TXQ = **16384 B**；乙型 devkitc 入网后
+#   free heap 只剩 ~7 KB ⇒ `oneye_mqtt_new()` 必失败（真机 11/11 `mqtt client alloc failed`）。
+# 用户 2026-10-20 裁定：「RX/TXQ 4096｜允许 deinit BLE」。
+#
+# 落法：**编译定义**从本工程注入 SDK 组件（`#ifndef` 守卫因此取到 Kconfig 值），
+#   键 / 缺省 / 代价都在 `main/Kconfig.projbuild` 的两个 int 项里（唯一事实源）。
+# ⚠️ 目标名写错必须**构建期失败**，⛔ 不许 `if(TARGET)` 静默跳过 —— 否则"改了却没生效"会被
+#   当成"改好了"（那正是本批要避免的形态）。
+# =============================================================================
+if(NOT TARGET __idf_oneye-dev-sdk)
+    message(FATAL_ERROR
+        "找不到 SDK 组件目标 `__idf_oneye-dev-sdk` ⇒ MQTT RX/TXQ 编译定义注入点失效（⛔ 不静默跳过）。\n"
+        "  检查 EXTRA_COMPONENT_DIRS 是否仍把 oneye-dev-sdk 作为组件挂上，以及组件名是否改过。")
+endif()
+target_compile_definitions(__idf_oneye-dev-sdk PRIVATE
+    ONEYE_MQTT_RX_BUF_BYTES=${CONFIG_ONEYE_FW_MQTT_RX_BUF_BYTES}
+    ONEYE_MQTT_TXQ_BYTES=${CONFIG_ONEYE_FW_MQTT_TXQ_BYTES})
+message(STATUS "devkitc_oneye: MQTT RX=${CONFIG_ONEYE_FW_MQTT_RX_BUF_BYTES} B / "
+               "TXQ=${CONFIG_ONEYE_FW_MQTT_TXQ_BYTES} B（注入 oneye-dev-sdk；⛔ 未改 SDK 源码）")

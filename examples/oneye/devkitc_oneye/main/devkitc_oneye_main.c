@@ -47,6 +47,7 @@
 
 #include "adv_identity.h"      /* ⛔ 只用于声明核对：身份的**唯一**读取点在 adv_identity.c */
 #include "ble_sig_material.h"  /* 乙档 prov.pair.ok.sig 的注入点（窄接口） */
+#include "prov_identity.h"     /* ★ 会话级节点身份（prov.verify.req 的激活码） */
 #include "wifi_prov.h"
 #include "wifi_prov_ble.h"
 #include "wifi_prov_status.h"
@@ -55,6 +56,13 @@
 #include "sntp_boot.h"
 
 static const char *TAG = "devkitc_oneye";
+
+/* 🔴 **2026-10-20〔offline_bytes 2 KiB 批〕**：离线缓存上限（用户裁定「**16KiB→2KiB**」）。
+ *   **旧值逐字留痕（⛔ 不抹）**：`ev_cfg.offline_bytes = 16 * 1024;`
+ *   ⚠️ 收成一个**文件级常量**的唯一理由：让开机自证行（`boot_identity_report`）与
+ *      `oneye_start()` 的赋值点**读同一个数**（⛔ 不两处各写一份 2 * 1024，避免"改了这里忘了那里"）。
+ *   ⛔ 本工程没有对应的 Kconfig/编译定义（grep 实测：devkitc 目录下 `offline_bytes` 只有下面那两处）。 */
+#define ONEYE_FW_OFFLINE_BYTES (2u * 1024u)
 
 /* ============================================================================
  * 0. 板级常量（ESP32-S3-DevKitC-1 官方板）
@@ -181,12 +189,91 @@ static void boot_identity_report(void)
                  esp_err_to_name(nvs));
     }
 
+    /* 🔴 **2026-10-20〔node 身份「尽力写 nvs」批〕**：**身份面**（`oneye_prov`）的媒介前提 ——
+     *   乙型**可能没有 nvs 分区**，用户裁定「只尝试写 nvs，写失败**不阻断**」⇒ 这里把"能不能写"
+     *   在**开机**就如实讲清（⛔ 不等到配网那一刻才第一次暴露）；写不进去⛔ 不影响任何流程。 */
+    {
+        esp_err_t prc = prov_identity_nvs_probe();
+        if (prc == ESP_OK) {
+            ESP_LOGI(TAG, "NVS 身份面：可打开（ns=%s key=%s）⇒ node 尽力写 nvs 的媒介前提成立"
+                          "（写失败仍**不阻断**；App 重新配网即可）",
+                     "oneye_prov", "node");
+        } else {
+            ESP_LOGW(TAG, "NVS 身份面：**打不开**（%s）⇒ 乙型可能**无 nvs 分区**；"
+                          "node 不落盘，⛔ 不阻断启动与上云（App 重新配网上平台即可）",
+                     esp_err_to_name(prc));
+        }
+    }
+
+    /* 🔴 **2026-10-20〔offline_bytes 2 KiB 批〕开机自证**：离线缓存上限也在这里打一行 ——
+     *   理由：它只在"入网后建云链路"那条路径上被使用，而**没有可用 Wi-Fi 凭据**的那次上电
+     *   根本不会走到 `oneye_start()` ⇒ 如果只在那边打，验收时"新值到底编进去了没有"就读不到。
+     *   ⚠️ 同一个数还有一处运行时回读（`oneye_dev_event_init` 之后，打印 `ev_cfg.offline_bytes`）
+     *   —— 编码点只有 [ONEYE_FW_OFFLINE_BYTES] 这一处。 */
+    ESP_LOGI(TAG, "[ev] offline_bytes=%u B（2026-10-20 裁定：由 16384 收窄到 2048，释放 ~14 KiB 运行余量）",
+             (unsigned)ONEYE_FW_OFFLINE_BYTES);
+
     /* 乙档的签名材料自证（⛔ 只打"有没有"，⛔ 不打材料内容）。 */
 #if CONFIG_ONEYE_FW_ONBOARDING_ROLE_BETA
     ESP_LOGI(TAG, "乙档 sig 材料：%s（prov.pair.ok 的 `sig` = 内嵌证书对 chal 的签名）",
              devkitc_ble_sig_material_present() ? "已注入" : "**未注入**（本构建没嵌入证书材料）");
 #else
     ESP_LOGI(TAG, "丙档：⛔ 不产 `prov.pair.ok.sig`（契约 §4.4.2：丙的 sig 不承载任何证明力）");
+#endif
+}
+
+/* ============================================================================
+ * 3.1 乙档 `prov.pair.ok.sig` 的**材料注入**（2026-10-19 批：补上全工程唯一的调用点）
+ *
+ * 🔴 **旧值逐字留痕（⛔ 不抹）**：本工程此前**从未**调用 `devkitc_ble_sig_material_set()`
+ *    （全工程零调用点 ⇒ `wifi_prov_ble.c:716` 的 `oneye_dev_ble_sig_material_apply()` 恒返回
+ *    `ESP_ERR_NOT_FOUND`）。真机首证 = 2026-10-19 COM13 启动日志两行：
+ *      `乙档 sig 材料：**未注入**（本构建没嵌入证书材料）`
+ *      `本构建无 sig 材料（ESP_ERR_NOT_FOUND）⇒ prov.pair.ok **不带** sig 字段`
+ *    ⚠️ 第二行括号里的"没嵌入证书材料"是**误导**：证书**确实**嵌了（ELF 有 `_binary_client_crt_*`，
+ *    TLS 用它连平台成功），缺的是"把 blob 交给 sig 注入点"这一步。
+ *
+ * 为什么调用点在本文件、而不是 `wifi_prov_ble.c`：`oneye_dev_ble_config_t bcfg` 是那边的
+ *   **局部变量**（那里只是"取材料写字段"），而材料的**唯一来源**是本文件 `oneye_start()` 里
+ *   那六个 `asm("_binary_*")` 符号 —— 谁持有 blob、谁负责注入。
+ *   ⛔ 本函数**不产生**材料、⛔ 不读文件、⛔ 不打任何材料内容（只打字节数与返回值）。
+ *
+ * 时机（硬要求）：**必须早于 `wifi_prov_boot()`** —— `wifi_prov_ble_start()` 在
+ *   `oneye_dev_ble_init()` 之前把材料取出并写进 `bcfg`（一次性的指针借用，⛔ 不拷贝）。
+ *
+ * 长度口径（⚠️ 与 `oneye_start()` 的 TLS 用法**相反**，别抄错）：
+ *   · 这里传 **blob 全长的原始字节数**（`end - start`，含末尾那个 NUL）—— `set()` 要求
+ *     `cert_pem[len-1] == '\0'`（理由：SDK 的 `sig_cert_pem`/`sig_key_pem` 按 C 串解析）；
+ *   · `oneye_start()` 的 TLS 路径则要**裁掉** NUL（mbedtls 用显式长度）。
+ *   ⇒ 两处口径不同是**故意的**，不是笔误。
+ * ============================================================================ */
+static void ble_sig_material_boot(void)
+{
+#if defined(ONEYE_FW_EMBED_CERTS) && defined(CONFIG_ONEYE_FW_ONBOARDING_ROLE_BETA)
+    extern const uint8_t oneye_sig_crt_start[] asm("_binary_client_crt_start");
+    extern const uint8_t oneye_sig_crt_end[]   asm("_binary_client_crt_end");
+    extern const uint8_t oneye_sig_key_start[] asm("_binary_client_key_start");
+    extern const uint8_t oneye_sig_key_end[]   asm("_binary_client_key_end");
+
+    /* 材料 = 构建期 `-DONEYE_FW_CERT_DIR` 的 client.crt / client.key（乙型 `credSource=embedded`
+     * 的同一份品类级凭据）；`ca.crt` 是 TLS 信任链，与 `sig` 无关 ⇒ 这里不取。 */
+    esp_err_t src = devkitc_ble_sig_material_set(
+        (const char *)oneye_sig_crt_start,
+        (size_t)(oneye_sig_crt_end - oneye_sig_crt_start),
+        (const char *)oneye_sig_key_start,
+        (size_t)(oneye_sig_key_end - oneye_sig_key_start));
+
+    if (src == ESP_OK) {
+        ESP_LOGI(TAG, "乙档 sig 材料已注入（client.crt %u B / client.key %u B，含末尾 NUL）"
+                      "⇒ prov.pair.ok 将携带「内嵌证书对一次性 chal 的签名」",
+                 (unsigned)(oneye_sig_crt_end - oneye_sig_crt_start),
+                 (unsigned)(oneye_sig_key_end - oneye_sig_key_start));
+    } else {
+        /* ⛔ 不谎报：注入失败 ⇒ 乙档仍会起栈/广播，只是 `prov.pair.ok` 不带 `sig`；
+         * 失败原因（参数非法 / blob 末尾不是 NUL / 本构建无材料）在本行如实给出。 */
+        ESP_LOGE(TAG, "乙档 sig 材料注入失败（%s）⇒ prov.pair.ok **不带** sig（其余流程不受影响）",
+                 esp_err_to_name(src));
+    }
 #endif
 }
 
@@ -261,6 +348,7 @@ static void prov_status_report_connected_once(void)
  *
  * ★ 「入网 ⇒ 上云」的**唯一收敛点**（ADR-0017 D2）：
  *   `wifi_prov.c` 的 `IP_EVENT_STA_GOT_IP` → ready 回调 → 本文件的 `on_wifi_ready()`
+ *   → **任务通知** `wifi_ready`（2026-10-20 起：重活不在 sys_evt 做）
  *   → `xTaskCreate(cloud_start_task)` → `oneye_start()`。
  *   配网通道侧**不**知道这里做什么，⛔ 也不许自己调 `oneye_start()`。
  *
@@ -352,20 +440,84 @@ static void oneye_start(void)
          *   · **丙（GAMMA）** 的物理事实是「**连不上云**（入网能力全交 App）」
          *     ⇒ **⛔ 不连平台**（连了反而会让"丙"这件事在空口上说不清）；
          *   · **甲（ALPHA）** 必须**有** creds 分区；没有 ⇒ 不联网（fail-closed）。
-         * ⛔ 三档都**不**回落编译期的 `CONFIG_ONEYE_FW_DEVICE_ID` 当身份（第二来源 = 冒充）。 */
+         * 🔴 **2026-10-20〔节点身份批〕乙档的节点来源已改**（⛔ 旧字不抹）：
+         *   旧值逐字为
+         *     `base_cfg.device_id = CONFIG_ONEYE_FW_DEVICE_ID;`
+         *     `base_cfg.username  = CONFIG_ONEYE_FW_DEVICE_ID;`
+         *     `base_cfg.client_id = CONFIG_ONEYE_FW_DEVICE_ID;`
+         *   旧值的问题（真机实证，`com13-join6-capture-20261020.log`）：`prov.verify.req` 里
+         *   App 交来的激活码是 `DEVKITC0001`（帧载荷 22 B = `{"code":"DEVKITC0001"}`），
+         *   而建云链路用的是编译期占位 `devkitc-0001` ⇒ 串口 `base initialized: node=devkitc-0001`
+         *   与云库/平台的 `DEVKITC0001` **是两套身份**（MQTT username / client_id / 主题前缀全错）。
+         *   现值 = **三档统一的来源优先级**：
+         *     ① 甲：`creds.node_id`（`oneye_dev_creds_apply()`，**既有路径、本批未动**）；
+         *     ② 乙（本分支）：`prov.verify.req` 交来的激活码（`prov_identity.c`，本会话 RAM）；
+         *     ③ 兜底：`CONFIG_ONEYE_FW_DEVICE_ID`（**台面占位**，如实打日志；⛔ 不是身份）。
+         *   ⚠️ ③ 只在"本次上电没收到过 `prov.verify.req`"时用到（例：已存 Wi-Fi 凭据、开机直接
+         *     入网，没走 BLE 复核）—— 这时身份**未知**，故日志必须把来源讲清（见下面那两行）。
+         *   ⛔ 三档都**不**用 `CONFIG_ONEYE_FW_DEVICE_ID` 冒充已核验身份。 */
 #if CONFIG_ONEYE_FW_ONBOARDING_ROLE_BETA
         {
-            if (strlen(CONFIG_ONEYE_FW_DEVICE_ID) == 0u) {
-                ESP_LOGE(TAG, "乙档：节点标识为空 ⇒ 不联网（⛔ 不用任何编译期常量冒充身份）");
-                return;
+            /* 静态缓冲：`base_cfg.*` 是**借用指针**（SDK 在 `base_init` 里拷进内部数组，
+             * 但"指针活到 init 结束"这条约束仍由本处自己保证 —— 与 creds 那条路径同口径）。 */
+            static char s_node[PROV_IDENTITY_NODE_MAX + 1u];
+            bool from_prov = prov_identity_get(s_node, sizeof(s_node));
+            bool from_nvs  = false;
+
+            /* 🔴 **2026-10-20〔node 身份「尽力写 nvs」批〕**：本次上电没收到 `prov.verify.req`
+             *   （已存 Wi-Fi 凭据、开机直接入网）⇒ **先看 nvs 里上次写入的那个 node**。
+             *   用户裁定逐字：「乙型可能无 nvs 等分区：**只尝试写 nvs**，写失败**不阻断**
+             *   （App 重新配网上平台即可；身份恢复没那么重要）」⇒ 本兜底**只是加分项**：
+             *   读不到（无分区 / 没写过 / 形态非法）⇒ 原样落到编译期占位，⛔ 不改任何判据。 */
+            if (!from_prov) {
+                from_nvs = prov_identity_nvs_load(s_node, sizeof(s_node));
             }
-            /* 节点标识 = **本机自称**的台面占位（⛔ 不是实例身份）。
-             * 契约 §4.4.10（三）：甲 / 乙 的 `prov.verify.req` 必经，且**乙的判据 = 形态/有效性**
-             * ⇒ 乙在拿到 App 交来的 `node_id` 之前就已有"自己该用哪个节点名"的问题；
-             * 本工程的处理 = 用编译期占位名连平台（**并如实登记**：这不是"身份已赋予"）。 */
-            base_cfg.device_id = CONFIG_ONEYE_FW_DEVICE_ID;
-            base_cfg.username  = CONFIG_ONEYE_FW_DEVICE_ID;
-            base_cfg.client_id = CONFIG_ONEYE_FW_DEVICE_ID;
+
+            if (!from_prov && !from_nvs) {
+                /* 兜底：编译期占位（⛔ 不是身份） */
+                snprintf(s_node, sizeof(s_node), "%s", CONFIG_ONEYE_FW_DEVICE_ID);
+                if (s_node[0] == '\0') {
+                    ESP_LOGE(TAG, "乙档：既没有 `prov.verify.req` 交来的激活码，编译期占位也为空"
+                                  " ⇒ 不联网（⛔ 不用任何常量冒充身份）");
+                    return;
+                }
+            }
+            base_cfg.device_id = s_node;
+            base_cfg.username  = s_node;   /* EMQX ACL 用 ${username} 取它 ⇒ 必须与 node 同值 */
+            base_cfg.client_id = s_node;
+            ESP_LOGI(TAG, "乙档节点身份：node=%s（来源=%s）",
+                     s_node,
+                     from_prov ? "**prov.verify.req 激活码**（本会话；= 云侧为该设备核验的 node_id）"
+                     : from_nvs ? "**nvs 上次写入**（本机持久化；只表示\"上次用过\"，⛔ 不是云侧确认）"
+                                : "**编译期 CONFIG_ONEYE_FW_DEVICE_ID**（兜底占位：本次上电没收到 "
+                                  "prov.verify.req，⛔ 这不是已核验身份）");
+            if (!from_prov && !from_nvs) {
+                ESP_LOGW(TAG, "⚠️ 本次上电**没有**激活码可用（未走 BLE 复核 / 已存 Wi-Fi 直接入网）"
+                              "⇒ 上云用的是台面占位名，平台侧很可能**认不出**这台设备。"
+                              "下一步（本批未做，需裁定）：上电从 SDK 的绑定期身份记录里恢复 node；"
+                              "取证与方案见报告 TLS-MEM-NODE-IDENTITY-FIX-20261020.md「未做/需裁定」②");
+            }
+
+            /* 🔴 **2026-10-20〔node 身份「尽力写 nvs」批〕**：本次真收到了 App 交来的激活码
+             *   ⇒ **尽力**把它写进 nvs（`oneye_prov` / `node`），供下次上电兜底。
+             *   ⚠️ **硬边界（用户裁定逐字）**：「写失败**不阻断**」「⛔ 不要为此改 SDK 加公开 getter，
+             *   也不要持久化失败就让流程失败」⇒ 这里**只**打日志：成功/失败都继续用 RAM 里的
+             *   `s_node` 建云链路，⛔ 不 return、⛔ 不改 `base_cfg`、⛔ 不影响启动与上云。 */
+            if (from_prov) {
+                esp_err_t nrc = prov_identity_nvs_save(s_node);
+                if (nrc == ESP_OK) {
+                    /* 回读确认：写进去的那串**读回来逐字相同**才算落住（⛔ 不靠"set 返回 0"自证）。 */
+                    char      back[PROV_IDENTITY_NODE_MAX + 1u];
+                    bool      ok = prov_identity_nvs_load(back, sizeof(back));
+                    ESP_LOGI(TAG, "乙档节点身份落 nvs：**成功**（ns=oneye_prov key=node，回读=%s）"
+                                  "⇒ 下次上电没有 prov.verify.req 时可用它兜底",
+                             (ok && strcmp(back, s_node) == 0) ? "逐字一致" : "**不一致（仅告警）**");
+                } else {
+                    ESP_LOGW(TAG, "乙档节点身份落 nvs：**失败**（%s）⇒ 仅告警，⛔ 不影响启动与上云"
+                                  "（本次会话仍用 RAM 里的 node=%s；App 重新配网上平台即可）",
+                             esp_err_to_name(nrc), s_node);
+                }
+            }
 #if defined(ONEYE_FW_EMBED_CERTS)
             /* 内嵌证书 = **品类级凭据 / 入网准入前提**（⛔ 不是一机一密、⛔ 不是身份）。
              * `main/CMakeLists.txt` 用 objcopy 把三件 PEM 嵌成 `_binary_*` blob，末尾带一个 NUL，
@@ -456,10 +608,36 @@ static void oneye_start(void)
     ONEYE_DEV_STRUCT_INIT(ev_cfg);
     ev_cfg.enabled = true;
     ev_cfg.track_enabled = false;   /* ⛔ 本工程不做埋点取证（korvo2 的那三条产出方不在此） */
-    ev_cfg.offline_bytes = 16 * 1024;
+    /* 🔴 **2026-10-20〔offline_bytes 2 KiB 批〕**：离线缓存上限 16 KiB ⇒ **2 KiB**（用户裁定逐字：
+     *   「`ev_cfg.offline_bytes` **16KiB→2KiB**（释放 ~14KB 运行余量）」）。
+     *   **旧值逐字留痕（⛔ 不抹）**：`ev_cfg.offline_bytes = 16 * 1024;`
+     *   为什么改（真机读数，COM13，`com13-join7-capture-20261020.log`）：
+     *   `[res] phase=cloud-start free_internal=1708 B / largest=1,280 B` —— 建链后内部 RAM
+     *   余量只剩 ~1.7 KB，随后 `mqtt link down` / 重连期 `TLS failed … -32512 (0x7F00)`。
+     *   这 14 KiB 是**运行期预留**（SDK 按 `cache_cap` 一次性申请），本工程不做埋点取证、
+     *   离线事件也只在断网时短暂堆积 ⇒ 缩到 2 KiB 是**如实**的容量取舍（满则丢最旧并计数，
+     *   语义由 SDK 定义、本处⛔ 不改）。
+     *   ⚠️ 落点：SDK 字段 = `oneye_dev_event_config_t.offline_bytes`（`oneye_dev_event.h`），
+     *   本工程**没有**对应的 Kconfig/编译定义（grep 实测：devkitc 目录下 `offline_bytes` 仅此一处）
+     *   ⇒ 改的就这一行；`sdkconfig.defaults*` **一个字节未动**。
+     *   回读：`oneye_dev_event_init` 之后立刻打印本结构体的值（见下），与 sdkconfig 无覆盖关系。 */
+    ev_cfg.offline_bytes = ONEYE_FW_OFFLINE_BYTES;
     (void)oneye_dev_event_init(&ev_cfg);
+    ESP_LOGI(TAG, "[ev] offline_bytes=%u B（2026-10-20 由 16384 收窄；释放 ~14 KiB 内部 RAM 余量）",
+             (unsigned)ev_cfg.offline_bytes);
 
     /* 链路 */
+    /* 🔴 2026-10-20〔`mqtt client alloc failed` 批〕：`oneye_mqtt_new()` 的两笔大分配就发生在这条调用里
+     *   （RX `ONEYE_MQTT_RX_BUF_BYTES` ＋ TXQ `ONEYE_MQTT_TXQ_BYTES`，本工程按用户裁定各 4096）。
+     *   SDK 侧那条 `mqtt client alloc failed` 日志**不带读数**，而本批⛔ 不改 SDK 源码
+     *   ⇒ 把**紧邻**的 free / largest 打出来，"alloc failed" 与真实余量就能直接对照，
+     *   不用再靠"大概还剩多少"去猜。 */
+    ESP_LOGI(TAG, "[res] 建云链路前（base_start 前一刻）：internal free=%u B / largest=%u B / PSRAM free=%u B"
+                  "（MQTT 将申请 RX %d B + TXQ %d B + 结构体）",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+             (int)CONFIG_ONEYE_FW_MQTT_RX_BUF_BYTES, (int)CONFIG_ONEYE_FW_MQTT_TXQ_BYTES);
     rc = oneye_dev_base_start();
     if (rc != ONEYE_DEV_SDK_OK) {
         ESP_LOGE(TAG, "base start 失败：%s", oneye_dev_sdk_strerror(rc));
@@ -475,12 +653,29 @@ static void oneye_start(void)
         char src_json[64];
 
         if (oneye_dev_creds_state_json(cred_src, src_json, sizeof(src_json)) == ONEYE_DEV_SDK_OK) {
-            snprintf(shadow, sizeof(shadow), "{\"firmwareVersion\":\"%s\",\"power\":true,\"%s\":%s}",
-                     CONFIG_ONEYE_FW_VERSION, ONEYE_DEV_CREDS_SHADOW_KEY,
-                     (src_json[0] == '{') ? src_json + 1 : "\"unknown\"}");
+            /* 🔴 **2026-10-20〔影子 JSON 合法性批〕旧值逐字留痕（⛔ 不抹）** —— 旧拼装逐字为：
+             *     `snprintf(shadow, sizeof(shadow), "{\"firmwareVersion\":\"%s\",\"power\":true,\"%s\":%s}",`
+             *     `         CONFIG_ONEYE_FW_VERSION, ONEYE_DEV_CREDS_SHADOW_KEY,`
+             *     `         (src_json[0] == '{') ? src_json + 1 : "\"unknown\"}");`
+             *   实测产物（`cred_src = embedded`，`src_json = {"credSource":"embedded"}`）：
+             *     `{"firmwareVersion":"…","power":true,"credSource":"credSource":"embedded"}}`
+             *   ⇒ **重复键 ＋ 多一个右括号**（① 键名已经由格式串写了 `"credSource":`，而 `src_json + 1`
+             *     里又带着 `"credSource":`；② `src_json` 自带的收尾 `}` 之外**又补了一个** `}`）。
+             *   成因 = 只剥掉开头的 `{`，却把"内层键名 + 收尾括号"一起当成了内层值 ⇒
+             *   `oneye_dev_base_report_state()` 判 INVALID **静默失败**（串口只可能看到"影子上报失败"，
+             *   平台侧永远没有 `credSource`）。
+             * 现值：`oneye_dev_creds_state_json()`（SDK 唯一构造点）产出的就是**合法整对象**，把它去掉
+             *   开头 `{` 的**内层**接在本对象逗号之后，**⛔ 不再补右括号**（收尾由它自带的 `}` 承担）。
+             *   产物：`{"firmwareVersion":"…","power":true,"credSource":"embedded"}`（可解析）。
+             * ⚠️ 构建期钉子：`tools/check-shadow-json.py`（由 `tools/build-devkitc.sh` 在 idf.py 之前跑）。 */
+            const char *cred_inner =
+                (src_json[0] == '{') ? src_json + 1 : "\"credSource\":\"unknown\"}";
+            snprintf(shadow, sizeof(shadow), "{\"firmwareVersion\":\"%s\",\"power\":true,%s",
+                     CONFIG_ONEYE_FW_VERSION, cred_inner);
             /* 上面这行把 `{"credSource":"x"}` 的**内层**并进本对象：去掉开头的 `{`
-             * 之后，结尾那个 `}` 正好当本对象的收尾 —— ⛔ 不再拼第二个 `}`（那会产出非法 JSON，
-             * 而 `report_state()` 会以 INVALID 静默失败，串口上看起来一切正常）。 */
+             * 之后，结尾那个 `}` 正好当本对象的收尾 —— ⛔ 不再拼第二个 `}`（那会产出非法 JSON）。
+             * ⚠️ 上一句是**意图**；旧实现只做到了"剥 `{`"，却**又**在格式串尾部补了一个 `}` 且**多写了一遍键名**
+             * ⇒ 实际产出非法（留痕见本块开头）。现值由 `tools/check-shadow-json.py` 在**构建期**机械校验。 */
             rc = oneye_dev_base_report_state(shadow);
             if (rc == ONEYE_DEV_SDK_OK) {
                 ESP_LOGI(TAG, "影子上报成功（shadow/up）：%s", shadow);
@@ -520,22 +715,42 @@ static void cloud_start_task(void *arg)
 
 /* ============================================================================
  * 6. 入网后收敛点（**唯一**触发边；所有通道共用）
+ *
+ * ★ 2026-10-20〔**栈溢出根治**批〕**执行上下文与触发边分离**（判据/帧/状态序列**一个字没改**）：
+ *   真机（COM13，2026-10-20 11:36:52 与 11:26:47 两轮）实测：GOT_IP 之后本回调运行在
+ *   **sys_evt**（`CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=2304`），走到
+ *   `prov_status_report_connected_once()`（AES-GCM 加密 + 分片 + `ble_gap_notify`）时
+ *   `***ERROR*** A stack overflow in task sys_evt` ⇒ panic 重启 ⇒ App 永远收不到 `connected`。
+ *   ⇒ 本批把「加密上报 / SNTP 授时 / 建上云任务」三件重活**投递**到本文件新增的
+ *   `wifi_ready` 任务（栈 8192，prio 5）；本回调只留两件**常数级**动作：停广播 + 任务通知。
+ *
+ *   ⛔ 为什么**不**复用 SDK 已有的 `oneye_prov` worker（如实登记，避免"看着有现成的"误解）：
+ *     `oneye_prov` 是 `components/oneye-dev-sdk/src/oneye_dev_link.c` 里的 **static** 实现
+ *     （`static link_prov_worker_t *s_prov_worker`），队列只收 `oneye_link_prov_job_t` 的
+ *     **三种** link 协议动作（`ONEYE_LINK_PROV_JOB_SCAN` / `_CONNECT` / `_RESET`，分派点
+ *     `oneye_link_prov_execute()`），**没有**"投递任意回调"的公开入口 ⇒ 复用必须改 pin 住的
+ *     SDK 组件（超出"只碰 embedded 应用层"的本批范围）。
+ *   ⇒ 按最小新增投递：**一个常驻任务 ＋ 任务通知**（`xTaskNotifyGive` / `ulTaskNotifyTake`）。
+ *     用通知而不用队列：GOT_IP 稀疏、且下游 `prov_status_report_connected_once()` 本身是
+ *     "读当前状态 ＋ 幂等位"（不是消费事件载荷）⇒ 通知天然合并重复且**不会丢事件**；
+ *     ⛔ 队列满时丢事件反而是新缺陷。
  * ============================================================================ */
-static void on_wifi_ready(void)
+static TaskHandle_t s_ready_worker;   /* 入网后处理器（task=wifi_ready）；NULL = 未起步 ⇒ 退化路径 */
+static bool s_cloud_started;          /* 原 `on_wifi_ready()` 的函数内静态 `started`，语义逐字不变 */
+
+/* 入网后的**重活**（⛔ 只允许在 `wifi_ready` 任务上下文里跑）。
+ * 顺序与旧 `on_wifi_ready()` **逐字相同**：上报 connected → 授时 → 建上云任务。 */
+static void wifi_ready_work(void)
 {
-    static bool started;
-
-    wifi_prov_ble_stop_advertising();     /* 已入网 ⇒ 停 BLE 广播（幂等，重连时重复调无害） */
-
     /* 上报 `prov.status{connected, ip}`：**每次** GOT_IP 都要考虑（幂等位在函数内）。
      * ⚠️ 位置**故意在** 下面那次一次性守卫之前：本行是事件级动作，与"上云链路只启动一次"
      *    那把守卫**不是**同一件事（否则内存不足时 App 会"明明联网却收不到 connected"）。 */
     prov_status_report_connected_once();
 
-    if (started) {
+    if (s_cloud_started) {
         return;
     }
-    started = true;
+    s_cloud_started = true;      /* 与旧 `started = true` 的**同一位置、同一语义** */
 
     ESP_LOGI(TAG, "Wi-Fi 已连接：ip=%s（ssid=%s，来源 %s）",
              wifi_prov_ip(), wifi_prov_ssid(), wifi_prov_source());
@@ -547,23 +762,102 @@ static void on_wifi_ready(void)
                   "绑定由 **App 代发** `POST /api/v1/bindings`（设备侧不参与）");
     return;
 #else
+    /* 🔴 2026-10-20〔`mqtt client alloc failed` 批 · 用户裁定「允许 deinit BLE」〕
+     * **入网成功 ⇒ BLE 的历史使命结束**：App 已收到 `prov.status{connected,ip}`（上面那行已发），
+     * 配网窗口也已关（`stop_advertising()` → `window_stop()`）。把 NimBLE 整栈 deinit 才能给
+     * `oneye_mqtt_new()`（RX 4096 + TXQ 4096 + 结构体）腾出 heap —— 真机读数：deinit 前
+     * `[res] cloud-start` 只剩 ~7 KB，而单笔 RX 旧值就是 65568 B。
+     *
+     * ⚠️ 位置是**硬要求**（三条同时成立）：① Wi-Fi 已 GOT_IP（本函数只因它被通知才跑）；
+     *   ② 停广播之后（`on_wifi_ready()` 已停，本函数内的 `stop_advertising()` 是幂等再确认）；
+     *   ③ **建 MQTT 之前**（`cloud_start_task` → `oneye_start()` → `base_start`）。
+     * ⛔ 不许挪到 `on_wifi_ready()`（sys_evt，2 KB 栈）里：`nimble_port_stop()` 要等主机任务退出，属阻塞动作。
+     *
+     * ⚠️ **重配网路径（换了网 / 清凭据后）**：`wifi_prov_ble_deinit_after_provisioned()` 会把
+     *    `s_started/s_advertising/s_pairing` 清零 ⇒ 下一次 `wifi_prov_ble_start()` 走**完整 init**
+     *    （NimBLE 重起栈 + GATT 重注册 + 重开广播）。这就是所需的 re-init 路径，⛔ 未另造一套。
+     *    已入网期间长按 BOOT 仍被 `pairing_enter()` 拒（"已入网不再进入配网模式"）—— 该判据**一字未改**。
+     * ⚠️ 副作用（如实登记）：deinit 后本进程内 `prov.status` 再也发不出去；Wi-Fi 掉线后再次 GOT_IP 时
+     *    那一行上报会失败并**如实打印"未发出"**（幂等位不置），⛔ 不假装已上报。 */
+    res_report("pre-ble-deinit（已入网、已停广播、建 MQTT 前）");
+    {
+        esp_err_t ble_rc = wifi_prov_ble_deinit_after_provisioned();
+
+        if (ble_rc == ESP_OK) {
+            ESP_LOGI(TAG, "★ 入网后 BLE 已释放（deinit 成功）⇒ heap 让给云链路"
+                          "（回收读数见上一行 BLE 日志与下面 post-ble-deinit 的 [res]）");
+        } else {
+            ESP_LOGW(TAG, "入网后 BLE deinit 未成功（%s）⇒ MQTT 仍可能因内存不足而 alloc failed"
+                          "（⛔ 不静默：本行出现时应优先看 [res] 的 largest 读数）",
+                     esp_err_to_name(ble_rc));
+        }
+    }
+    res_report("post-ble-deinit（建 MQTT 前）");
+
     /* ★ 2026-10-13〔本批 ③b〕**启动期授时**：乙档是**严格 TLS**（`CONFIG_ONEYE_FW_TLS_INSECURE`
      *   在台面档为 y、量产为 n），而板子**没有 RTC** ⇒ 未授时时系统时间是 1970、服务端证书的
      *   notBefore 落在未来 ⇒ mbedtls 必然报 `BADCERT_FUTURE`。故"**先有钟、再建链**"是硬顺序：
      *   本行必须在下面 `xTaskCreate*`（→ `oneye_start()`）**之前**（与 korvo2_oneye 的
      *   `on_wifi_ready()` 同一口径；那边的门禁 A11/A12 断言这条顺序）。
-     *   ⚠️ 本调用在**系统事件任务**上下文，是有界的同步等待：最多 2×10 s（两台服务器各 10 s；
-     *   真机正常路径实测 ≈1 s）。失败**不阻塞**上云（见 `sntp_boot.h:9-11`：那是**故意**的可见失败）。
+     *   ⚠️ 本调用是**有界**的同步等待：最多 2×10 s（两台服务器各 10 s；真机正常路径实测 ≈1 s）。
+     *   失败**不阻塞**上云（见 `sntp_boot.h:9-11`：那是**故意**的可见失败）。
+     *   ★ 2026-10-20：**执行者已换成本任务（wifi_ready，栈 8192）** —— 旧位置在 sys_evt
+     *   （2304 B）上跑 mbedtls，即便 connected 那次侥幸过去，这里也几乎必然再炸一次。
      *   ⛔ 丙（GAMMA）档不调用它：丙按契约**不建云链路**（设备侧零 TLS）⇒ 不需要钟。 */
     (void)sntp_boot_sync();
 
     if (xTaskCreate(cloud_start_task, "cloud_start", 6144, NULL, 4, NULL) != pdPASS) {
-        started = false;
+        s_cloud_started = false;   /* 内存不足 ⇒ 允许下一次 GOT_IP 再试（旧口径，⛔ 不静默放弃） */
         ESP_LOGE(TAG, "上云任务创建失败（内存不足）—— 设备已联网但不会上平台");
         return;
     }
     ESP_LOGI(TAG, "已联网 → 启动上云（oneye-dev-sdk）");
 #endif
+}
+
+/* 入网后处理器：**唯一**执行重活的任务（通知驱动；不消费载荷 ⇒ 天然合并重复通知）。 */
+static void ready_worker_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);   /* 等 `on_wifi_ready()` 的那一次通知 */
+        wifi_ready_work();
+    }
+}
+
+static void ready_worker_start(void)
+{
+    if (xTaskCreate(ready_worker_task, "wifi_ready", 8192, NULL, 5, &s_ready_worker) != pdPASS) {
+        s_ready_worker = NULL;
+        ESP_LOGE(TAG, "入网后处理器任务（wifi_ready / 8192 B）创建失败 ⇒ 入网后重活将退回 sys_evt 执行"
+                      "（⚠️ 那是**退化**路径：sys_evt 栈只有 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE，"
+                      "有栈溢出风险；⛔ 不当成正常路径）");
+        return;
+    }
+    ESP_LOGI(TAG, "入网后处理器已起步（task=wifi_ready prio=5 stack=8192）："
+                  "prov.status 加密上报 / SNTP 授时 / 建上云任务**都在本任务**执行，⛔ 不在 sys_evt 里做重活");
+}
+
+/* 收敛点本体：**运行在 sys_evt**（Wi-Fi 系统事件任务）⇒ 这里只许常数级动作。 */
+static void on_wifi_ready(void)
+{
+    wifi_prov_ble_stop_advertising();     /* 已入网 ⇒ 停 BLE 广播（幂等，重连时重复调无害） */
+
+    if (s_ready_worker != NULL) {
+        /* ★ 本批核心：**只投递**。AES-GCM 加密 + 分片 + notify、mbedtls 授时、建上云任务
+         *   全在 `wifi_ready` 任务里跑 ⇒ sys_evt 的栈不再被这些重活撑爆。 */
+        if (xTaskNotifyGive(s_ready_worker) != pdPASS) {
+            ESP_LOGW(TAG, "[diag] 入网后处理器通知失败 ⇒ 本次不上报 connected"
+                          "（幂等位未置；下一段会话 GOT_IP 会再来一次）");
+            return;
+        }
+        ESP_LOGI(TAG, "[diag] 入网后重活已投递：task=wifi_ready（sys_evt 只做投递，⛔ 不在本任务加密/授时）");
+        return;
+    }
+
+    ESP_LOGW(TAG, "[diag] 入网后处理器**未起步**（任务创建失败）⇒ 退回 sys_evt 直接执行"
+                  "（⚠️ 栈溢出风险的退化路径，不是正常路径）");
+    wifi_ready_work();
 }
 
 /* ============================================================================
@@ -763,6 +1057,11 @@ void app_main(void)
     ESP_LOGI(TAG, "devkitc_oneye 启动：ESP32-S3-DevKitC-1 · 零音频依赖（无 codec / 无 LCD / "
                   "无摄像头 / 无 SD 卡；IDF 5.5 / 不引 ADF）");
 
+    /* ★ 2026-10-19〔sig 材料注入批〕**必须先于 boot_identity_report() 与 wifi_prov_boot()**：
+     *   ① 前者要如实打印"已注入 / 未注入"（判据 = `devkitc_ble_sig_material_present()`）；
+     *   ② 后者在 `oneye_dev_ble_init()` 之前把材料取走。⛔ 挪到任意一处之后都会让本批回到旧现象。 */
+    ble_sig_material_boot();
+
     boot_identity_report();      /* 档位 / 身份 / NVS / 签名材料 自证（含 nvs_flash_init） */
 
 #if CONFIG_ONEYE_FW_DIAG_PROV_TRACE
@@ -773,6 +1072,11 @@ void app_main(void)
     res_report("pre-prov（配网与 NimBLE 之前；本机型无外设可初始化）");
 
     key_gate_start();            /* 长按 BOOT(GPIO0) 切换配网模式 */
+
+    /* ★ 2026-10-20〔栈溢出根治批〕**必须先于** `wifi_prov_set_ready_cb()` 与 `wifi_prov_boot()`：
+     *   前者的回调里要往本任务投递（`s_ready_worker` 为 NULL 时才会走"退回 sys_evt"的退化路径）；
+     *   后者一旦起栈就可能入网。⛔ 挪到任意一处之后都会让本批回到旧现象。 */
+    ready_worker_start();
 
     wifi_prov_set_ready_cb(on_wifi_ready);   /* **唯一**收敛点注册点 */
     /* ★ 2026-10-13〔本批 ③a · 同步 korvo2 e00aa9c9〕**会话结束边**（Wi-Fi 断开）⇒ 复位

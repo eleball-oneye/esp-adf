@@ -224,6 +224,41 @@ menu "devkitc_oneye 板级固件配置（ESP32-S3-DevKitC-1 · 零音频依赖�
                 「chal 失效」与「配网窗口关闭」是同一刻。
                 ⚠️ 若把本值调**大于** chal TTL，则 chal 会先在窗口内轮换（App 侧需重新取 chal）
                 —— 仍可用，但两端"有效期"不再一致，故非必要不要偏离 300。
+
+        # =====================================================================
+        # 🔴 2026-10-20〔`mqtt client alloc failed` 批〕MQTT 收发缓冲上界
+        #   注入方式 = 本工程 `CMakeLists.txt` 的 `target_compile_definitions(__idf_oneye-dev-sdk …)`
+        #   ⇒ SDK 源码 `src/internal/oneye_mqtt.c:58-65` 的 `#ifndef` 守卫取到本值（⛔ 未改 SDK 源码）。
+        #   用户裁定（2026-10-20）：「RX/TXQ 4096｜允许 deinit BLE」。
+        # =====================================================================
+
+        config ONEYE_FW_MQTT_RX_BUF_BYTES
+            int "MQTT 接收组装缓冲（字节；注入 SDK 的 ONEYE_MQTT_RX_BUF_BYTES）"
+            range 512 65568
+            default 4096
+            help
+                SDK 缺省（**旧值**，逐字留痕）＝ `(ONEYE_MQTT_PAYLOAD_MAX + 32u)` = **65568 B**
+                （`ONEYE_MQTT_PAYLOAD_MAX` = 64 KiB）；本工程按用户 2026-10-20 裁定取 **4096**。
+
+                为什么：devkitc（乙型）入网后 free heap 只剩 ~7 KB 量级，而 `oneye_mqtt_new()`
+                在同一时刻要一笔 65568 B（RX）＋ 16384 B（TXQ）＋ 结构体 ⇒ 真机 11/11 次
+                `mqtt client alloc failed`。RX/TXQ 各降到 4096 后单次 `oneye_mqtt_new()` 约 8 KB。
+
+                ⚠️ 代价（如实登记，⛔ 不美化）：**单帧 > 本值的下行报文装不下** ——
+                `oneye_mqtt.c` 的 `mqtt_handle_packet()` 遇到"帧长 > 缓冲"会丢弃已收字节
+                （该帧丢失、计 `decode_errors`，并可能让紧随其后的解析错位）。
+                本批验证面（影子 `shadow/up`、`status/up`、命令）单帧远小于 4096。
+                ⛔ 不要为了让"某个大下行"过而把它单独调大：那会重新吃满 heap（这正是本批的成因）。
+
+        config ONEYE_FW_MQTT_TXQ_BYTES
+            int "MQTT 发送队列容量（字节；注入 SDK 的 ONEYE_MQTT_TXQ_BYTES）"
+            range 512 65536
+            default 4096
+            help
+                SDK 缺省（**旧值**，逐字留痕）＝ **16384 B**；本工程取 **4096**。
+                队列满 ⇒ `oneye_mqtt_publish()` 返回 -7（= `ONEYE_DEV_SDK_ERR_NO_SPACE`），
+                不是"发出去又丢"—— 调用方可见。QoS1 未确认报文在 PUBACK 前不回收 ⇒
+                4096 下**同时**在途的未确认报文总长受此上界约束（本工程上行报文均为百字节级）。
     endmenu
 
     # =========================================================================

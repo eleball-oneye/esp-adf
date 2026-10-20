@@ -49,6 +49,10 @@ idf_component_register(
          "wifi_prov_ble.c"
          # Wi-Fi 生命周期 + **入网后收敛点**（唯一 `oneye_start()` 触发边）＋ 优先级判据落点
          "wifi_prov.c"
+         # ★ 2026-10-20〔节点身份批〕**会话级节点身份**（`prov.verify.req` 交来的激活码）：
+         #   乙 / 丙 上平台前无实例身份 ⇒ 真实 node 只能来自 App 那一帧；本 TU 只存 RAM。
+         #   取值方式 = SDK **公开** API `oneye_dev_ble_config_t.frame_cb`（⛔ 不引 internal 头）。
+         "prov_identity.c"
          # 设备身份的**唯一**读取点（creds 分区的 node_id 与 sn 两串）
          # **单独一个 TU** 的理由（逐字沿用源目录）：`oneye_dev_creds.h` 带进的
          # `oneye_dev_base.h:164` 与 `oneye_dev_link.h:163` 同名不同构
@@ -61,7 +65,19 @@ idf_component_register(
          # 接入点 = `devkitc_oneye_main.c` 的 `on_wifi_ready()`（**在**建上云任务之前）。
          "sntp_boot.c"
     INCLUDE_DIRS "."
-    EMBED_FILES ${_oneye_cert_files}
+    # 🔴 2026-10-19〔sig 材料注入批〕**旧值逐字留痕（⛔ 不抹）**：`EMBED_FILES ${_oneye_cert_files}`
+    #   旧值的问题（实测，非推断）：`EMBED_FILES` ⇒ `target_add_binary_data(..., "BINARY")`
+    #   ⇒ 生成物 `build-beta/client.crt.S` 的**最后一个字节是 `0x0a`（PEM 的换行）**、
+    #     `client_crt_length = 700` = 文件字节数 ⇒ **没有 NUL 结尾**。
+    #   而乙档 `prov.pair.ok.sig` 的材料出口（`main/ble_sig_material.c` 的
+    #   `devkitc_ble_sig_material_set()`）要求 blob **以 NUL 结尾**（SDK 侧 `sig_cert_pem` /
+    #   `sig_key_pem` 是 C 串）⇒ 直传旧 blob 会被**当场拒收**（只加调用点仍然"未注入"）。
+    #   ⇒ 本批改用 `EMBED_TXTFILES`（`"TEXT"` ⇒ 生成物**追加一个 NUL**）：
+    #     · 符号名**不变**（仍 `_binary_ca_crt_start` / `_binary_client_crt_start` / …）；
+    #     · TLS 侧不吃亏：`devkitc_oneye_main.c` 的 `oneye_start()` 里本来就有"末尾是 NUL 就裁掉"的
+    #       防御（旧值下恒不触发，现在**正好生效**）⇒ 交给 mbedtls 的仍是同一份 PEM 字节；
+    #     · ⛔ 不新增文件、不改任何一帧、不改档位判定。
+    EMBED_TXTFILES ${_oneye_cert_files}
     REQUIRES oneye-dev-sdk
              esp_wifi
              esp_netif

@@ -19,3 +19,8 @@ build-gamma-bench/
 #    它只是构建入参（`-DONEYE_FW_CERT_DIR=` 显式指向），量产档缺省取 `main/certs`（不存在）
 #    ⇒ 与量产出货档**无关**（机械证据见 README「量产档不内嵌」条）。
 certs-bench-beta/
+
+# ★ 2026-10-20〔栈溢出+证书对齐批〕乙档**本机型专用**证书目录（不再借 korvo2 的 certs）。
+# ⚠️ 同样含设备私钥（client.key）⇒ 整目录忽略，⛔ 永不提交；内容是三件 PEM，
+#    来源 / CN / issuer / 全链路验证读数逐条登记在**入库**的 CERTS-BETA.md 里。
+certs-beta/

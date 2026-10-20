@@ -47,6 +47,46 @@ CONFIG_ONEYE_FW_TRANSPORT_TLS=y
 CONFIG_ONEYE_FW_CLOUD_HOST="mqtt.oneye.me"
 CONFIG_ONEYE_FW_CLOUD_PORT=18886
 
+# ---- 系统事件任务（sys_evt）栈：**双保险的第二道**（2026-10-20）-------------------
+# 为什么加：COM13 真机两轮实测（2026-10-20 11:26 / 11:36）—— GOT_IP 之后
+#   `main/devkitc_oneye_main.c` 的 `on_wifi_ready()` 在 sys_evt 里做 AES-GCM 加密上报
+#   （紧随其后还有 mbedtls 的 SNTP 授时）⇒ `***ERROR*** A stack overflow in task sys_evt`
+#   ⇒ panic 重启 ⇒ App 永远收不到 `prov.status{state=connected}`。
+# 第一道（**根治**）= 把三件重活（加密上报 / 授时 / 建上云任务）投递到专用任务
+#   `wifi_ready`（8192 B），sys_evt 里只留"停广播 ＋ 任务通知"；
+#   落点见 `main/devkitc_oneye_main.c` 的 `ready_worker_start()` / `wifi_ready_work()`。
+# 本行是第二道：防"将来又在 sys_evt 里加东西"时同一个坑重开（⛔ 不是撤销第一道的理由）。
+# ★ 旧值留痕（⛔ 不删）：本符号此前**不在任何 defaults 文件里**，取 IDF 缺省 2304
+#   —— 实测读自 `build-beta/sdkconfig`（2026-10-19 那批构建，与板载固件同批）。
+#   ⇒ 现值 = 4096（原值 ×1.78；IDF 允许区间 1536..65536）。
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
+
+# ---- mbedTLS 单帧内容上限：**这条是本批 TLS 内存不足的根治项**（2026-10-20）---------
+# 真机取证（COM13，`_oneye-logs/com13-join6-capture-20261020.log`）：
+#   入网 + `prov.status{connected}` + BLE deinit 全部成功（internal free 67,384 → 138,324 B），
+#   随后**在同一个 free 余量下**仍：
+#     `W oneye_tls: TLS failed at mbedtls_ssl_setup: ret=-32512 (0x7f00)`
+#   0x7f00 = `MBEDTLS_ERR_SSL_ALLOC_FAILED`；紧邻读数 `[res] 建云链路前：internal free=58,148 /
+#   largest=31,744`；重试 10 次全败（时间戳 690,792 → 923,212 ms）。
+# 成因（不是"总内存不够"，是"**连续**内存不够"）：IDF 缺省按
+#   `CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384` ＋ `CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096`
+# 在 `mbedtls_ssl_setup()` 里**一次性各要一整块连续缓冲**（≈20 KiB ＋ 变换/头部开销），
+# 而入网 + BLE 起停 + SNTP 之后堆已被打碎 ⇒ largest(31,744) 虽大于单笔，但**凑不出**那两笔连续块
+#   ⇒ 必败，且失败发生在**任何握手 I/O 之前**（云端只看到 TCP SYN→FIN，看不到 ClientHello）。
+# 判据（为什么这两个值够用）：
+#   · 入向：本工程下行帧上限 = MQTT 载荷（`CONFIG_ONEYE_FW_MQTT_RX_BUF_BYTES=4096`），
+#     4096 B 内容长度 ⇒ 单条 MQTT 报文（含固定头/topic）落在同一量级，不会越界；
+#   · 出向：`ONEYE_MQTT_PAYLOAD_MAX` 与影子/日志上报的**实际**帧都远小于 2048 B，
+#     2048 B 对"设备 → 云"单帧是**宽裕**的（余量见报告里的实测帧长）。
+# ⚠️ 这两项是**折衷不是免费**：单帧超过 4096 B 的下行报文会被 mbedtls 拒收（`BUFFER_TOO_SMALL`
+#   这类症状），将来若确有 >4096 B 的下行需求，**先**把缓冲改走 PSRAM（`CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC`，
+#   见 sdkconfig.defaults.bench-local 的做法）**再**回抬本值 —— ⛔ 不要只把本值改回 16384。
+# ★ 旧值逐字留痕（⛔ 不删）：此前**这两个符号不在任何 defaults 文件里**，取 IDF 缺省
+#   `CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384` / `CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096`；
+#   实测读自 `build-beta/sdkconfig:2234-2235`（2026-10-20 那批与板载固件同批）。
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=4096
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=2048
+
 # ---- 档位载体（**逐档覆盖**，见 sdkconfig.defaults.beta / .gamma）---------------
 # ⚠️ 这里**不写**默认档位：档位是"机型事实"，必须由档位预设显式给出，
 #    ⛔ 不允许"忘了叠档位预设 ⇒ 悄悄编出一个甲型件"（Kconfig 的 choice 缺省是甲，最严）。

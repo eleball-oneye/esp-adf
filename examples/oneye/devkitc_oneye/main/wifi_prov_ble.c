@@ -14,6 +14,7 @@
 
 #include "esp_log.h"
 #include "esp_err.h"
+#include "esp_heap_caps.h" /* 2026-10-20：deinit BLE 前后的 free/largest 读数（只读，不分配） */
 #include "esp_timer.h"     /* 配网窗口超时：既有依赖（ESP-IDF 核心组件，多处在用），⛔ 不引新依赖 */
 /* 诊断留痕（2026-10-10）：provider 现在跑在 **SDK 的 prov worker 任务**上（`oneye_prov`，见
  * `oneye-dev-sdk/src/oneye_dev_link.c` §5.1），而它曾经跑在 NimBLE 收包任务上。
@@ -27,6 +28,7 @@
 #include "oneye_dev_link.h"
 
 #include "adv_identity.h"
+#include "prov_identity.h"
 #include "wifi_prov.h"
 #include "wifi_prov_ble.h"
 /* 🔴 devkitc_oneye：乙档 `prov.pair.ok.sig` 的材料注入点（**窄接口**，见该头文件头）。
@@ -680,7 +682,34 @@ esp_err_t wifi_prov_ble_start(void)
      *   · `adv_sn = NULL` ＋ 档位乙 / 丙 ⇒ 平台层产出 `0x28` ＋ 空 `sn_field` 占位（契约 §4.4.10（一）/（二））；
      *   · `adv_sn = NULL` ＋ 档位甲 / 未声明 ⇒ 整段 0xFF 不产出（⛔ 不冒充，一字未改）。
      * ⛔ 两者都⛔ **不得**回落 `CONFIG_ONEYE_FW_DEVICE_ID`。 */
-    bcfg.device_id = (s_ids.node_id[0] != '\0') ? s_ids.node_id : "";
+    /* 🔴 2026-10-19〔`from` 空串批 · 用户裁定「设备填广播名/缺省节点名」〕
+     *   **旧值逐字留痕（⛔ 不抹）**：
+     *     `bcfg.device_id = (s_ids.node_id[0] != '\0') ? s_ids.node_id : "";`
+     *   旧值的问题（代码级可判，与真机症状"扫得到、连得上、App 无回应"吻合）：
+     *     · `s_ble.device_id` 是**每一条出站帧**的 `from`（`oneye_dev_ble.c:676 / 865 / 989`；
+     *       错误帧同源 `:357`），而**组帧的唯一合规点** `internal/oneye_link_frame.c:160` 对
+     *       `from` 为空**直接返回 0**（`from == NULL || from[0] == '\0'` ⇒ `return 0`）
+     *       ⇒ 乙档 `prov.hello` / `prov.pair.ok` / `prov.verify.rsp` / `error` **一帧都组不出来**
+     *       （不是"发出去被丢弃"，而是**根本没发**；`oneye_dev_ble.c` 各调用点见 `n == 0` 即静默）；
+     *       App 侧同样不认空 `from`：`LinkFrame.kt:139-140` `MissingField("from")`；
+     *       契约为准：`contracts/local/link-frames.json` 的 `envelope.required` 含 `from`。
+     *     · 现取值 = **SDK 自己文档化的缺省节点名 `oneye-unset`**（⛔ 不是身份，⛔ 不回
+     *       `CONFIG_ONEYE_FW_DEVICE_ID`）：
+     *         ① 与 SDK 缺省**同值**：`oneye_dev_ble_config_defaults()` 逐字
+     *            `cfg->device_id = "oneye-unset";`（`src/oneye_dev_ble.c:1178`）；
+     *         ② 与 **link 侧同口径**：本文件 `lcfg.node_id` 在无身份时传 `NULL`（:654）⇒
+     *            `oneye_dev_link.c:186` 取 `"oneye-unset"`（`oneye_dev_link.h:177` 逐字
+     *            「`node_id`；NULL = \"oneye-unset\"」）⇒ 两层 `from` 现在是**同一个名字**；
+     *         ③ 字符集合法：`^[A-Za-z0-9._-]{1,64}$`（`oneye_node_id_valid()`）；
+     *         ④ 乙档 `prov.verify.req` **不拿它比对**（`oneye_ble_verify_decide_tier()`：
+     *            乙只看 `code` 形态）⇒ 换缺省名不动任何一道闸；
+     *         App 侧只要求 `from` 非空、不做格式/等值校验（`LinkFrame.kt:139`）⇒ 可接受。
+     *     ⚠️ 派生副作用（如实留痕）：`adv_sn` 为空 ⇒ 广播名回落 `device_id` 后 4 位
+     *       （`oneye_dev_ble.c:1381-1383`）⇒ GAP 名由 **"ONEYE-"** 变为 **"ONEYE-nset"**；
+     *       `ONEYE-` 前缀不变（App 扫描/`isOneye` 判据 = 前缀，`BleLinkClient.kt:169`）。
+     *     ⛔ 本处只填缺省节点名：⛔ 不改帧协议、⛔ 不做 `from` 的运行时 fallback、
+     *       ⛔ 不把 `device_id` 挪作它用（甲型核验基准仍只取 `s_ids.node_id`）。 */
+    bcfg.device_id = (s_ids.node_id[0] != '\0') ? s_ids.node_id : "oneye-unset";
     bcfg.adv_sn = (s_ids.sn[0] != '\0') ? s_ids.sn : NULL;
     /* 🔴 2026-10-14：**机型 `productKey`** 直通（契约 §1.1 v3 ⇒ 空口 off 25 的 `pk_code`）。
      * ⛔ 它是**机型属性、不是身份**（同一机型的设备共用一个值）；载体 = 本工程 Kconfig
@@ -729,6 +758,14 @@ esp_err_t wifi_prov_ble_start(void)
     bcfg.prov.scan = ble_prov_scan;
     bcfg.prov.connect = ble_prov_connect;
     bcfg.prov.reset = ble_prov_reset;
+    /* ★ 2026-10-20〔节点身份批〕**帧观察者**：SDK 在每一帧解密后、内置处理**之前**调用它
+     *   （`oneye_dev_ble.c:619-621`），这正是"拿到 `prov.verify.req` 里的激活码"的**公开**入口。
+     *   为什么必须由应用侧抓：`base_cfg.device_id` 的取值点是本工程 `devkitc_oneye_main.c`
+     *   的 `oneye_start()`，而 SDK 不提供"读已复核 node"的公开 getter（内部只有
+     *   `oneye_ble_bindid_*`，属 `src/internal/`）⇒ 走 internal 头会破坏"⛔ 不改 SDK"的边界。
+     *   ⛔ 本回调**不改**任何帧、⛔ 不改判据（乙的形态判据仍在 SDK 里）、⛔ 不落盘。 */
+    bcfg.frame_cb = prov_identity_frame_cb;
+    bcfg.frame_ctx = NULL;
 #if CONFIG_ONEYE_FW_DIAG_PROV_TRACE
     /* 🔴 诊断留痕（2026-10-10 配网诊断批）：**应用确实把三件套交出去了**的第一手证据。
      *   缺了这一行，"provider 没注册" 与 "SDK 收下配置却从不使用" 两件事在串口上不可分辨。
@@ -861,4 +898,69 @@ void wifi_prov_ble_stop_advertising(void)
             ESP_LOGI(TAG, "已停止 BLE 广播（配网模式已退出 ⇒ 回到待机）");
         }
     }
+}
+
+/* ============================================================================
+ * 🔴 2026-10-20〔`mqtt client alloc failed` 批〕入网后**释放 BLE 整栈**
+ *
+ * 成因（真机读数，⛔ 非推断）：乙型 devkitc 入网后 `[res] cloud-start` 的 internal free ≈ **7 KB**，
+ *   而 `oneye_mqtt_new()` 一次要 **65568 B（RX）+ 16384 B（TXQ）+ 结构体** ⇒ 11/11
+ *   `mqtt client alloc failed`。RX/TXQ 已按用户裁定降到 4096（见 Kconfig / CMakeLists），
+ *   但 ~8 KB 仍装不进 7 KB ⇒ **必须**同时把 NimBLE 占的那 ~100 KB 还回 heap。
+ *
+ * 用户 2026-10-20 裁定：「RX/TXQ 4096｜**允许 deinit BLE**」。
+ *
+ * ⛔ 本函数**不**：改帧 / 改判据 / 动凭据 / 停 Wi-Fi / 停 link（link 的 prov 通道保留，代价是
+ *   deinit 后它发不出 BLE 帧 —— 已入网设备本来也不再发现场帧）。
+ * ============================================================================ */
+esp_err_t wifi_prov_ble_deinit_after_provisioned(void)
+{
+#if !CONFIG_ONEYE_FW_ENABLE_BLE_PROV
+    ESP_LOGW(TAG, "BLE 通道未启用（CONFIG_ONEYE_FW_ENABLE_BLE_PROV=n）⇒ 无需 deinit（幂等）");
+    return ESP_ERR_NOT_SUPPORTED;
+#else
+    /* 1) 先停广播（幂等）—— 顺序与 `on_wifi_ready()` 的既有动作一致，⛔ 不在这里抢它的职责。
+     *    ⚠️ `stop_advertising()` 内部还会按"已入网 / 配网模式"打一行；这里紧接着再打 deinit 结论行。 */
+    wifi_prov_ble_stop_advertising();
+
+    /* 2) 已 deinit / 从未 init ⇒ 只清本地状态位（幂等），⛔ 不重复释放（SDK 会回 ERR_STATE） */
+    if (!oneye_dev_ble_is_initialized()) {
+        s_started = false;
+        s_advertising = false;
+        s_pairing = false;
+        window_stop();
+        ESP_LOGI(TAG, "BLE 已在 deinit 状态（幂等：本次不重复释放；重配网时 start() 会重新 init）");
+        return ESP_OK;
+    }
+
+    {
+        /* 3) 读数**先取**，再 deinit：这一对读数就是"BLE 到底占了多少"的唯一判据（⛔ 不估算）。 */
+        unsigned free_before = (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        unsigned largest_before = (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+        oneye_dev_sdk_err_t rc = oneye_dev_ble_deinit();
+        unsigned free_after = (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        unsigned largest_after = (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+
+        /* 4) 状态位必须**无条件**清零（即使 SDK 返回非 OK）：
+         *    `wifi_prov_ble_start()` 的幂等判据是 `s_started` —— 留着 true 会让"重配网"走进
+         *    `oneye_dev_ble_advertise(true)` 的 ERR_STATE 分支而**看起来成功**（那正是要防的假象）。 */
+        s_started = false;
+        s_advertising = false;
+        s_pairing = false;
+        window_stop();
+
+        if (rc != ONEYE_DEV_SDK_OK) {
+            ESP_LOGE(TAG, "BLE deinit 失败（%d）⇒ 内存**未**回收，MQTT 仍可能 alloc failed；"
+                          "internal free=%u B / largest=%u B",
+                     (int)rc, free_after, largest_after);
+            return ESP_FAIL;
+        }
+        ESP_LOGI(TAG, "★ BLE 整栈已 deinit（入网后释放）：internal free %u → %u B（+%d B）、"
+                      "largest %u → %u B；下一次 `wifi_prov_ble_start()`（重配网）会重新 init"
+                      "（NimBLE 重起栈 + GATT 重注册 + 重开广播）",
+                 free_before, free_after, (int)free_after - (int)free_before,
+                 largest_before, largest_after);
+        return ESP_OK;
+    }
+#endif
 }

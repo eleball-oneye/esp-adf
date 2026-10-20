@@ -542,6 +542,8 @@ EX=embedded/esp-adf/examples/oneye/korvo2_oneye
 CERT=/tmp/oneye-empty-certs && mkdir -p "$CERT"
 
 # ① SD 卡机型（有卡槽；WIFI_FILE=y 走机型能力位，其余全部生产口径）
+#    🔴 2026-10-20 起同一条命令产出的固件**同时带 BLE 回退**（`.production` 自己打开 BLE，
+#       见 §5.12.8）——插卡走 SD、拔卡走 BLE，⛔ 不要给甲型再叠 `.ble`。
 idf.py -B /tmp/korvo2-mp-sd -DSDKCONFIG=/tmp/korvo2-mp-sd/sdkconfig \
   -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.defaults.production" \
   -DONEYE_FW_CERT_DIR="$CERT" build
@@ -892,6 +894,42 @@ POP=894767` `@188`、`BLE 配网通道已就绪` `@189`、`下一步：` `@190`�
 ⚠️ **诚实边界**：BLE 端到端仍**未验**（无同场手机）；`ble-ready` 是**入网前**的读数，⛔ 不能外推成
 "BLE 机型入网后也够用"。
 
+### 5.12.8 甲型（有卡槽）启用 BLE 回退（🔴 2026-10-20 用户裁定）
+
+> 用户口径（逐字，最高依据，⛔ 不得改写）：
+> 「com12 甲型需要支持蓝牙配网使能，**拔出 SD 卡的时候用蓝牙配网，有 SD 卡时用 SD 卡凭据配网**」
+
+**旧行为（逐字留痕，⛔ 不抹）**：量产链（`sdkconfig.defaults` → `.esp32s3` → `.production`）里
+`CONFIG_ONEYE_FW_ENABLE_BLE_PROV` 未定义（NimBLE 关）⇒ 有卡槽机型**只有 SD 一条通道**；
+拔出 SD 卡（或卡上无 `oneye-wifi.txt`）后串口止于
+`未找到可用的 Wi-Fi 凭据 → 本次启动不会上云`，App 侧**搜不到**这台设备
+（2026-10-20 真机取证，`E:\workspace\_oneye-logs\COM12-ALPHA-READINESS-20261020.md` §1.3）。
+
+**改法（只加配置；⛔ 未改判据 / 帧协议 / 收敛点 / 身份来源）**：`sdkconfig.defaults.production`
+新增「配网通道（2026-10-20 用户裁定）」段，打开 `ONEYE_FW_ENABLE_BLE_PROV=y`、
+`ONEYE_FW_ONBOARDING_ROLE_ALPHA=y`、NimBLE 与 Wi-Fi/BLE 共存；按键门控保持 **n**。
+
+| 上电时的物理状态 | 走的通道 | 串口判据 | BLE 是否起栈 |
+| --- | --- | --- | --- |
+| **卡在 ＋ `oneye-wifi.txt` 解析成功 ＋ 本次入网成功** | C3 凭据文件（rank 0） | `从凭据文件读取 Wi-Fi` → `Wi-Fi 已连接` → `凭据来源：**creds 分区** node=…` | **否**（`wifi_prov_boot()` 在 BLE 段之前 `return`） |
+| 卡在 ＋ 文件解析失败（缺 `ssid=` / 格式坏） | C1/C2 BLE | `未找到 Wi-Fi 凭据文件` → `启动 BLE 配网通道` → `BLE 配网通道已就绪：广播中` | 是（**开机即广播**） |
+| **卡不在** / 挂载失败 | C1/C2 BLE | `Sdcard mount failed`（既有）→ `未找到 Wi-Fi 凭据文件` → `BLE 配网通道已就绪：广播中` | 是（**开机即广播**） |
+| 卡在 ＋ 凭据命中但 20 s 内**连不上** | C1/C2 BLE（2026-10-13 D2 自动回落） | `SD 卡凭据未能入网 ⇒ 释放采信槽` → `已自动进入 BLE 配网模式（等价长按 SET，无需再按键）` | 是（配网窗口 300 s） |
+
+- **切换条件（写清，⛔ 别指望热切换）**：SD 只在上电时挂载/读取一次 ⇒ **插卡/拔卡都要复位
+  （重启）才生效**；运行期插卡**不会**让设备立刻改用卡上凭据，运行期拔卡**也不会**立刻开 BLE。
+- **甲型身份不变**：BLE 只下发 **Wi-Fi** 凭据；连云身份仍只来自 **creds 分区**
+  （`oneye_start()` → `oneye_dev_creds_load()`，`main/korvo2_oneye_main.c:1491`）。
+  ⛔ 不得用激活码顶替甲型 creds 身份；激活码只作 `prov.pair` / `prov.verify.req` 的配对与核验基准。
+- **受控构建命令不变**（仍三份 defaults，见 §5.10 / §5.11.4 ①），BLE 由 `.production` 自己带；
+  ⛔ 不要给甲型再叠 `.ble`（那会与"SD 优先"的机型能力位语义混淆，且本预设已含同值）。
+- **自证**：构建后回读 `sdkconfig` 必须有
+  `CONFIG_ONEYE_FW_ENABLE_BLE_PROV=y` / `CONFIG_ONEYE_FW_ONBOARDING_ROLE_ALPHA=y` /
+  `CONFIG_ONEYE_FW_ENABLE_WIFI_FILE=y` / `# CONFIG_ONEYE_FW_BLE_PROV_KEY_GATE is not set` /
+  `CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=12288`；
+  门禁 `python tools/check-sdkconfig-defaults.py --sdkconfig <构建>/sdkconfig --require sdkconfig.defaults.production`
+  必须 `[ OK ]`（缺 `IDF_PATH` 会多出结构性误报，见脚本头）。
+
 ---
 
 ## 6. 配置（`idf.py menuconfig` → `korvo2_oneye 板级固件配置`）
@@ -905,7 +943,7 @@ POP=894767` `@188`、`BLE 配网通道已就绪` `@189`、`下一步：` `@190`�
 | `ONEYE_FW_CLOUD_TOKEN` | 空 | 设备令牌（空 = 匿名 dev 形态） |
 | `ONEYE_FW_TLS_INSECURE` | **n** | 仅 dev/产测可开；生产须投放自研 CA（`tls_ca_pem`） |
 | `ONEYE_FW_ENABLE_WIFI_FILE` | **y** | 凭据文件配网（SD/SPIFFS `oneye-wifi.txt`）+ `/api/action wifi_set`。★ **机型能力位**：有卡槽机型 y / 无卡槽机型 n（⛔ 不是量产/台面开关，见 §5.11 与 ADR-0017 D3） |
-| `ONEYE_FW_ENABLE_BLE_PROV` | n | 配网通道 **C1/C2：BLE**（自研 GATT + 配对凭据 = 激活码＋一次性 `chal`）；依赖 `ONEYE_DEV_SDK_ENABLE_BLE=y`。**无卡槽机型应置 y**（此时 `WIFI_FILE=n`，构建期门禁保证仍有通道）。参考预设 `sdkconfig.defaults.ble` |
+| `ONEYE_FW_ENABLE_BLE_PROV` | n（`.defaults`）/ **量产链 = y**（`.production`） | 配网通道 **C1/C2：BLE**（自研 GATT + 配对凭据 = 激活码＋一次性 `chal`）；依赖 `ONEYE_DEV_SDK_ENABLE_BLE=y`。**无卡槽机型应置 y**（此时 `WIFI_FILE=n`，构建期门禁保证仍有通道）。参考预设 `sdkconfig.defaults.ble`。🔴 **2026-10-20**：**甲型（有卡槽）也置 y**（`sdkconfig.defaults.production` 已固化，= SD 缺失时的回退；SD 仍在时优先、且 BLE 不起栈）——见 §5.12.8 |
 | ~~`ONEYE_FW_BLE_POP`~~ | — | ⛔ **已删除**（原：固定 BLE 配对 POP（6 位数字），台面注入口）。依据 = 用户 2026-10-09 裁定「彻底删除实现及契约（POP）」 |
 | `ONEYE_FW_WIFI_SSID` / `_PASSWORD` | 空 | 兜底凭据；空且无凭据文件 = 只跑板级自检与按键，不上云 |
 | `ONEYE_FW_ENABLE_KEYS` | y | 6 键 → `event/up` |

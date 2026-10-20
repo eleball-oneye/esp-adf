@@ -17,10 +17,17 @@
 #        漏了它就回落到 Kconfig 的 choice 缺省 = **甲**（最严）⇒ 编出一个与预期**不同档**的件。
 #
 # 用法（在**本工程目录**下）：
-#   bash tools/build-devkitc.sh beta  <证书目录>            # 乙：证书目录必须含 ca.crt/client.crt/client.key
-#   bash tools/build-devkitc.sh gamma <空目录>              # 丙：给一个**空**目录（本档不嵌证书）
-#   bash tools/build-devkitc.sh beta  <证书目录> bench      # ★ 台面档：再叠加 sdkconfig.defaults.bench-local
-#   bash tools/build-devkitc.sh gamma <空目录>   bench      #   （云指本机栈 192.168.110.208:18830 + mbedTLS PSRAM）
+#   bash tools/build-devkitc.sh beta                   # 乙：证书目录缺省 = 本工程 certs-beta/（2026-10-20 起）
+#   bash tools/build-devkitc.sh beta  <证书目录>        # 乙：显式指定（须含 ca.crt/client.crt/client.key）
+#   bash tools/build-devkitc.sh gamma <空目录>          # 丙：**必须**给一个空目录（本档不嵌证书）
+#   bash tools/build-devkitc.sh beta  [<证书目录>] bench # ★ 台面档：再叠加 sdkconfig.defaults.bench-local
+#   bash tools/build-devkitc.sh gamma <空目录>   bench   #   （云指本机栈 192.168.110.208:18830 + mbedTLS PSRAM）
+#
+# ★ 2026-10-20〔栈溢出+证书对齐批〕乙档**新增机内缺省证书目录** `certs-beta/`（不再是"借 korvo2 的 certs"）：
+#   · 为什么给缺省：乙档此前每次构建都得手打 `…/korvo2_oneye/main/certs`（别的机型的件），
+#     那是 README §7 ⑦ 登记的待裁定项；本批为 devkitc 建了专用目录后，缺省指向它才是"机型事实"。
+#   · ⛔ 丙档**仍然**必须显式给空目录：丙不嵌证书，给缺省等于把"这一档不嵌"藏进脚本。
+#   · 证书来源 / CN / issuer / 验证读数见 `CERTS-BETA.md`（该目录含私钥 ⇒ gitignore，⛔ 不入库）。
 #
 # ★ 2026-10-13〔本批〕新增第 3 个参数 `bench`：**只**追加一份预设，且它是**最后一份**
 #   （IDF 后叠加者胜 ⇒ 台面档的端点/PSRAM/mbedTLS 覆盖前面的量产口径）。
@@ -38,19 +45,27 @@ CERT_DIR="${2:-}"
 BENCH="${3:-}"
 
 if [[ "$TIER" != "beta" && "$TIER" != "gamma" ]]; then
-    echo "用法: bash tools/build-devkitc.sh <beta|gamma> <证书目录> [bench]" >&2
+    echo "用法: bash tools/build-devkitc.sh <beta|gamma> [证书目录] [bench]" >&2
     exit 2
 fi
 if [[ -n "$BENCH" && "$BENCH" != "bench" ]]; then
     echo "错误：第 3 个参数只能是 \`bench\`（或缺省）—— 实测 '$BENCH'" >&2
     exit 2
 fi
-if [[ -z "$CERT_DIR" ]]; then
-    echo "错误：必须显式给出证书目录（乙=非空目录；丙=空目录）—— ⛔ 不提供默认值" >&2
-    exit 2
-fi
 
 PROJ_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# ★ 2026-10-20：乙档的证书目录**有缺省**（本机型专用 `certs-beta/`）；丙档**仍然必须显式**给空目录。
+CERT_DIR_DEFAULTED=""
+if [[ -z "$CERT_DIR" ]]; then
+    if [[ "$TIER" == "beta" ]]; then
+        CERT_DIR="$PROJ_DIR/certs-beta"
+        CERT_DIR_DEFAULTED=1
+    else
+        echo "错误：丙档必须显式给出一个**空**证书目录（本档不嵌证书）—— ⛔ 不提供默认值" >&2
+        exit 2
+    fi
+fi
 # ★ 台面档用**独立构建目录**（⛔ 不覆盖量产档的 build-<档位>/）：两套件的 sdkconfig/产物并存可对照。
 if [[ "$BENCH" == "bench" ]]; then
     BUILD_DIR="$PROJ_DIR/build-$TIER-bench"
@@ -63,7 +78,7 @@ SDK_LIB_OUT="/nonexistent-oneye-lib-out"
 echo "== devkitc_oneye · 档位=$TIER${BENCH:+ · 台面档(bench)} =="
 echo "   工程    : $PROJ_DIR"
 echo "   构建目录: $BUILD_DIR"
-echo "   证书目录: $CERT_DIR"
+echo "   证书目录: $CERT_DIR${CERT_DIR_DEFAULTED:+  ← **机内缺省**（2026-10-20 起；来源见 CERTS-BETA.md）}"
 echo "   ADF_PATH: ${ADF_PATH:-<未导出>}"
 
 if [[ -z "${ADF_PATH:-}" ]]; then
@@ -101,6 +116,19 @@ if [[ "$BENCH" == "bench" ]]; then
 else
     DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.defaults.ble;sdkconfig.defaults.$TIER"
     echo "   defaults: $DEFAULTS（量产口径；⛔ 不含 bench-local）"
+fi
+
+# ★ 2026-10-20〔影子 JSON 合法性批〕**构建期钉子**（⛔ 不是"顺手多跑一个脚本"）：
+#   旧拼装在 `main/devkitc_oneye_main.c` 里产出
+#   `{"firmwareVersion":"…","power":true,"credSource":"credSource":"embedded"}}`
+#   （重复键 ＋ 多一个右括号）⇒ `oneye_dev_base_report_state()` 判 INVALID **静默失败**，
+#   编译照样成功、串口可能一行错都不打，平台侧只是"永远没有 credSource"。
+#   ⇒ 在本步拦：模板不可解析 / 结构不符 ⇒ **拒绝构建**（退出码 3，不与 idf.py 的失败混淆）。
+#   ⚠️ 判据细节与射程见 `tools/check-shadow-json.py` 文件头（含"只校验拼装模板"的边界声明）。
+if ! python3 "$PROJ_DIR/tools/check-shadow-json.py"; then
+    echo "错误：影子 reported JSON 不可解析或结构不符 ⇒ 拒绝构建" >&2
+    echo "      拼装点：main/devkitc_oneye_main.c 的 snprintf(shadow, …)；判据：tools/check-shadow-json.py" >&2
+    exit 3
 fi
 
 CCACHE_ENABLE=0 idf.py -B "$BUILD_DIR" \

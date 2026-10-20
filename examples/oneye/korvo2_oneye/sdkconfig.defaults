@@ -101,6 +101,10 @@ CONFIG_SPIFFS_MAX_PARTITIONS=3
 CONFIG_ONEYE_FW_ENABLE_WIFI_FILE=y
 # BLE 配网通道（C1/C2）：**基础 defaults 不开**（NimBLE + Wi-Fi + AFE 同栈要额外内部 RAM，
 # 见 ADR-0017 D6）⇒ 只在需要它的机型/构建里由 `sdkconfig.defaults.ble` 覆盖打开。
+# 🔴 **2026-10-20 补充（用户裁定「拔出 SD 卡的时候用蓝牙配网，有 SD 卡时用 SD 卡凭据配网」）**：
+#   甲型（有卡槽）的**量产链**也会打开它 —— 落点 = `sdkconfig.defaults.production` 里新增的
+#   「配网通道（2026-10-20 用户裁定）」段（它在本文件之后施加 ⇒ 覆盖本行的 n）。
+#   ⇒ 本行的 n 仍保留（它是"基础 defaults 不带 BLE"的**默认形态**，台面/无 BLE 构建据此不变）。
 CONFIG_ONEYE_FW_ENABLE_BLE_PROV=n
 # microSD：凭据文件、AEC 录音落盘、板上回放都依赖它（未插卡仅告警，不阻塞启动）
 CONFIG_ONEYE_FW_ENABLE_SDCARD=y

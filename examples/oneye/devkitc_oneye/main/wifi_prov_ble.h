@@ -73,6 +73,32 @@ bool wifi_prov_ble_active(void);
 void wifi_prov_ble_stop_advertising(void);
 
 /**
+ * 🔴 **2026-10-20〔`mqtt client alloc failed` 批〕新增：入网成功后把 BLE 整栈 deinit，回收 ~100 KB**。
+ *
+ * 为什么需要它（真机读数，⛔ 非推断）：乙型 devkitc 入网后 free heap ≈ 7 KB（NimBLE 主机栈 ＋
+ * Wi-Fi 动态缓冲占着），而 `oneye_mqtt_new()` 要一笔 65568 B ＋ 16384 B ⇒ `mqtt client alloc failed`。
+ * 用户 2026-10-20 裁定：「RX/TXQ 4096｜**允许 deinit BLE**」。
+ *
+ * 语义（⛔ 不新增帧 / ⛔ 不改判据 / ⛔ 不动凭据）：
+ *   · 先停广播（幂等），再 `oneye_dev_ble_deinit()`（SDK 侧 = `nimble_port_stop()` +
+ *     `nimble_port_deinit()` + 释放锁，见 `src/oneye_dev_ble.c:1455-1470`）；
+ *   · 本模块的 `s_started` / `s_advertising` / `s_pairing` 一并清零 ⇒ **下一次
+ *     `wifi_prov_ble_start()` 会走完整 init 路径**（NimBLE 重新起栈、GATT 重新注册、
+ *     广播重新开）—— 这就是"换网 / 重配网"所需的 re-init 路径，⛔ 不需要另外补一套；
+ *   · **幂等**：已 deinit / 通道未启用 ⇒ 直接返回，⛔ 不报错、⛔ 不重复释放。
+ *
+ * ⚠️ 调用时机（唯一合规点）：`devkitc_oneye_main.c` 的 `wifi_ready_work()` —— 即
+ *   **Wi-Fi 已 GOT_IP、`prov.status{connected}` 已发出、停广播之后、建 MQTT（`oneye_start()`）之前**。
+ *   ⛔ 不要在 `on_wifi_ready()`（sys_evt）里调：`nimble_port_stop()` 要等主机任务退出，属阻塞动作。
+ * ⚠️ 副作用（如实登记）：deinit 之后本进程内 `prov.status` 再也发不出去（BLE 不在）——
+ *   已入网设备不需要它；Wi-Fi 掉线后再 GOT_IP 的那一次上报会失败并**如实打印"未发出"**，
+ *   ⛔ 不假装已上报。用户此时长按 BOOT 仍可重配网（`pairing_enter` 会重新 init BLE）。
+ *
+ * @return `ESP_OK` = 已 deinit（或本来就不在）；`ESP_FAIL` = SDK 明确拒绝；`ESP_ERR_NOT_SUPPORTED` = 本构建没开 BLE 通道。
+ */
+esp_err_t wifi_prov_ble_deinit_after_provisioned(void);
+
+/**
  * ★ 2026-10-10：上报 `prov.status{state=connected, ip=…}`（契约 §4.1 的**既有**状态，本批落实）。
  *
  * 为什么这一帧由**本模块**发出（而不是收敛点 `main.c` 直接调 SDK）：

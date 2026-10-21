@@ -54,6 +54,9 @@
 /* ★ 2026-10-13〔本批 ③b〕启动期授时（乙档严格 TLS 的"先有钟再建链"）——
  *   与 korvo2_oneye/main/sntp_boot.c **同源复制**（逐字节），接入点见 `on_wifi_ready()`。 */
 #include "sntp_boot.h"
+/* 机型 → `status/up` 周期 H 的**唯一**对照表（两例程共用同一份；见文件头）。
+ * ⚠️ 用相对路径引入而不是复制一份：H 与 cloud 机型配置必须一致，⛔ 不能有两份真值。 */
+#include "../../oneye_status_period.h"
 
 static const char *TAG = "devkitc_oneye";
 
@@ -580,6 +583,29 @@ static void oneye_start(void)
     base_cfg.tls_insecure_skip_verify = false;
 #endif
     base_cfg.enable_status_topic = true;   /* status/up（retained + 遗嘱） */
+
+    /* ★ 2026-10-21〔按机型周期 status/up 批〕H 由**机型**决定（用户裁定；见
+     *   `examples/oneye/oneye_status_period.h` 文件头的云侧语义与"为什么不另起任务"）：
+     *     · 乙型 OY-SPK-02（beta）= **300 s** → cloud 在线键 TTL = 6×H = 1800 s；
+     *     · 甲型 OY-SPK-01（若以 alpha 档构建）= 60 s；丙型 OY-SPK-03 不上云（值不生效）。
+     *   SDK base 负责"建链即发一帧 + 每 H 秒心跳 + 重连后恢复"，本处只**给周期**。
+     *
+     *   **旧值逐字留痕（⛔ 不抹）**：本处此前只有下面这一行（行尾块注释符从略，
+     *   以免提前闭合本段注释）：
+     *     base_cfg.enable_status_topic = true;   （行尾注释：status/up（retained + 遗嘱））
+     *   —— 即 `status_interval_s` **从未设置** ⇒ 走 SDK 缺省 **300 s**：乙型恰好等于
+     *   本批的目标 H，但**当时是巧合**（谁也没把它与机型绑定），甲/丙一旦换档就会错。
+     *
+     *   ⚠️ **必须与 cloud 侧该机型的 H 一致**：cloud 改机型 H ⇒ 同步改
+     *   `oneye_status_period.h` 的表（或 Kconfig `ONEYE_FW_STATUS_INTERVAL_S` 覆盖值）。
+     *   ⛔ 不得把 H 放进 shadow state：`heartbeatIntervalSec` 未进 TSL ⇒ 整帧被拒。 */
+    {
+        uint16_t status_h_s = ONEYE_STATUS_INTERVAL_SEC();
+        base_cfg.status_interval_s = status_h_s;
+        ESP_LOGI(TAG, "status/up 周期 H=%us（机型 %s；cloud 在线键 TTL=6×H=%us）",
+                 (unsigned)status_h_s, CONFIG_ONEYE_FW_PRODUCT_KEY,
+                 (unsigned)(6u * (uint32_t)status_h_s));
+    }
 
     rc = oneye_dev_base_init(&base_cfg);
     if (rc != ONEYE_DEV_SDK_OK) {

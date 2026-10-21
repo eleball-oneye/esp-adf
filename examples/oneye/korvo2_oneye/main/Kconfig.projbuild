@@ -24,6 +24,28 @@ menu "korvo2_oneye 板级固件配置"
             理由与字节布局见 contracts/local/ble-gatt.md 与 include/oneye_dev_ble.h）。
             空串 ⇒ 只带 SN、不带品类（App 侧 `pk_present=0`），⛔ 不填默认值。
 
+    config ONEYE_FW_STATUS_INTERVAL_S
+        int "status/up 周期 H（秒；0 = 按机型自动）"
+        range 0 3600
+        default 0
+        help
+            cloud 的在线会话键 TTL = **6 × H**，且**每条已认证上行**都会滑动续期
+            （2026-10-21 `73dcfb7c`）⇒ 设备只要按 **≤ H** 的节奏发 `status/up`，
+            在线键就不会过期（App 侧不会误判离线）。
+
+            ⚠️ **H 必须与 cloud 侧该机型的配置一致**（机型配置在 cloud 侧）：
+              · OY-SPK-01（甲 / Korvo-2 / 本工程）= **60**
+              · OY-SPK-02（乙 / devkitc beta）        = 300
+            两侧不一致的后果：设备发得比 H 慢 ⇒ 在线键过期（App 显示离线）；
+            发得比 H 快 ⇒ 只多耗流量。cloud 改机型 H 时**必须**同步改这里
+            （或改 `examples/oneye/oneye_status_period.h` 的机型表）。
+
+            0 = **按 ONEYE_FW_PRODUCT_KEY 自动取**（推荐，机型即 H）。
+            >0 = 显式覆盖（用于与 cloud 临时对齐；⛔ 改了它就要同步 cloud）。
+
+            ⛔ 不得把 H 放进 shadow state：`heartbeatIntervalSec` 未进 TSL ⇒ 整帧被拒。
+            ⛔ 不要用 0xFFFF 关心跳（那是 SDK 的"关闭"哨兵）：关了在线键就没人续。
+
     menu "接入（EMQX / 云端）"
 
         config ONEYE_FW_CLOUD_HOST

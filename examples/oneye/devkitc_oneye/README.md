@@ -163,6 +163,23 @@
 ⚠️ **待办（属 cloud 侧）**：`OY-SPK-02` / `OY-SPK-03` 需在 cloud 机型表（TSL ＋
 `dev_product_credential_policy`）里有登记，否则准入会判未知品类。
 
+### 3.5 `status/up` 周期 H（★ 2026-10-21 · 按机型）
+
+**为什么**：cloud 的在线会话键 **TTL = 6 × H**，且自 `73dcfb7c`（2026-10-21）起**每一条已认证上行**都会滑动续期 ⇒ 设备按 **≤ H** 的节奏发 `status/up`，在线键就不会过期；静默超过 6×H 就会被判离线。
+
+| 项 | 值 / 落点 |
+| --- | --- |
+| H 的来源 | **机型**。cloud 侧机型配置：`OY-SPK-01 = 60`、`OY-SPK-02 = 300` |
+| 本工程生效值 | 乙（beta，`OY-SPK-02`）= **300 s**（TTL = 6×300 = 1800 s）；甲若以 alpha 档构建 = 60 s；丙（gamma，`OY-SPK-03`）**不建云链路** ⇒ 值不生效 |
+| 设备侧唯一对照表 | [`../oneye_status_period.h`](../oneye_status_period.h)（与 korvo2_oneye **共用同一份**，⛔ 不复制第二份真值） |
+| 编译期覆盖 | Kconfig `ONEYE_FW_STATUS_INTERVAL_S`（0 = 按机型自动；>0 = 显式覆盖，⛔ 改它必须同步 cloud） |
+| 发送方 | **SDK base 的唯一 status 路径**：建链即发一帧 `{online:true}`、之后每 H 秒心跳、断线重连由 `bint_on_link_up()` 重置并重发 ⇒ 本工程**不新增**第二个定时任务（避免双发同一条 retained 状态） |
+| 启动自证（串口） | `status/up 周期 H=300s（机型 OY-SPK-02；cloud 在线键 TTL=6×H=1800s）` |
+| 观测口径 | SDK `tx progress: app_tx=…`（每 10 s 一行）：静默期里**每 H 秒恰好 +1 帧** = 心跳那一帧 |
+
+⚠️ **两侧必须一致**：cloud 改机型 H ⇒ 同步改 `oneye_status_period.h`（或 Kconfig 覆盖值）。
+⛔ **不要**把 H 放进 shadow state（`heartbeatIntervalSec` 未进 TSL ⇒ 整帧被拒）。
+
 ---
 
 ## 4. 两档固件的受控产出

@@ -163,6 +163,88 @@ CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=8
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
 
+# ---- mbedTLS 单帧内容上限：**甲型上云 TLS 分配失败的根治项**（2026-10-21）---------
+# ⚠️ 本段是**第一版（降档）**，其结论已被同日 15:11 的真机取证**推翻** ⇒ 现行为见本段末尾
+#    「二修（批次 KORVO2-TLS-HANDSHAKE-FIX2）」块。本段文字**逐字留痕、⛔ 不删**（仓库纪律）。
+# 真机取证（COM12，2026-10-21 14:47，板载 prod 固件 `v2.8-177-g4b5d27b0-dirty`）：
+#   Wi-Fi 已连、IP 已取、`net_probe` 到 18886 TCP 通，随后**建 TLS 会话即失败**：
+#     W oneye_tls: TLS failed at mbedtls_ssl_setup: ret=-32512 (0x7f00)
+#     [W] connect mqtt.oneye.me:18886 (mqtt-tls) failed: rc=-6 (0xfffffffa)
+#   0x7f00 = `MBEDTLS_ERR_SSL_ALLOC_FAILED`（IDF 5.5.5
+#   components/mbedtls/mbedtls/include/mbedtls/ssl.h:109 逐字
+#   `#define MBEDTLS_ERR_SSL_ALLOC_FAILED  -0x7F00`）。
+# 成因（与乙型 devkitc **同源**；⛔ 不是"总内存不够"，是"**连续**内存不够"）：
+#   `mbedtls_ssl_setup()` 在**建会话**时按下面这两个缺省值**一次性各要一整块连续缓冲**
+#   （收 16 KiB ＋ 发 4 KiB ＋ 变换/头部开销），取不到就直接返回该码 ⇒ **连 ClientHello 都发不出去**，
+#   云端只看到 TCP SYN→FIN，App 侧表现为"一直等设备上平台"。
+#   甲型量产件同时跑 Wi-Fi ＋ NimBLE ＋ ADF 音频 ＋ 配网，内部 RAM 已高度碎片化。
+# 本档取证（`build-alpha-ble-fallback/sdkconfig`，与 COM12 板载件**同批**构建）逐字：
+#   CONFIG_SPIRAM=y / CONFIG_SPIRAM_MODE_OCT=y / CONFIG_SPIRAM_USE_MALLOC=y
+#   # CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC is not set   ← SPIRAM 在，但 **mbedTLS 没走它**
+#   # CONFIG_MBEDTLS_DYNAMIC_BUFFER is not set
+#   ⇒ 那 16 KiB 收缓冲实际落在**内部** RAM ⇒ 碎片化后必然取不到。
+# 为什么本档**不**走 PSRAM（台面档 `sdkconfig.defaults.bench-local:120` 的做法）：
+#   那条路用 PSRAM 保住 16384 B 标准口径，代价是 TLS 缓冲/上下文全走外部 RAM（延迟）；
+#   本批按用户裁定「最小改动、与乙型同口径」⇒ 选择**降档**，不新增第二条内存路径。
+#   ⛔ 将来若确有 >4096 B 的下行需求：**先**改走 PSRAM（`CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC`）
+#   **再**回抬本值 —— ⛔ 不要只把本值改回 16384（那等于把本次失败原样搬回来）。
+# 判据（为什么这两个值够用）：
+#   · 入向 4096 B：下行帧 = MQTT 影子/命令载荷，单条报文远小于 4 KiB；
+#   · 出向 2048 B：设备→云的上报（status/shadow/log）实际帧远小于 2 KiB。
+#   ⚠️ 上面两行"远小于"沿用乙型口径，**本批尚未在 korvo2 上逐帧实测复核**（见报告 §5 缺口）。
+# ⚠️ 这是**折衷不是免费**：单帧超过 4096 B 的下行报文会被 mbedtls 拒收（`BUFFER_TOO_SMALL` 一类症状）。
+# ★ 旧值逐字留痕（⛔ 不删）：此前**这两个符号不在本文件里**，取 IDF 缺省
+#   `CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384` / `CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096`；
+#   实测读自 `build-alpha-ble-fallback/sdkconfig`（2026-10-20 那批，与板载固件同批）。
+#   ⛔ 本段是**本文件唯一**的配置符号新增，判据/帧协议/身份来源/配网通道一律未动。
+# ---------------------------------------------------------------------------
+# 二修（批次 KORVO2-TLS-HANDSHAKE-FIX2，2026-10-21 15:2x）：**恢复 IDF 缺省档 + mbedTLS 全走 PSRAM**
+#
+# 真机取证（COM12，2026-10-21 15:11，板载 = 上面第一版降档固件 4096/2048）：
+#   W (457357) oneye_tls: TLS handshake failed: ret=-16 (0x0010) verify_result=0xffffffff
+#   [W] connect mqtt.oneye.me:18886 (mqtt-tls) failed: rc=-6 (0xfffffffa)
+#   ⇒ -16 (0x0010) **不是** "OUT=2048 太小"，而是 `MBEDTLS_ERR_MPI_ALLOC_FAILED`：
+#     · 定义：IDF 5.5.5 components/mbedtls/mbedtls/include/mbedtls/bignum.h:39
+#       `#define MBEDTLS_ERR_MPI_ALLOC_FAILED  -0x0010`
+#     · 返回点：同树 library/bignum.c:218-219（`mbedtls_mpi_grow` 里
+#       `mbedtls_calloc(nblimbs, ciL) == NULL` ⇒ 直接返回该码）
+#     · 含义：握手期的大数（ECDHE 密钥生成 / 证书公钥验签）小块**分配不到**
+#       ⇒ 仍是**内存**问题，只是失败点从 `mbedtls_ssl_setup`（第一版 -0x7F00）挪到了握手内部。
+#     · `verify_result=0xFFFFFFFF` 是 mbedtls 的"**没有会话对象可查**"（library/ssl_tls.c:3157-3168
+#       仅当 session / session_negotiate 都为 NULL 才返回它）⇒ 失败发生在**证书校验之前**，
+#       ⛔ 不能用它读"证书为什么没验过"。
+#     · 若真因是"单帧超 2048 B"，mbedtls 会给 `MBEDTLS_ERR_SSL_BUFFER_TOO_SMALL`(-0x7180) 一类，
+#       ⛔ 不会给 -0x0010 ⇒ 本次把"OUT 太小"这个假设**排除**。
+#
+# 为什么选「PSRAM 路线」而不是继续降档 / 折中档 8192+4096：
+#   ① 降档只挪动了**失败点**，没解决"内部 RAM 里分配 mbedTLS 对象"这一根因（第一版已证）；
+#   ② 8192/4096 不开 PSRAM 反而把**连续**内部需求从 6 KiB 抬到 12 KiB，且 bignum 小块仍落内部
+#      ⇒ 同一类失败的概率更高，⛔ 不选；
+#   ③ PSRAM 实测 free_psram=8004572 B（2026-10-21 13:54 那批 `[res]` 行，甲型量产链、
+#      Wi-Fi+NimBLE+ADF 全起之后）⇒ 16 KiB+4 KiB 缓冲与全部 bignum 都搬过去毫无压力，
+#      并可回到 **13:54 那台真机跑通过握手/上线**的 IDF 缺省档（16384/4096）。
+#   ④ 分配器口径（已核对，满足 mbedTLS 要求）：
+#      IDF 5.5.5 components/mbedtls/port/esp_mem.c:15-20
+#        `#ifdef CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC  → heap_caps_calloc(..., MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT)`
+#        `#elif CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC  → heap_caps_calloc(..., MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT)`
+#      Kconfig: components/mbedtls/Kconfig:31-33 `MBEDTLS_EXTERNAL_MEM_ALLOC` 依赖
+#        `SPIRAM_USE_CAPS_ALLOC || SPIRAM_USE_MALLOC` ⇒ 本档 `CONFIG_SPIRAM_USE_MALLOC=y` **满足**。
+#      并且 mbedTLS 的缓冲**不要求 DMA 能力**：收发走 `oneye_osal_sock_*`（lwIP 自己的内部缓冲），
+#      mbedTLS 只是软件读写这块内存 ⇒ `MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT` 就是正确 caps，
+#      ⛔ 不存在"mbedTLS 只许内部 RAM"的限制。
+#   ⑤ 代价（如实登记）：TLS 上下文/编解码全在外部 RAM ⇒ 有 PSRAM 访问延迟；
+#      本机不跑 light-sleep/deep-sleep 保 PSRAM，故不存在"睡醒丢上下文"的问题。
+#
+# ★ 旧值逐字留痕（⛔ 不删）：本批**上一版**在这里逐字为
+#     `CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=4096`
+#     `CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=2048`
+#   （2026-10-21 15:03 批次 KORVO2-TLS-MEM-FIX 引入；再上一版 = 不在本文件、取 IDF 缺省 16384/4096，
+#    回读见 `build-alpha-tlsmem/sdkconfig`）。
+# ---------------------------------------------------------------------------
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
+
 # ---- 自检与体积 ---------------------------------------------------------------
 # 板级自检失败即中止上云（量产要的是"坏的别上网"，不是"坏的也上网")
 CONFIG_ONEYE_FW_SELFTEST_STRICT=y

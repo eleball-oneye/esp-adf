@@ -958,12 +958,29 @@ POP=894767` `@188`、`BLE 配网通道已就绪` `@189`、`下一步：` `@190`�
 | 面 | 本固件行为 |
 | --- | --- |
 | `caps/up` | 上线声明能力集（缺省 `NONE`；`model_version="1"`、`fw_version`） |
-| `status/up` | `enable_status_topic=true`（retained + LWT） |
+| `status/up` | `enable_status_topic=true`（retained + LWT）；**周期 H 按机型**（见 §7.1）：甲 OY-SPK-01 = **60 s**、乙 OY-SPK-02 = 300 s。**旧值逐字留痕**：本行此前逐字为「`enable_status_topic=true`（retained + LWT）」—— `status_interval_s` 从未设置 ⇒ 走 SDK 缺省 **300 s** |
 | `shadow/up` | 只写**已登记键**：`firmwareVersion`、`power`（不新增键） |
 | `log/up` | 板级自检结论、启动信息（`tag=oneye_base`） |
 | `event/up` | 按键事件（`type=device_event`，`data{key,action}`） |
 | `command/down` → `command/up` | 解析载荷取 `id` ⇒ **一律回执 `{"id":…,"status":"error","error":"unknown command"}`**（两面均 `x-oneye-envelope: false`，**RAW 不套信封**）。命令执行面属 S16 未落地 ⇒ `caps/up` 的 `cmds[]` 为空 ⇒ 契约上每条命令都是**未知命令**，而契约逐字规定「下发未知命令应回执 `status=error`」（`物模型与能力集.md` §5 / `Korvo-2设备能力与协议映射.md` §2 第 6 行）⇒ **回 error 是正确行为，⛔ 不假回 `ok`**。载荷非 JSON 或缺合法 `id` 时不回执并告警（无关联依据）。**此改动消除的是「收到命令完全无回执 ⇒ 云端 `dev_command.status` 停在 `SENT` 到超时」的缺口，不是「命令闭环打通」** |
 | `mpp/*` | 缺省不启用（媒体数据面未真机验证） |
+
+### 7.1 `status/up` 周期 H 与 cloud 在线键（★ 2026-10-21）
+
+**为什么要有这一节**：cloud 的在线会话键 **TTL = 6 × H**，且自 `73dcfb7c`（2026-10-21）起**每一条已认证上行**都会滑动续期。⇒ 设备只要按 **≤ H** 的节奏发 `status/up`，在线键就不会过期；反过来，设备静默超过 6×H 就会被判离线（App 显示离线）。
+
+| 项 | 值 / 落点 |
+| --- | --- |
+| H 的来源 | **机型**。cloud 侧机型配置：`OY-SPK-01 = 60`、`OY-SPK-02 = 300`（另一批在 cloud 落地） |
+| 设备侧唯一对照表 | [`../oneye_status_period.h`](../oneye_status_period.h)（korvo2_oneye 与 devkitc_oneye **共用同一份**，⛔ 不复制第二份真值） |
+| 本工程生效值 | `OY-SPK-01` ⇒ **60 s**（TTL = 6×60 = 360 s）；机型宏 = `CONFIG_ONEYE_FW_PRODUCT_KEY` |
+| 编译期覆盖 | Kconfig `ONEYE_FW_STATUS_INTERVAL_S`（0 = 按机型自动；>0 = 显式覆盖，⛔ 改它必须同步 cloud） |
+| 发送方 | **SDK base 的唯一 status 路径**：建链成功即发一帧 `{online:true}`、之后每 H 秒心跳（`bint_maybe_heartbeat()`）、断线重连由 `bint_on_link_up()` 重置周期并重发 ⇒ 本工程**不新增**第二个定时任务（否则会双发同一条 retained 在线状态） |
+| 启动自证（串口） | `status/up 周期 H=60s（机型 OY-SPK-01；cloud 在线键 TTL=6×H=360s）` |
+| 观测口径 | SDK `tx progress: app_tx=…`（每 10 s 一行）：静默期里 **每 60 s 恰好 +1 帧** = 心跳那一帧 |
+
+⚠️ **两侧必须一致**：cloud 改机型 H ⇒ 同步改 `oneye_status_period.h`（或 Kconfig 覆盖值）；只改一侧的后果是"App 误判离线"或"白耗上行"。
+⛔ **不要**把 H 放进 shadow state（`heartbeatIntervalSec` 未进 TSL ⇒ `TslRegistry.validate` 抛错、**整帧被拒**，见 `E:\workspace\_oneye-logs\SHADOW-HEARTBEAT-INTERVAL-20261021.md`）。
 
 ## 8. 本轮实测记录
 

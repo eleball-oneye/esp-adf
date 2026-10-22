@@ -50,8 +50,30 @@ void wifi_prov_ble_set_autostart(bool autostart);
  * （`CONFIG_ONEYE_FW_BLE_PROV_PAIRING_WINDOW_S`）。幂等：已在广播中只重置计时。
  * 幂等之外的两个**显式拒绝**（都不静默）：① 通道未启用 ⇒ `ESP_ERR_NOT_SUPPORTED`；
  * ② 设备**已入网** ⇒ `ESP_ERR_INVALID_STATE`（入网成功后不再保持可配网态）。
+ * 🔴 **2026-10-21 订正（⛔ 旧字逐字留痕，⛔ 不抹）**：上面第 ② 条**已作废** —— 旧行为是"已入网 ⇒ 拒绝"，
+ *    现为"已入网 ⇒ 先忘记 Wi-Fi 凭据（含 NVS 持久化配置）再进入配网"（长按 BOOT/SET ≥3 s 的语义）。
+ *    对"已入网"**不再返回** `ESP_ERR_INVALID_STATE`；需要"只忘记不进入"的调用者请直接调
+ *    `wifi_prov_forget_wifi()`。旧实现逐字见 `wifi_prov_ble.c` 的 `pairing_enter()` 内留痕块。
  */
 esp_err_t wifi_prov_ble_pairing_enter(void);
+
+/**
+ * 🔴 **2026-10-21〔BOOT 长按忘记 WiFi + 重进 BLE 配网批〕长按重配的唯一入口**。
+ *
+ * 语义 = **忘记 Wi-Fi 凭据 + 重新进入 BLE 配网**（两例程共用这一份）：
+ *   ① `wifi_prov_forget_wifi()`：断开并停 STA、清 RAM 采信槽/STA 配置、`esp_wifi_restore()`
+ *      擦掉 NVS 持久化 Wi-Fi 配置（⛔ 不动 creds 分区、⛔ 不动 nvs 其它命名空间、⛔ 不删 SD 卡文件）；
+ *   ② `wifi_prov_ble_pairing_enter()`：起栈/重开广播 + 重置窗口计时
+ *      （甲型若当前走 SD 路径 ⇒ 本次运行期切到 BLE 配网，SD 采信槽已清）；
+ *   ③ 成功时打印用户逐字要求的结论行 `BOOT 长按：已清除 WiFi 凭据，进入 BLE 配网`。
+ *
+ * 三种起点都收敛到同一条路径（幂等）：已入网（旧行为是**拒绝**，见实现里的旧字留痕）/
+ * 在线且 BLE 已 deinit / 离线待机。
+ *
+ * ⚠️ 必须从**任务上下文**调用（内部 `esp_wifi_stop()` 阻塞），⛔ 不在 sys_evt / esp_timer 回调里调用。
+ * ⛔ 不打任何凭据（SSID/密码/激活码/chal）。
+ */
+esp_err_t wifi_prov_ble_pairing_reprovision(void);
 
 /** 退出配网模式：停广播 + 停计时（幂等；不在配网模式时只打印一行，不报错）。 */
 esp_err_t wifi_prov_ble_pairing_exit(void);

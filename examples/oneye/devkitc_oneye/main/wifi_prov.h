@@ -114,6 +114,27 @@ esp_err_t wifi_prov_load_file(char *ssid, size_t ssid_cap, char *pass, size_t pa
                               char *src_path, size_t path_cap);
 
 /**
+ * 🔴 2026-10-22〔WiFi 凭据持久化批〕从 **NVS** 读回设备自己记住的那份 WiFi 凭据。
+ *
+ * 为什么需要它（现场缺陷本体）：配网成功 = 只把凭据交给 `esp_wifi_set_config()` + 连上，
+ *   **启动流程里没有任何一处去读"上一次配网留下的凭据"** ⇒ 一复位，`wifi_prov_boot()` 只能
+ *   从"BLE 通道"重新开始 ⇒ 设备回到广播、云端显示离线
+ *   （2026-10-22 上午 COM13 实测：`rst:0x1 (POWERON)` 之后直接
+ *    `BLE 配网通道已就绪：广播中`，无 `esp_wifi_connect`、无 `GOT_IP`）。
+ *
+ * 语义（⛔ 不新增通道语义、⛔ 不改判据）：本函数**只读**，把读到的凭据回填给调用方；
+ *   调用方（`wifi_prov_boot()`）必须经**唯一入网入口** `wifi_prov_submit_credentials*()`
+ *   以 `WIFI_PROV_CHAN_NVS` 递交 —— 它和 BLE 一样只是"凭据从哪来"。
+ *
+ * 返回：
+ *   - `ESP_OK` —— 读到一份非空 ssid（`pass` 可能为空 = 开放网络）；
+ *   - `ESP_ERR_NVS_NOT_FOUND` / 其它 NVS 错误 —— 没记住（首次上电 / 被 `wifi_prov_forget_wifi()` 擦过）；
+ *   - `ESP_ERR_INVALID_ARG` —— 入参为空。
+ * ⚠️ 只回填 ssid/pass，⛔ 不打印密码（日志只说"已提供/为空"）。
+ */
+esp_err_t wifi_prov_load_nvs(char *ssid, size_t ssid_cap, char *pass, size_t pass_cap);
+
+/**
  * ★ **所有配网通道的唯一入网入口**（ADR-0017 D2/D4）★
  *
  * 做的事只有三件：① 过**优先级判据**（`wifi_prov_policy_decide()`）；② 记录来源；
@@ -165,6 +186,22 @@ esp_err_t wifi_prov_set_source(const char *src);
  *  里的采信槽与 STA 配置，flash/NVS 里的凭据**一字未写**。
  *  同时清空采信槽 ⇒ 恢复"任一通道都可被重新采信"的状态。 */
 void wifi_prov_forget(void);
+
+/**
+ * 🔴 **2026-10-21〔BOOT 长按忘记 WiFi 批〕显式"忘记这台设备记住的 WiFi"**（`wifi_prov_forget()` 的**持久化**版本）。
+ *
+ * 与 `wifi_prov_forget()` 的差别只有一条（⛔ 不要合并）：本函数在"清 RAM 采信槽 + STA 配置"之后
+ * **再擦掉 NVS 里的 Wi-Fi 持久化配置**（`esp_wifi_stop()` + `esp_wifi_restore()`）⇒ 重新上电
+ * 也不会再用旧 SSID 自动重连。`prov.reset` 的契约语义（只清 RAM、flash/NVS 保留）**一字未改**。
+ *
+ * 唯一合规调用者 = `wifi_prov_ble_pairing_reprovision()`（BOOT/SET 长按 ≥3 s 的"忘记并重配"）。
+ * ⛔ 不动 creds 分区 / ⛔ 不动 nvs 其它命名空间 / ⛔ 日志不打印 SSID 或密码。
+ * ⚠️ 会**阻塞**（`esp_wifi_stop()`）⇒ 只在任务上下文调用，⛔ 不在 sys_evt / esp_timer 回调里调用。
+ *
+ * @param reason 只进日志的成因标签（可 NULL）
+ * @return `ESP_OK` = 已忘记（或本来就没初始化）；否则为 `esp_wifi_restore()` 的错误码（其余步骤只留痕不升级）。
+ */
+esp_err_t wifi_prov_forget_wifi(const char *reason);
 
 /**
  * 联网就绪回调：获得 IP 时触发（含运行期改配后的重新入网）。

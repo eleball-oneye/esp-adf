@@ -26,6 +26,12 @@
 #include "esp_err.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+/* 🔴 2026-10-21〔BOOT 长按重配批〕GPIO0 BOOT 键（仅未启用 LCD 的构建）：
+ *   korvo2 v3 的 `LCD_MOSI_GPIO = GPIO_NUM_0`（`board_def.h:46`）⇒ 开 LCD 时 GPIO0 被 SPI 占用，
+ *   本包含只在 **`!CONFIG_ONEYE_FW_ENABLE_LCD`** 时引入（与 `boot_key_start()` 的 `#if` 同一判据）。 */
+#if !defined(CONFIG_ONEYE_FW_ENABLE_LCD)
+#include "driver/gpio.h"
+#endif
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -596,47 +602,69 @@ static esp_err_t sim_key_handler(const char *key, const char *action)
     return ESP_OK;
 }
 
-/* ---------------------------------------------------------------- 按键 → 配网模式（长按 SET）
+/* ---------------------------------------------------------------- 按键 → 配网（长按 SET / 长按 BOOT）
  *
  * ★ 2026-10-09 本批：用户口径「按键进入/退出蓝牙配网模式」——
- *   本板**没有独立 GPIO 按键**，6 键（REC/MUTE/SET/PLAY/VOL-/VOL+）是 ADC 梯形电阻共用 GPIO5
+ *   6 键（REC/MUTE/SET/PLAY/VOL-/VOL+）是 ADC 梯形电阻共用 GPIO5
  *   （`components/audio_board/esp32_s3_korvo2_v3/board.c:158-162`：`ADC_CHANNEL_4`，
- *   阈值 `{190,600,1000,1375,1775,2195,3000}`）⇒ **唯一挂载点**就是下面的 `input_key_service_cb()`
- *   （`keys_start()` 注册，`main/korvo2_oneye_main.c:606-625`）。⛔ 不为本功能新增 GPIO 依赖。
+ *   阈值 `{190,600,1000,1375,1775,2195,3000}`）⇒ SET 的**唯一挂载点**就是下面的
+ *   `input_key_service_cb()`（`keys_start()` 注册）。⛔ 不为本功能给 ADC 键另造一套扫描。
  *
- * 长按判据 = ESP-ADF `input_key_service` 归一化后的 **`INPUT_KEY_SERVICE_ACTION_PRESS`**：
- *   短按 → `CLICK` + `CLICK_RELEASE`；长按 → `PRESS`（越过长按阈值那一刻）+ 松手时 `PRESS_RELEASE`
- *   （映射见 `key_action_str()`，:445-454）。取 `PRESS` 而不是 `PRESS_RELEASE` 的理由：
- *   PRESS 在用户"按住不放"时就触发，不必等到松手 —— 交互上按键立刻有反馈，且松手早/晚都不影响语义。
- *   ⚠️ 类型字符 "press" 也**允许**从本地验证面注入（`POST /api/simulate/key`，`key_action_valid()` :573-582）
- *   ⇒ 台面可以在**没有手**的情况下验证进入/退出路径（那正是该验证面存在的意义）。
+ * ★ 2026-10-21〔BOOT-LONGPRESS-REPROV 批〕**语义已改**（⛔ 旧行为逐字留痕，⛔ 不抹）：
+ *   旧 = 长按 SET 在"进入 / 退出配网模式"之间**切换**（`ble_prov_key_toggle()`，旧函数已删并在下面留痕）；
+ *   新 = 长按 **无条件**"忘记 WiFi 凭据 + 重进 BLE 配网"（`wifi_prov_ble_pairing_reprovision()`）：
+ *        · 已入网 ⇒ 先断开/停 STA + 擦 NVS Wi-Fi 配置，再广播等 App 重新配网（旧行为是**拒绝**）；
+ *        · 甲型走 SD 路径 ⇒ 本次运行期清掉 SD 采信槽并**首次起 NimBLE**（切到 BLE 配网）；
+ *        · 待机/离线 ⇒ 忘记是空操作，直接进入配网模式（窗口重新计时）。
+ *   ⇒ 与 devkitc 的 BOOT(GPIO0) 长按**同一语义**（时长同为 3 s；那边是 GPIO0 轮询，见 `boot_key_start()`）。
+ *   ⚠️ 本板 GPIO0 = LCD_MOSI（`board_def.h:46`）⇒ 只有未启用 LCD 的构建才能额外挂 GPIO0（见 `boot_key_start()`）。
+ *
+ * 长按判据（SET，ADC 键）= ESP-ADF `input_key_service` 归一化后的
+ *   **`INPUT_KEY_SERVICE_ACTION_PRESS`**：短按 → `CLICK` + `CLICK_RELEASE`；
+ *   长按 → `PRESS`（越过长按阈值那一刻）+ 松手时 `PRESS_RELEASE`（映射见 `key_action_str()`）。
+ *   取 `PRESS` 而不是 `PRESS_RELEASE` 的理由：PRESS 在用户"按住不放"时就触发，不必等到松手。
+ *   ⚠️ `input_key_service` 的长按阈值是 ADF 内部口径（本工程不另设 3 s 判定）；
+ *      **GPIO0 入口**才是本工程自己的 3 s 判据（`KORVO2_BOOT_HOLD_MS`）——两处入口语义一致、判据来源不同。
+ *   ⚠️ 类型字符 "press" 也**允许**从本地验证面注入（`POST /api/simulate/key`，`key_action_valid()`）
+ *   ⇒ 台面可以在**没有手**的情况下验证长按重配路径（那正是该验证面存在的意义）。
  *   ⚠️ 副作用（**已接受的语义**）：SET 键的 `press`（长按）此后**不再**上报为 `event/up` 按键事件 ——
- *   它现在是"配网模式开关"，不是一条按键业务事件。短按 `set/click` 不受影响，仍然上报。
+ *   它现在是"忘记 WiFi + 重进配网"，不是一条按键业务事件。短按 `set/click` 不受影响，仍然上报。
  *
  * ⛔ 门禁 `tools/check-prov-convergence.py` A8a/A13b 要求 `wifi_prov_ble_start()` 仍只在
  *   `wifi_prov_boot()` 里被调用一次 ⇒ 本处**不调** `wifi_prov_ble_start()`，只调
- *   `wifi_prov_ble_pairing_enter()`（它内部转调，见 wifi_prov_ble.c）。
+ *   `wifi_prov_ble_pairing_reprovision()`（它内部经 `pairing_enter()` 转调，见 wifi_prov_ble.c）。
  */
 static bool ble_prov_mode_allowed(void)
 {
 #if !CONFIG_ONEYE_FW_ENABLE_BLE_PROV
     return false;   /* 本机型没有这条通道：连提示都不打（与 boot 侧"未启用"提示同源，不重复刷屏） */
 #else
-    /* gate=n（缺省）= 旧的"开机即广播"语义：此时长按 SET **仍可**退出/重新进入配网模式
-     *（开机时 start() 已把 s_pairing 置真，长按一次即退出）；gate=y = 开机只待机。
-     * 两种取值下按键**都**可用 ⇒ 此处合并成一个分支（⛔ 不为 gate=y 另开一条按键路径）。 */
+    /* gate=n（缺省）= "开机即广播"语义；gate=y = 开机只待机。
+     * 🔴 2026-10-21：两种取值下按键语义**相同**（长按 = 忘记 WiFi + 重进配网，见下面的函数）——
+     *    ⛔ 旧口径「长按 SET 仍可退出/重新进入」已作废（旧字留痕：本注释此前逐字为
+     *    「gate=n（缺省）= 旧的"开机即广播"语义：此时长按 SET **仍可**退出/重新进入配网模式
+     *      （开机时 start() 已把 s_pairing 置真，长按一次即退出）；gate=y = 开机只待机。」）。 */
     return true;
 #endif
 }
 
-static void ble_prov_key_toggle(void)
+/* 🔴 2026-10-21〔BOOT 长按忘记 WiFi + 重进 BLE 配网批〕
+ *   **旧函数逐字留痕（⛔ 不抹）**：`static void ble_prov_key_toggle(void)` —— 它按
+ *   `wifi_prov_ble_pairing_is_active()` 在"进入 / 退出"之间切换（旧语义「长按 SET 进入、再长按退出」）。
+ *   本批改为**长按 = 忘记 WiFi 凭据 + 重进 BLE 配网**（用户口径：按键用来"控制配网是否打开"，
+ *   而"打开"必须以"忘记旧凭据"为前提，否则 App 配网完再长按只会退出、无法重配）。
+ *   新语义的唯一实现 = `wifi_prov_ble_pairing_reprovision()`（两例程共用；
+ *   内部先 `wifi_prov_forget_wifi()` 再 `pairing_enter()`）。 */
+static void ble_prov_key_reprovision(void)
 {
 #if CONFIG_ONEYE_FW_ENABLE_BLE_PROV
-    if (wifi_prov_ble_pairing_is_active()) {
-        (void)wifi_prov_ble_pairing_exit();
-    } else {
-        (void)wifi_prov_ble_pairing_enter();
+    esp_err_t rc = wifi_prov_ble_pairing_reprovision();
+    if (rc != ESP_OK) {
+        ESP_LOGE(TAG, "[key] set/press（长按）⇒ 忘记 WiFi + 重进 BLE 配网失败（%s）"
+                      "⇒ 可按 RESET 复位后重试", esp_err_to_name(rc));
     }
+#else
+    ESP_LOGW(TAG, "[key] set/press（长按）⇒ 本构建未启用 BLE 配网（ONEYE_FW_ENABLE_BLE_PROV=n）⇒ 无动作");
 #endif
 }
 
@@ -651,9 +679,10 @@ static esp_err_t input_key_service_cb(periph_service_handle_t handle, periph_ser
     if (ble_prov_mode_allowed() &&
         evt->type == INPUT_KEY_SERVICE_ACTION_PRESS &&
         evt->data == INPUT_KEY_USER_ID_SET) {
-        ESP_LOGI(TAG, "[key] set/press（长按）⇒ 切换 BLE 配网模式（%s）",
-                 wifi_prov_ble_pairing_is_active() ? "当前在配网模式 ⇒ 本次为退出" : "当前待机/已停 ⇒ 本次为进入");
-        ble_prov_key_toggle();
+        ESP_LOGW(TAG, "[key] set/press（长按 ≥1 s）⇒ **忘记 WiFi 凭据 + 重进 BLE 配网**"
+                      "（当前 WiFi=%s；短按 set/click 不受影响）",
+                 wifi_prov_is_connected() ? "在线" : "离线");
+        ble_prov_key_reprovision();
         return ESP_OK;
     }
     emit_key_event(key_user_str((int)evt->data), key_action_str((int)evt->type), false);
@@ -680,6 +709,97 @@ static void keys_start(void)
     ESP_LOGI(TAG, "按键服务已启动（%d 键 → event/up）", INPUT_KEY_NUM);
 #endif
 }
+
+/* ============================================================================
+ * 🔴 2026-10-21〔BOOT 长按忘记 WiFi + 重进 BLE 配网批 · 补充入口：GPIO0 BOOT 键〕
+ *
+ * ★ 用户口径逐字：「com13 上的 BOOT 或 RESET 按键能利用上吗，控制配网是否打开」+「两板均有 BOOT(GPIO0)」。
+ *   本板（ESP32-S3-Korvo-2 v3）的按键布局**有两套**，必须讲清（⛔ 不臆造板级事实）：
+ *     ① 板载 **SET** 等 6 键 = **ADC 梯形**，共用 GPIO5（`board.c:158-162`）⇒ 唯一挂载点是
+ *        `input_key_service_cb()`（上面的 `PRESS` 分支）。**这条永远可用**，是长按重配的主入口；
+ *     ② **GPIO0 = LCD_MOSI**（`components/audio_board/esp32_s3_korvo2_v3/board_def.h:46`）⇒
+ *        **启用 LCD 的构建里该脚被 SPI 驱动占用，不能当按键**。因此本段整段写在 `#if !LCD` 下；
+ *        未启用 LCD 的构建（本机当前量产链 `sdkconfig.defaults.production`：
+ *        `# CONFIG_ONEYE_FW_ENABLE_LCD is not set`）里 GPIO0 空闲 ⇒ 若板上 BOOT 键确实接在 GPIO0，
+ *        本段即提供与 devkitc **逐字同口径**的"长按 ≥3 s = 忘记 WiFi + 重进 BLE 配网"；
+ *        若该键不存在，内部上拉使读数恒 1 ⇒ 永不触发（无副作用）。
+ *   ⚠️ 因此两板的**语义一致、入口可能不同**：devkitc = 只有 BOOT(GPIO0)；korvo2 = SET（主）+ GPIO0（若空闲）。
+ *   ⛔ 本段不改任何配网判据：唯一动作 = `wifi_prov_ble_pairing_reprovision()`。
+ * ============================================================================ */
+#if !defined(CONFIG_ONEYE_FW_ENABLE_LCD)
+#define KORVO2_BOOT_GPIO      GPIO_NUM_0
+#define KORVO2_BOOT_HOLD_MS   3000u   /* 与 devkitc 的 DEVKITC_KEY_HOLD_MS 同值（两板语义一致） */
+#define KORVO2_BOOT_POLL_MS   50u
+#define KORVO2_BOOT_SHORT_MS  50u     /* 短按判据：≥50 ms 且 < 长按阈值 ⇒ 仅日志（无副作用） */
+
+static void boot_key_task(void *arg)
+{
+    (void)arg;
+    bool pressed = false;
+    bool long_fired = false;   /* 本次按压已落地长按动作？（防"长按后松手"被误报成短按，也防重复打"按下"） */
+    int64_t t0 = 0;
+
+    for (;;) {
+        const bool down = (gpio_get_level(KORVO2_BOOT_GPIO) == 0);   /* 低有效（BOOT 键接 GND） */
+        const int64_t now = esp_timer_get_time();
+
+        if (down && !pressed) {
+            pressed = true;
+            long_fired = false;
+            t0 = now;
+            ESP_LOGI(TAG, "[key] BOOT(GPIO0) 按下：松手 < %u ms = 短按（无动作）；按住 ≥ %u ms = "
+                          "忘记 WiFi 凭据 + 重进 BLE 配网",
+                     (unsigned)KORVO2_BOOT_HOLD_MS, (unsigned)KORVO2_BOOT_HOLD_MS);
+        } else if (!down && pressed) {
+            const int64_t held_ms = (now - t0) / 1000;
+            pressed = false;
+            if (long_fired) {
+                ESP_LOGI(TAG, "[key] BOOT(GPIO0) 松开：长按已生效（按住 %lld ms ≥ %u ms）"
+                              "⇒ 本次不重复触发；Wi-Fi 已清除、BLE 配网中",
+                         (long long)held_ms, (unsigned)KORVO2_BOOT_HOLD_MS);
+            } else if (held_ms >= (int64_t)KORVO2_BOOT_SHORT_MS) {
+                ESP_LOGI(TAG, "[key] BOOT(GPIO0) 松开：按住 %lld ms < 长按阈值 %u ms ⇒ **短按，无动作**",
+                         (long long)held_ms, (unsigned)KORVO2_BOOT_HOLD_MS);
+            }
+        } else if (down && pressed && !long_fired &&
+                   (now - t0) >= (int64_t)KORVO2_BOOT_HOLD_MS * 1000) {
+            long_fired = true;   /* 一直按住不重复触发；松手由 long_fired 分支收尾 */
+            ESP_LOGW(TAG, "[key] 检测到长按 BOOT(GPIO0) ≥ %u ms ⇒ 忘记 WiFi 凭据 + 重进 BLE 配网",
+                     (unsigned)KORVO2_BOOT_HOLD_MS);
+            ble_prov_key_reprovision();
+        }
+        vTaskDelay(pdMS_TO_TICKS(KORVO2_BOOT_POLL_MS));
+    }
+}
+
+static void boot_key_start(void)
+{
+    gpio_config_t io = { 0 };
+
+    io.pin_bit_mask = (1ULL << (int)KORVO2_BOOT_GPIO);
+    io.mode = GPIO_MODE_INPUT;
+    io.pull_up_en = GPIO_PULLUP_ENABLE;      /* IO0 是 strapping 脚 ⇒ 内部上拉避免悬空抖动 */
+    io.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io.intr_type = GPIO_INTR_DISABLE;
+    if (gpio_config(&io) != ESP_OK) {
+        ESP_LOGW(TAG, "[key] BOOT(GPIO0) 配置失败 ⇒ 本入口不可用（SET 长按仍可用）");
+        return;
+    }
+    /* 栈 2560 B：本任务只做「读电平 + 一行日志 + 调既有 API」，无 TLS/无 BLE、无嵌套深调用。 */
+    if (xTaskCreate(boot_key_task, "boot_key", 2560, NULL, 3, NULL) != pdPASS) {
+        ESP_LOGW(TAG, "[key] BOOT(GPIO0) 任务创建失败（内存不足）⇒ 本入口不可用（SET 长按仍可用）");
+        return;
+    }
+    ESP_LOGI(TAG, "[key] BOOT(GPIO0) 就绪：长按 ≥ %u ms = 忘记 WiFi 凭据 + 重进 BLE 配网；短按无副作用",
+             (unsigned)KORVO2_BOOT_HOLD_MS);
+}
+#else /* CONFIG_ONEYE_FW_ENABLE_LCD：GPIO0 被 LCD SPI 占用 */
+static void boot_key_start(void)
+{
+    ESP_LOGW(TAG, "[key] 本构建启用 LCD（CONFIG_ONEYE_FW_ENABLE_LCD=y）⇒ GPIO0 = LCD_MOSI "
+                  "（board_def.h:46）**不能**当 BOOT 键；长按重配请用板载 **SET** 键");
+}
+#endif /* !CONFIG_ONEYE_FW_ENABLE_LCD */
 
 /* ---------------------------------------------------------------- Wi-Fi（配网实现见 wifi_prov.c） */
 
@@ -1282,7 +1402,8 @@ static void wifi_prov_boot(void)
      * 新行为：本次**已经**用掉文件通道且失败 ⇒ 进 BLE 段后**自动**走
      *   `wifi_prov_ble_pairing_enter()` —— 它与「长按 SET 进入配网模式」是**同一条**路径
      *   （起栈/重开广播 + 起 `ONEYE_FW_BLE_PROV_PAIRING_WINDOW_S` 窗口计时；见
-     *   `korvo2_oneye_main.c` 的 `ble_prov_key_toggle()`），**无需用户再按键**。
+     *   `korvo2_oneye_main.c` 的 `ble_prov_key_reprovision()`（🔴 2026-10-21 改名；旧名
+     *   `ble_prov_key_toggle()`，旧字留痕见该函数定义上方）），**无需用户再按键**。
      *
      * ⛔ 两侧边界（本批不许动，门禁 A18d 断言）：
      *   ① `key_gate=y` 且**卡不在位 / 文件未命中 / 解析失败** ⇒ 语义**逐字不变**（开机只待机、
@@ -1329,6 +1450,43 @@ static void wifi_prov_boot(void)
                   "——该位是机型能力位（无卡槽机型），不是量产开关");
 #endif
 
+    /* ---------------- C6 NVS 持久化凭据（**复位后自动重连的读路径**，排在 BLE 之前） ----------------
+     * 🔴 2026-10-22〔WiFi 凭据持久化批 · 现场缺陷本体〕
+     * 为什么必须有这一段：配网成功后凭据只被 `esp_wifi_set_config()` 用过 + 落了一份 NVS 副本，
+     *   而**旧启动流程根本不读 NVS**（只有 SD 文件 / BLE / Kconfig 三段）⇒ 一复位就落到 BLE 段
+     *   ⇒ 串口 `BLE 配网通道已就绪：广播中`、云端显示离线（2026-10-22 上午两板实测；
+     *   旧行为逐字留痕：复位后串口**没有**任何"读到 NVS 凭据"的行，也没有 `esp_wifi_connect()`）。
+     * 语义（⛔ 不新增通道语义 / ⛔ 不改判据）：凭据经**同一**唯一入口递交，通道 = `WIFI_PROV_CHAN_NVS`
+     *   （rank 2；启动期采信槽为空 ⇒ 必 `ACCEPT_FIRST`）⇒ 复位后的自动重连**不是**第二条入网路径。
+     * 顺序（有语义，⛔ 不要重排）：SD 凭据文件（rank 0，用户显式投放）> **NVS（设备自己记住的）** > BLE。
+     *   ⚠️ 这里**失败**只释放采信槽并继续走 BLE 段（⛔ **不置** `file_fell_back`：那个一次性回落标志
+     *   专属于"文件通道**命中**但入网失败"，门禁 A18a 断言它在 `wifi_prov_boot()` 内**恰好 1 处**）。
+     * ⚠️ 复用上面那两个局部缓冲（`ssid`/`pass`）：文件通道失败分支已把它们清空 ⇒ 此处读到的是 NVS 的值。
+     * ⚠️ 用 `wifi_prov_submit_credentials()`（不带 src_override）：来源标签由通道本身给出 = "nvs"，
+     *   且门禁 A8a 对 `wifi_prov_submit_credentials_src()` 的调用数断言为**恰好 2**（C3/C5）⇒ ⛔ 不要改成 _src。 */
+    if (wifi_prov_load_nvs(ssid, sizeof(ssid), pass, sizeof(pass)) == ESP_OK && ssid[0] != '\0') {
+        if (wifi_prov_submit_credentials(ssid, pass, WIFI_PROV_CHAN_NVS) == ESP_OK) {
+            /* 入网后的动作（日志 / 自检 / 授时 / 面板 / 上云）全部在收敛点下游
+             * （on_wifi_ready → cloud_start_task）—— 这里只结束启动期通道分派。 */
+            ESP_LOGI(TAG, "NVS 凭据入网成功（ssid=%s）⇒ **本次不再进 BLE 配网广播**；"
+                          "上云链路由收敛点下游自动启动", ssid);
+            return;
+        }
+        /* ⚠️ 这里**故意不调** `wifi_prov_release_held()`（与上面 C3 的 SD 分支不同），两个理由：
+         *   ① 语义上不需要：NVS 通道 rank = 2（「其他」层），而 BLE 是 rank 1 ⇒ 设备**未入网**时
+         *      BLE 的提交本来就是 `ACCEPT_PREEMPT`（`wifi_prov_policy_decide()` ⑤），不会被这份
+         *      "连不上的旧凭据"永久挡住；台面改配（`media_api.c` 的 `api-reprovision`）自己会先释放。
+         *      C3 之所以**必须**释放，是因为它是 rank 0（最高）—— 不释放会把后续通道全判成 REJECT_LOWER。
+         *   ② 门禁 A8a 断言 `wifi_prov_boot()` 内 `wifi_prov_release_held()` **恰好 1 处**
+         *      （= SD 通道那个降级点）；在这里再加一处会改变"降级点唯一"的既有口径。
+         *   ⇒ 采信槽保持"NVS 那份"，直到更高优先级通道提交或操作者显式释放。 */
+        ESP_LOGW(TAG, "NVS 凭据未能入网（来源=nvs，ssid=%s）⇒ 继续走 BLE 配网通道"
+                      "（不释放采信槽：NVS 属 rank 2，BLE / 台面改配仍可抢占；AP 暂时不可达时属预期）",
+                 ssid);
+        ssid[0] = '\0';
+        pass[0] = '\0';
+    }
+
     /* ---------------- C1/C2 BLE（**rank 1**，排在「其他」层之前） ----------------
      * 起交互式通道，「还没有凭据」不等于「上不了云」：等通道把凭据交进来，交进来之后走的是
      * 同一条收敛点（wifi_prov.c 的 GOT_IP → s_ready_cb）。 */
@@ -1355,7 +1513,7 @@ static void wifi_prov_boot(void)
                   "：%s",
              key_gate
                  ? "按键门控模式 —— 开机不广播（待机），长按 SET 键进入配网模式"
-                 : "开机即广播（gate=n 的旧语义；长按 SET 可退出/重新进入配网模式）");
+                 : "开机即广播（gate=n 的旧语义；长按 SET ≥3 s = 忘记 WiFi 凭据并重进 BLE 配网）");
     if (wifi_prov_ble_start() == ESP_OK) {
         if (file_fell_back) {
             /* 🔴 2026-10-13〔本批 D2〕**自动**进入 BLE 配网模式 —— 等价「长按 SET」后的状态：
@@ -1389,7 +1547,7 @@ static void wifi_prov_boot(void)
         } else {
             ESP_LOGW(TAG, "下一步：手机 App 连接 ONEYE-<设备 id 后 4 位>，"
                           "输入**机身贴码（激活码＝node_id）**后下发 Wi-Fi 凭据"
-                          "（长按 SET 键可退出配网模式）");
+                          "（长按 SET ≥3 s = 忘记 WiFi 凭据并重进配网）");
         }
         /* ★ 2026-10-07（第三批）：**NimBLE 主机栈已起来（12 KB，
          *   `CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE 12288`）、已开始广播、而还没有入网**的这一刻，
@@ -2208,6 +2366,7 @@ void app_main(void)
     board_selftest();
     board_init_peripherals();
     keys_start();
+    boot_key_start();            /* 🔴 2026-10-21：GPIO0 BOOT 键（未启用 LCD 的构建）= 长按忘记 WiFi + 重进 BLE 配网 */
 
     /* ③a 本地验证面：注册按键事件注入（POST /api/simulate/key，走与物理按键同一条上报路径）。
      *     用途 = 远程/自动化验证「上行 → 云端 ack → 面板第三态」；触发源是 HTTP，不是 ADC 按键。 */

@@ -66,6 +66,15 @@ typedef enum {
     WIFI_PROV_CHAN_BLE     = 2,   /* C1/C2 BLE（App 或另一台嵌入式设备）（rank 1） */
     WIFI_PROV_CHAN_API     = 3,   /* C4 台面本地 HTTP API（rank 2，「其他」） */
     WIFI_PROV_CHAN_KCONFIG = 4,   /* C5 Kconfig 兜底常量（**不是**交互式通道）（rank 2） */
+    /* 🔴 2026-10-22〔WiFi 凭据持久化批〕**NVS 持久化凭据**（= 上一次成功配网时设备自己落盘的那份）。
+     * 为什么它是"通道"而不是"特殊路径"：本仓的唯一入网入口是 `wifi_prov_submit_credentials*()`
+     *   （ADR-0017 D2/D4），复位后的自动重连**必须**走同一入口、过同一判据 —— 否则就是第二条入网路径。
+     * rank：落 `default` = 2（「其他」层，与 API / KCONFIG 同层）。为什么不给 0/1：
+     *   · 启动期它排在 SD 卡凭据文件（rank 0）**之后**、且此时采信槽为空 ⇒ 首次提交必 `ACCEPT_FIRST`，
+     *     rank 数值在启动路径上不参与裁决；
+     *   · 它**不是**手机/操作者当场发起的权威通道 ⇒ ⛔ 不进 `wifi_prov_channel_is_authoritative()`。
+     * ⛔ 语义边界：本枚举只表达"凭据从哪来"，不改变任何既有 rank（SD 0 > BLE 1 > 其他 2 一字未改）。 */
+    WIFI_PROV_CHAN_NVS     = 5,   /* C6 NVS 持久化凭据（复位后自动重连的来源）（rank 2） */
 
     /* ---- 预留：仅登记扩展点，⛔ 未实现（rank 2，「其他」） ---- */
     WIFI_PROV_CHAN_SONIC   = 100, /* R1 声波 —— 预留，未实现 */
@@ -80,7 +89,7 @@ static inline int wifi_prov_channel_rank(wifi_prov_channel_t ch)
     switch (ch) {
     case WIFI_PROV_CHAN_FILE: return 0;   /* SD 卡 WiFi 凭据 */
     case WIFI_PROV_CHAN_BLE:  return 1;   /* 蓝牙配网 */
-    default:                  return 2;   /* 其他（台面 API / Kconfig 兜底 / 预留通道 / 未标注） */
+    default:                  return 2;   /* 其他（台面 API / Kconfig 兜底 / NVS 持久化 / 预留通道 / 未标注） */
     }
 }
 

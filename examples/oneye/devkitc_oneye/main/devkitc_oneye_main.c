@@ -83,7 +83,14 @@ static const char *TAG = "devkitc_oneye";
 
 #define DEVKITC_BOOT_GPIO          GPIO_NUM_0
 #define DEVKITC_STATUS_LED_GPIO    GPIO_NUM_2
-#define DEVKITC_KEY_HOLD_MS        1000u   /* "长按" = 持续低 ≥ 1 s */
+/* 🔴 2026-10-21〔BOOT 长按忘记 WiFi + 重进 BLE 配网批〕长按阈值 **1 s → 3 s**。
+ *   **旧值逐字留痕（⛔ 不抹）**：`#define DEVKITC_KEY_HOLD_MS 1000u`
+ *   （旧注释口径：「"长按" = 持续低 ≥ 1 s」）。
+ *   为什么改 3 s：本批长按的语义从"切换配网窗口"变成**不可逆的破坏性动作**（忘记 WiFi + 擦 NVS
+ *   持久化配置）⇒ 阈值必须长到"不会被误触"；用户建议值 = 3 s。
+ *   ⚠️ 短按（松开时 < 3 s）**无任何副作用**（只打一行日志），见 key_gate_task()。 */
+#define DEVKITC_KEY_HOLD_MS        3000u   /* "长按" = 持续低 ≥ 3 s ⇒ 忘记 WiFi + 重进 BLE 配网 */
+#define DEVKITC_KEY_SHORT_MS       50u     /* 短按判据：按住 ≥50 ms 且 < 长按阈值 ⇒ 仅日志（无副作用） */
 #define DEVKITC_KEY_POLL_MS        50u
 
 /* ============================================================================
@@ -435,6 +442,13 @@ static void oneye_start(void)
                  oneye_dev_sdk_strerror(rc));
         return;
     } else {
+        /* 🔴 2026-10-22〔取证留痕〕上面那行 SDK 警告 `oneye_creds: magic 不是 "ONEYECR1"…→ 视为从未写入`
+         *   是**乙型的正常起点**，不是故障：乙型量产形态**不需要** creds 分区（`partitions.csv:15`），
+         *   它的身份由 App↔cloud 核验后写入 nvs `oneye_prov/node`；分区里的 0xFF = 产线从没写、固件也从不写
+         *   （运行期只有 `esp_partition_read`，见 SDK `src/oneye_creds_plat_idf.c:78`）⇒ 这里补一行把它讲清，
+         *   免得现场把"没有分区凭据"误读成"身份丢了"。 */
+        ESP_LOGI(TAG, "creds 分区：未写入（%s）⇒ 乙型正常（无出厂凭据；身份见下面的 node 面，"
+                      "⛔ 本固件不写 creds 分区）", oneye_dev_sdk_strerror(rc));
         /* ---- 身份（2/2）：没写过分区 ----
          * 🔴 **乙 / 丙 的档位感知分派（本工程的核心差异，逐条对照契约）**：
          *   · **乙（BETA）** 的物理事实是「**能连云** ＋ **有品类级内嵌证书**」
@@ -474,6 +488,15 @@ static void oneye_start(void)
              *   读不到（无分区 / 没写过 / 形态非法）⇒ 原样落到编译期占位，⛔ 不改任何判据。 */
             if (!from_prov) {
                 from_nvs = prov_identity_nvs_load(s_node, sizeof(s_node));
+                /* 🔴 2026-10-22〔本批新增日志口径〕启动必须能**一眼看出**"持久化身份读到了没有"：
+                 *   旧实现只在下面那行 `乙档节点身份：node=…（来源=…）` 里间接体现来源，
+                 *   现场照抄时容易把"nvs 上次写入"误读成"云侧已确认"⇒ 这里把介质与结论分开讲。 */
+                if (from_nvs) {
+                    ESP_LOGI(TAG, "读取持久化凭据：ok（ns=oneye_prov key=node，node=%s；"
+                                  "⛔ 只表示「上次上电写过」，不是云侧确认）", s_node);
+                } else {
+                    ESP_LOGI(TAG, "读取持久化凭据：无（ns=oneye_prov key=node 无记录 / 读不出 / 形态非法）");
+                }
             }
 
             if (!from_prov && !from_nvs) {
@@ -512,9 +535,18 @@ static void oneye_start(void)
                     /* 回读确认：写进去的那串**读回来逐字相同**才算落住（⛔ 不靠"set 返回 0"自证）。 */
                     char      back[PROV_IDENTITY_NODE_MAX + 1u];
                     bool      ok = prov_identity_nvs_load(back, sizeof(back));
+                    const char *echo = (ok && strcmp(back, s_node) == 0) ? "逐字一致"
+                                                                         : "**不一致（仅告警）**";
                     ESP_LOGI(TAG, "乙档节点身份落 nvs：**成功**（ns=oneye_prov key=node，回读=%s）"
                                   "⇒ 下次上电没有 prov.verify.req 时可用它兜底",
-                             (ok && strcmp(back, s_node) == 0) ? "逐字一致" : "**不一致（仅告警）**");
+                             echo);
+                    /* 🔴 2026-10-22〔本批日志口径〕用户要求的两行之一：
+                     *   **身份面**（`oneye_prov/node`）才是乙型跨复位要保住的那一项；
+                     *   ⛔ TLS 客户端材料（品类级证书/私钥/CA）走的是**编译期内嵌**（见下面那段），
+                     *   本来就复位不丢 ⇒ 这里不许把"内嵌证书"说成"已持久化到 flash"。 */
+                    ESP_LOGI(TAG, "乙型凭据已持久化（身份面：ns=oneye_prov key=node；node=%s；回读=%s）"
+                                  "—— ⛔ TLS 材料仍为编译期内嵌品类级证书（复位不丢，无需持久化）",
+                             s_node, echo);
                 } else {
                     ESP_LOGW(TAG, "乙档节点身份落 nvs：**失败**（%s）⇒ 仅告警，⛔ 不影响启动与上云"
                                   "（本次会话仍用 RAM 里的 node=%s；App 重新配网上平台即可）",
@@ -622,12 +654,41 @@ static void oneye_start(void)
     caps.fw_version = CONFIG_ONEYE_FW_VERSION;
     (void)oneye_dev_base_set_caps(&caps);
 
-    /* log（自检结论走这里，不新造通道） */
+    /* log（自检结论走这里，不新造通道）
+     * 🔴 2026-10-22〔乙型复位后 `mqtt client alloc failed` 批〕**缓冲上限必须显式给出**：
+     *   `oneye_dev_log_init()` 的两处缓冲**缺省各 32 KB**（SDK `src/oneye_dev_log.c:968-972`），
+     *   实占 ≈ 32 KB(环形) + 32 KB(data scratch) + 32.5 KB(frame scratch) + 3.5 KB(item)
+     *   ≈ **100 KB 内部 RAM**；同批 `oneye_dev_event_init()` 缺省再占 ≈ 56 KB
+     *   （SDK `src/oneye_dev_event.c:877-917`：queue 16 KB + track 16 KB + 两条 scratch）。
+     *   本板（ESP32-S3-DevKitC-1，**无 PSRAM**）入网后内部堆只剩 ~158 KB ⇒ 两者吃掉 ~156 KB 后，
+     *   TLS（≈35 KB）＋MQTT（RX/TXQ 各 4 KB ＋ 结构体）**分不到连续块**。
+     *   真机实证（COM13，2026-10-22 10:47 复位，`_oneye-logs/com13-verify-1022.log`）：
+     *     `[res] 建云链路前 internal free=45540 B` ⇒ `[E] mqtt client alloc failed` 反复、无 `link up`；
+     *   而 10-21 那次能上云的启动里 `log_init` 因**堆碎片**失败（日志只有 `module registered: event`、
+     *   没有 `log`，见 `_oneye-logs/periodic-status/com13-long.log:380`），才"侥幸"给 TLS/MQTT 留下 72 KB
+     *   ⇒ 这是**潜在缺陷**（能不能上云取决于堆布局），不是本批新引入的。
+     * **旧值逐字留痕（⛔ 不抹）**：旧实现只有 `level` / `uplink_enabled` 两行，缓冲全走缺省（32 KB / 32 KB）。
+     * 现值 = 按本工程**真实用途**定的量级（短行日志、契约 ≤1 帧/s）：4 KB 环形 + 4 KB 单帧。
+     * ⛔ 不改 SDK 缺省、⛔ 不改契约帧语义与任何字段；改的只是**本实例**的缓冲上限。 */
     memset(&log_cfg, 0, sizeof(log_cfg));
     ONEYE_DEV_STRUCT_INIT(log_cfg);
     log_cfg.level = ONEYE_DEV_LOG_LEVEL_INFO;
     log_cfg.uplink_enabled = true;
-    (void)oneye_dev_log_init(&log_cfg);
+    log_cfg.buffer_bytes = 4u * 1024u;
+    log_cfg.max_frame_bytes = 4u * 1024u;
+    {
+        /* 失败**不再静默**（旧实现 `(void)` 丢掉返回码 ⇒ 现场只看到"没有 log/up 帧"）。 */
+        oneye_dev_sdk_err_t lrc = oneye_dev_log_init(&log_cfg);
+        if (lrc == ONEYE_DEV_SDK_OK) {
+            ESP_LOGI(TAG, "[diag] log 模块已起：buf=4 KB / 单帧=4 KB（旧默认 32 KB/32 KB，吃掉 ~100 KB）");
+        } else {
+            ESP_LOGW(TAG, "log 模块未起（%s）⇒ 只是**不上行日志**，⛔ 不影响配网与上云",
+                     oneye_dev_sdk_strerror(lrc));
+        }
+        ESP_LOGI(TAG, "[res] log_init 之后：internal free=%u B / largest=%u B",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    }
 
     /* event */
     memset(&ev_cfg, 0, sizeof(ev_cfg));
@@ -648,9 +709,27 @@ static void oneye_start(void)
      *   ⇒ 改的就这一行；`sdkconfig.defaults*` **一个字节未动**。
      *   回读：`oneye_dev_event_init` 之后立刻打印本结构体的值（见下），与 sdkconfig 无覆盖关系。 */
     ev_cfg.offline_bytes = ONEYE_FW_OFFLINE_BYTES;
-    (void)oneye_dev_event_init(&ev_cfg);
+    /* 🔴 2026-10-22〔乙型复位后 `mqtt client alloc failed` 批〕**发送队列也必须显式小量化**：
+     *   缺省 `queue_bytes = 0` ⇒ SDK 取 16 KB/帧（`oneye_dev_event.c:877`），再加上 `track` 的固定
+     *   16 KB（`EV_TRACK_FRAME_MAX`，本工程 `track_enabled=false` 也照分配）＋ 两条 scratch
+     *   ⇒ 实占 ≈ 56 KB 内部 RAM。与 log 的 ~100 KB 叠加后，TLS/MQTT 就分不到连续块（成因与实证见
+     *   上面 log 那一段的注释）。
+     * **旧值逐字留痕（⛔ 不抹）**：旧实现只设 `enabled` / `track_enabled` / `offline_bytes` 三个字段，
+     * `queue_bytes` 走缺省 16 KB。
+     * 现值 = 4 KB/帧（本工程只上报少量状态类事件，仍满足契约"每帧 ≤32 条、≤32 KB"上限）。 */
+    ev_cfg.queue_bytes = 4u * 1024u;
+    {
+        oneye_dev_sdk_err_t erc = oneye_dev_event_init(&ev_cfg);
+        if (erc != ONEYE_DEV_SDK_OK) {
+            ESP_LOGW(TAG, "event 模块未起（%s）⇒ 只是**不上行事件**，⛔ 不影响配网与上云",
+                     oneye_dev_sdk_strerror(erc));
+        }
+    }
     ESP_LOGI(TAG, "[ev] offline_bytes=%u B（2026-10-20 由 16384 收窄；释放 ~14 KiB 内部 RAM 余量）",
              (unsigned)ev_cfg.offline_bytes);
+    ESP_LOGI(TAG, "[res] event_init 之后：internal free=%u B / largest=%u B",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 
     /* 链路 */
     /* 🔴 2026-10-20〔`mqtt client alloc failed` 批〕：`oneye_mqtt_new()` 的两笔大分配就发生在这条调用里
@@ -802,7 +881,11 @@ static void wifi_ready_work(void)
      * ⚠️ **重配网路径（换了网 / 清凭据后）**：`wifi_prov_ble_deinit_after_provisioned()` 会把
      *    `s_started/s_advertising/s_pairing` 清零 ⇒ 下一次 `wifi_prov_ble_start()` 走**完整 init**
      *    （NimBLE 重起栈 + GATT 重注册 + 重开广播）。这就是所需的 re-init 路径，⛔ 未另造一套。
-     *    已入网期间长按 BOOT 仍被 `pairing_enter()` 拒（"已入网不再进入配网模式"）—— 该判据**一字未改**。
+     *    🔴 2026-10-21〔BOOT-LONGPRESS-REPROV 批〕**旧口径已作废（旧字逐字留痕，⛔ 不抹）**：
+     *      「已入网期间长按 BOOT 仍被 `pairing_enter()` 拒（"已入网不再进入配网模式"）—— 该判据**一字未改**。」
+     *      现在的语义 = **长按 BOOT ≥3 s ⇒ 忘记 WiFi 凭据（含 NVS 持久化配置）+ 重进 BLE 配网**
+     *      （`wifi_prov_ble_pairing_reprovision()`），**在线时同样受理** ⇒ 上文"重配网路径"从
+     *      "换网/清凭据后才会发生"变成"用户随时可按出来"。
      * ⚠️ 副作用（如实登记）：deinit 后本进程内 `prov.status` 再也发不出去；Wi-Fi 掉线后再次 GOT_IP 时
      *    那一行上报会失败并**如实打印"未发出"**（幂等位不置），⛔ 不假装已上报。 */
     res_report("pre-ble-deinit（已入网、已停广播、建 MQTT 前）");
@@ -897,6 +980,33 @@ static void on_wifi_ready(void)
  * ============================================================================ */
 static void wifi_prov_boot(void)
 {
+    /* ---------------- C6 NVS 持久化凭据（**复位后自动重连的读路径**，排在 BLE 之前） ----------------
+     * 🔴 2026-10-22〔WiFi 凭据持久化批 · 现场缺陷本体〕
+     * 为什么必须有这一段：旧启动流程**只有 BLE 一段**，从不读"上一次配网留下的凭据" ⇒ 一复位就
+     *   `BLE 配网通道已就绪：广播中`、云端显示离线（2026-10-22 上午 COM13 实测 t≈1.0 s 即广播，
+     *   无 `esp_wifi_connect()`、无 `GOT_IP`）。
+     * 语义（⛔ 不新增通道语义 / ⛔ 不改判据）：凭据经**同一**唯一入口 `wifi_prov_submit_credentials()`
+     *   递交，通道 = `WIFI_PROV_CHAN_NVS`（rank 2；启动期采信槽为空 ⇒ 必 `ACCEPT_FIRST`）
+     *   ⇒ 复位后的自动重连**不是**第二条入网路径，上云链路仍只在收敛点下游启动一次。
+     * 失败 ⇒ 释放采信槽后照旧走 BLE 段（AP 暂时不可达属预期，App 可重新下发凭据）。 */
+    char nssid[WIFI_PROV_SSID_MAX] = { 0 };
+    char npass[WIFI_PROV_PASS_MAX] = { 0 };
+    if (wifi_prov_load_nvs(nssid, sizeof(nssid), npass, sizeof(npass)) == ESP_OK && nssid[0] != '\0') {
+        if (wifi_prov_submit_credentials(nssid, npass, WIFI_PROV_CHAN_NVS) == ESP_OK) {
+            ESP_LOGI(TAG, "NVS 凭据入网成功（ssid=%s）⇒ **本次不再进 BLE 配网广播**；"
+                          "上云链路由收敛点下游自动启动", nssid);
+            return;
+        }
+        /* ⚠️ 这里**故意不调** `wifi_prov_release_held()`：NVS 通道 rank = 2（「其他」层），
+         *   而 BLE 是 rank 1 ⇒ 设备**未入网**时 BLE 的提交本来就是 `ACCEPT_PREEMPT`
+         *   （`wifi_prov_policy_decide()` ⑤），不会被这份"连不上的旧凭据"永久挡住；
+         *   台面改配（`media_api.c` 的 `api-reprovision`）自己会先释放采信槽。
+         *   ⇒ 采信槽保持"NVS 那份"，直到更高优先级通道提交或操作者显式释放。 */
+        ESP_LOGW(TAG, "NVS 凭据未能入网（来源=nvs，ssid=%s）⇒ 继续起 BLE 配网通道"
+                      "（不释放采信槽：NVS 属 rank 2，BLE / 台面改配仍可抢占；AP 暂时不可达时属预期）",
+                 nssid);
+    }
+
 #if CONFIG_ONEYE_FW_ENABLE_BLE_PROV
 #  ifdef CONFIG_ONEYE_FW_BLE_PROV_KEY_GATE
     const bool key_gate = true;
@@ -909,13 +1019,13 @@ static void wifi_prov_boot(void)
 
     wifi_prov_ble_set_autostart(!key_gate);
     ESP_LOGI(TAG, "启动 BLE 配网通道 C1/C2（手机 App 或另一台嵌入式设备经 BLE 下发 SSID/密码）：%s",
-             key_gate ? "按键门控模式 —— 开机不广播（待机），长按 BOOT(GPIO0) 进入配网模式"
-                      : "开机即广播（长按 BOOT(GPIO0) 可退出 / 重新进入配网模式）");
+             key_gate ? "按键门控模式 —— 开机不广播（待机），长按 BOOT(GPIO0) ≥3 s 进入配网模式"
+                      : "开机即广播（长按 BOOT(GPIO0) ≥3 s = 忘记 WiFi 凭据并重进 BLE 配网）");
 
     if (wifi_prov_ble_start() == ESP_OK) {
         if (key_gate) {
-            ESP_LOGW(TAG, "下一步：**长按 BOOT 键**进入 BLE 配网模式"
-                          "（串口会打印本机档位与剩余时间；再长按一次退出，%d s 未配网成功自动退出）",
+            ESP_LOGW(TAG, "下一步：**长按 BOOT 键 ≥3 s** 进入 BLE 配网模式"
+                          "（串口会打印本机档位与剩余时间；%d s 未配网成功自动退出）",
                      (int)CONFIG_ONEYE_FW_BLE_PROV_PAIRING_WINDOW_S);
         } else {
             ESP_LOGW(TAG, "下一步：手机 App 扫描并连接 **ONEYE-<广播名后缀>**，"
@@ -942,24 +1052,36 @@ static void wifi_prov_boot(void)
 }
 
 /* ============================================================================
- * 8. 按键：长按 BOOT(GPIO0) 进入 / 退出配网窗口
+ * 8. 按键：**长按 BOOT(GPIO0) ≥ 3 s ⇒ 忘记 WiFi 凭据 + 重进 BLE 配网**
+ *
+ * ★ 2026-10-21〔BOOT-LONGPRESS-REPROV 批 · 用户逐字需求「com13 上的 BOOT 或 RESET 按键能利用上吗，
+ *   控制配网是否打开」〕语义**已改**（⛔ 旧行为逐字留痕，⛔ 不抹）：
+ *   旧 = "长按切换配网窗口（进入 / 退出）"，且**设备已入网时长按被 `pairing_enter()` 拒绝**
+ *        （`wifi_prov_ble.c` 的旧拒绝分支，旧字留在该函数里）；
+ *   新 = 长按 **无条件**"忘记 WiFi + 重新进入 BLE 配网"：
+ *        · 已入网 ⇒ 先断开/停 STA + 擦 NVS Wi-Fi 配置，再广播等 App 重新配网；
+ *        · 入网后 BLE 已 deinit（乙型省内存路径）⇒ `start()` 走完整 re-init（NimBLE 重起栈）；
+ *        · 待机/离线 ⇒ 忘记是空操作，直接进入配网模式（窗口重新计时）。
+ *   ⇒ 于是"设备在线时 App 搜不到"不再需要复位或拆机，**一颗 BOOT 键就能把它变回可配网态**。
+ *   ⚠️ 短按（< 3 s）**无副作用**（仅一行日志）；RESET = 硬件复位（无代码，按一下即重启）。
  *
  * ★ 与 korvo2_oneye 的差异（⛔ 必须讲清）：korvo2 的按键是**板载 6 键 ADC 梯形**
  *   （ADF 的 `input_key_service`，共用 GPIO5），本工程**没有**那颗 ADC —— 用的是
  *   DevKitC-1 上的 **BOOT 键（GPIO0，低有效、有外部上拉）**，直接走 IDF 的 `driver/gpio`。
  *   ⛔ 本工程不链接 `input_key_service` / `esp_peripherals`（那是 ADF 面）。
  *
- * ★ 门控语义（逐字沿用 `wifi_prov_ble.h` / Kconfig 的口径）：
- *   `wifi_prov_ble_set_autostart(false)`（= `ONEYE_FW_BLE_PROV_KEY_GATE=y`）时开机**不广播**，
- *   长按进入配网模式；`autostart=true`（本工程缺省）时开机即广播，长按用于**退出 / 重新进入**。
- *   ⇒ 本任务**两种情况都要挂**（否则 gate=y 的构建会"没人能进配网模式"）。
+ * ★ 门控语义（`wifi_prov_ble_set_autostart()`，与 Kconfig `ONEYE_FW_BLE_PROV_KEY_GATE` 对应）：
+ *   gate=y ⇒ 开机**不广播**（待机）；gate=n（本工程缺省）⇒ 开机即广播。
+ *   ⇒ 本任务的"长按重配"**两种情况都要挂**（否则 gate=y 的构建会"没人能进配网模式"）。
  * ============================================================================ */
-static void key_window_toggle(void)
+static void key_longpress_reprovision(void)
 {
-    if (wifi_prov_ble_pairing_is_active()) {
-        (void)wifi_prov_ble_pairing_exit();
-    } else {
-        (void)wifi_prov_ble_pairing_enter();
+    /* 唯一实现 = `wifi_prov_ble_pairing_reprovision()`（两例程共用一份语义；本函数只留一行按键上下文日志）。
+     * ⚠️ 它跑在**本任务**（key_gate，栈 3072）上下文：内部 `esp_wifi_stop()` 会阻塞，这是允许的；
+     *    ⛔ 不要在 `sys_evt` 里做同一件事。 */
+    esp_err_t rc = wifi_prov_ble_pairing_reprovision();
+    if (rc != ESP_OK) {
+        ESP_LOGE(TAG, "[key] BOOT 长按重配失败（%s）⇒ 可按 RESET 复位后重试", esp_err_to_name(rc));
     }
 }
 
@@ -967,6 +1089,7 @@ static void key_gate_task(void *arg)
 {
     (void)arg;
     bool pressed = false;
+    bool long_fired = false;   /* 本次按压已落地长按动作？（防"长按后松手"被误报成短按，也防重复打"按下"） */
     int64_t t0 = 0;
 
     for (;;) {
@@ -977,14 +1100,32 @@ static void key_gate_task(void *arg)
 
         if (down && !pressed) {
             pressed = true;
+            long_fired = false;
             t0 = now;
+            /* 按压提示（用户口径：带按压提示/日志）：告诉现场"按住多久会发生什么"。 */
+            ESP_LOGI(TAG, "[key] BOOT(GPIO0) 按下：松手 < %u ms = 短按（无动作）；按住 ≥ %u ms = "
+                          "**忘记 WiFi 凭据 + 重进 BLE 配网**",
+                     (unsigned)DEVKITC_KEY_HOLD_MS, (unsigned)DEVKITC_KEY_HOLD_MS);
         } else if (!down && pressed) {
+            const int64_t held_ms = (now - t0) / 1000;
             pressed = false;
-        } else if (down && pressed && (now - t0) >= (int64_t)DEVKITC_KEY_HOLD_MS * 1000) {
-            /* 长按落地一次；把 t0 往后推，避免一直按住时反复触发。 */
-            pressed = false;
-            ESP_LOGI(TAG, "检测到长按 BOOT(GPIO0) ≥ %u ms", (unsigned)DEVKITC_KEY_HOLD_MS);
-            key_window_toggle();
+            if (long_fired) {
+                /* 长按已生效 ⇒ 松手只做收尾说明（⛔ 不许再打"短按，无动作"，那会让串口说假话）。 */
+                ESP_LOGI(TAG, "[key] BOOT(GPIO0) 松开：长按已生效（按住 %lld ms ≥ %u ms）"
+                              "⇒ 本次不重复触发；Wi-Fi 已清除、BLE 配网中",
+                         (long long)held_ms, (unsigned)DEVKITC_KEY_HOLD_MS);
+            } else if (held_ms >= (int64_t)DEVKITC_KEY_SHORT_MS) {
+                ESP_LOGI(TAG, "[key] BOOT(GPIO0) 松开：按住 %lld ms < 长按阈值 %u ms ⇒ **短按，无动作**"
+                              "（Wi-Fi 状态与广播状态均未改变）",
+                         (long long)held_ms, (unsigned)DEVKITC_KEY_HOLD_MS);
+            }
+        } else if (down && pressed && !long_fired &&
+                   (now - t0) >= (int64_t)DEVKITC_KEY_HOLD_MS * 1000) {
+            /* 长按落地一次（一直按住时不重复触发；松手由上面的 long_fired 分支收尾）。 */
+            long_fired = true;
+            ESP_LOGW(TAG, "[key] 检测到长按 BOOT(GPIO0) ≥ %u ms ⇒ 忘记 WiFi 凭据 + 重进 BLE 配网",
+                     (unsigned)DEVKITC_KEY_HOLD_MS);
+            key_longpress_reprovision();
         }
         vTaskDelay(pdMS_TO_TICKS(DEVKITC_KEY_POLL_MS));
     }
@@ -1000,15 +1141,16 @@ static void key_gate_start(void)
     io.pull_down_en = GPIO_PULLDOWN_DISABLE;
     io.intr_type = GPIO_INTR_DISABLE;
     if (gpio_config(&io) != ESP_OK) {
-        ESP_LOGW(TAG, "BOOT 键（GPIO%d）配置失败 ⇒ 长按进入配网模式不可用"
-                      "（开机即广播的形态不受影响）", (int)DEVKITC_BOOT_GPIO);
+        ESP_LOGW(TAG, "BOOT 键（GPIO%d）配置失败 ⇒ 长按重配不可用"
+                      "（设备在线时只能靠 RESET 或重新烧录恢复配网态）", (int)DEVKITC_BOOT_GPIO);
         return;
     }
     if (xTaskCreate(key_gate_task, "key_gate", 3072, NULL, 3, NULL) != pdPASS) {
-        ESP_LOGW(TAG, "按键任务创建失败（内存不足）⇒ 长按进入配网模式不可用");
+        ESP_LOGW(TAG, "按键任务创建失败（内存不足）⇒ 长按重配不可用");
         return;
     }
-    ESP_LOGI(TAG, "按键就绪：长按 **BOOT(GPIO0)** ≥ %u ms 切换 BLE 配网模式（进入 / 退出）",
+    ESP_LOGI(TAG, "按键就绪：**长按 BOOT(GPIO0) ≥ %u ms = 忘记 WiFi 凭据 + 重进 BLE 配网**；"
+                  "短按无副作用；RESET = 硬件复位",
              (unsigned)DEVKITC_KEY_HOLD_MS);
 }
 
@@ -1097,7 +1239,7 @@ void app_main(void)
     /* 配网/NimBLE **之前**的基线读数（两种档位在同一位置打 ⇒ 跨档可比）。 */
     res_report("pre-prov（配网与 NimBLE 之前；本机型无外设可初始化）");
 
-    key_gate_start();            /* 长按 BOOT(GPIO0) 切换配网模式 */
+    key_gate_start();            /* 长按 BOOT(GPIO0) ≥3 s = 忘记 WiFi 凭据 + 重进 BLE 配网（短按无副作用） */
 
     /* ★ 2026-10-20〔栈溢出根治批〕**必须先于** `wifi_prov_set_ready_cb()` 与 `wifi_prov_boot()`：
      *   前者的回调里要往本任务投递（`s_ready_worker` 为 NULL 时才会走"退回 sys_evt"的退化路径）；

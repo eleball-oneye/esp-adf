@@ -388,7 +388,8 @@ static void ensure_window_timer(void)
     if (rc != ESP_OK) {
         /* ⛔ 不静默：没有计时器就没有超时自动退出（配网模式会一直开着），必须让人看见 */
         ESP_LOGE(TAG, "配网窗口计时器创建失败（%s）⇒ 本次进入**没有超时自动退出**，"
-                      "只能再长按 SET 退出", esp_err_to_name(rc));
+                      "只能按 RESET 复位（长按 BOOT 现在是「忘记 WiFi 并重配」，不是退出）",
+                 esp_err_to_name(rc));
         s_window_timer = NULL;
     }
 }
@@ -421,6 +422,55 @@ static void window_stop(void)
 
 #endif /* CONFIG_ONEYE_FW_ENABLE_BLE_PROV（配网窗口计时器段） */
 
+/* ============================================================================
+ * 🔴 2026-10-21〔BOOT 长按忘记 WiFi + 重进 BLE 配网批〕**长按重配的唯一入口**
+ *
+ * 用户需求（逐字）：「com13 上的 BOOT 或 RESET 按键能利用上吗，控制配网是否打开」
+ * 本批裁定：**长按 BOOT（≥3 s）⇒ 忘记 WiFi 凭据 + 重新进入 BLE 配网**；短按无副作用。
+ *
+ * 为什么单独一个函数（⛔ 不把"忘记"塞进 `pairing_enter()` 的调用者里）：
+ *   ① 两例程（korvo2 甲 / devkitc 乙）的按键实现完全不同（ADC 梯形 vs GPIO0 轮询），
+ *      但"长按要做什么"必须**只有一份**（否则两板语义漂移）；
+ *   ② 设备在线时 `pairing_enter()` 原本**拒绝**（旧行为）；本函数把"忘记"放在它**之前**，
+ *      于是同一个函数在"在线 / 离线 / BLE 已 deinit"三种起点下都收敛到同一条路径。
+ *
+ * 语义（幂等，⛔ 不新增帧 / ⛔ 不动 creds 分区 / ⛔ 不打印凭据）：
+ *   · 忘记：`wifi_prov_forget_wifi()` —— 断开并停 STA、清 RAM 采信槽/STA 配置、擦 NVS Wi-Fi 配置；
+ *   · 重进：`wifi_prov_ble_pairing_enter()` —— 起栈（若入网后 deinit 过 ⇒ 走完整 re-init：
+ *     NimBLE 重起栈 + GATT 重注册）/重开广播 + 重置配网窗口计时；
+ *   · 日志（用户逐字要求的可观测口径）：成功时打
+ *     `BOOT 长按：已清除 WiFi 凭据，进入 BLE 配网`。
+ * ============================================================================ */
+esp_err_t wifi_prov_ble_pairing_reprovision(void)
+{
+#if !CONFIG_ONEYE_FW_ENABLE_BLE_PROV
+    ESP_LOGW(TAG, "BLE 配网通道未启用（CONFIG_ONEYE_FW_ENABLE_BLE_PROV=n）⇒ 长按重配不可用"
+                  "（Wi-Fi 凭据未被清除）");
+    return ESP_ERR_NOT_SUPPORTED;
+#else
+    ESP_LOGW(TAG, "BOOT 长按（≥3 s）⇒ 开始忘记 WiFi 并重进 BLE 配网"
+                  "（端口=%s；本行不含任何凭据）",
+             wifi_prov_is_connected() ? "在线" : "离线");
+    esp_err_t frc = wifi_prov_forget_wifi("boot-longpress");
+    if (frc != ESP_OK) {
+        ESP_LOGW(TAG, "忘记 WiFi 凭据未完全成功（%s）⇒ 仍继续进入 BLE 配网（App 可覆盖旧配置）",
+                 esp_err_to_name(frc));
+    }
+
+    esp_err_t rc = wifi_prov_ble_pairing_enter();
+    if (rc != ESP_OK) {
+        ESP_LOGE(TAG, "BOOT 长按：WiFi 凭据已清除，但**进入 BLE 配网失败**（%s）"
+                      "⇒ 请检查 BLE 通道配置；RESET 复位后可重试", esp_err_to_name(rc));
+        return rc;
+    }
+    /* ★ 用户逐字要求的结论行（⛔ 不含 SSID / 密码 / 激活码 / chal）。 */
+    ESP_LOGW(TAG, "BOOT 长按：已清除 WiFi 凭据，进入 BLE 配网（广播中=%d；窗口 %d s 后自动退出；"
+                  "App 可重新搜索并下发新凭据）",
+             s_advertising ? 1 : 0, (int)CONFIG_ONEYE_FW_BLE_PROV_PAIRING_WINDOW_S);
+    return ESP_OK;
+#endif
+}
+
 esp_err_t wifi_prov_ble_pairing_enter(void)
 {
 #if !CONFIG_ONEYE_FW_ENABLE_BLE_PROV
@@ -428,11 +478,21 @@ esp_err_t wifi_prov_ble_pairing_enter(void)
     return ESP_ERR_NOT_SUPPORTED;
 #else
     if (ble_already_connected()) {
-        /* ⛔ 已入网 ≠ 可再配网：契约（ADR-0017 D2）里入网成功后不再保持可配网态。
-         *    需要换网请走明确的"清除凭据/重新配网"路径，而不是靠长按 SET 悄悄重开。 */
-        ESP_LOGW(TAG, "长按 SET 被忽略：设备**已入网** ⇒ 不再进入 BLE 配网模式"
-                      "（换网请用清除凭据/重新配网路径）");
-        return ESP_ERR_INVALID_STATE;
+        /* ⛔ **旧行为逐字留痕（⛔ 不抹）** —— 本分支此前为**拒绝**：
+         *     ESP_LOGW(TAG, "长按 SET 被忽略：设备**已入网** ⇒ 不再进入 BLE 配网模式"
+         *                   "（换网请用清除凭据/重新配网路径）");
+         *     return ESP_ERR_INVALID_STATE;
+         *   🔴 2026-10-21〔用户裁定「长按 BOOT ⇒ 忘记 WiFi + 重进 BLE 配网」〕改为**受理为重配**：
+         *   先忘记 Wi-Fi 凭据（RAM 采信槽 + STA 配置 + NVS 持久化配置；断开并停 STA），
+         *   再走下面**同一条**"起栈（deinit 过则完整 re-init）/重开广播 + 窗口计时"路径。
+         *   ⇒ 设备在线时再长按 BOOT，不再被拒；App 可以重新搜索到并配网。⛔ 未新增第二条进入路径。 */
+        ESP_LOGW(TAG, "设备**已入网** ⇒ 长按按「重配」受理：先忘记 Wi-Fi 凭据（断开 STA + 擦 NVS 持久化配置），"
+                      "再进入 BLE 配网");
+        esp_err_t frc = wifi_prov_forget_wifi("pairing-enter-while-online");
+        if (frc != ESP_OK) {
+            ESP_LOGW(TAG, "忘记 Wi-Fi 凭据未完全成功（%s）⇒ 仍继续进入 BLE 配网（App 可重新下发凭据）",
+                     esp_err_to_name(frc));
+        }
     }
     if (s_advertising) {
         ESP_LOGI(TAG, "配网模式已在广播中（幂等：只重置超时计时）");
@@ -455,7 +515,7 @@ esp_err_t wifi_prov_ble_pairing_enter(void)
      *   "剩余时间" = 整个窗口（刚进入），后续由超时那一行给出结论。 */
     ESP_LOGI(TAG, "已进入 BLE 配网模式：广播中；本机型档位=%s（依据 %s；%s激活凭证 cred_req=%d）；"
                   "配对凭据 = 激活码（机身贴码）＋一次性 chal（chal TTL %d s）；"
-                  "配网窗口剩余 %d s；再长按 SET 退出",
+                  "配网窗口剩余 %d s（超时自动退出；长按 BOOT ≥3 s = 忘记 WiFi 并重开窗口）",
              oneye_dev_ble_device_tier_name((int)dev_onboarding_tier()), dev_onboarding_tier_basis(),
              dev_cred_required() ? "需要" : "不需要", dev_cred_required() ? 1 : 0,
              (int)CONFIG_ONEYE_DEV_SDK_BLE_CHAL_TTL_S,
@@ -710,7 +770,19 @@ esp_err_t wifi_prov_ble_start(void)
      *     ⛔ 本处只填缺省节点名：⛔ 不改帧协议、⛔ 不做 `from` 的运行时 fallback、
      *       ⛔ 不把 `device_id` 挪作它用（甲型核验基准仍只取 `s_ids.node_id`）。 */
     bcfg.device_id = (s_ids.node_id[0] != '\0') ? s_ids.node_id : "oneye-unset";
-    bcfg.adv_sn = (s_ids.sn[0] != '\0') ? s_ids.sn : NULL;
+    /* 🔴 2026-10-21〔pair.ok.sn 批 · 设备侧唯一改动点〕**SN 只认真身**（与本工程 korvo2 同名改动同批）：
+     *   `adv_identity.c` 在 `creds.sn` 为空时会**回落 `node_id`** 并置 `sn_fell_back`（旧口径）；
+     *   本条裁定（用户 2026-10-21）：甲型 `prov.pair.ok.sn` **必须**来自 `creds.sn`，
+     *   **取不到 ⇒ 按契约 §4.4.16 fail-closed**（SDK 不发 `prov.pair.ok`，回既有 `error{internal}`）；
+     *   ⛔ **不伪造**：`node_id`（激活码=私密）/ 广播名 / MAC 一律不得顶替 `sn`。
+     *   ⚠️ 广播名不受影响（`adv_sn` 空时 SDK 用 `device_id` 派生 `ONEYE-<后 4 位>`，串值同回落时）；
+     *   ⚠️ 厂商字段：甲的回落态不再产出 `sn_field`；乙/丙 回落态改 `0x28`＋空 `sn_field` 占位。
+     *   ⛔ 不改 creds 分区内容、⛔ 不造占位串。 */
+    bcfg.adv_sn = (!s_ids.sn_fell_back && s_ids.sn[0] != '\0') ? s_ids.sn : NULL;
+    if (s_ids.sn_fell_back) {
+        ESP_LOGW(TAG, "creds.sn 缺失（sn_fell_back=1）⇒ adv_sn **不装载**（⛔ 不用 node_id 顶替 sn）："
+                      "甲型 prov.pair.ok 将按契约 §4.4.16 fail-closed；乙/丙 按档位产出空 sn_field 占位");
+    }
     /* 🔴 2026-10-14：**机型 `productKey`** 直通（契约 §1.1 v3 ⇒ 空口 off 25 的 `pk_code`）。
      * ⛔ 它是**机型属性、不是身份**（同一机型的设备共用一个值）；载体 = 本工程 Kconfig
      * `ONEYE_FW_PRODUCT_KEY`（缺省 `OY-SPK-01`；乙 / 丙 两档由各自 `sdkconfig.defaults.*`

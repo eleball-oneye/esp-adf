@@ -57,8 +57,8 @@ static const char *TAG = "gw_child";
 #define GW_CHILD_NVS_NS        "oneye_child"
 #define GW_CHILD_NVS_KEY_CNT   "n"
 
-/* 绑定表上限：与 oneye_link_config_t.max_links（4，见 main.c）同量级 —— 不要超 */
-#define GW_CHILD_MAX           4
+/* 绑定表上限：与 oneye_link_config_t.max_links（5，见 main.c）同量级 —— 不要超 */
+#define GW_CHILD_MAX           5
 
 #define GW_CHILD_NODE_MAX      40
 #define GW_CHILD_PK_MAX        33
@@ -500,6 +500,26 @@ bool gw_child_any_bound(void)
         }
     }
     return false;
+}
+
+/* 2026-10-25〔共存降载 · 方案 1〕绑定数量 = BLE 的"目标子设备数"。
+ *   link-sdk 据此决定"还要不要扫描"：已在线数 ≥ 目标数 ⇒ 停扫，把射频让给 Wi-Fi。
+ *   ⚠️ 任何改变绑定表的动作（启动恢复 / child.pair / child.unpair）之后都必须重新同步一次。 */
+uint8_t gw_child_bound_count(void)
+{
+    uint8_t n = 0;
+    for (size_t i = 0; i < GW_CHILD_MAX; i++) {
+        if (s_binds[i].used) {
+            n++;
+        }
+    }
+    return n;
+}
+
+/* 把绑定数量同步给 link-sdk（放在所有"绑定表变更"路径的收口处调用）。 */
+static void sync_target_links(void)
+{
+    oneye_link_set_target_links(gw_child_bound_count());
 }
 
 /* ---------------------------------------------------------------- 上报 */
@@ -1525,6 +1545,8 @@ static void do_pair(const gw_cmd_t *c)
              nb.node, nb.model, (nb.product_key[0] != '\0') ? nb.product_key : "(未给)",
              idx, use_builtin ? " ⚠️ 下发档案残缺，已回退内置" :
                   ((c->has_profile) ? "" : " ⚠️ 无 linkProfile"));
+    /* 2026-10-25〔共存降载〕绑定数 +1 ⇒ 让 link-sdk 重新开扫（直到新子设备连上）。 */
+    sync_target_links();
     ack_command(c->id, NULL);
 }
 
@@ -1570,6 +1592,8 @@ static void do_unpair(const gw_cmd_t *c)
     }
 
     ESP_LOGI(TAG, "★ 子设备已解绑：node=%s model=%s", c->node, model);
+    /* 2026-10-25〔共存降载〕绑定数 -1 ⇒ 目标数变小，link-sdk 视情况停扫。 */
+    sync_target_links();
     ack_command(c->id, NULL);
 }
 
@@ -1821,6 +1845,10 @@ void gw_child_boot(void)
                  (s_binds[i].product_key[0] != '\0') ? s_binds[i].product_key : "(未给)",
                  (s_binds[i].addr[0] != '\0') ? s_binds[i].addr : "(未学到)");
     }
+    /* 2026-10-25〔共存降载〕把"已绑定子设备数"同步给 link-sdk：
+     *   全部在线后停扫（省射频给 Wi-Fi）；本函数早于 oneye_link_init，但 setter 只写目标值，
+     *   NimBLE 同步完成（ble_scan_start）时自然按目标判断。 */
+    sync_target_links();
 }
 
 void gw_child_restore_profiles(void)

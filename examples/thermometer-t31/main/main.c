@@ -692,7 +692,7 @@ static void cloud_start_task(void *arg)
         /* ⚠️ node_id 取 **creds 分区的 node_id**（= 云端认得的那台设备），
          *    ⛔ 不用 CONFIG_ONEYE_FW_DEVICE_ID（那只是台面占位；甲型必然有分区凭据）。 */
         lcfg.node_id = s_creds.node_id;
-        lcfg.max_links = 4;
+        lcfg.max_links = 5;   /* 2026-10-25：2–5 台子设备场景（原 4） */
         lcfg.scan_interval_ms = 1000;
         /* 2026-10-25〔云链路闪断修复〕扫描窗口 200 ms → 100 ms：
          *   原值 = 20% 占空比，和 Wi-Fi STA 抢同一套射频 ⇒ 现场出现过 `reason=200`（beacon 超时）
@@ -762,6 +762,11 @@ static void cloud_start_task(void *arg)
              *   第一轮真机读数：`post-link-init largest_internal=31744` → event 库一起就掉到
              *   `7680` → `oneye_link_start 失败`。⇒ event 库必须再往后挪到 start **之后**。 */
             res_report("pre-link-start（NimBLE central 已起、link_start 前）");
+#if 0 /* A/B 实验结束（2026-10-25）：恢复正式行为 = 正常启动 BLE 扫描/接入。
+       * 实验结论见 logs/th-20261025-c6-smoke/ab2-bleoff.txt：BLE 关闭 7 分钟
+       * beacon 超时 0 / Wi-Fi 断开 0 / 云掉线 0 ⇒ 共存确为根因；后续按"降低 BLE 占空比"方案处置。 */
+            ESP_LOGW(TAG, "⚠️ 台面 A/B：**跳过 oneye_link_start()** ⇒ BLE 中央完全停用（测试共存影响）");
+#else
             if (oneye_link_start() != ONEYE_LINK_OK) {
                 ESP_LOGE(TAG, "oneye_link_start 失败 ⇒ 不扫描子设备");
             } else {
@@ -769,6 +774,7 @@ static void cloud_start_task(void *arg)
                               "命中 `T31*` + 服务 FFF0、notify FFF1");
                 res_report("post-link-start（扫描已启动）");
             }
+#endif
 
             /* ★🔴 2026-10-23（真机 `子设备事件队列满`）：**先建队列 + 任务，再建 event 库**。
              *   上一版顺序 = 先 init event（≈34 KB 内部 RAM）→ 再 `xTaskCreate(gw_child, 8192)`；

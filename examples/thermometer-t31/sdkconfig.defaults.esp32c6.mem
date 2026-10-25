@@ -36,7 +36,8 @@ CONFIG_ESP_WIFI_MGMT_SBUF_NUM=6
 #   而现值 2880 已是工程缺省、再往上调反而更费内存 ⇒ 这一项**保持缺省**（收益 <1 KB，不值当）。
 
 # ---- NimBLE（中央侧只连 1~2 条温感子设备）----
-CONFIG_BT_NIMBLE_MAX_CONNECTIONS=2
+# 2026-10-25：2–5 台子设备场景（原 2）。⚠️ Kconfig 行尾不支持注释 ⇒ 说明必须写在上一行。
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=6
 CONFIG_BT_NIMBLE_ACL_BUF_COUNT=10
 CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=8
 

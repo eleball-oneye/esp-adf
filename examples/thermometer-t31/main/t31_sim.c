@@ -20,6 +20,12 @@
  *        · checksum = **从 cmd 起逐字节求和取低 8 位**（自定义；真机校验口径未知 ⇒ 见下）
  *        · cmd 0x01（温度）：payload = i16 **LE** 温度(0.01 ℃) + u16 **LE** 帧序号
  *        · cmd 0xB1（电量）：payload = u8 电量% + u16 **LE** 电池 mV
+ *        · 🔴 2026-10-25 新增 cmd 0x02（GNSS 定位，**本仓扩展**；真 T31 没有该命令）：
+ *            payload = i32 **LE** 纬度(1e-7°)、i32 **LE** 经度(1e-7°)、i16 **LE** 海拔(m)、
+ *                      u16 **LE** 地速(0.01 m/s)、u8 卫星数、u8 定位类型(0 未定位/1 2D/2 3D)
+ *            ⇒ payload 14 B、整帧 **18 B**（≤ BLE 默认 MTU 的 20 B 载荷上限 ⇒ 不依赖 MTU 协商）。
+ *            网关（gw_child.c）解这一帧后**并进温度帧的 TLV** 上报（TLV 0x50–0x55，见
+ *            oneye-link-sdk/docs/TLV-REGISTRY.md §5），云端解成 latitude/longitude/… 属性。
  *   ⚠️ 两条必须写明的口径差异（⛔ 不要当成协议事实传播）：
  *     ① **真 T31 的帧体编码（含校验和算法、字段偏移）未解出**；本实现只保证
  *        「本模拟器 → 本仓网关（含 profiles/t31.json 的模拟器覆盖档案）」两端**自洽**。
@@ -57,6 +63,10 @@
 
 #include "t31_sim.h"
 
+#if CONFIG_ONEYE_GNSS_ENABLE
+#include "gnss_atgm336x.h"
+#endif
+
 static const char *TAG = "t31sub";
 
 /* ---------------------------------------------------------------- 常量 */
@@ -69,6 +79,7 @@ static const char *TAG = "t31sub";
 #define T31_FRAME_EOP        0x6Au
 #define T31_CMD_TEMP         0x01u
 #define T31_CMD_BATT         0xB1u
+#define T31_CMD_GPS          0x02u   /* 🔴 2026-10-25 本仓扩展：GNSS 定位（见文件头） */
 
 #define T31_SIM_PI           3.14159265f
 /* 模拟温度区间（℃ ×100）：36.00 – 37.50（用户口径） */
@@ -168,9 +179,82 @@ static void t31_notify(const uint8_t *buf, size_t len)
 }
 
 /*
- * 生成并推送一帧；**无连接/未订阅时不推送、只打日志**（用户口径）。
- * 每 10 帧顺带推一帧电量（cmd 0xB1）。
+ * 🔴 2026-10-25：GNSS 定位帧（cmd 0x02）—— 本仓对 T31 模拟器的**扩展命令**。
+ *
+ * 为什么单独一帧、而不是并进温度帧：
+ *   · 温度帧 8 B / 本帧 18 B，都 ≤ BLE 默认 MTU 的 20 B 载荷上限 ⇒ **不依赖 MTU 协商**；
+ *   · 定位 1 Hz、温度 2 s 一帧，两者节奏不同（且室内可能整场无有效定位）；
+ *   · 网关侧把最近一次定位**并进温度帧的 TLV** 上报（见 gw_child.c），云端无温度缺帧风险。
+ *
+ * ⚠️ payload 全部 **LE**（与本模拟器既有帧一致）；上游 TLV 是 **BE**，转换在网关做。
+ * 未定位（fix=0）时仍发帧：sats/fix 字段让云端知道"模组在、但没信号"，经纬度填 0。
  */
+#if CONFIG_ONEYE_GNSS_ENABLE
+static void t31_emit_gps(void)
+{
+    static unsigned gps_no;
+    gnss_fix_t g;
+    uint8_t pl[14];
+    uint8_t frame[24];
+    int32_t lat = 0;
+    int32_t lon = 0;
+    int16_t alt = 0;
+    uint16_t spd = 0;
+    uint8_t sats;
+    uint8_t fix;
+    size_t len;
+
+    if (s_conn == BLE_HS_CONN_HANDLE_NONE || !s_subscribed) {
+        return;   /* 与温度同口径：无连接/未订阅不推送（只由温度帧留日志） */
+    }
+    if (!gnss_get(&g)) {
+        if ((gps_no % 30u) == 0u) {
+            ESP_LOGI(TAG, "[gnss→ble] 尚无 NMEA ⇒ 本周期不发 GPS 帧（累计尝试 %u）", gps_no + 1u);
+        }
+        gps_no++;
+        return;
+    }
+
+    sats = g.sats;
+    fix = g.fix ? g.fix_type : 0u;
+    if (g.fix) {
+        lat = g.lat_e7;
+        lon = g.lon_e7;
+        alt = g.alt_m;
+        spd = g.speed_cms;
+    }
+
+    pl[0] = (uint8_t)((uint32_t)lat & 0xFFu);
+    pl[1] = (uint8_t)(((uint32_t)lat >> 8) & 0xFFu);
+    pl[2] = (uint8_t)(((uint32_t)lat >> 16) & 0xFFu);
+    pl[3] = (uint8_t)(((uint32_t)lat >> 24) & 0xFFu);
+    pl[4] = (uint8_t)((uint32_t)lon & 0xFFu);
+    pl[5] = (uint8_t)(((uint32_t)lon >> 8) & 0xFFu);
+    pl[6] = (uint8_t)(((uint32_t)lon >> 16) & 0xFFu);
+    pl[7] = (uint8_t)(((uint32_t)lon >> 24) & 0xFFu);
+    pl[8] = (uint8_t)((uint16_t)alt & 0xFFu);
+    pl[9] = (uint8_t)(((uint16_t)alt >> 8) & 0xFFu);
+    pl[10] = (uint8_t)(spd & 0xFFu);
+    pl[11] = (uint8_t)((spd >> 8) & 0xFFu);
+    pl[12] = sats;
+    pl[13] = fix;
+
+    len = t31_build_frame(T31_CMD_GPS, pl, sizeof(pl), frame, sizeof(frame));
+    if (len == 0) {
+        return;
+    }
+    t31_notify(frame, len);
+    gps_no++;
+    if ((gps_no % 5u) == 1u) {
+        ESP_LOGI(TAG, "→ notify GPS 帧 #%u：fix=%u sats=%u lat=%.7f lon=%.7f alt=%d m"
+                      "（%u B；室内 fix=0 属正常，见 gnss_atgm336x.h）",
+                 gps_no, (unsigned)fix, (unsigned)sats,
+                 (double)lat / 1e7, (double)lon / 1e7, (int)alt, (unsigned)len);
+    }
+}
+#endif /* CONFIG_ONEYE_GNSS_ENABLE */
+
+
 static void t31_emit_once(void)
 {
     static uint16_t seq;
@@ -182,6 +266,11 @@ static void t31_emit_once(void)
     int16_t centi;
     size_t len;
     bool online = (s_conn != BLE_HS_CONN_HANDLE_NONE);
+
+#if CONFIG_ONEYE_GNSS_ENABLE
+    /* 定位帧先发（独立 cmd/独立缓冲）：温度帧仍是 FFF1 READ 的"最近一帧" */
+    t31_emit_gps();
+#endif
 
     centi = t31_sim_temp_centi();
     payload[0] = (uint8_t)((uint16_t)centi & 0xFFu);          /* i16 LE 低字节 */

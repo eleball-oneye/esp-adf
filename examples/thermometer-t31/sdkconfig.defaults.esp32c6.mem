@@ -1,0 +1,46 @@
+# =============================================================================
+# thermometer-t31 —— **C6 网关"不改 UI 效果"的内存收紧预设**
+#
+# 背景（2026-10-25 现场）：C6-GEEK 无 PSRAM，全功能起来后 `event-init` 只剩 ~21 KB 可用、
+#   最大连续块 ~14 KB；WiFi 掉线重连那一下会把堆吃到见底 ⇒ 子设备 `sub.telemetry` 的
+#   cJSON 组装 OOM（日志 `cJSON OOM ⇒ 本帧丢弃`）。
+# 口径（用户逐字）：「A不用做。B内存问题有不动UI效果的其他解法吗，比如停掉用不到的业务」
+#   ⇒ 本文件**只动"看不见"的传输/协议栈缓冲与内存池**，⛔ 不动任何业务逻辑、⛔ 不动屏上版面与刷新。
+#
+# 叠加顺序（必须排在最后，才能覆盖前面的缺省值）：
+#   sdkconfig.defaults ; esp32c6 ; mem ; （子设备再叠 esp32c6.subdev + subdev）
+#
+# 每一项的取值理由（宁可保守，也不能把功能弄坏）：
+#   · WiFi：默认值是"电脑级"的（静态 RX 4 / 动态 RX 8 / 动态 TX 32 / TX BA 6 / RX BA 4 /
+#     管理帧 sbuf 32）。我们只跑一条 MQTT-TLS 连接 + 2 s 一次小上行 ⇒ 减半绰绰有余；
+#     ⛔ 别再往下砍到 STATIC_RX=2 / MGMT_SBUF=6 以下（那是 LWIP 下限，容易引起丢包重传）。
+#   · LWIP TCP 收发缓冲：**Kconfig 下限是 2440**（不是 2048），所以按最小值取。
+#   · NimBLE：只服务 1~2 条 T31 链路、每帧 8~16 B ⇒ ACL 10×255 / MSYS 8×128 足够；
+#     ⛔ MAX_CONNECTIONS 不要低于 2（网关还要留一条给 App 直连排障）。
+#   · oneye-dev-sdk：日志环形缓冲 8 KB→1 KB（不接管 ESP_LOG，只影响云端日志回捞深度）、
+#     上行队列 4 KB→2 KB、离线事件队列 4 KB→2 KB —— 都只影响"极端情况下能缓存多少"，
+#     不影响正常收发（当前上行 payload 约 100 B/条）。
+# =============================================================================
+
+# ---- WiFi 传输层缓冲（业务/UI 无感）----
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=3
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=6
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_TX_BA_WIN=3
+CONFIG_ESP_WIFI_RX_BA_WIN=2
+CONFIG_ESP_WIFI_MGMT_SBUF_NUM=6
+
+# ---- LWIP TCP 收发缓冲：**不动** --------------------------------------------------
+#   试过按 Kconfig 下限 2440 收紧，但 LWIP 编译期 sanity check 要求
+#   `TCP_SND_BUF >= 2*TCP_MSS`（MSS 1460 ⇒ 至少 2920），2440 直接 `#error` 编不过；
+#   而现值 2880 已是工程缺省、再往上调反而更费内存 ⇒ 这一项**保持缺省**（收益 <1 KB，不值当）。
+
+# ---- NimBLE（中央侧只连 1~2 条温感子设备）----
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=2
+CONFIG_BT_NIMBLE_ACL_BUF_COUNT=10
+CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=8
+
+# ---- oneye-dev-sdk 内存池（只影响缓存上限，不影响正常收发）----
+CONFIG_ONEYE_DEV_SDK_LOG_BUFFER_BYTES=1024
+CONFIG_ONEYE_DEV_SDK_TX_QUEUE_BYTES=2048
+CONFIG_ONEYE_DEV_SDK_EVENT_OFFLINE_BYTES=2048

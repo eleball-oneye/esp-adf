@@ -41,7 +41,15 @@
 
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <sys/time.h>
+#include <sys/select.h>
+
+/* 12d 的裸 TCP 探测（绕过 SDK/TLS，直接验证到云端的 TCP 三次握手） */
+#include "lwip/sockets.h"
+#include "lwip/inet.h"
 
 #include "sdkconfig.h"
 #include "esp_err.h"
@@ -90,14 +98,32 @@ static esp_err_t boot_nvs_init(void)
 #include "sntp_boot.h"
 #include "wifi_prov.h"          /* Wi-Fi 生命周期 + 入网后**唯一收敛点** */
 #include "wifi_prov_ble.h"      /* BLE 配网通道；配网后 deinit 整栈 */
-#include "board_key.h"          /* Korvo-2(DU1906) 板载 ADC 按键（任意键长按 ≥3 s = 重新配网） */
+#include "board_key.h"          /* Korvo-2(DU1906) 板载 ADC 按键（任意键长按 ≥3 s = 重新配网）；C6-GEEK 走 BOOT(GPIO9) */
+#include "board_lcd.h"          /* C6-GEEK 板载 ST7789 简易 GUI（温度 + WiFi 图标），⛔ 不引 LVGL */
 #include "gw_child.h"           /* 子设备绑定（child.pair/unpair）+ sub.* 事件上报 */
 
 #else  /* ======== 子设备角色：只依赖 NimBLE 外设模拟器 ======== */
 #include "t31_sim.h"
+#include "gnss_atgm336x.h"     /* ATGM336H-5N（UART1 NMEA）—— 仅 CONFIG_ONEYE_GNSS_ENABLE 时有实现 */
 #endif /* CONFIG_ONEYE_T31_ROLE_GATEWAY（头文件分派） */
 
 #if CONFIG_ONEYE_T31_ROLE_GATEWAY
+
+#include "esp_wifi.h"
+
+/* ============================================================================
+ * 0b. 板载屏 UI 的**状态快照**（2026-10-25 用户要求：屏上显示温感温度 + WiFi 状态）
+ *
+ * 线程模型（与 gw_child 同一条纪律）：写侧只有 SDK 回调 / link 回调（`volatile` 标量赋值，
+ * 无锁、无阻塞）；读侧只有本工程的 `lcd_ui_task`。⛔ 不在这里做任何解码/格式化（格式化在
+ * board_lcd 里，且只在 UI 任务上下文）。
+ * ============================================================================ */
+static volatile bool s_ui_sub_online;
+static volatile bool s_ui_has_temp;
+static volatile int  s_ui_temp_centi;
+static volatile int  s_ui_battery = -1;
+static volatile bool s_ui_cloud_up;
+static char          s_ui_model[32] = "T31";   /* link 事件里整体覆盖写，UI 侧只读（长度对齐 evt->model） */
 
 /* 任务规格（栈字节数）：8 KB 是 devkitc 实测"sys_evt 溢出"的根治值，⛔ 不要压小 */
 #define GW_READY_TASK_STACK 8192
@@ -273,6 +299,7 @@ static void on_dev_event(oneye_dev_event_t evt, const void *payload, size_t len,
     switch (evt) {
     case ONEYE_DEV_SDK_EVT_CLOUD_LINK_UP:
         ESP_LOGI(TAG, "云链路已建立（CLOUD_LINK_UP）⇒ 立刻补报一次当前影子");
+        s_ui_cloud_up = true;                    /* 2026-10-25：屏上 CLOUD 指示 */
         s_last_report_ms = 0;                    /* 补报不受节流限制 */
         if (s_state_task != NULL) {
             (void)xTaskNotifyGive(s_state_task);
@@ -292,6 +319,7 @@ static void on_dev_event(oneye_dev_event_t evt, const void *payload, size_t len,
             s_down_win_ms = now_ms;
         }
         s_down_cnt++;
+        s_ui_cloud_up = false;                   /* 2026-10-25：屏上 CLOUD 指示 */
         ESP_LOGW(TAG, "云链路断开（CLOUD_LINK_DOWN）⇒ SDK 自动重连；重连成功后补报影子"
                       "（60 s 窗口内第 %u 次）", (unsigned)s_down_cnt);
         if (s_down_cnt >= 3u) {
@@ -374,6 +402,15 @@ static void gw_on_sub_data(const oneye_link_event_t *evt, const char *addr)
         }
     }
 
+    /* 🔴 2026-10-25 板载屏 UI：把解出的温度/电量记进快照（供 lcd_ui_task 显示）。
+     *   ⛔ 只写 volatile 标量，不做格式化、不碰 SPI —— 这里仍是 SDK 任务上下文。 */
+    s_ui_sub_online = true;
+    if (has_temp) {
+        s_ui_has_temp = true;
+        s_ui_temp_centi = (int)(temp_c * 100.0f + ((temp_c >= 0) ? 0.5f : -0.5f));
+    }
+    s_ui_battery = (batt >= 0) ? batt : -1;
+
     if (!has_temp) {
         /* 没解出温度：只留日志（可能是透传帧 —— 真 T31 的 cmd=0x01 body 编码未解出时就是这样） */
         ESP_LOGW(TAG, "[数据] %s 本帧**未解出温度**（TLV 无 0x10；原始帧见上行日志）", addr);
@@ -412,12 +449,17 @@ static void on_link_event(const oneye_link_event_t *evt, void *ctx)
         /* 上线：model 进日志；影子上的 power 保持 true（子设备在线 = 在工作） */
         ESP_LOGI(TAG, "[上线] %s model=%s rssi=%d（继续按温度帧代报影子）",
                  addr, evt->model, (int)evt->rssi);
+        s_ui_sub_online = true;                                  /* 2026-10-25 屏上 SUB 指示 */
+        if (evt->model[0] != '\0') {
+            (void)snprintf(s_ui_model, sizeof(s_ui_model), "%s", evt->model);
+        }
         break;
     case ONEYE_LINK_EVT_SUB_OFFLINE:
         /* 离线：按用户口径**只记日志**，不把 power 改成 false
          * （T31 是体温贴，"离线"多为超出范围/休眠，不代表设备关机；影子里的最后一次温度仍需可读） */
         ESP_LOGW(TAG, "[离线] %s model=%s（⛔ 不改 power；只保留最后一次影子值）",
                  addr, evt->model);
+        s_ui_sub_online = false;                                 /* 2026-10-25 屏上 SUB 指示 */
         break;
     case ONEYE_LINK_EVT_SUB_DATA:
         gw_on_sub_data(evt, addr);
@@ -652,9 +694,18 @@ static void cloud_start_task(void *arg)
         lcfg.node_id = s_creds.node_id;
         lcfg.max_links = 4;
         lcfg.scan_interval_ms = 1000;
-        lcfg.scan_window_ms = 200;
+        /* 2026-10-25〔云链路闪断修复〕扫描窗口 200 ms → 100 ms：
+         *   原值 = 20% 占空比，和 Wi-Fi STA 抢同一套射频 ⇒ 现场出现过 `reason=200`（beacon 超时）
+         *   导致云链路闪断。子设备只有 T31 一台、且连上后就不再需要扫描 ⇒ 降到 10% 足够，
+         *   首次连接最多晚 ~1 s，换来 Wi-Fi 稳定。 */
+        lcfg.scan_window_ms = 100;
         lcfg.cache_entries = 512;
-        lcfg.passthrough_unknown = true;
+        /* 🔴 2026-10-25 真机订正：从 true 改成 **false**。
+         *   原值 true = 「广播里有名字/服务就接」，现场环境里那些无关 BLE 设备（耳机/iBeacon 等）
+         *   也会被接进 4 个槽位 ⇒ 槽位被占满后 `ble_scan_start()` 因 `free_slot_count()<=0`
+         *   直接返回 ⇒ **真正的 T31 永远扫不到 / 屏上 sub 一直是 0**（重启才恢复，因为槽位清空）。
+         *   产品口径也是"只接自己的子设备"：⛔ 不认识机型就别连。 */
+        lcfg.passthrough_unknown = false;
 
         if (oneye_link_init(&lcfg) != ONEYE_LINK_OK) {
             ESP_LOGE(TAG, "oneye_link_init 失败 ⇒ **T31 子设备接入不可用**"
@@ -1017,6 +1068,11 @@ static void gw_wifi_prov_boot(void)
  *   下次上电走完整启动序列（NVS 无凭据 ⇒ 进 BLE 广播）。⛔ 不新增 SDK API。
  * ⚠️ 短按（< 3 s）无副作用；RESET = 硬件复位。
  * ============================================================================ */
+/* ⚠️ 2026-10-25 C6 换板后清理：本段（`key_gate_*`，监听 **GPIO0**）是 S3/Korvo-2 时代的实现，
+ *   C6-GEEK 的真按键是 **GPIO9**（由 `board_key.c` 的 `board_key_start()` 负责）。
+ *   两条都开着会让 C6 的串口同时打「按键就绪：长按 BOOT(GPIO0)」和「板载 BOOT 按键已启动：GPIO9」，
+ *   容易误判到底哪个键生效（C6 上 GPIO0 没有按键）⇒ **C6 构建把它整段关掉**，只留 board_key.c。 */
+#if !CONFIG_IDF_TARGET_ESP32C6
 static void key_gate_task(void *arg)
 {
     bool pressed = false;
@@ -1080,6 +1136,288 @@ static void key_gate_start(void)
     ESP_LOGI(TAG, "按键就绪：长按 BOOT(GPIO0) ≥ %u ms = 忘记 WiFi + 重启（重新配网）；短按无副作用",
              (unsigned)GW_KEY_HOLD_MS);
 }
+#endif /* !CONFIG_IDF_TARGET_ESP32C6 */
+
+/* ============================================================================
+ * 12b. 板载屏 UI 任务（2026-10-25 用户要求）
+ *
+ * 用户逐字：「其上屏幕需要实现简易的GUI，显示连接的温感子设备的温度数据以及当前wifi
+ *            连接状态（一个wifi图标展示是否连接以及信号强度），UI背景图在
+ *            E:\Oneye\logo\oneye1.png」
+ *
+ * 分工：**本任务只取状态 + 判变化 + 调 board_lcd_render()**；像素级绘制全在 board_lcd.c。
+ *   · WiFi 状态：直接问 `esp_wifi_sta_get_ap_info()`（成功 = 已连上 AP，rssi = 信号强度）；
+ *   · 温度/电量/子设备在线：SDK/link 回调写的 volatile 快照（见 §0b）；
+ *   · 云链路：dev-sdk 的 CLOUD_LINK_UP/DOWN 事件。
+ * 刷新策略：**状态变了才重绘**（SPI 40 MHz 全屏 ≈ 20–40 ms），另加 RSSI 5 dBm 分桶，
+ *   避免信号抖动把 SPI 打成常亮。
+ * ============================================================================ */
+static void lcd_ui_task(void *arg)
+{
+    (void)arg;
+    int  last_temp = INT32_MIN;
+    int  last_rssi_bucket = INT32_MIN;
+    int  last_batt = INT32_MIN;
+    bool last_wifi = false;
+    bool last_sub = false;
+    bool last_cloud = false;
+    bool last_has_temp = false;
+    bool first = true;
+    uint32_t renders = 0;
+
+    for (;;) {
+        lcd_status_t st;
+        wifi_ap_record_t ap;
+
+        memset(&st, 0, sizeof(st));
+        memset(&ap, 0, sizeof(ap));
+        st.wifi_connected = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK);
+        st.wifi_rssi = st.wifi_connected ? (int)ap.rssi : 0;
+        st.cloud_up = s_ui_cloud_up;
+        st.sub_online = s_ui_sub_online;
+        st.has_temp = s_ui_has_temp;
+        st.temp_centi = s_ui_temp_centi;
+        st.battery = s_ui_battery;
+        st.sub_model = s_ui_model;
+
+        const int rssi_bucket = st.wifi_rssi / 5;
+        /* 重绘判据包含 RSSI 分桶（信号每变 5 dBm 刷一次）；**打日志只认状态变化**
+         * （否则 WiFi 抖动会把串口刷成每秒一行） */
+        const bool need_draw = first ||
+                               st.wifi_connected != last_wifi ||
+                               rssi_bucket != last_rssi_bucket ||
+                               st.cloud_up != last_cloud ||
+                               st.sub_online != last_sub ||
+                               st.has_temp != last_has_temp ||
+                               st.temp_centi != last_temp ||
+                               st.battery != last_batt;
+        const bool state_changed = first ||
+                                   st.wifi_connected != last_wifi ||
+                                   st.cloud_up != last_cloud ||
+                                   st.sub_online != last_sub ||
+                                   st.has_temp != last_has_temp ||
+                                   st.temp_centi != last_temp ||
+                                   st.battery != last_batt;
+
+        if (need_draw) {
+            board_lcd_render(&st);
+            renders++;
+            first = false;
+            last_wifi = st.wifi_connected;
+            last_rssi_bucket = rssi_bucket;
+            last_sub = st.sub_online;
+            last_cloud = st.cloud_up;
+            last_has_temp = st.has_temp;
+            last_temp = st.temp_centi;
+            last_batt = st.battery;
+            if (state_changed) {
+                /* 只在状态变化时打一行（也是"屏到底有没有在刷新"的判据） */
+                ESP_LOGI(TAG, "[lcd] 刷新 #%u：wifi=%d rssi=%d cloud=%d sub=%d temp=%d.%02d batt=%d",
+                         (unsigned)renders, (int)st.wifi_connected, st.wifi_rssi, (int)st.cloud_up,
+                         (int)st.sub_online, st.temp_centi / 100, abs(st.temp_centi % 100), st.battery);
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
+/* ============================================================================
+ * 12c. Wi-Fi 自愈看门狗（2026-10-25 现场：Wi-Fi 会"卡死在连不上"的状态，重启才恢复）
+ *
+ * 现场证据（`wifi-drop-now.txt`）：85 s 内 `Wi-Fi 断开 reason=201`（NO_AP_FOUND）**35 次**，
+ *   期间同一位置的路由器对 PC 可见、且设备**一重启 1.4 s 就重新连上** ⇒ 不是没信号，
+ *   而是 STA/驱动内部状态卡住（共存 + 扫描 + 省电历史状态的坑）。
+ * 策略（和"长按 BOOT 忘 WiFi"互补，⛔ 不清凭据）：
+ *   · 连续断网 **60 s**  ⇒ 原地重启 Wi-Fi 驱动（`esp_wifi_stop()` → `start()`，保留 NVS 凭据）；
+ *   · 连续断网 **180 s** ⇒ 整机 `esp_restart()`（真机已验证：重启是最可靠的自愈手段）。
+ * 判据只用 `esp_wifi_sta_get_ap_info()`（= "有没有连上 AP"），⛔ 不看云链路（云掉线另有原因）。
+ * ============================================================================ */
+/* ============================================================================
+ * 12d. 云端自愈 + 裸 TCP 探测（2026-10-25 现场：Wi-Fi 正常但到云端的 TCP 连不上）
+ *
+ * 现场证据（`io-to-fix.txt`）：Wi-Fi rssi=-40 且 DNS 正常，但
+ *   `sock_connect: TCP 连接超时 host=mqtt.oneye.me port=18886 timeout=10000 ms`
+ *   反复出现、SDK 重连全部失败 ⇒ 屏上 `cloud=0` 一直不恢复（只能人工复位）。
+ * 本任务做两件事：
+ *   ① **裸 TCP 探测**：云断 30 s 时，绕过 TLS/MQTT/DNS 直接对云公网 IP 的 443/18886 各连一次，
+ *      把「SYN 是否通、耗时、errno」打出来 —— 下次一眼分清是运营商/防火墙丢 SYN，还是设备协议栈问题；
+ *   ② **云端自愈**：云连续断 **120 s** ⇒ 整机重启（真机已验证重启必恢复；凭据/绑定都在 NVS，不丢配置）。
+ * 判据用 `s_ui_cloud_up`（CLOUD_LINK_UP/DOWN 事件写的 volatile 快照），⛔ 不碰 Wi-Fi 逻辑
+ *（Wi-Fi 有自己的 12c 看门狗）。
+ * ============================================================================ */
+static void tcp_probe(const char *ip, uint16_t port, uint32_t timeout_ms)
+{
+    struct sockaddr_in sa;
+    int fd;
+    int flags;
+    int rc;
+    int64_t t0;
+    int64_t cost_ms;
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    if (inet_pton(AF_INET, ip, &sa.sin_addr) != 1) {
+        ESP_LOGW(TAG, "[probe] %s:%u IP 非法", ip, (unsigned)port);
+        return;
+    }
+    fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (fd < 0) {
+        ESP_LOGW(TAG, "[probe] %s:%u socket() 失败 errno=%d", ip, (unsigned)port, errno);
+        return;
+    }
+    flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) {
+        (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    }
+
+    t0 = esp_timer_get_time();
+    rc = connect(fd, (struct sockaddr *)&sa, sizeof(sa));
+    if (rc == 0) {
+        cost_ms = (esp_timer_get_time() - t0) / 1000;
+        ESP_LOGI(TAG, "[probe] %s:%u ✅ TCP 直连成功（%lld ms，绕过 TLS/MQTT/DNS）",
+                 ip, (unsigned)port, (long long)cost_ms);
+    } else if (errno == EINPROGRESS) {
+        fd_set wf;
+        struct timeval tv;
+        int sel;
+
+        FD_ZERO(&wf);
+        FD_SET(fd, &wf);
+        tv.tv_sec = (time_t)(timeout_ms / 1000u);
+        tv.tv_usec = (suseconds_t)((timeout_ms % 1000u) * 1000u);
+        sel = select(fd + 1, NULL, &wf, NULL, &tv);
+        cost_ms = (esp_timer_get_time() - t0) / 1000;
+        if (sel > 0) {
+            int soerr = 0;
+            socklen_t slen = (socklen_t)sizeof(soerr);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &slen) == 0 && soerr == 0) {
+                ESP_LOGI(TAG, "[probe] %s:%u ✅ TCP 直连成功（%lld ms）",
+                         ip, (unsigned)port, (long long)cost_ms);
+            } else {
+                ESP_LOGW(TAG, "[probe] %s:%u ❌ TCP 失败 so_error=%d（%lld ms）",
+                         ip, (unsigned)port, soerr, (long long)cost_ms);
+            }
+        } else if (sel == 0) {
+            ESP_LOGW(TAG, "[probe] %s:%u ❌ TCP 超时（%u ms 未完成三次握手）",
+                     ip, (unsigned)port, (unsigned)timeout_ms);
+        } else {
+            ESP_LOGW(TAG, "[probe] %s:%u ❌ select 失败 errno=%d", ip, (unsigned)port, errno);
+        }
+    } else {
+        ESP_LOGW(TAG, "[probe] %s:%u ❌ connect 立即失败 errno=%d", ip, (unsigned)port, errno);
+    }
+    (void)close(fd);
+}
+
+static void cloud_heal_task(void *arg)
+{
+    (void)arg;
+    int down_s = 0;
+    bool probed30 = false;
+
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        if (s_ui_cloud_up || !s_cloud_started) {
+            if (down_s >= 120) {
+                ESP_LOGI(TAG, "[cloud-heal] 云链路已恢复（断 %d s 后）", down_s);
+            }
+            down_s = 0;
+            probed30 = false;
+            continue;
+        }
+        down_s += 5;
+        if (down_s == 30 && !probed30) {
+            probed30 = true;
+            ESP_LOGW(TAG, "[cloud-heal] 云已断 30 s ⇒ 做一次裸 TCP 探测（区分 DNS/TLS/运营商）");
+            tcp_probe("8.136.141.88", 443, 4000);
+            tcp_probe("8.136.141.88", 18886, 4000);
+        }
+        if (down_s == 60) {
+            ESP_LOGW(TAG, "[cloud-heal] 云已断 60 s（Wi-Fi 若正常，说明是到云端的 TCP 路径问题）");
+        }
+        if (down_s >= 120) {
+            /* ⚠️ 只在 Wi-Fi 正常时才整机重启：Wi-Fi 本身断了由 12c 看门狗负责，
+             *   两套同时重启会互相打断（一个刚重启到一半又被另一个重启）。 */
+            wifi_ap_record_t ap;
+            if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) {
+                if ((down_s % 30) == 0) {
+                    ESP_LOGW(TAG, "[cloud-heal] 云断 %d s 但 Wi-Fi 也断 ⇒ 交给 Wi-Fi 看门狗，本任务先不重启",
+                             down_s);
+                }
+                continue;
+            }
+            ESP_LOGE(TAG, "[cloud-heal] ★ 云连续断 %d s 且 Wi-Fi 正常 ⇒ 整机重启（凭据/绑定均在 NVS，不丢配置）",
+                     down_s);
+            vTaskDelay(pdMS_TO_TICKS(500));
+            esp_restart();
+        }
+    }
+}
+
+static void cloud_heal_start(void)
+{
+    if (xTaskCreate(cloud_heal_task, "cloud_heal", 4096, NULL, 2, NULL) != pdPASS) {
+        ESP_LOGW(TAG, "云端自愈任务创建失败（内存不足）⇒ 云掉线只能靠手动复位");
+        return;
+    }
+    ESP_LOGI(TAG, "云端自愈看门狗已启动（断 30 s 裸 TCP 探测 / 断 120 s 整机重启）");
+}
+
+static void wifi_heal_task(void *arg)
+{
+    (void)arg;
+    int down_s = 0;
+
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        wifi_ap_record_t ap;
+        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+            if (down_s >= 60) {
+                ESP_LOGI(TAG, "[wifi-heal] Wi-Fi 已恢复（断网 %d s 后）", down_s);
+            }
+            down_s = 0;
+            continue;
+        }
+        down_s += 5;
+        ESP_LOGW(TAG, "[wifi-heal] 未连上 AP：已持续 %d s（60 s 重启 Wi-Fi 驱动 / 180 s 整机重启）", down_s);
+        if (down_s == 60) {
+            ESP_LOGW(TAG, "[wifi-heal] ★ 重启 Wi-Fi 驱动（保留 NVS 凭据）：stop → ps=NONE → start");
+            (void)esp_wifi_stop();
+            (void)esp_wifi_set_ps(WIFI_PS_NONE);
+            esp_err_t rc = esp_wifi_start();   /* STA_START 事件里 wifi_prov 会自己 esp_wifi_connect() */
+            if (rc != ESP_OK) {
+                ESP_LOGE(TAG, "[wifi-heal] esp_wifi_start 失败 rc=%d(%s)", (int)rc, esp_err_to_name(rc));
+            }
+        } else if (down_s >= 180) {
+            ESP_LOGE(TAG, "[wifi-heal] ★ 连续 180 s 连不上 AP ⇒ 整机重启（真机已验证可恢复）");
+            vTaskDelay(pdMS_TO_TICKS(500));
+            esp_restart();
+        }
+    }
+}
+
+static void wifi_heal_start(void)
+{
+    if (xTaskCreate(wifi_heal_task, "wifi_heal", 3072, NULL, 3, NULL) != pdPASS) {
+        ESP_LOGW(TAG, "Wi-Fi 自愈任务创建失败（内存不足）⇒ 断网只能靠手动复位");
+        return;
+    }
+    ESP_LOGI(TAG, "Wi-Fi 自愈看门狗已启动（断 60 s 重启 Wi-Fi 驱动 / 断 180 s 整机重启）");
+}
+
+static void lcd_ui_start(void)
+{
+    if (!board_lcd_ready()) {
+        ESP_LOGI(TAG, "板载屏未就绪 ⇒ 不起 UI 任务（本板可能没有屏 / 构建未启用 LCD）");
+        return;
+    }
+    if (xTaskCreate(lcd_ui_task, "lcd_ui", 4096, NULL, 2, NULL) != pdPASS) {
+        ESP_LOGW(TAG, "LCD UI 任务创建失败（内存不足）⇒ 屏保持最后一帧");
+        return;
+    }
+    ESP_LOGI(TAG, "LCD UI 任务已启动（500 ms 轮询，变化才重绘）");
+}
 
 #endif /* CONFIG_ONEYE_T31_ROLE_GATEWAY */
 
@@ -1098,6 +1436,15 @@ void app_main(void)
     }
 
 #if CONFIG_ONEYE_T31_ROLE_GATEWAY
+    /* ⓪ 板载屏（仅 C6-GEEK 有；S3 构建/无屏板返回 NOT_SUPPORTED）——失败只 WARN，不影响上云
+     *   ⚠️ 前后各打一行 [res]：C6 无 PSRAM，屏的条带缓冲/SPI DMA 是**从内部堆里拿的**，
+     *   必须能量出它的真实代价（真机首测就吃掉 ~25 KB）。 */
+    res_report("pre-lcd-init");
+    if (board_lcd_init() != ESP_OK) {
+        ESP_LOGI(TAG, "板载屏未启用/不可用 ⇒ 跳过屏幕 UI（不影响配网与上云）");
+    }
+    res_report("post-lcd-init");
+
     /* ① 自证（身份 / creds / 云端点 / 周期）——只读，不影响行为 */
     boot_identity_report();
 
@@ -1117,9 +1464,24 @@ void app_main(void)
     /* ④ 按键（长按 = 忘记 WiFi + 重启）
      * 🔴 2026-10-23：Korvo-2（DU1906）**没有 BOOT 键**，它的 VOLUP/VOLDOWN/MUTE/SET 四键挂在
      *   GPIO2 的 ADC 电阻梯上（`components/audio_board/esp32_korvo_du1906/board_def.h:84-116`）；
-     *   ⇒ 增加板载 ADC 按键长按触发（任意键长按 ≥3 s = 重新配网广播）。 */
+     *   ⇒ 增加板载 ADC 按键长按触发（任意键长按 ≥3 s = 重新配网广播）。
+     * ⚠️ 2026-10-25：上述 `key_gate_*` 是 **S3 专用**（监听 GPIO0）；C6-GEEK 的按键在 GPIO9，
+     *   由 `board_key_start()` 负责 ⇒ C6 构建不启动 key_gate（避免两套并存、日志互相打脸）。 */
+#if !CONFIG_IDF_TARGET_ESP32C6
     key_gate_start();
+#endif
     (void)board_key_start();
+
+    /* ④a Wi-Fi 自愈看门狗：断网 60 s 重启 Wi-Fi 驱动、180 s 整机重启（现场"卡死连不上"的兜底） */
+    wifi_heal_start();
+
+    /* ④a2 云端自愈看门狗：云断 30 s 做裸 TCP 探测、断 120 s 整机重启（现场"Wi-Fi 正常但到云端 TCP 不通"的兜底） */
+    cloud_heal_start();
+
+    /* ④b 板载屏 UI（C6-GEEK）：温度 + WiFi 图标/强度 */
+    res_report("pre-lcd-ui-task");
+    lcd_ui_start();
+    res_report("post-lcd-ui-task");
 
     /* ⑤ 配网：NVS 凭据优先，否则 BLE 通道 */
     gw_wifi_prov_boot();
@@ -1129,9 +1491,17 @@ void app_main(void)
     }
 #else
     /* ---- 子设备角色：只起 NimBLE 外设（⛔ 不连云、⛔ 不读 creds、⛔ 不做配网）---- */
-    ESP_LOGI(TAG, "==== thermometer-t31 温感子设备模拟器（ESP32-S3）启动 ====");
+    ESP_LOGI(TAG, "==== thermometer-t31 温感子设备模拟器（ESP32-C6/ZERO）启动 ====");
     ESP_LOGI(TAG, "固件 %s / 角色 SUBDEV / 周期 %d ms",
              CONFIG_ONEYE_FW_VERSION, (int)CONFIG_ONEYE_T31_SUB_TEMP_REPORT_MS);
+
+#if CONFIG_ONEYE_GNSS_ENABLE
+    /* GNSS 先起（UART 与 BLE 互不依赖；失败只 WARN —— 本板仍是一台可用的温感子设备） */
+    err = gnss_start();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "GNSS 启动失败（%s）⇒ 本板只发温度、不发定位", esp_err_to_name(err));
+    }
+#endif
 
     err = t31_sim_start();
     if (err != ESP_OK) {

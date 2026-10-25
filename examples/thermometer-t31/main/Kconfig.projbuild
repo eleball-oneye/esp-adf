@@ -72,6 +72,94 @@ menu "thermometer-t31 例程配置"
             下限 1000 ms 是硬要求（用户 2026-10-23："例如 ≥1s 一帧"）；
             上限 60000 是保护值（再长不如不报）。
 
+    # =========================================================================
+    # GNSS（ATGM336H-5N）—— 仅子设备角色
+    # 2026-10-25 新增：用户把 GNSS 模组接在 **COM4 = ESP32-C6-ZERO** 上，要求温度 + 定位
+    #   一起经网关代传（子设备仍是"BLE 外设、不自带 MQTT"）。
+    # 引脚依据（微雪 C6-ZERO 官方 pinout + ESP32-C6 数据手册）：避开 strapping GPIO4/5/8/9/15、
+    #   USB GPIO12/13、板上 WS2812=GPIO8、BOOT=GPIO9；UART0（GPIO16/17）仍是 IDF console 主通道。
+    #   ⇒ 方案 A：UART1 TX=GPIO20（→模组 RXD）、RX=GPIO21（←模组 TXD）、PPS=GPIO22（可选）。
+    #   模组 3.3 V TTL、9600 8N1、上电即输出 NMEA 1 Hz（资料：E:\hardware\ATGM336H-5N模块资料）。
+    # =========================================================================
+
+    config ONEYE_GNSS_ENABLE
+        bool "子设备角色：启用 GNSS 定位（ATGM336H-5N，UART NMEA 接收）"
+        depends on ONEYE_T31_ROLE_SUBDEV
+        default y if IDF_TARGET_ESP32C6
+        help
+            仅 SUBDEV 角色生效。启用后子设备每帧温度之后**另发一帧 cmd=0x02 的定位帧**
+            （A6 02 <14 B payload> checksum 6A，见 t31_sim.c 文件头），网关把它并进
+            `sub.telemetry` 的 TLV（标签 0x50–0x55）上报云端影子。
+
+            ⛔ 本项只负责"读 NMEA + 发帧"；真正的影子属性来自云端物模型 TSL（latitude/
+            longitude/altitude/speed/satellites/gnssFix）。
+
+    config ONEYE_GNSS_UART_NUM
+        int "GNSS 使用的 UART 端口号"
+        depends on ONEYE_GNSS_ENABLE
+        default 1
+        range 0 2
+        help
+            固定用 **UART1**（UART0 是 IDF console 主通道，UART2 在 C6 上不存在）。
+            改端口时注意：UART0 上的 console 输出会被打进 GNSS 数据流。
+
+    config ONEYE_GNSS_TX_GPIO
+        int "GNSS UART TX 引脚（ESP → 模组 RXD）"
+        depends on ONEYE_GNSS_ENABLE
+        default 20
+        range 0 48
+        help
+            方案 A = GPIO20（C6-ZERO 排针右侧，与 RX/PPS 物理相邻）。
+            真正收数据只需要 RX；TX 只用于给模组发配置命令（本工程当前不发任何命令）。
+
+    config ONEYE_GNSS_RX_GPIO
+        int "GNSS UART RX 引脚（ESP ← 模组 TXD）"
+        depends on ONEYE_GNSS_ENABLE
+        default 21
+        range 0 48
+        help
+            方案 A = GPIO21。这是**主数据线**：模组上电即持续输出 NMEA。
+
+    config ONEYE_GNSS_PPS_GPIO
+        int "GNSS PPS 输入引脚（-1 = 不接/不计数）"
+        depends on ONEYE_GNSS_ENABLE
+        default 22
+        range -1 48
+        help
+            方案 A 的可选第三根：PPS（1PPS 秒脉冲）只做**计数自证**，不参与定位解析。
+            -1 = 模组 PPS 不接。轮询周期 200 ms；1 Hz 脉冲宽度 ~100 ms ⇒ 不会漏计。
+
+    config ONEYE_GNSS_BAUD
+        int "GNSS 串口波特率"
+        depends on ONEYE_GNSS_ENABLE
+        default 9600
+        range 4800 115200
+        help
+            模组出厂默认 9600 8N1（可用中科微 GNSSToolKit Lite 改并保存到模组 EEPROM）。
+            ⛔ 改了模组侧参数却没改这里 = 收到一堆乱码（日志里体现为"校验和不对/无合法 NMEA"）。
+
+    config ONEYE_GNSS_LOG_RAW
+        bool "打印原始 NMEA 行（排查接线/波特率时开）"
+        depends on ONEYE_GNSS_ENABLE
+        default n
+        help
+            打开后每收到一行 NMEA 就打一条 INFO。1 Hz × ~10 行/秒 ⇒ 串口很吵，
+            只建议接线排查时临时开。
+
+    config ONEYE_GNSS_TEST_FIX
+        bool "【仅验证用】注入一个模拟定位（室内联调经纬度链路时开）"
+        depends on ONEYE_GNSS_ENABLE
+        default n
+        help
+            ⚠️ **这不是产品功能**：打开后 `gnss_get()` 在真实定位无效时**返回一组写死的坐标**
+            （lat=39.9123456 / lon=116.4123456 / alt=43 m / speed=0.5 m/s / sats=9 / fix=3D），
+            串口会逐条打印「⚠️ GNSS 测试注入」字样。
+
+            为什么需要它：模组在室内永远拿不到定位（RMC=V / GGA 质量=0），若只在"有真定位"
+            时才能走到经纬度分支，那么 sub→BLE→网关→TLV→云端解码→影子这一整条路**要等到
+            户外才第一次执行**，等于把 bug 留到现场。室内用它把链路跑通后，**必须重建并回刷
+            默认构建（本项 = n）**；⛔ 生产构建永远不得打开。
+
 endmenu
 
 # =============================================================================
@@ -262,5 +350,56 @@ menu "oneye 甲型网关（上云 / BLE 配网）"
         help
             打开后把 wifi_prov / wifi_prov_ble / oneye_ble / oneye_link / oneye 五个 tag
             放宽到 DEBUG，并回显运行期日志级别。⛔ 不含密码 / 激活码 / chal / 令牌。
+
+    # =========================================================================
+    # 板载显示（ESP32-C6-GEEK 的 1.14" ST7789，240x135）
+    #
+    # 用户 2026-10-25 逐字：「其上屏幕需要实现简易的GUI，显示连接的温感子设备的温度数据
+    # 以及当前wifi连接状态（一个wifi图标展示是否连接以及信号强度），UI背景图在
+    # E:\Oneye\logo\oneye1.png」
+    #
+    # ⛔ 不引 LVGL：C6 无 PSRAM，稳态内部 RAM 只有 ~44 KB（真机实测，见
+    # logs/th-20261025-c6-smoke/EVIDENCE-C6-20261025.md §5），LVGL 的 draw buffer +
+    # 对象树会把余量吃光。本实现只常驻一个 240×15 的条带缓冲（7.2 KB）。
+    # =========================================================================
+    config ONEYE_T31_LCD_ENABLE
+        bool "启用板载 LCD 简易 GUI（温感温度 + WiFi 图标/信号强度）"
+        default y if IDF_TARGET_ESP32C6
+        default n
+        help
+            仅 ESP32-C6-GEEK（ST7789 135x240 横装）适用；S3 联调板（Korvo-2）没有这块屏，
+            缺省 n（打开会因引脚不匹配初始化失败，但不影响主功能）。
+
+    config ONEYE_T31_LCD_ROT
+        int "面板镜像档（0..3；换档必须重烧才生效）"
+        depends on ONEYE_T31_LCD_ENABLE
+        range 0 3
+        default 0
+        help
+            🔴 2026-10-25 真机照片订正：这块玻璃是 **135(W)×240(H) 竖屏**（官方 demo 口径：
+            hres=135 / vres=240 / **不 swap** / mirror(x,y) / gap(52,40)）。
+            第一版按横屏 240×135 + swap_xy 画，真机上是「转 90° + 每行错切 + 竖条纹」
+            —— CASET 只有 135 列，喂 240 像素/行会每行折到下一行。⛔ 不要回到横屏方案。
+
+            本项只切 MADCTL 的**镜像位**组合（换向/修反字用）：
+              0 = mirror(x=1, y=1)   （缺省，官方 demo 组合）
+              1 = mirror(x=1, y=0)
+              2 = mirror(x=0, y=1)
+              3 = mirror(x=0, y=0)
+            ⚠️ 判定方法：正常画面 WiFi 图标在**顶部**、温度大数字在**底部**、字是正的。
+
+    config ONEYE_T31_LCD_SWAP_BYTES
+        bool "备用：LCD 像素字节序用**软件**交换（面板不认 RAMCTRL 端序位时）"
+        depends on ONEYE_T31_LCD_ENABLE
+        default n
+        help
+            🔴 2026-10-25 真机「花图」根因 = RGB565 字节序：
+              IDF 的 st7789 驱动缺省把 RAMCTRL 写成**大端**（esp_lcd_panel_st7789.c:112 `ramctl_val_2=0xf0
+              // Use big endian by default`），而本工程的像素是**小端** RGB565（背景图工具产物就是 LE）
+              ⇒ 每个像素高低字节互换 ⇒ 红底变蓝紫 / 奶油字变暗绿，看起来就是花屏。
+            缺省 n = 走**硬件**端序位（`.data_endian = LCD_RGB_DATA_ENDIAN_LITTLE`，零 CPU 开销）。
+            ⚠️ 只有当画面**仍然颜色错乱**（说明这块 ST7789P3 不认 RAMCTRL 的端序位）才置 y：
+            那时本模块会保持面板大端、并在推每条带前逐像素交换（每帧约 3.4 万次操作，可忽略）。
+            ⛔ 与「色域/色彩深度」无关（面板就是 16 位 RGB565 = 65K 色），⛔ 也不是 SPI 性能问题。
 
 endmenu

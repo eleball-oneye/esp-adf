@@ -26,6 +26,7 @@
 set -euo pipefail
 
 ROLE="${1:-}"
+TARGET="${2:-s3}"        # s3（Korvo-2 / 双 S3 联调板，缺省）| c6（微雪 ESP32-C6-GEEK 网关目标板）
 PROJ_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_DIR"
 
@@ -36,39 +37,69 @@ fi
 
 build_one() {
     local role="$1"
+    local target="$2"
     local build defaults
 
-    case "$role" in
-    gw)
+    case "$role:$target" in
+    # ---- ESP32-S3（Korvo-2 网关 / 双 S3 联调）----
+    gw:s3)
         build="build-gw"
         defaults="sdkconfig.defaults;sdkconfig.defaults.esp32s3"
         ;;
-    sub)
+    sub:s3)
         build="build-sub"
         defaults="sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.defaults.subdev"
         ;;
+    # ---- ESP32-C6（微雪 C6-GEEK 网关；子设备可用 C6-ZERO，2026-10-25 起）----
+    # `sdkconfig.defaults.esp32c6.mem` 必须排最后：只收紧"看不见"的 WiFi/LWIP/NimBLE/dev-sdk
+    # 缓冲（不改 UI、不改业务），用来把断网重连时的 OOM 消掉（见该文件头注释）。
+    gw:c6)
+        build="build-gw-c6"
+        defaults="sdkconfig.defaults;sdkconfig.defaults.esp32c6;sdkconfig.defaults.esp32c6.mem"
+        ;;
+    # 2026-10-25：COM13 的 S3 板不再插，改用 **COM4 = ESP32-C6-ZERO** 当温感子设备模拟器
+    #   ⇒ 子设备角色也要能出 C6 构建。多叠一份 `sdkconfig.defaults.esp32c6.subdev`
+    #   （关 LCD、flash 按 8 MB），最后再叠 `sdkconfig.defaults.subdev`（角色/推送周期）。
+    sub:c6)
+        build="build-sub-c6"
+        defaults="sdkconfig.defaults;sdkconfig.defaults.esp32c6;sdkconfig.defaults.esp32c6.subdev;sdkconfig.defaults.subdev"
+        ;;
+    # ---- C6-GEEK 板载 LCD 背景图（烧到 model 分区，不参与编译）----
+    bg:c6|bg:s3)
+        build=""
+        defaults=""
+        ;;
     *)
-        echo "用法: bash tools/build-roles.sh <gw|sub|both>" >&2
+        echo "用法: bash tools/build-roles.sh <gw|sub|bg|both> [s3|c6]" >&2
+        echo "  例: bash tools/build-roles.sh gw          # S3 Korvo-2 网关" >&2
+        echo "      bash tools/build-roles.sh gw c6       # ESP32-C6-GEEK 网关（带屏）" >&2
+        echo "      bash tools/build-roles.sh sub         # S3 温感子设备模拟器" >&2
+        echo "      bash tools/build-roles.sh both        # 两块 S3 全编" >&2
         exit 2
         ;;
     esac
 
-    echo "== thermometer-t31 · 角色=$role · 构建目录=$build =="
+    if [[ "$role" == "bg" ]]; then
+        echo "== 背景图不参与编译：用 tools/mk-lcd-bg.py 生成 lcd-bg.bin 后按 0x410000 烧 =="
+        return 0
+    fi
+
+    echo "== thermometer-t31 · 角色=$role · 目标=$target · 构建目录=$build =="
     echo "   SDKCONFIG         = $build/sdkconfig"
     echo "   SDKCONFIG_DEFAULTS= $defaults"
     rm -rf "$build"
-    idf.py -B "$build" -DSDKCONFIG="$build/sdkconfig" -DSDKCONFIG_DEFAULTS="$defaults" set-target esp32s3
+    idf.py -B "$build" -DSDKCONFIG="$build/sdkconfig" -DSDKCONFIG_DEFAULTS="$defaults" set-target "esp32${target}"
     idf.py -B "$build" build
 }
 
 case "$ROLE" in
-gw|sub) build_one "$ROLE" ;;
+gw|sub) build_one "$ROLE" "$TARGET" ;;
 both)
-    build_one gw
-    build_one sub
+    build_one gw s3
+    build_one sub s3
     ;;
 *)
-    echo "用法: bash tools/build-roles.sh <gw|sub|both>" >&2
+    echo "用法: bash tools/build-roles.sh <gw|sub|bg|both> [s3|c6]" >&2
     exit 2
     ;;
 esac

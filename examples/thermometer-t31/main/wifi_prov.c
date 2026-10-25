@@ -39,6 +39,7 @@
 #include "esp_netif.h"
 #include "esp_event.h"
 #include "esp_wifi.h"
+#include "esp_coexist.h"     /* 2026-10-25：共存偏好「优先 Wi-Fi」（BLE 中央 + STA 抢射频时保云链路） */
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "freertos/FreeRTOS.h"
@@ -147,6 +148,15 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
             ESP_LOGI(TAG, "[diag] STA_START 分支 esp_wifi_connect() rc=%d(%s)",
                      (int)crc, esp_err_to_name(crc));
         }
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_BEACON_TIMEOUT) {
+        /* 🔴 2026-10-25〔设备侧稳定性〕把"听不到 AP beacon"单独留痕：
+         *   现场（final-watch.txt）云掉线前总是先出现 `DISCONNECTED reason=200`（BEACON_TIMEOUT）。
+         *   只做诊断计数/打印，⛔ 不改任何连接行为（重连仍由 DISCONNECTED 分支负责）。 */
+        static uint32_t s_beacon_timeouts;
+        s_beacon_timeouts++;
+        ESP_LOGW(TAG, "[wifi-health] ★ BEACON_TIMEOUT（累计 %u 次）⇒ 本机听不到 AP 信标，"
+                      "Wi-Fi 将按 driver 策略重连；如果频繁出现优先查共存/干扰/11ax",
+                 (unsigned)s_beacon_timeouts);
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         int reason = (data != NULL) ? (int)((wifi_event_sta_disconnected_t *)data)->reason : -1;
         s_connected = false;
@@ -502,6 +512,12 @@ static esp_err_t wifi_prov_connect(const char *ssid, const char *pass, uint32_t 
     if (pass) {
         snprintf((char *)sta.sta.password, sizeof(sta.sta.password), "%s", pass);
     }
+    /* 🔴 2026-10-25〔设备侧稳定性〕扫描策略：全信道扫描 + 按信号排序。
+     *   现场反复出现 `reason=201 (NO_AP_FOUND)`：快速扫描（只扫已知信道）在 AP 换信道/多 BSSID 时
+     *   会**漏掉**它。全信道扫描慢 ~1–2 s，但能找到 AP；按信号选 BSSID 可减少"连到远端 BSSID"的抖动。
+     *   ⚠️ 副作用：重连比原来慢 1–2 s（可接受，已有 15 s 退避与自愈兜底）。 */
+    sta.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    sta.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
     s_connected = false;
     s_ip[0] = '\0';
     xEventGroupClearBits(s_eg, WIFI_CONNECTED_BIT);
@@ -524,6 +540,32 @@ static esp_err_t wifi_prov_connect(const char *ssid, const char *pass, uint32_t 
     ESP_LOGI(TAG, "[diag] esp_wifi_start() rc=%d(%s)；STA_START 是否已发起连接=%d",
              (int)st_rc, esp_err_to_name(st_rc), s_sta_start_connect_issued ? 1 : 0);
     ESP_ERROR_CHECK(st_rc);
+    /* 🔴 2026-10-25〔云链路闪断修复〕**关掉 Wi-Fi 省电**。
+     *   现场：屏上"C"（云）间断闪烁，串口是
+     *     `Wi-Fi 断开（reason=200）`（200 = BEACON_TIMEOUT）+ `mqtt link down (reason=-4)`
+     *     ⇒ 云链路跟着断开重连。原因是本网关同时跑 **BLE 中心（连 T31，扫描 1000/200 ms）**
+     *     与 Wi-Fi STA，C6 的共存调度下默认 modem-sleep（WIFI_PS_MIN_MODEM）会漏 beacon。
+     *   网关是**常电设备**（不是纽扣电池节点）⇒ 没必要省这点电，关掉省电换来链路稳定。
+     *   ⚠️ 幂等：重复调用无害；只在任务上下文调用（本函数就是）。 */
+    esp_err_t ps_rc = esp_wifi_set_ps(WIFI_PS_NONE);
+    ESP_LOGI(TAG, "Wi-Fi 省电已关闭（WIFI_PS_NONE）rc=%d(%s) ⇒ 换来 BLE 共存下的 beacon 稳定",
+             (int)ps_rc, esp_err_to_name(ps_rc));
+    /* 🔴 2026-10-25〔设备侧稳定性·第二组〕
+     *   ① **关掉 11ax（HE）**：C6 缺省协议含 `WIFI_PROTOCOL_11AX`（见 IDF esp_wifi.h 注释），
+     *      现场 AP 侧若是 WiFi6/OFDMA/TWT，容易出现"信号 -40 dBm 却 BEACON_TIMEOUT"。
+     *      本项目上行只有 ~100 B/2 s，完全不需要 HE ⇒ 限制到 11b/g/n。
+     *      ⚠️ 副作用：峰值吞吐上限下降（对本业务无感）；极小概率遇到"仅 11ax"的 AP 会连不上（可回滚此项）。
+     *   ② **共存偏好 WiFi**：BLE 中央（连 T31）与 Wi-Fi 抢射频时优先保 Wi-Fi。
+     *      ⚠️ 副作用：T31 的 notify 可能被延迟/偶发丢一帧（2 s 一帧、断连有自愈重连，可接受）。 */
+    {
+        uint8_t proto = WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N;
+        esp_err_t prc = esp_wifi_set_protocol(WIFI_IF_STA, proto);
+        ESP_LOGI(TAG, "Wi-Fi protocol 限制到 11b/g/n（关 11ax）rc=%d(%s)", (int)prc, esp_err_to_name(prc));
+    }
+    {
+        esp_err_t crc2 = esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
+        ESP_LOGI(TAG, "共存偏好已设为「优先 Wi-Fi」rc=%d(%s)", (int)crc2, esp_err_to_name(crc2));
+    }
     if (!s_sta_start_connect_issued) {
         /* 🔴 2026-10-10〔诊断版 FIX-D1〕**BLE 通道从不发起连接的缺陷本体**。
          *

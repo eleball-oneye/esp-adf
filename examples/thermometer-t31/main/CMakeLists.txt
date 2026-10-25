@@ -21,6 +21,8 @@ idf_component_register(
          "ble_sig_material.c"
          "sntp_boot.c"
          "board_key.c"
+         "board_lcd.c"
+         "gnss_atgm336x.c"
     INCLUDE_DIRS "."
     REQUIRES oneye-link-sdk
              oneye-dev-sdk
@@ -34,4 +36,7 @@ idf_component_register(
              driver
              esp_timer
              esp_adc
+             esp_lcd
+             esp_coex
+             esp_partition
              lwip)

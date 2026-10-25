@@ -45,6 +45,7 @@
 #include "oneye_dev_sdk.h"   /* base（ack_command / strerror）+ event（event/up）+ types */
 #include "oneye_link.h"      /* link-sdk：档案注册/注销、主动断开、地址工具 */
 #include "oneye_link_profile.h"
+#include "oneye_link_tlv.h"  /* ONEYE_TLV_RAW_FRAME（子设备 GPS 帧的透传 TLV 兜底路径） */
 
 #include "gw_child.h"
 
@@ -71,8 +72,24 @@ static const char *TAG = "gw_child";
 #define GW_CHILD_RAW_CAP       32
 /* 🔴 2026-10-23：sub.telemetry 上报的 tlv 十六进制上限（字节数）—— 超过就截断并带 trunc 标记。
  *   事件库/云端对单条 data 有长度约束（真机 `invalid argument`）⇒ 只发可解码的最小集，
- *   `raw` 不再随 telemetry 上报（TLV 自带的 RAW_FRAME(0x80) 已覆盖"云端换解析器"的需求）。 */
-#define TELE_TLV_MAX           32u
+ *   `raw` 不再随 telemetry 上报（TLV 自带的 RAW_FRAME(0x80) 已覆盖"云端换解析器"的需求）。
+ * 🔴 2026-10-25：32 → **64**（旧值逐字留痕，⛔ 不抹：`#define TELE_TLV_MAX           32u`）。
+ *   原因：GNSS 定位并进温度帧 TLV 后总长 = 温度帧 TLV 18 B + GPS 26 B = **44 B**；
+ *   32 B 会把 GPS 标签整段截掉（截断标记不补发 ⇒ 云端永远收不到纬度）。 */
+#define TELE_TLV_MAX           64u
+
+/* GNSS 定位帧（子设备 cmd=0x02）与它并进 TLV 的标签/长度 —— 与
+ * oneye-link-sdk/docs/TLV-REGISTRY.md §5 的 0x50–0x55 逐字同源。 */
+#define GW_GPS_FRAME_LEN       18u   /* A6 02 <14 B payload> checksum 6A */
+#define GW_GPS_PAYLOAD_LEN     14u
+#define GW_GPS_FRESH_MS        30000 /* 30 s 内的定位才并进 telemetry（模组 1 Hz） */
+#define GW_TLV_GNSS_LAT        0x50u /* i32 BE 1e-7° */
+#define GW_TLV_GNSS_LON        0x51u /* i32 BE 1e-7° */
+#define GW_TLV_GNSS_ALT        0x52u /* i16 BE m */
+#define GW_TLV_GNSS_SPEED      0x53u /* u16 BE 0.01 m/s */
+#define GW_TLV_GNSS_SATS       0x54u /* u8 颗 */
+#define GW_TLV_GNSS_FIX        0x55u /* u8 0=未定位 1=2D 2=3D */
+#define GW_TLV_GNSS_BYTES      26u   /* 有定位时的全部 GPS 标签字节数（6+6+4+4+3+3） */
 
 /* 队列深度：命令很罕见（配对/解绑），子设备事件每 2 s 一帧 */
 #define GW_CHILD_CMD_Q_DEPTH   2
@@ -582,14 +599,257 @@ static bool emit_event(const char *type, const char *data_json)
 
 /* ---------------------------------------------------------------- 子设备事件处理（工作任务） */
 
+/* ========================================================================
+ * 🔴 2026-10-25：子设备 GNSS 定位（cmd 0x02）→ 并进温度帧的 TLV 上报
+ *
+ * 线协议（子设备 t31_sim.c 文件头）：`A6 02 <14 B LE payload> checksum 6A`，
+ *   payload = lat i32le(1e-7°) / lon i32le(1e-7°) / alt i16le(m) / speed u16le(0.01 m/s)
+ *             / sats u8 / fix u8(0 未定位 1 2D 2 3D)。
+ *
+ * ★ 为什么"先缓存、再并进温度帧"而不是直接把它当成一条 telemetry 上报：
+ *   · 云端 `decodeT31` 的硬判据是"这一帧必须有温度（0x10）"——单独一帧 GPS 会被整帧丢弃；
+ *   · 温度帧本来就按 CONFIG_ONEYE_T31_GW_SUB_TELE_MIN_MS 节流上报，把最近 30 s 内的定位
+ *     并进去，既不额外增加 event/up 频率，又保证"有温度就有定位（若有）"。
+ *   · 未定位（fix=0）时只并 sats/fix 两个标签：云端影子能看出"模组在、没信号"，
+ *     ⛔ 不会用 0/0 的假经纬度污染地图。
+ * ★ 云端标签口径（0x50–0x55）见 oneye-link-sdk/docs/TLV-REGISTRY.md §5；单位/大端与
+ *   TLV 编码一致（i32/i16/u16 均大端，与温度 0x10 同族）。
+ * ======================================================================== */
+
+typedef struct {
+    bool     valid;      /* 收到过合法定位帧 */
+    int32_t  lat_e7;
+    int32_t  lon_e7;
+    int16_t  alt_m;
+    uint16_t speed_cms;
+    uint8_t  sats;
+    uint8_t  fix;        /* 0 未定位 / 1 2D / 2 3D */
+    int64_t  ms;         /* 最近一次收到定位帧的本地毫秒（now_ms 口径） */
+} gw_gps_t;
+
+static gw_gps_t s_gps;
+static uint32_t s_gps_frames;      /* 累计收到的定位帧（诊断） */
+static uint32_t s_gps_bad;         /* 累计结构/校验失败的定位帧（诊断） */
+static uint32_t s_gps_merged;      /* 累计把 GPS 标签并进 telemetry 的帧数（诊断） */
+
+static int32_t gps_rd_i32le(const uint8_t *p)
+{
+    return (int32_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                     ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24));
+}
+
+static int16_t gps_rd_i16le(const uint8_t *p)
+{
+    return (int16_t)(uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+
+static uint16_t gps_rd_u16le(const uint8_t *p)
+{
+    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+
+/** 解一帧 `A6 02 …`；失败返回 false 且 ⛔ 不修改 out。 */
+static bool gw_gps_decode_frame(const uint8_t *frame, size_t len, gw_gps_t *out)
+{
+    gw_gps_t g = { 0 };
+    uint8_t sum = 0;
+
+    if (frame == NULL || out == NULL || len != GW_GPS_FRAME_LEN) {
+        return false;
+    }
+    if (frame[0] != 0xA6u || frame[1] != 0x02u || frame[GW_GPS_FRAME_LEN - 1u] != 0x6Au) {
+        return false;
+    }
+    for (size_t i = 1; i < GW_GPS_FRAME_LEN - 2u; i++) {   /* cmd + payload（不含 checksum/EOP） */
+        sum = (uint8_t)(sum + frame[i]);
+    }
+    if (sum != frame[GW_GPS_FRAME_LEN - 2u]) {
+        return false;
+    }
+    g.lat_e7 = gps_rd_i32le(frame + 2);
+    g.lon_e7 = gps_rd_i32le(frame + 6);
+    g.alt_m = gps_rd_i16le(frame + 10);
+    g.speed_cms = gps_rd_u16le(frame + 12);
+    g.sats = frame[14];
+    g.fix = (frame[15] <= 2u) ? frame[15] : 0u;
+    /* 合理性闸门：fix 有效才校经纬度范围（未定位时字段是 0/0，不是错误） */
+    if (g.fix != 0u &&
+        (g.lat_e7 < -900000000 || g.lat_e7 > 900000000 ||
+         g.lon_e7 < -1800000000 || g.lon_e7 > 1800000000)) {
+        return false;
+    }
+    if (g.fix == 0u) {
+        g.lat_e7 = 0;
+        g.lon_e7 = 0;
+        g.alt_m = 0;
+        g.speed_cms = 0;
+    }
+    g.valid = true;
+    *out = g;
+    return true;
+}
+
+/* TLV 写入小工具（大端）；缓冲不足返回原 used（调用方先算 needs） */
+static size_t tlv_put_u8(uint8_t *b, size_t used, uint8_t tag, uint8_t v)
+{
+    b[used++] = tag;
+    b[used++] = 1u;
+    b[used++] = v;
+    return used;
+}
+
+static size_t tlv_put_u16(uint8_t *b, size_t used, uint8_t tag, uint16_t v)
+{
+    b[used++] = tag;
+    b[used++] = 2u;
+    b[used++] = (uint8_t)(v >> 8);
+    b[used++] = (uint8_t)(v & 0xFFu);
+    return used;
+}
+
+static size_t tlv_put_i16(uint8_t *b, size_t used, uint8_t tag, int16_t v)
+{
+    return tlv_put_u16(b, used, tag, (uint16_t)v);
+}
+
+static size_t tlv_put_i32(uint8_t *b, size_t used, uint8_t tag, int32_t v)
+{
+    uint32_t u = (uint32_t)v;
+
+    b[used++] = tag;
+    b[used++] = 4u;
+    b[used++] = (uint8_t)(u >> 24);
+    b[used++] = (uint8_t)(u >> 16);
+    b[used++] = (uint8_t)(u >> 8);
+    b[used++] = (uint8_t)(u & 0xFFu);
+    return used;
+}
+
+/** 把 GPS 标签追加到 TLV（fix=0 时只写 0x54/0x55）。返回新的 used。 */
+static size_t gw_tlv_append_gps(uint8_t *buf, size_t used, const gw_gps_t *g)
+{
+    if (g->fix != 0u) {
+        used = tlv_put_i32(buf, used, GW_TLV_GNSS_LAT, g->lat_e7);
+        used = tlv_put_i32(buf, used, GW_TLV_GNSS_LON, g->lon_e7);
+        used = tlv_put_i16(buf, used, GW_TLV_GNSS_ALT, g->alt_m);
+        used = tlv_put_u16(buf, used, GW_TLV_GNSS_SPEED, g->speed_cms);
+    }
+    used = tlv_put_u8(buf, used, GW_TLV_GNSS_SATS, g->sats);
+    used = tlv_put_u8(buf, used, GW_TLV_GNSS_FIX, g->fix);
+    return used;
+}
+
+/** 处理一帧定位帧（cmd 0x02）：优先用原始 notify 字节（e->raw），退回 TLV 0x80 里的原始帧。 */
+static void gw_gps_on_frame(const gw_sub_evt_t *e)
+{
+    gw_gps_t g = { 0 };
+    bool ok = false;
+    const uint8_t *frame = NULL;
+    size_t len = 0;
+
+    if (e->raw_len == GW_GPS_FRAME_LEN) {
+        frame = e->raw;
+        len = e->raw_len;
+    } else if (e->tlv_len >= (2u + GW_GPS_FRAME_LEN) && e->tlv[0] == ONEYE_TLV_RAW_FRAME &&
+               e->tlv[1] == GW_GPS_FRAME_LEN) {
+        frame = e->tlv + 2;
+        len = GW_GPS_FRAME_LEN;
+    }
+    if (frame != NULL) {
+        ok = gw_gps_decode_frame(frame, len, &g);
+    }
+    if (!ok) {
+        s_gps_bad++;
+        if ((s_gps_bad % 20u) == 1u) {
+            ESP_LOGW(TAG, "[gnss] 定位帧解不出（累计 %u 帧坏）raw_len=%u tlv_len=%u cmd=0x%02X",
+                     (unsigned)s_gps_bad, (unsigned)e->raw_len, (unsigned)e->tlv_len,
+                     (unsigned)e->cmd);
+        }
+        return;
+    }
+    g.ms = now_ms();
+    s_gps = g;
+    s_gps_frames++;
+    if ((s_gps_frames % 5u) == 1u) {
+        if (g.fix != 0u) {
+            ESP_LOGI(TAG, "[gnss] 定位帧 #%u：fix=%u sats=%u lat=%.7f lon=%.7f alt=%d m "
+                          "speed=%.2f m/s ⇒ 已缓存，随下一帧温度并入 TLV",
+                     (unsigned)s_gps_frames, (unsigned)g.fix, (unsigned)g.sats,
+                     (double)g.lat_e7 / 1e7, (double)g.lon_e7 / 1e7, (int)g.alt_m,
+                     (double)g.speed_cms / 100.0);
+        } else {
+            ESP_LOGI(TAG, "[gnss] 定位帧 #%u：**未定位** fix=0 sats=%u（室内属正常；"
+                          "已缓存 sats/fix，经纬度等高等着）",
+                     (unsigned)s_gps_frames, (unsigned)g.sats);
+        }
+    }
+}
+
+/** 简化 JSON 字符串转义（真机事故：手写拼串遇到引号/反斜杠就产出非法 JSON）。
+ *  本工程 node/model 来自 NVS/档案，理论上很短且受控，但仍按 JSON 规则转义。 */
+static void json_escape_copy(char *dst, size_t cap, const char *src)
+{
+    size_t o = 0;
+
+    if (dst == NULL || cap == 0) {
+        return;
+    }
+    for (const char *p = src; p != NULL && *p != '\0'; p++) {
+        unsigned char c = (unsigned char)*p;
+
+        if (o + 8u >= cap) {
+            break;
+        }
+        if (c == '"' || c == '\\') {
+            dst[o++] = '\\';
+            dst[o++] = (char)c;
+        } else if (c >= 0x20u && c < 0x7Fu) {
+            dst[o++] = (char)c;
+        } else {
+            int w = snprintf(dst + o, cap - o, "\\u%04X", (unsigned)c);
+            if (w <= 0) {
+                break;
+            }
+            o += (size_t)w;
+        }
+    }
+    dst[o] = '\0';
+}
+
+/** 组装 sub.telemetry 的 data（手写，⛔ 不用 cJSON：C6 无 PSRAM，Wi-Fi 重连时堆只剩 ~10 KB，
+ *  真机就在这段出现过 `cJSON OOM ⇒ 本帧丢弃`）。返回 false = 超缓冲。 */
+static bool build_telemetry_json(char *out, size_t cap, const char *node, const char *model,
+                                 int rssi, uint8_t cmd, const char *tlv_hex, bool cut)
+{
+    char esc_node[(GW_CHILD_NODE_MAX * 6u) + 1u];
+    char esc_model[(GW_CHILD_MODEL_MAX * 6u) + 1u];
+    int n;
+
+    json_escape_copy(esc_node, sizeof(esc_node), node);
+    json_escape_copy(esc_model, sizeof(esc_model), model);
+    n = snprintf(out, cap,
+                 "{\"node\":\"%s\",\"model\":\"%s\",\"rssi\":%d,\"cmd\":\"0x%02X\",\"tlv\":\"%s\"%s",
+                 esc_node, esc_model, rssi, (unsigned)cmd, tlv_hex,
+                 cut ? ",\"trunc\":true" : "");
+    if (n < 0 || (size_t)n + 2u > cap) {
+        return false;
+    }
+    out[n++] = '}';
+    out[n] = '\0';
+    return true;
+}
+
 static void handle_sub(const gw_sub_evt_t *e)
 {
     /* 🔴 2026-10-23（真机 `event/up sub.telemetry 失败：invalid argument`）：载荷**瘦身**——
      *   · data 只发最小可解码集：`{"node","model","rssi","cmd","tlv"}`；
      *   · ⛔ 不再带 `raw`（原始 notify 帧）：TLV 里的 RAW_FRAME(0x80) 已能承担"云端换解析器"，
      *     双份 hex 会把单条 data 撑长（真机事件库校验直接 ERR_INVALID）；
-     *   · `tlv` 最多 TELE_TLV_MAX(32) 字节 → 64 个十六进制字符，超出截断并带 `"trunc":true`。 */
-    char data[256];
+     *   · `tlv` 最多 TELE_TLV_MAX(64) 字节 → 128 个十六进制字符，超出截断并带 `"trunc":true`。
+     *   🔴 2026-10-25：data[256] → **[320]**（旧值逐字留痕，⛔ 不抹：`char data[256];`）。
+     *      64 B TLV = 128 hex 字符，加上 node/model/rssi/cmd 后约 200–230 B，256 只剩一点余量；
+     *      而超长是**整帧丢弃**（不是截断）⇒ 给足余量。 */
+    char data[320];
     char tlv_hex[(TELE_TLV_MAX * 2u) + 1u];
     int idx;
 
@@ -632,6 +892,15 @@ static void handle_sub(const gw_sub_evt_t *e)
     case GW_SUB_KIND_TELEMETRY: {
         const int64_t now = now_ms();
 
+        /* 🔴 2026-10-25：cmd=0x02 = 子设备的 GNSS 定位帧（本仓对 T31 模拟器的扩展命令）。
+         *   ⛔ 不当成一条 telemetry 上报 —— 云端 decodeT31 要求"这一帧必须有温度"，
+         *   单独一帧 GPS 会被整帧丢弃；⇒ 只解出来缓存，随下一帧温度并入 TLV。
+         *   定位帧**不参与**温度节流（否则 2 s 的温度窗口会把它一起挡掉）。 */
+        if (e->has_cmd && e->cmd == 0x02u) {
+            gw_gps_on_frame(e);
+            return;
+        }
+
         /* 节流：同频上报没有意义（子设备 2 s 一帧 × 多子设备会把 event/up 打爆）。
          * 失败**不推进**节流位 ⇒ 下一帧立刻重试，不用等满一个窗口。 */
         if (s_last_tele_ms != 0 &&
@@ -644,52 +913,45 @@ static void handle_sub(const gw_sub_evt_t *e)
             return;
         }
 
-        /* 瘦身后只发最小集：node/model/rssi/cmd/tlv；tlv 超 32 B 截断并带 trunc 标记。
-         * 🔴 2026-10-23 真机收尾修复：手写 snprintf 拼串只要 `node`/`model` 里混进一个
-         *   **双引号 / 反斜杠 / 控制字符**，输出就是非法 JSON（真机现象：data_len=103 但
-         *   json_obj=0 ⇒ SDK 返回 ERR_INVALID）。⇒ 改用 **cJSON 组装**：字符串转义由
-         *   `cJSON_PrintUnformatted()` 负责，结构上保证是合法 JSON 对象。 */
+        /* 2026-10-25：TLV = 档案解出的温度/电池 TLV +（有则）GPS 标签 0x50–0x55。
+         * 🔴 2026-10-23 真机收尾修复保留：手写拼串遇到引号/反斜杠会产出非法 JSON ⇒
+         *   这里用 build_telemetry_json()（内置转义），⛔ 不再走 cJSON（C6 无 PSRAM，
+         *   Wi-Fi 重连时堆只剩 ~10 KB，真机在这段出现过 `cJSON OOM ⇒ 本帧丢弃`）。 */
         {
-            size_t n = (e->tlv_len < TELE_TLV_MAX) ? e->tlv_len : (size_t)TELE_TLV_MAX;
-            bool cut = (e->tlv_len > n) || e->tlv_trunc;
-            char cmd_str[8];
-            cJSON *o;
+            uint8_t tlvbuf[TELE_TLV_MAX];
+            size_t tlv_used = (e->tlv_len < sizeof(tlvbuf)) ? e->tlv_len : sizeof(tlvbuf);
+            size_t gps_need = 0;
+            bool have_gps = s_gps.valid && (now - s_gps.ms) <= GW_GPS_FRESH_MS;
+            size_t n;
+            bool cut;
 
-            hex_upper(e->tlv, n, tlv_hex, sizeof(tlv_hex));
-            (void)snprintf(cmd_str, sizeof(cmd_str), "0x%02X", (unsigned)e->cmd);
-            o = cJSON_CreateObject();
-            if (o == NULL) {
-                ESP_LOGE(TAG, "sub.telemetry data 组装失败（cJSON OOM）⇒ 本帧丢弃");
+            memcpy(tlvbuf, e->tlv, tlv_used);
+            if (have_gps) {
+                gps_need = (s_gps.fix != 0u) ? GW_TLV_GNSS_BYTES : 6u;
+                if (tlv_used + gps_need <= sizeof(tlvbuf)) {
+                    tlv_used = gw_tlv_append_gps(tlvbuf, tlv_used, &s_gps);
+                } else {
+                    ESP_LOGW(TAG, "TLV 放不下 GPS（%u + %u > %u）⇒ 本帧只报温度",
+                             (unsigned)tlv_used, (unsigned)gps_need, (unsigned)sizeof(tlvbuf));
+                }
+            }
+            n = (tlv_used < TELE_TLV_MAX) ? tlv_used : (size_t)TELE_TLV_MAX;
+            cut = (tlv_used > n) || e->tlv_trunc;
+
+            hex_upper(tlvbuf, n, tlv_hex, sizeof(tlv_hex));
+            if (!build_telemetry_json(data, sizeof(data), s_binds[idx].node, s_binds[idx].model,
+                                      (int)e->rssi, e->cmd, tlv_hex, cut)) {
+                ESP_LOGW(TAG, "sub.telemetry data 超过缓冲（上限 %u B）⇒ 本帧丢弃",
+                         (unsigned)sizeof(data));
                 return;
             }
-            (void)cJSON_AddStringToObject(o, "node", s_binds[idx].node);
-            (void)cJSON_AddStringToObject(o, "model", s_binds[idx].model);
-            (void)cJSON_AddNumberToObject(o, "rssi", (int)e->rssi);
-            (void)cJSON_AddStringToObject(o, "cmd", cmd_str);
-            (void)cJSON_AddStringToObject(o, "tlv", tlv_hex);
-            if (cut) {
-                (void)cJSON_AddBoolToObject(o, "trunc", true);
-            }
-            {
-                char *txt = cJSON_PrintUnformatted(o);
-
-                if (txt == NULL) {
-                    ESP_LOGE(TAG, "sub.telemetry data 打印失败（cJSON OOM）⇒ 本帧丢弃");
-                    cJSON_Delete(o);
-                    return;
+            if (have_gps) {
+                s_gps_merged++;
+                if ((s_gps_merged % 10u) == 1u) {
+                    ESP_LOGI(TAG, "[gnss] 已并入 TLV：fix=%u sats=%u（tlv=%u B）",
+                             (unsigned)s_gps.fix, (unsigned)s_gps.sats, (unsigned)tlv_used);
                 }
-                /* 事件 data 契约上限 ~158 B（真机 OY 云端/事件帧口径）⇒ 超了就丢，⛔ 不截断成非法 JSON */
-                if (strlen(txt) >= sizeof(data)) {
-                    ESP_LOGW(TAG, "sub.telemetry data 超过缓冲（%u B）⇒ 本帧丢弃",
-                             (unsigned)strlen(txt));
-                    cJSON_free(txt);
-                    cJSON_Delete(o);
-                    return;
-                }
-                (void)snprintf(data, sizeof(data), "%s", txt);
-                cJSON_free(txt);
             }
-            cJSON_Delete(o);
         }
 
         if (emit_event(GW_EVT_SUB_TELEMETRY, data)) {
@@ -1078,6 +1340,58 @@ void gw_child_profile_selftest(void)
     } else {
         ESP_LOGI(TAG, "[自检] ✅ 通过：frame{} 与 SIM 档字段映射自洽（真机若仍 passthrough ⇒"
                       "检查运行时生效档是否被 NVS/云端档覆盖）");
+    }
+
+    /* 🔴 2026-10-25：GNSS 定位帧（cmd 0x02）**离线自检** —— 用硬编码样本帧走一遍网关侧解码。
+     *   为什么必须在开机自检里验一次：室内/无天线时模组一直 fix=0，**真机根本走不到有经纬度
+     *   的分支**；若把"解码/并 TLV"这段留到有信号时才第一次执行，等于把 bug 留到户外现场。
+     *   样本值：lat 39.9123456° / lon 116.4123456° / alt 43 m / speed 0.50 m/s / sats 9 / fix 2。 */
+    {
+        gw_gps_t g;
+        uint8_t f[GW_GPS_FRAME_LEN] = { 0 };
+        int32_t lat = 399123456;
+        int32_t lon = 1164123456;
+        int16_t alt = 43;
+        uint16_t spd = 50;
+        uint8_t sum = 0;
+        bool dok;
+
+        f[0] = 0xA6u;
+        f[1] = 0x02u;
+        f[2] = (uint8_t)((uint32_t)lat & 0xFFu);
+        f[3] = (uint8_t)(((uint32_t)lat >> 8) & 0xFFu);
+        f[4] = (uint8_t)(((uint32_t)lat >> 16) & 0xFFu);
+        f[5] = (uint8_t)(((uint32_t)lat >> 24) & 0xFFu);
+        f[6] = (uint8_t)((uint32_t)lon & 0xFFu);
+        f[7] = (uint8_t)(((uint32_t)lon >> 8) & 0xFFu);
+        f[8] = (uint8_t)(((uint32_t)lon >> 16) & 0xFFu);
+        f[9] = (uint8_t)(((uint32_t)lon >> 24) & 0xFFu);
+        f[10] = (uint8_t)((uint16_t)alt & 0xFFu);
+        f[11] = (uint8_t)(((uint16_t)alt >> 8) & 0xFFu);
+        f[12] = (uint8_t)(spd & 0xFFu);
+        f[13] = (uint8_t)((spd >> 8) & 0xFFu);
+        f[14] = 9u;
+        f[15] = 2u;
+        for (size_t i = 1; i < GW_GPS_FRAME_LEN - 2u; i++) {
+            sum = (uint8_t)(sum + f[i]);
+        }
+        f[GW_GPS_FRAME_LEN - 2u] = sum;
+        f[GW_GPS_FRAME_LEN - 1u] = 0x6Au;
+
+        dok = gw_gps_decode_frame(f, sizeof(f), &g);
+        if (!dok || !g.valid || g.fix != 2u || g.sats != 9u ||
+            g.lat_e7 != lat || g.lon_e7 != lon || g.alt_m != alt || g.speed_cms != spd) {
+            ESP_LOGE(TAG, "[自检] ❌ GPS 样本帧解码失败（ok=%d lat=%ld lon=%ld alt=%d spd=%u fix=%u）"
+                          "⇒ GPS 帧格式与网关解码不一致，按 t31_sim.c 文件头订正",
+                     (int)dok, (long)g.lat_e7, (long)g.lon_e7, (int)g.alt_m,
+                     (unsigned)g.speed_cms, (unsigned)g.fix);
+        } else {
+            ESP_LOGI(TAG, "[自检] ✅ GPS 样本帧 %u B → lat=%.7f lon=%.7f alt=%d m speed=%.2f m/s "
+                          "sats=%u fix=%u（TLV 将并出 26 B：0x50–0x55）",
+                     (unsigned)sizeof(f), (double)g.lat_e7 / 1e7, (double)g.lon_e7 / 1e7,
+                     (int)g.alt_m, (double)g.speed_cms / 100.0,
+                     (unsigned)g.sats, (unsigned)g.fix);
+        }
     }
 }
 

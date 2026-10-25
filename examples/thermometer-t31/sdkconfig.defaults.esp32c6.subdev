@@ -1,0 +1,33 @@
+# =============================================================================
+# thermometer-t31 —— **ESP32-C6 子设备角色（温感模拟器）** 板级预设
+#
+# 叠加顺序（本文件必须排在 `sdkconfig.defaults.esp32c6` **之后**、`sdkconfig.defaults.subdev` 之前）：
+#   sdkconfig.defaults ; sdkconfig.defaults.esp32c6 ; sdkconfig.defaults.esp32c6.subdev ; sdkconfig.defaults.subdev
+#
+# 2026-10-25 新增原因（用户口径）：COM13 那块 S3 板不再插，改用 **COM4 = ESP32-C6-ZERO** 开发板
+#   充当温感子设备模拟器（广播名 T31-xxxx / 服务 FFF0 / notify FFF1，周期性推温度帧）。
+#   ⇒ 子设备角色也要能出 **C6** 构建，否则每次换板都要重新找 S3。
+#
+# 与「C6-GEEK 网关」那份的唯一差别：
+#   ① ⛔ 不开 LCD —— 子设备没有屏，开着会白占 ~17–25 KB 内部 RAM（C6 无 PSRAM，实测很紧）；
+#   ② flash 按 8 MB（C6-ZERO 实板 `flash_id` = Manufacturer 0x20 / Device 0x4017 / 8 MB），
+#      而 C6-GEEK 网关板是 16 MB。分区表沿用工程那份（factory 4 MB + model 1 MB + creds 16 KB +
+#      storage 1 MB ⇒ 到 0x614000 ≈ 6.08 MB），8 MB 板装得下；creds 仍固定在 0x510000。
+# =============================================================================
+
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="8MB"
+
+# ---- 子设备没有屏：关掉 LCD（省内部 RAM），也避免编译期把 ST7789 拉进来 ----
+# CONFIG_ONEYE_T31_LCD_ENABLE is not set
+
+# ---- GNSS：ATGM336H-5N 接在 UART1（方案 A：TX=GPIO20 / RX=GPIO21 / PPS=GPIO22）----
+# 依据：微雪 C6-ZERO 官方 pinout（排针右侧三针相邻）+ ESP32-C6 数据手册（避开 strapping/
+# USB/JTAG/UART0-console）；模组 9600 8N1、3.3 V TTL、上电即输出 NMEA 1 Hz。
+CONFIG_ONEYE_GNSS_ENABLE=y
+CONFIG_ONEYE_GNSS_UART_NUM=1
+CONFIG_ONEYE_GNSS_TX_GPIO=20
+CONFIG_ONEYE_GNSS_RX_GPIO=21
+CONFIG_ONEYE_GNSS_PPS_GPIO=22
+CONFIG_ONEYE_GNSS_BAUD=9600
+# CONFIG_ONEYE_GNSS_LOG_RAW is not set

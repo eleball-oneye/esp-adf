@@ -61,6 +61,15 @@ static inline uint16_t oneye_status_period_for_model(const char *product_key)
     if (strcmp(product_key, "OY-SPK-03") == 0) {
         return 300u; /* 丙型不建云链路 ⇒ 该值不会被使用 */
     }
+    /* 🆕 2026-10-23（TH-20261023 批次）：机型自助化后新增的两款机型的 H。
+     *   云端机型表单里的「在线心跳周期 H」必须与这里**同值**（⛔ 两侧口径不得分叉）：
+     *   OY-GAW-01（USB 网关，甲型，直连云）= 60；OY-THE-01（体温贴，由网关代报，不直连）= 300。 */
+    if (strcmp(product_key, "OY-GAW-01") == 0) {
+        return 60u;
+    }
+    if (strcmp(product_key, "OY-THE-01") == 0) {
+        return 300u;
+    }
     return (uint16_t)ONEYE_STATUS_PERIOD_FALLBACK_S;
 }
 

@@ -70,3 +70,7 @@ examples/oneye/korvo2_oneye/main/certs/
 # oneye 甲型固件本机并行构建目录（idf.py -B build-alpha*/ 生成，含 CMakeCache/sdkconfig/对象文件）
 #   实测这批目录此前未被忽略（一个 build-alpha/ 就有数万文件），一律不入库。
 examples/oneye/korvo2_oneye/build-alpha*/
+
+# 构建产物（2026-10-25：build-* 曾误入库，已移除跟踪；本地仍可保留）
+build/
+build-*/

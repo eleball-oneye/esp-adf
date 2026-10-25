@@ -1,0 +1,850 @@
+/*
+ * wifi_prov.c —— Wi-Fi 配网实现（口径见 wifi_prov.h）
+ *
+ * ★ 本模块是「入网后收敛点」的**唯一持有者**（ADR-0017 D2）★
+ *   所有配网通道（C1/C2 BLE、C3 凭据文件、C4 台面 API、C5 Kconfig）都只是**把凭据交进来**；
+ *   「入网成功 ⇒ 触发上云」这件事**只**发生在下面 `on_wifi_event()` 的 GOT_IP 分支里
+ *   （→ `s_ready_cb()` → `devkitc_oneye_main.c:on_wifi_ready()` → `oneye_start()`）。
+ *   ⛔ 新增通道时不要在本文件之外复制这段逻辑；也不要在这里按通道分叉「入网后做什么」——
+ *      下游（面板/授时/net_probe/影子/埋点）对**所有**通道是同一条路径，这正是本设计的价值。
+ *      ★ 2026-10-07：`net_probe` 与 `sntp` 原先只挂在 C3/C5 的启动路径上（BLE 通道会跳过），
+ *      现已收进该下游；门禁 `tools/check-prov-convergence.py` 的 A11/A12 机械断言这件事。
+ *
+ * ★ 本模块同时是**优先级判据的唯一落码点**（ADR-0017 D2/D4）★
+ *   优先级 = **SD 卡 WiFi 凭据 > 蓝牙配网 > 其他（声波/二维码等预留）**，语义是
+ *   「同一台设备上多通道都可得时**谁先被采信**」，**不是**互斥开关。判据本体在
+ *   `wifi_prov_policy.h`（纯逻辑，与主机侧单测 `tools/test-prov-priority.c` 编译**同一份源**），
+ *   本文件只负责 ① 保存采信槽（`s_held_*`）② 按判据决定采信/拒绝 ③ **采信的**才交给连接层。
+ *   ⛔ 连接层 `wifi_prov_connect()` 已收为 `static`：**模块外没有任何路径能绕过判据发起入网**。
+ *   ⛔ 已入网（拿到 IP）之后一律拒绝 —— **只入网一次**；显式改配 / `prov.reset` 走
+ *      `wifi_prov_release_held()` 这条**显式**路径（调用方自己声明"这是重新配网"）。
+ *   ★ 2026-10-12（用户裁定，最高依据）：上面这条"已入网一律拒绝"**多了一个例外** ——
+ *      **App（BLE 通道 C1/C2）发起的配网是权威通道，一经受理即权威生效**：
+ *      设备**先 `esp_wifi_disconnect()` 断开现有连接**、丢弃旧配置的采信态，
+ *      再 `esp_wifi_set_config(新凭据)` → `esp_wifi_connect()`（"断旧连新"）。
+ *      用户裁定逐字：「**已有app发起配网时设备要断现有wifi重新连接目标wifi**，否则app会卡在配网中这个流程。」
+ *      ⛔ 该放宽**只对 BLE 通道**（`wifi_prov_channel_is_authoritative()`），
+ *      C3 凭据文件 / C4 台面改配 / C5 兜底的优先级语义**一字未改**。
+ *   所有拒绝/抢占都在串口留痕（统一前缀 `[prov-priority]`；"断旧连新"用 `[prov-switch]`），
+ *   不是静默丢弃。
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+#include "esp_log.h"
+#include "esp_err.h"
+#include "esp_netif.h"
+#include "esp_event.h"
+#include "esp_wifi.h"
+#include "nvs_flash.h"
+#include "nvs.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "freertos/semphr.h"
+
+#include "wifi_prov.h"
+
+static const char *TAG = "wifi_prov";
+
+#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_PROV_DEFAULT_TIMEOUT_MS 20000
+
+static EventGroupHandle_t s_eg;
+static bool s_inited;
+static volatile bool s_connected;
+/* 🔴 2026-10-10〔诊断版 FIX-D1〕**STA_START 是否已经替我们发起过连接**。
+ * 为什么需要这个位（配网 BLE 通道的真机缺陷，逐段见 wifi_prov_connect 的注释）：
+ *   `esp_wifi_connect()` 在本文件里**只有两处**调用点（STA_START 事件、DISCONNECTED 事件），
+ *   而 BLE 通道**先扫描**（`wifi_prov_prepare_scan()` 里 `s_scan_only=true` 之后才 `esp_wifi_start()`）
+ *   ⇒ STA_START 派发时被 `s_scan_only` 挡掉；等到 `prov.connect.req` 走到 `wifi_prov_connect()`
+ *   时 Wi-Fi **已经在跑**，`esp_wifi_start()` 是幂等的（**不再派发 STA_START**）
+ *   ⇒ 这一路上**没有任何人**调 `esp_wifi_connect()` ⇒ 站点从不发起连接、等到 20 s 超时。
+ *   本标志 = 「本次 set_config 之后，STA_START 处理器是否已经发起过连接」：
+ *   置位者 = on_wifi_event 的 STA_START 分支；清零者 = wifi_prov_connect（每次重配前）。
+ *   ⇒ C3/C5 通道（未扫描过、start 会派发 STA_START）行为**逐字不变**；
+ *      BLE 通道则补上这一次显式发起（这正是缺陷本体）。 */
+static volatile bool s_sta_start_connect_issued;
+/* 扫描态：为 C1/C2 的 AP 扫描把 Wi-Fi 起起来，但**不**自动重连（否则无凭据时空转刷屏）。
+ * 一旦某通道提交了凭据（wifi_prov_submit_credentials*），本标志清零。 */
+static volatile bool s_scan_only;
+/* 🔴 2026-10-12〔本批：App 发起配网 = 断旧连新〕**权威通道重新配网进行中**。
+ * 为什么需要它：`esp_wifi_disconnect()` 会派发 `WIFI_EVENT_STA_DISCONNECTED`，而
+ * `on_wifi_event()` 的断开分支**默认立刻 `esp_wifi_connect()` 重连**；那一刻 STA 里
+ * 还是**旧配置** ⇒ "换网"会退化成"重连旧网"（旧 SSID 仍被使用，App 仍卡在配网中）。
+ * 置位者 = `wifi_prov_submit_credentials_src()` 的权威重配前置段（断链之前）；
+ * 清零者 = `wifi_prov_connect()` 内 `esp_wifi_set_config()` **成功之后**
+ * （新配置已落到 STA ⇒ 之后的自动重连都用新配置），并在提交路径末尾兜底清零。 */
+static volatile bool s_reprovision;
+/* 🔴 2026-10-21〔BOOT 长按忘记 WiFi 批 · 两例程同批〕**"操作者已显式忘记凭据"** 抑制位。
+ * 为什么需要它：`esp_wifi_disconnect()` 会派发 `WIFI_EVENT_STA_DISCONNECTED`，而
+ *   `on_wifi_event()` 的断开分支**默认立刻 `esp_wifi_connect()` 重连**（那一刻 STA 里还是旧配置）
+ *   ⇒ "忘记 WiFi" 会退化成"每 1–2 s 用旧 SSID 重试一次"，串口刷屏、且与用户意图相反。
+ * 置位者 = `wifi_prov_forget_wifi()`（BOOT 长按 / 重配入口）；清零者 = `wifi_prov_connect()`
+ *   （新凭据已落到 STA ⇒ 恢复"断线自动重连"的既有语义）。
+ * ⛔ 它**不**参与优先级判据：采信槽仍只由 `s_held_valid/s_held_chan` 表达。 */
+static volatile bool s_forgotten;
+static char s_ip[20];
+static char s_ssid[WIFI_PROV_SSID_MAX];
+static char s_source[48];
+static wifi_prov_ready_cb_t s_ready_cb;
+/* 🔴 2026-10-12〔本批〕**会话结束**通知位（见 wifi_prov.h 的同名 API 注释）：
+ *   置位者 = 应用侧（`devkitc_oneye_main.c` 的 `app_main()`，与 ready 回调同一处生命周期注册）；
+ *   调用者 = 下面 `on_wifi_event()` 的 `WIFI_EVENT_STA_DISCONNECTED` 分支。
+ *   ⛔ 本模块不解释它的应用层含义；⛔ 它不参与任何"要不要重连"的判断。 */
+static wifi_prov_disconnected_cb_t s_disconnected_cb;
+
+/* ★ 采信槽（ADR-0017 D2/D4）：**当前被采信的那一份凭据来自哪条通道**。
+ * 同一时刻只有一份被采信；`wifi_prov_policy_decide()` 用它做优先级比较。
+ * 只有三处能改它：submit（采信）、release_held（显式释放）、forget（回到未配网态）。 */
+static bool s_held_valid;
+static wifi_prov_channel_t s_held_chan = WIFI_PROV_CHAN_UNKNOWN;
+/* 拒绝计数（留痕可量化：串口日志之外，还能在调试时一眼看出"是不是一直被拒"）。 */
+static unsigned s_reject_lower;
+static unsigned s_reject_already_up;
+
+bool wifi_prov_is_connected(void)   { return s_connected; }
+const char *wifi_prov_ip(void)      { return s_ip; }
+const char *wifi_prov_ssid(void)    { return s_ssid; }
+const char *wifi_prov_source(void)  { return s_source; }
+
+const char *wifi_prov_channel_source(wifi_prov_channel_t ch)
+{
+    switch (ch) {
+    case WIFI_PROV_CHAN_FILE:    return "file";
+    case WIFI_PROV_CHAN_BLE:     return "ble";
+    case WIFI_PROV_CHAN_API:     return "api";
+    case WIFI_PROV_CHAN_KCONFIG: return "kconfig";
+    case WIFI_PROV_CHAN_NVS:     return "nvs";
+    /* 预留通道**没有**实现：走到这里说明有人只登记了枚举、没登记来源字符串（见 wifi_prov.h
+     * 的「新增通道步骤 ①」）。返回 "unknown" 而不是编一个像样的名字，免得日志看起来像已实现。 */
+    case WIFI_PROV_CHAN_SONIC:
+    case WIFI_PROV_CHAN_QRCODE:
+    case WIFI_PROV_CHAN_UNKNOWN:
+    default:                     return "unknown";
+    }
+}
+
+void wifi_prov_set_ready_cb(wifi_prov_ready_cb_t cb) { s_ready_cb = cb; }
+void wifi_prov_set_disconnected_cb(wifi_prov_disconnected_cb_t cb) { s_disconnected_cb = cb; }
+
+static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    (void)arg;
+    /* 诊断留痕（2026-10-10）：把「事件是否到达 / 被哪条分支吃掉」讲清楚。
+     * ⛔ 只打事件名与原因码，⛔ 不打密码（ssid 沿用既有口径，不属于本文件的机密面）。 */
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        ESP_LOGI(TAG, "[diag] WIFI_EVENT_STA_START：s_scan_only=%d ⇒ %s",
+                 s_scan_only ? 1 : 0,
+                 s_scan_only ? "扫描态，本次**不**发起连接（由 connect 路径显式发起）"
+                             : "发起 esp_wifi_connect()");
+        if (!s_scan_only) {
+            esp_err_t crc = esp_wifi_connect();
+            s_sta_start_connect_issued = (crc == ESP_OK);
+            ESP_LOGI(TAG, "[diag] STA_START 分支 esp_wifi_connect() rc=%d(%s)",
+                     (int)crc, esp_err_to_name(crc));
+        }
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        int reason = (data != NULL) ? (int)((wifi_event_sta_disconnected_t *)data)->reason : -1;
+        s_connected = false;
+        s_ip[0] = '\0';
+        /* 🔴 2026-10-12〔本批〕**会话结束**：这一次配网会话到此为止 ⇒ 通告应用侧
+         *   （应用侧据此复位 `prov.status{connected}` 的"只报一次"幂等位；本体 = wifi_prov_status.h 的 ④）。
+         * ⛔ 位置**故意在**下面那个 `s_scan_only || s_reprovision` 分支**之前**：
+         *   权威通道"断旧连新"产生的这一次断开**正是**要复位的场景（`s_reprovision` 为真、下面直接
+         *   `return` 不重连）—— 若把通知挂在"会重连"的那条路上，本批要修的第二轮配网**恰好被漏掉**。
+         * ⛔ 只通告，不改行为：下面两个抑制位与"是否自动重连"的判断一字未动。 */
+        ESP_LOGI(TAG, "[diag] Wi-Fi 会话结束（DISCONNECTED reason=%d）⇒ 通告应用侧复位本次配网的 "
+                      "connected 幂等位（下一次 GOT_IP 可以再报一次）", reason);
+        if (s_disconnected_cb) {
+            s_disconnected_cb();
+        }
+        if (s_scan_only || s_reprovision || s_forgotten) {
+            ESP_LOGI(TAG, "[diag] WIFI_EVENT_STA_DISCONNECTED reason=%d ⇒ %s，不自动重连",
+                     reason,
+                     s_scan_only ? "扫描态"
+                                 : (s_reprovision ? "权威通道重新配网进行中（旧配置已作废，等新凭据连接）"
+                                                  : "操作者已显式忘记 WiFi 凭据（等 App 重新下发；BOOT 长按可再进配网）"));
+            return;                 /* 扫描态 / 权威重配 / 已显式忘记：不自动重连（见 s_scan_only、s_reprovision、s_forgotten 注释） */
+        }
+        ESP_LOGW(TAG, "Wi-Fi 断开，重连…（reason=%d）", reason);
+        esp_err_t crc = esp_wifi_connect();
+        ESP_LOGI(TAG, "[diag] 断开后 esp_wifi_connect() rc=%d(%s)", (int)crc, esp_err_to_name(crc));
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *evt = (ip_event_got_ip_t *)data;
+        esp_ip4addr_ntoa(&evt->ip_info.ip, s_ip, sizeof(s_ip));
+        s_connected = true;
+        ESP_LOGI(TAG, "Wi-Fi 已获取 IP：%s（ssid=%s，来源=%s）", s_ip, s_ssid, s_source);
+        /* ★ 诊断关键行：GOT_IP 是否真的到达、以及事件组位是否置上（worker 正等在这一位上）。 */
+        ESP_LOGI(TAG, "[diag] GOT_IP 已到达并置 WIFI_CONNECTED_BIT：s_eg=%s（这一步之后才轮到上报 connected）",
+                 (s_eg != NULL) ? "非空" : "**为空**");
+        if (s_eg) {
+            xEventGroupSetBits(s_eg, WIFI_CONNECTED_BIT);
+        }
+        /* ★★ 收敛点：无论凭据来自哪条通道，都在**这一处**触发上云链路（ADR-0017 D2）★★
+         * 通道侧不需要、也不允许知道"入网之后要做什么"。 */
+        if (s_ready_cb) {
+            s_ready_cb();       /* 上云启动/补启由应用侧回调处理（本模块不依赖 SDK） */
+        } else {
+            ESP_LOGW(TAG, "[diag] s_ready_cb 为空 ⇒ 本次 GOT_IP **不会**走上云链路（也不会上报 connected）");
+        }
+    } else {
+        ESP_LOGD(TAG, "[diag] 其它 Wi-Fi 事件 base=%p id=%d", (const void *)base, (int)id);
+    }
+}
+
+esp_err_t wifi_prov_init(void)
+{
+    if (s_inited) {
+        return ESP_OK;
+    }
+    if (s_eg == NULL) {
+        s_eg = xEventGroupCreate();
+        if (s_eg == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    (void)esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&init_cfg));
+    /* 🔴 2026-10-22〔WiFi 凭据持久化批〕**显式**钉住存储介质 = FLASH（缺省虽为 FLASH，但这是进程级开关）。
+     * 为什么不能只靠缺省：`esp_wifi_set_storage()` 对 STA/AP **同时**生效，任何同链接组件
+     *   （本仓里就有：`components/wifi_service/src/wifi_service.c:265`、
+     *    `components/esp_peripherals/periph_wifi.c:425` 都调 `WIFI_STORAGE_RAM`）先调过它，
+     *   之后的 `esp_wifi_set_config()` 就**不落 NVS** ⇒ "配网成功、复位即丢"。
+     *   本工程不链接 ADF 外设组件，但这条显式钉住让语义不依赖"谁先跑"。
+     * ⚠️ 失败**不中止**启动（连接本身不依赖它）：驱动侧写不进去时，复位后的自动重连仍由
+     *   本文件 `wifi_prov_nvs_save()` 写的那份**本模块 NVS 副本**保证。 */
+    esp_err_t stor_rc = esp_wifi_set_storage(WIFI_STORAGE_FLASH);
+    ESP_LOGI(TAG, "[diag] esp_wifi_set_storage(WIFI_STORAGE_FLASH) rc=%d(%s) ⇒ %s",
+             (int)stor_rc, esp_err_to_name(stor_rc),
+             (stor_rc == ESP_OK) ? "STA 配置会落 NVS（驱动侧）"
+                                 : "⚠️ 驱动侧持久化不可用 ⇒ 仅靠本模块的 NVS 副本");
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, on_wifi_event, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, on_wifi_event, NULL));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    s_inited = true;
+    return ESP_OK;
+}
+
+/* ------------------------------------------------------------------ AP 扫描（供 BLE 通道的 prov.scan.req） */
+
+esp_err_t wifi_prov_prepare_scan(void)
+{
+    esp_err_t rc = wifi_prov_init();
+    if (rc != ESP_OK) {
+        ESP_LOGE(TAG, "[diag] prepare_scan：wifi_prov_init 失败 rc=%d(%s)", (int)rc, esp_err_to_name(rc));
+        return rc;
+    }
+    /* 先置扫描态再 start：STA_START / DISCONNECTED 两个事件都不会去 connect（见 on_wifi_event）。
+     * 顺序不能反 —— esp_wifi_start() 会同步派发 STA_START。
+     * 🔴 诊断版在此显式留痕：**这一步会把 Wi-Fi 拉起来**（后续 connect 路径的 esp_wifi_start()
+     *    因此是幂等的、不会再派发 STA_START）—— 这正是 FIX-D1 的成因现场。 */
+    s_scan_only = true;
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    esp_err_t src = esp_wifi_start();       /* 已在跑则为幂等 */
+    ESP_LOGI(TAG, "[diag] prepare_scan：s_scan_only=true；esp_wifi_start() rc=%d(%s)（首次 start 会派发 STA_START）",
+             (int)src, esp_err_to_name(src));
+    return src;
+}
+
+esp_err_t wifi_prov_scan_json(char *out, size_t cap)
+{
+    if (out == NULL || cap < 8) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    out[0] = '\0';
+    esp_err_t rc = wifi_prov_prepare_scan();
+    if (rc != ESP_OK) {
+        ESP_LOGE(TAG, "[diag] 扫描未开始：prepare_scan 失败 rc=%d(%s)", (int)rc, esp_err_to_name(rc));
+        return rc;
+    }
+    wifi_scan_config_t sc = { 0 };
+    ESP_LOGI(TAG, "[diag] 开始 AP 扫描（阻塞式，esp_wifi_scan_start wait=true）…");
+    rc = esp_wifi_scan_start(&sc, true);
+    ESP_LOGI(TAG, "[diag] esp_wifi_scan_start rc=%d(%s)", (int)rc, esp_err_to_name(rc));
+    if (rc != ESP_OK && rc != ESP_ERR_WIFI_STATE) {
+        return rc;
+    }
+    uint16_t num = 12;
+    wifi_ap_record_t *recs = calloc(num, sizeof(wifi_ap_record_t));
+    if (recs == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    esp_err_t gerr = esp_wifi_scan_get_ap_records(&num, recs);
+    if (gerr != ESP_OK) {
+        ESP_LOGE(TAG, "[diag] esp_wifi_scan_get_ap_records 失败 rc=%d(%s)", (int)gerr, esp_err_to_name(gerr));
+        free(recs);
+        return gerr;
+    }
+    size_t off = 0;
+    off += snprintf(out + off, cap - off, "[");
+    for (uint16_t i = 0; i < num && off < cap - 64; i++) {
+        const char *auth = (recs[i].authmode == WIFI_AUTH_OPEN) ? "open" : "wpa2";
+        off += snprintf(out + off, cap - off, "%s{\"ssid\":\"%.32s\",\"rssi\":%d,\"auth\":\"%s\"}",
+                        i ? "," : "", (const char *)recs[i].ssid, recs[i].rssi, auth);
+    }
+    snprintf(out + off, cap - off, "]");
+    free(recs);
+    ESP_LOGI(TAG, "AP 扫描完成：%u 个（仅上报 SSID/RSSI/加密类型）", (unsigned)num);
+    return ESP_OK;
+}
+
+/* ------------------------------------------------------------------ 凭据文件解析 */
+
+static char *trim(char *s)
+{
+    while (*s && isspace((unsigned char)*s)) {
+        s++;
+    }
+    char *end = s + strlen(s);
+    while (end > s && isspace((unsigned char)end[-1])) {
+        *--end = '\0';
+    }
+    return s;
+}
+
+static bool parse_creds(const char *path, char *ssid, size_t ssid_cap, char *pass, size_t pass_cap)
+{
+    FILE *fp = fopen(path, "r");
+    if (fp == NULL) {
+        return false;
+    }
+    char line[160];
+    bool have_ssid = false;
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        char *p = trim(line);
+        if (*p == '\0' || *p == '#' || *p == ';') {
+            continue;
+        }
+        char *eq = strchr(p, '=');
+        if (eq == NULL) {
+            eq = strchr(p, ':');          /* 也接受 ssid: xxx */
+        }
+        if (eq == NULL) {
+            continue;
+        }
+        *eq = '\0';
+        char *key = trim(p);
+        char *val = trim(eq + 1);
+        if (strcasecmp(key, "ssid") == 0 || strcasecmp(key, "wifi_ssid") == 0) {
+            snprintf(ssid, ssid_cap, "%s", val);
+            have_ssid = (val[0] != '\0');
+        } else if (strcasecmp(key, "password") == 0 || strcasecmp(key, "pass") == 0 ||
+                   strcasecmp(key, "psk") == 0 || strcasecmp(key, "wifi_password") == 0) {
+            snprintf(pass, pass_cap, "%s", val);
+        }
+    }
+    fclose(fp);
+    return have_ssid;
+}
+
+esp_err_t wifi_prov_load_file(char *ssid, size_t ssid_cap, char *pass, size_t pass_cap,
+                              char *src_path, size_t path_cap)
+{
+    if (ssid == NULL || pass == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    ssid[0] = '\0';
+    pass[0] = '\0';
+
+    static const char *candidates[] = {
+        "/sdcard/oneye-wifi.txt",
+        "/spiffs/oneye-wifi.txt",
+    };
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        if (parse_creds(candidates[i], ssid, ssid_cap, pass, pass_cap)) {
+            if (src_path && path_cap) {
+                snprintf(src_path, path_cap, "file:%s", candidates[i]);
+            }
+            ESP_LOGI(TAG, "从凭据文件读取 Wi-Fi：%s（ssid=%s，密码%s）",
+                     candidates[i], ssid, pass[0] ? "已提供" : "为空（开放网络）");
+            return ESP_OK;
+        }
+    }
+    ESP_LOGI(TAG, "未找到 Wi-Fi 凭据文件（试过 /sdcard/oneye-wifi.txt 与 /spiffs/oneye-wifi.txt）");
+    return ESP_ERR_NOT_FOUND;
+}
+
+/* ------------------------------------------------------------------ 连接（**模块内部**） */
+
+/* ------------------------------------------------------------------ NVS 持久化（复位后自动连接的凭据来源）
+ *
+ * 🔴 2026-10-22〔WiFi 凭据持久化批 · 现场缺陷本体〕
+ * 现场（2026-10-22 上午 COM13）：App 经 BLE 配网成功 ⇒ `prov.status connected`、云侧绑定 200、
+ *   EMQX 一度 `connected=true`；随后复位 ⇒ 串口直接 `BLE 配网通道已就绪：广播中`（t≈1.0 s），
+ *   **没有** `esp_wifi_connect()`、**没有** `GOT_IP` ⇒ 云端无 MQTT 客户端、Redis online 键 TTL=-2。
+ * 取证结论（文件:行见报告 WIFI-CRED-PERSIST-20261022.md）：
+ *   · `CONFIG_ESP_WIFI_NVS_ENABLED=y`（本机型 sdkconfig 成立）⇒ 驱动在 `esp_wifi_set_config()`
+ *     时**本来**会把 STA 配置写进 NVS（`nvs.net80211`）；
+ *   · 但**本模块的启动路径从不读回它**（`wifi_prov_boot()` 只有 BLE 一段）⇒ "配网成功"与
+ *     "复位后自动重连"之间**少了一条读路径**，这才是设备回广播的原因；
+ *   · `s_forgotten` 是 `static volatile bool`（纯 RAM），复位即 false ⇒ **不是**抑制自动连接的原因。
+ * 本节的修法（最小）：配网成功时**显式**把 ssid/pass 落到本模块自己的 NVS 命名空间
+ *   （⛔ 不依赖驱动内部的键名/格式 ⇒ 驱动侧写不进去时这条路仍然成立），启动时由
+ *   `wifi_prov_load_nvs()` 读回，再由调用方经**唯一入网入口**以 `WIFI_PROV_CHAN_NVS` 递交。
+ * ⛔ 边界：只写本命名空间（`WIFI_PROV_NVS_NS`）的两个键；⛔ 不动 creds 分区、
+ *   ⛔ 不动 nvs 其它命名空间、⛔ 不打印密码（日志只说"已提供/为空"）。
+ */
+#define WIFI_PROV_NVS_NS       "oneye_wifi"   /* 本模块自己的命名空间（与驱动的 nvs.net80211 无关） */
+#define WIFI_PROV_NVS_KEY_SSID "ssid"
+#define WIFI_PROV_NVS_KEY_PASS "pass"
+
+/** 把本次被采信的凭据显式落 NVS（`wifi_prov_connect()` 在 `set_config` **成功之后**调用）。 */
+static esp_err_t wifi_prov_nvs_save(const char *ssid, const char *pass)
+{
+    if (ssid == NULL || ssid[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t h;
+    esp_err_t rc = nvs_open(WIFI_PROV_NVS_NS, NVS_READWRITE, &h);
+    if (rc != ESP_OK) {
+        ESP_LOGE(TAG, "WiFi 凭据持久化失败：nvs_open(ns=%s) rc=%d(%s) ⇒ **复位后不会自动重连**"
+                      "（本次连接不受影响）", WIFI_PROV_NVS_NS, (int)rc, esp_err_to_name(rc));
+        return rc;
+    }
+    rc = nvs_set_str(h, WIFI_PROV_NVS_KEY_SSID, ssid);
+    if (rc == ESP_OK) {
+        rc = nvs_set_str(h, WIFI_PROV_NVS_KEY_PASS, (pass != NULL) ? pass : "");
+    }
+    if (rc == ESP_OK) {
+        rc = nvs_commit(h);              /* ★ 不 commit 就只写了 RAM 缓存（这正是"以为写了、其实没落盘"的坑） */
+    }
+    nvs_close(h);
+    if (rc != ESP_OK) {
+        ESP_LOGE(TAG, "WiFi 凭据持久化失败：写 ns=%s rc=%d(%s) ⇒ **复位后不会自动重连**",
+                 WIFI_PROV_NVS_NS, (int)rc, esp_err_to_name(rc));
+        return rc;
+    }
+    /* ★ 现场要求的留痕串：串口可见"确实落了 NVS"，复位后与启动那句「启动读到 NVS WiFi 凭据」成对核对。 */
+    ESP_LOGI(TAG, "WiFi 凭据已持久化(nvs)：ns=%s ssid=%s（密码%s）"
+                  "⇒ 复位/掉电后由启动路径读回并自动连接",
+             WIFI_PROV_NVS_NS, ssid, (pass != NULL && pass[0] != '\0') ? "已提供" : "为空（开放网络）");
+    return ESP_OK;
+}
+
+/** 擦掉本模块记住的凭据（**只**由 `wifi_prov_forget_wifi()` 调：操作者显式"忘记"必须跨复位生效）。 */
+static esp_err_t wifi_prov_nvs_erase(void)
+{
+    nvs_handle_t h;
+    esp_err_t rc = nvs_open(WIFI_PROV_NVS_NS, NVS_READWRITE, &h);
+    if (rc != ESP_OK) {
+        /* 命名空间本来就不存在 ⇒ "没有记住的凭据"，正是目标态，不算失败。 */
+        return (rc == ESP_ERR_NVS_NOT_FOUND) ? ESP_OK : rc;
+    }
+    rc = nvs_erase_all(h);
+    if (rc == ESP_OK) {
+        rc = nvs_commit(h);
+    }
+    nvs_close(h);
+    return rc;
+}
+
+esp_err_t wifi_prov_load_nvs(char *ssid, size_t ssid_cap, char *pass, size_t pass_cap)
+{
+    if (ssid == NULL || pass == NULL || ssid_cap == 0 || pass_cap == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    ssid[0] = '\0';
+    pass[0] = '\0';
+    nvs_handle_t h;
+    esp_err_t rc = nvs_open(WIFI_PROV_NVS_NS, NVS_READONLY, &h);
+    if (rc != ESP_OK) {
+        ESP_LOGI(TAG, "启动读 NVS WiFi 凭据：没有（ns=%s 打不开 rc=%d(%s)：首次上电，或已被「忘记 WiFi」擦除）",
+                 WIFI_PROV_NVS_NS, (int)rc, esp_err_to_name(rc));
+        return rc;
+    }
+    size_t n = ssid_cap;
+    rc = nvs_get_str(h, WIFI_PROV_NVS_KEY_SSID, ssid, &n);
+    if (rc != ESP_OK || ssid[0] == '\0') {
+        nvs_close(h);
+        ssid[0] = '\0';
+        ESP_LOGI(TAG, "启动读 NVS WiFi 凭据：没有（ns=%s key=%s rc=%d(%s)）",
+                 WIFI_PROV_NVS_NS, WIFI_PROV_NVS_KEY_SSID, (int)rc, esp_err_to_name(rc));
+        return (rc == ESP_OK) ? ESP_ERR_NOT_FOUND : rc;
+    }
+    size_t pn = pass_cap;
+    esp_err_t prc = nvs_get_str(h, WIFI_PROV_NVS_KEY_PASS, pass, &pn);
+    nvs_close(h);
+    if (prc != ESP_OK) {
+        pass[0] = '\0';          /* 键缺失 / 长度不符 ⇒ 按"无密码"处理，⛔ 不因此丢掉 ssid */
+    }
+    /* ★ 现场要求的留痕串（复位后第一行"我还记得 WiFi"的证据，后面必须紧跟连接尝试）。 */
+    ESP_LOGI(TAG, "启动读到 NVS WiFi 凭据 ⇒ 自动连接：ssid=%s（密码%s，来源=nvs）",
+             ssid, (pass[0] != '\0') ? "已提供" : "为空（开放网络）");
+    return ESP_OK;
+}
+
+/* ★ 本函数是 `static`，且**故意**不进 `wifi_prov.h`（ADR-0017 D2/D4）：
+ * 连接层是"绕过优先级判据的唯一下口子"，收成内部函数之后，模块外**任何**通道都只能经
+ * `wifi_prov_submit_credentials*()` 入网 ⇒ 判据不可能被旁路。门禁 A8 会断言这一点。 */
+static esp_err_t wifi_prov_connect(const char *ssid, const char *pass, uint32_t timeout_ms)
+{
+    if (ssid == NULL || ssid[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t rc = wifi_prov_init();
+    if (rc != ESP_OK) {
+        return rc;
+    }
+    s_scan_only = false;            /* 有凭据了 ⇒ 退出扫描态，恢复正常的连接/重连语义 */
+    s_forgotten = false;            /* 新凭据即将落地 ⇒ 解除"显式忘记"的自动重连抑制 */
+    snprintf(s_ssid, sizeof(s_ssid), "%s", ssid);
+
+    wifi_config_t sta = { 0 };
+    snprintf((char *)sta.sta.ssid, sizeof(sta.sta.ssid), "%s", ssid);
+    if (pass) {
+        snprintf((char *)sta.sta.password, sizeof(sta.sta.password), "%s", pass);
+    }
+    s_connected = false;
+    s_ip[0] = '\0';
+    xEventGroupClearBits(s_eg, WIFI_CONNECTED_BIT);
+
+    esp_err_t cfg_rc = esp_wifi_set_config(WIFI_IF_STA, &sta);
+    if (cfg_rc != ESP_OK) {
+        ESP_LOGE(TAG, "[diag] esp_wifi_set_config 失败 rc=%d(%s)", (int)cfg_rc, esp_err_to_name(cfg_rc));
+    }
+    ESP_ERROR_CHECK(cfg_rc);
+    /* 🔴 2026-10-22〔WiFi 凭据持久化批〕**显式持久化**：本次被采信的凭据落到 NVS，复位/掉电后由
+     *   `wifi_prov_boot()` 的 NVS 段读回并自动连接（⛔ 不改变本函数的任何连接语义）。
+     * 位置有语义：必须在 `set_config` **成功之后** —— 连不上/配置失败的凭据不该被记住。 */
+    (void)wifi_prov_nvs_save(ssid, pass);
+    /* ★ 新配置**已经**落到 STA ⇒ 恢复事件驱动的自动重连语义（让"断旧连新"不至于连
+     *   "连不上时的自动重试"也一起被抑制）。见 `s_reprovision` 的注释。 */
+    s_reprovision = false;
+    /* ★ 清位：本次 set_config 之后，先看 STA_START 是否会替我们发起连接（C3/C5 路径会，BLE 路径不会）。 */
+    s_sta_start_connect_issued = false;
+    esp_err_t st_rc = esp_wifi_start();      /* 已在跑则为幂等（**不再派发 STA_START**） */
+    ESP_LOGI(TAG, "[diag] esp_wifi_start() rc=%d(%s)；STA_START 是否已发起连接=%d",
+             (int)st_rc, esp_err_to_name(st_rc), s_sta_start_connect_issued ? 1 : 0);
+    ESP_ERROR_CHECK(st_rc);
+    if (!s_sta_start_connect_issued) {
+        /* 🔴 2026-10-10〔诊断版 FIX-D1〕**BLE 通道从不发起连接的缺陷本体**。
+         *
+         * 现场（真机两轮 + 本文件事件分支逐条对应）：
+         *   ① `prov.scan.req` ⇒ `wifi_prov_scan_json()` ⇒ `wifi_prov_prepare_scan()`：
+         *      `s_scan_only = true` **之后**才 `esp_wifi_start()` ⇒ **首次 start 在这里**，
+         *      STA_START 被 `s_scan_only` 挡掉（on_wifi_event 的 STA_START 分支不 connect）；
+         *   ② `prov.connect.req` ⇒ 本函数：`s_scan_only = false` → `esp_wifi_set_config()`
+         *      → `esp_wifi_start()`，而 Wi-Fi **已经在跑** ⇒ 幂等、**不再派发 STA_START**
+         *      ⇒ ②之后无人调 `esp_wifi_connect()`。
+         *   ③ `esp_wifi_set_config()` **自己也连接**吗？—— **不会**。已按二进制取证（IDF 5.5.5
+         *      `components/esp_wifi/lib/esp32s3/libnet80211.a` 的 `ieee80211_api.o`）：
+         *      `esp_wifi_set_config` 只把一条 ioctl 投给 Wi-Fi 任务（处理函数
+         *      `wifi_set_config_process` 在 `ieee80211_ioctl.o`），而
+         *      `wifi_set_config_process` 与 `wifi_station_set_config_local_2` 两个函数体内
+         *      **不含任何 connect 调用**（只有 wifi_nvs_get/set、memcpy、strnlen 等）；
+         *      同一目标文件里 connect 只出现在 `_do_wifi_disconnect` 与 `ieee80211_sta_connect`。
+         *   ⇒ 结论：BLE 配网路上**从来没有发起过连接**，站点空等到 20 s 超时
+         *      （`E wifi_prov: Wi-Fi 连接超时`）⇒ `prov.status{connected}` **永远不会**产生。
+         *
+         * 最小修法（本行）：在这里**显式** `esp_wifi_connect()`。
+         *   · 语义**不变**：没有新帧 / 没有新错误码 / 没有改状态序列；仅补上"本来就该发生、
+         *     却因扫描先行而没发生"的那一次连接发起；
+         *   · C3/C5 通道（STA_START 已经发起过连接）走不进这个分支 ⇒ 行为逐字不变；
+         *   · 返回码原样打印，⚠️ `ESP_ERR_WIFI_CONN`（已在连接中）按"已发起"处理，不重试、不等待。 */
+        esp_err_t crc = esp_wifi_connect();
+        s_sta_start_connect_issued = (crc == ESP_OK || crc == ESP_ERR_WIFI_CONN);
+        ESP_LOGI(TAG, "[diag] FIX-D1：显式 esp_wifi_connect() rc=%d(%s)（BLE 通道先扫过 ⇒ 必须自己发起）",
+                 (int)crc, esp_err_to_name(crc));
+    }
+
+    if (timeout_ms == 0) {
+        timeout_ms = WIFI_PROV_DEFAULT_TIMEOUT_MS;
+    }
+    ESP_LOGI(TAG, "连接 Wi-Fi：ssid=%s（超时 %u ms）", ssid, (unsigned)timeout_ms);
+    EventBits_t bits = xEventGroupWaitBits(s_eg, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE,
+                                           pdMS_TO_TICKS(timeout_ms));
+    if (bits & WIFI_CONNECTED_BIT) {
+        ESP_LOGI(TAG, "[diag] 等到 GOT_IP 位（用时 < %u ms）⇒ 返回 ESP_OK", (unsigned)timeout_ms);
+        return ESP_OK;
+    }
+    ESP_LOGE(TAG, "Wi-Fi 连接超时（ssid=%s）：请检查凭据文件的 ssid/password", ssid);
+    ESP_LOGE(TAG, "[diag] 超时 %u ms 已用满且未等到 GOT_IP 位 ⇒ 返回 ESP_ERR_TIMEOUT"
+                  "（上层 SDK 据此向 App 报 failed{err=auth_failed}）", (unsigned)timeout_ms);
+    return ESP_ERR_TIMEOUT;
+}
+
+esp_err_t wifi_prov_set_source(const char *src)
+{
+    snprintf(s_source, sizeof(s_source), "%s", src ? src : "");
+    return ESP_OK;
+}
+
+/* ------------------------------------------------- 通道唯一入网入口（含优先级仲裁） */
+
+/**
+ * ★ 所有配网通道的**唯一入网入口**（ADR-0017 D2/D4）★
+ *
+ * ① 过**唯一判据** `wifi_prov_policy_decide()`（本体在 `wifi_prov_policy.h`，与主机侧单测同源）；
+ * ② 采信 ⇒ 记来源 + 交给 **static** 的 `wifi_prov_connect()`（由它触发 GOT_IP → s_ready_cb 收敛点）；
+ * ③ 拒绝 ⇒ 留痕（`[prov-priority]`）+ 返回 `ESP_ERR_INVALID_STATE`，**不发起入网**。
+ * ④ ★ 2026-10-12：**权威通道（BLE/App）** 采信之后、交给连接层之前，**先断旧**：
+ *    `esp_wifi_disconnect()`（在线才断，恰好一次）+ 丢弃旧配置的采信态 ⇒ 再 `set_config` + `connect`
+ *    （"断旧连新"，用户裁定逐字见本文件头与 `wifi_prov_channel_is_authoritative()`）。
+ * ⛔ 这里**不**做任何「入网后」动作 —— 那是收敛点下游（on_wifi_ready → oneye_start）的事。
+ */
+esp_err_t wifi_prov_submit_credentials_src(const char *ssid, const char *pass,
+                                           wifi_prov_channel_t ch, const char *src_override)
+{
+    if (ssid == NULL || ssid[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const char *src = (src_override != NULL && src_override[0] != '\0')
+                          ? src_override : wifi_prov_channel_source(ch);
+
+    /* ★ 唯一判据 ★ —— 决策 token 与主机侧单测用的是同一个 `wifi_prov_decision_str()`。
+     * `onboarded` = 「已用**当前被采信**的那份凭据入网」（`s_connected && s_held_valid`）：
+     * 采信槽被**显式释放**（台面改配 / prov.reset）后即视为"可重新配网"，
+     * ⛔ 但上云链路仍只启动一次（唯一调用点在收敛点下游，见门禁 A1/A9）。
+     * ⚠️ 2026-10-12：判据**按通道分派** —— 权威通道（BLE/App）不会被"已入网"闸掉
+     *    （`wifi_prov_channel_is_authoritative()`，本体在 `wifi_prov_policy.h`）。 */
+    const wifi_prov_decision_t d =
+        wifi_prov_policy_decide(s_held_valid, s_held_chan, ch, s_connected && s_held_valid);
+
+    if (!wifi_prov_decision_is_accept(d)) {
+        if (d == WIFI_PROV_DECISION_REJECT_LOWER) {
+            s_reject_lower++;
+        } else {
+            s_reject_already_up++;
+        }
+        ESP_LOGW(TAG, "[prov-priority] %s（%s）：channel=%s(rank %d)，已采信=%s(rank %d)，已入网=%s"
+                      "（ssid=%s）⇒ 不采信、不发起入网（累计 lower=%u already_up=%u）",
+                 wifi_prov_decision_str(d),
+                 (d == WIFI_PROV_DECISION_REJECT_LOWER)
+                     ? "低优先级不采信"
+                     : "已入网且采信槽未被释放（只入网一次；要换网请先 prov.reset 或走台面改配）",
+                 src, wifi_prov_channel_rank(ch),
+                 wifi_prov_channel_source(s_held_chan), wifi_prov_channel_rank(s_held_chan),
+                 s_connected ? "是" : "否", ssid, s_reject_lower, s_reject_already_up);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGI(TAG, "[prov-priority] %s：channel=%s(rank %d)（ssid=%s，密码%s）",
+             wifi_prov_decision_str(d), src, wifi_prov_channel_rank(ch),
+             ssid, (pass && pass[0]) ? "已提供" : "为空（开放网络）");
+
+    /* ---------------- ★ 2026-10-12：权威通道（BLE/App）= 断旧连新 ★ ----------------
+     * 用户裁定逐字：「**已有app发起配网时设备要断现有wifi重新连接目标wifi**，否则app会卡在配网中这个流程。」
+     * 判据已保证权威通道**不会被"已入网"闸掉**（`REJECT_ALREADY_UP` 对它不可达）；
+     * 这里补上"断旧"这半件事，"连新"由紧随其后的 `wifi_prov_connect()`
+     * （`esp_wifi_set_config` → `esp_wifi_connect`）完成：
+     *   ① **在线才断** —— 未在线不必断；正因如此，本路径的 `esp_wifi_disconnect()` **恰好一次**；
+     *   ② 断之前先置 `s_reprovision` —— 抑制 `WIFI_EVENT_STA_DISCONNECTED` 分支
+     *      "用**旧配置**自动重连"（否则"换网"会退化成"重连旧网"）；
+     *   ③ 旧配置的**采信态作废**（`s_held_valid=false` + 清 `s_connected/s_ip`）——
+     *      即"旧 SSID 不再被采信"；新凭据在这段之后重新落槽、再连新网。
+     * ⛔ 只对权威通道（BLE/App）生效：C3 凭据文件 / C4 台面改配 / C5 兜底的提交
+     *    **不经过**这一段（它们的优先级语义一字未改）。
+     * ⛔ 旧值逐字留痕（⛔ 不抹）：本段此前**不存在** —— 旧行为 = 已入网 ⇒ 判据给
+     *    `WIFI_PROV_DECISION_REJECT_ALREADY_UP` ⇒ 直接 `return ESP_ERR_INVALID_STATE`
+     *    （不采信、不发起入网、**不断链**）⇒ App 卡在"配网中"。 */
+    if (wifi_prov_channel_is_authoritative(ch)) {
+        if (s_connected) {
+            s_reprovision = true;               /* ⇐ 必须先置位：断链事件是异步派发的 */
+            esp_err_t drc = esp_wifi_disconnect();
+            ESP_LOGW(TAG, "[prov-switch] 权威通道（%s）发起重新配网：**先断开现有连接**"
+                          "（原 ssid=%s）rc=%d(%s) ⇒ 随后 set_config(新凭据) + connect",
+                     src, s_ssid, (int)drc, esp_err_to_name(drc));
+        } else {
+            ESP_LOGI(TAG, "[prov-switch] 权威通道（%s）：当前未在线 ⇒ 无需断开，直接按新凭据重连",
+                     src);
+        }
+        s_connected = false;
+        s_ip[0] = '\0';
+        s_held_valid = false;                   /* ⇐ 丢弃旧配置的采信态（旧 SSID 不再被采信） */
+        s_held_chan = WIFI_PROV_CHAN_UNKNOWN;
+    }
+
+    s_held_valid = true;
+    s_held_chan = ch;
+    (void)wifi_prov_set_source(src);
+    esp_err_t crc = wifi_prov_connect(ssid, pass, 0);
+    /* 兜底：`wifi_prov_connect()` 若在 `esp_wifi_set_config()` 之前就返回（初始化失败等），
+     * 抑制位不得残留（否则后续掉线再也不会自动重连）。正常路径上它在 set_config 之后已清零。 */
+    s_reprovision = false;
+    return crc;
+}
+
+esp_err_t wifi_prov_submit_credentials(const char *ssid, const char *pass, wifi_prov_channel_t ch)
+{
+    return wifi_prov_submit_credentials_src(ssid, pass, ch, NULL);
+}
+
+void wifi_prov_release_held(const char *reason)
+{
+    if (!s_held_valid) {
+        ESP_LOGI(TAG, "[prov-priority] 释放采信槽：本来就是空的（reason=%s）", reason ? reason : "-");
+        return;
+    }
+    ESP_LOGW(TAG, "[prov-priority] 释放采信槽：原=%s（reason=%s）"
+                  "⇒ 之后任一通道的提交都按「首次有效凭据」重新裁决",
+             wifi_prov_channel_source(s_held_chan), reason ? reason : "-");
+    s_held_valid = false;
+    s_held_chan = WIFI_PROV_CHAN_UNKNOWN;
+}
+
+/**
+ * 清除当前凭据并回到未配网态（通道的 `prov.reset` 用）。
+ * 🔴 2026-10-13 口径订正（⛔ 旧字逐字留痕 = 「只清 RAM、不写 flash」/ 日志串「仅 RAM」）：
+ *    **只清当前 RAM 采信态 / STA 配置；flash/NVS 里的凭据保留** —— 说清"清的是什么、留的是什么"：
+ *    被清 = `s_held_valid` 采信槽 + RAM 里那份 STA 配置；保留 = flash/NVS 里的凭据（本函数一字未写）。
+ * ⚠️ 本函数**不清 NVS/flash**（那会与「凭据分区是身份来源」的另一条线打架），
+ *    只断开连接并清掉 RAM 里的 STA 配置 ⇒ 复位后 Kconfig/凭据文件仍会重新生效。
+ * ★ 同时清空**采信槽**（ADR-0017 D4）：`prov.reset` 是操作者的显式动作，
+ *   释放后任一通道都可以重新被采信（不是"只入网一次"的例外，而是明确回到未配网态）。
+ */
+void wifi_prov_forget(void)
+{
+    s_held_valid = false;
+    s_held_chan = WIFI_PROV_CHAN_UNKNOWN;
+    if (!s_inited) {
+        return;
+    }
+    esp_wifi_disconnect();
+    wifi_config_t sta = { 0 };
+    (void)esp_wifi_set_config(WIFI_IF_STA, &sta);
+    s_connected = false;
+    s_ip[0] = '\0';
+    s_ssid[0] = '\0';
+    s_source[0] = '\0';
+    // 🔴 2026-10-13 口径订正（⛔ 旧日志串逐字留痕 = 「已清除当前 Wi-Fi 凭据（仅 RAM）⇒ 回到未配网态，可经任一通道重新配网」）：
+    //    本串把"仅 RAM"说全 = 只清当前 RAM 采信态/STA 配置；flash/NVS 里的凭据保留。
+    ESP_LOGW(TAG, "已清除当前 Wi-Fi 凭据（只清当前 RAM 采信态/STA 配置；flash/NVS 里的凭据保留）"
+                  "⇒ 回到未配网态，可经任一通道重新配网");
+}
+
+/* ============================================================================
+ * 🔴 2026-10-21〔BOOT 长按忘记 WiFi + 重进 BLE 配网批 · 用户逐字需求〕
+ *
+ * 用户需求（逐字）：「com13 上的 BOOT 或 RESET 按键能利用上吗，控制配网是否打开」
+ *   ⇒ 本批裁定：**BOOT 长按（≥3 s）= 忘记 WiFi 凭据 + 重新进入 BLE 配网**；
+ *      短按无副作用；RESET 仍是硬件复位（无代码）。
+ *
+ * 与 `wifi_prov_forget()` 的**分工**（⛔ 不要合并成一个函数）：
+ *   · `wifi_prov_forget()`  = BLE 契约 `prov.reset` 的语义：**只清 RAM**（采信槽 + STA 配置），
+ *     flash/NVS 里的凭据**保留**（重上电后 Kconfig/SD 通道仍会生效）。契约行为一字未改。
+ *   · `wifi_prov_forget_wifi()` = **操作者显式"忘记这台设备记住的 WiFi"**：在上一行基础上
+ *     再 `esp_wifi_stop()` + `esp_wifi_restore()` ⇒ **擦掉 NVS 里的 Wi-Fi 持久化配置**
+ *     （IDF 文档：restore 会复位 `esp_wifi_set_config` / `set_mode` 等**持久化设置**）。
+ *     ⇒ 重上电后不会再用旧 SSID 自动重连（DB 里的 creds 分区⛔ 不动，身份与 WiFi 凭据是两回事）。
+ *
+ * ✅ 2026-10-22〔WiFi 凭据持久化批〕**同上语义 + 多擦一份本模块的 NVS 副本**：
+ *    `esp_wifi_restore()` 只擦**驱动侧**的持久化配置；而复位后的自动重连读的是
+ *    `wifi_prov_load_nvs()`（本模块命名空间 `oneye_wifi`，见文件上方 NVS 一节）。
+ *    ⇒ "忘记"必须**两处都擦**，否则长按 BOOT 忘记之后复位仍会自动连回旧网（与用户意图相反）。
+ *
+ * ⛔ 边界：不动 creds 分区、不动 nvs 其它命名空间、不打印 SSID/密码（日志只说"已清除"）。
+ * ⚠️ 调用上下文：任务上下文（按键任务 / BLE 事件回调）——`esp_wifi_stop()` 是阻塞动作，
+ *    ⛔ 不要在 `sys_evt` / esp_timer 回调里调用它（与 `wifi_prov_ble_deinit_after_provisioned()` 同一条约束）。
+ * ============================================================================ */
+esp_err_t wifi_prov_forget_wifi(const char *reason)
+{
+    const char *why = (reason != NULL && reason[0] != '\0') ? reason : "-";
+
+    ESP_LOGW(TAG, "忘记 WiFi 凭据（reason=%s）：断开 STA + 清 RAM 采信槽/STA 配置 + esp_wifi_restore()"
+                  "（擦除 NVS 持久化 Wi-Fi 配置）；⛔ 不动 creds 分区 / ⛔ 不打印 SSID/密码", why);
+
+    /* 顺序有语义：先置抑制位，再断开 —— 断开事件（DISCONNECTED）在另一个任务上下文里派发，
+     * 若先断后置位，那一瞬间的处理器仍会发起一次重连。 */
+    s_forgotten = true;
+    wifi_prov_forget();             /* 既有语义：采信槽 + STA 配置 + s_connected/s_ip/s_ssid/s_source */
+
+    /* ★ 2026-10-22〔WiFi 凭据持久化批〕擦掉**本模块记住的那份**（⛔ 与 `esp_wifi_restore()` 缺一不可）：
+     *   复位后的自动重连读的是本模块的 NVS 副本 ⇒ 只擦驱动侧等于"忘了 RAM 里的，没忘设备记住的"。
+     * ⚠️ 位置在 `!s_inited` 早退**之前**：Wi-Fi 从未初始化时也可能已经写过这份副本。 */
+    esp_err_t nrc = wifi_prov_nvs_erase();
+
+    if (!s_inited) {
+        ESP_LOGW(TAG, "Wi-Fi 尚未初始化 ⇒ 本次只清 RAM 态（没有 NVS Wi-Fi 配置可擦）；"
+                      "本模块 NVS 副本擦除=%s", esp_err_to_name(nrc));
+        return (nrc == ESP_OK) ? ESP_OK : nrc;
+    }
+
+    esp_err_t drc = esp_wifi_disconnect();   /* 已断开 ⇒ ESP_ERR_WIFI_NOT_CONNECT，属正常 */
+    esp_err_t src = esp_wifi_stop();         /* 停 STA：断开射频连接，也给 BLE 让出共存窗口 */
+    esp_err_t rrc = esp_wifi_restore();      /* ★ 擦 NVS 持久化 Wi-Fi 配置（本函数与 forget 的唯一差别） */
+    /* restore 会把 mode 一并复位 ⇒ 显式恢复 STA 模式（此时已 stop，允许 set_mode）。
+     * ⚠️ 不 start：下一次 `prov.scan.req`（`wifi_prov_prepare_scan()`）会自己 set_mode + start，
+     *    下一次 `prov.connect.req`（`wifi_prov_connect()`）同样会 start —— 两条既有路径都不假设 Wi-Fi 在跑。 */
+    esp_err_t mrc = esp_wifi_set_mode(WIFI_MODE_STA);
+
+    ESP_LOGW(TAG, "忘记 WiFi 结果：disconnect=%s stop=%s restore=%s set_mode(STA)=%s nvs副本擦除=%s "
+                  "⇒ 已回到未配网态；复位后**不会**自动连回旧网，下一次入网只能由 App（BLE 配网）重新下发凭据",
+             esp_err_to_name(drc), esp_err_to_name(src), esp_err_to_name(rrc), esp_err_to_name(mrc),
+             esp_err_to_name(nrc));
+    if (nrc != ESP_OK) {
+        ESP_LOGE(TAG, "⚠️ 本模块 NVS 副本擦除失败（%s）⇒ 复位后**可能**仍会自动连回旧网"
+                      "（请复查 nvs 分区是否可用）", esp_err_to_name(nrc));
+    }
+    return (nrc != ESP_OK) ? nrc : rrc;   /* 两处擦除任一失败都如实返回（⛔ 不报"成功"） */
+}
+
+/* ============================================================================
+ * 🔴 2026-10-23 真机事故修复：**碰 flash 的配网动作必须在内部 RAM 栈上执行**
+ *
+ * 症状（COM12 真机，App 配网点「获取网络列表」时）：设备当场重启，串口逐字
+ *   `assert failed: spi_flash_disable_interrupts_caches_and_other_cpu cache_utils.c:127`
+ *   `(esp_task_stack_is_sane_cache_disabled())` + `rst:0xc (RTC_SW_CPU_RST)`
+ *
+ * 成因（不是猜测，是读 SDK 源码得出的）：`oneye-dev-sdk` 的 osal 为了让网络线程拿到
+ *   连续大栈，**主动**用 `heap_caps_calloc(MALLOC_CAP_SPIRAM)` 申请任务栈
+ *   （`components/oneye-dev-sdk/src/internal/oneye_osal_idf.c:390`）；SDK 的 `oneye_prov`
+ *   工作任务也走同一条路径 ⇒ 它的栈在 **PSRAM**。而 `esp_wifi_scan_start()` / NVS 写入
+ *   要**关 cache 做 flash 操作**，关 cache 后 PSRAM 栈不可访问 ⇒ IDF 的栈合法性断言必触发。
+ *
+ * 修法：provider 里只做"投递到内部栈任务 + 等结果"，真正的 flash 动作在**普通 xTaskCreate**
+ *   的任务里跑 —— IDF 的 `pvPortMallocStack()` 只从**内部 RAM** 取栈（见
+ *   SDK 同文件 :375-379 的取证），因此 `xTaskCreate` 出来的任务天生满足该断言。
+ *   ⛔ 不改 SDK（它是外部团队仓）；⛔ 不关 `CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY`
+ *   （SDK 是显式按 caps 申请的，关掉只会撞 SDK 静态任务的 PSRAM 栈断言）。
+ * ============================================================================ */
+
+typedef struct {
+    int (*fn)(void *arg);
+    void *arg;
+    SemaphoreHandle_t done;
+    int rc;
+} wifi_prov_internal_job_t;
+
+static void wifi_prov_internal_task(void *p)
+{
+    wifi_prov_internal_job_t *job = (wifi_prov_internal_job_t *)p;
+    job->rc = job->fn(job->arg);
+    (void)xSemaphoreGive(job->done);
+    vTaskDelete(NULL);
+}
+
+int wifi_prov_call_on_internal_stack(int (*fn)(void *arg), void *arg, uint32_t stack_bytes)
+{
+    if (fn == NULL) {
+        return -1;
+    }
+    wifi_prov_internal_job_t job;
+    job.fn = fn;
+    job.arg = arg;
+    job.rc = -1;
+
+    job.done = xSemaphoreCreateBinary();
+    if (job.done == NULL) {
+        ESP_LOGE(TAG, "内部栈执行器：信号量创建失败（内存不足）");
+        return -1;
+    }
+    uint32_t stack_eff = (stack_bytes > 0u) ? stack_bytes : 6144u;
+    if (xTaskCreate(wifi_prov_internal_task, "prov_flash", stack_eff, &job, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "内部栈执行器：任务创建失败（stack=%u）", (unsigned)stack_eff);
+        vSemaphoreDelete(job.done);
+        return -1;
+    }
+    /* ⚠️ 等到底：job 在调用方栈上，超时返回会让任务回写已失效的栈 ⇒ 不用超时（prov 动作自带超时）。 */
+    (void)xSemaphoreTake(job.done, portMAX_DELAY);
+    vSemaphoreDelete(job.done);
+    return job.rc;
+}
+

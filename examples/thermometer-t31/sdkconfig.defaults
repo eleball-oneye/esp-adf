@@ -1,17 +1,42 @@
-# thermometer-t31 默认配置（适用于 ESP32-C6-GEEK / ESP32-S3 / C3）
-# 目标：BLE 中心 4 连接 + Wi-Fi 上行 + MQTT
+# =============================================================================
+# thermometer-t31 默认配置（双角色：网关 GATEWAY / 温感子设备模拟器 SUBDEV）
+#
+# 目标板：ESP32-S3（8 MB flash + Octal PSRAM）；后续换 ESP32-C6-GEEK 时另立 target 预设。
+#
+# 叠加顺序（SDKCONFIG_DEFAULTS **按文件顺序**施加，后者覆盖前者）：
+#   sdkconfig.defaults                 ← 本文件（通用：BLE 双角色 / 甲型档位 / 云端点 / 内存口径）
+#     ; sdkconfig.defaults.esp32s3      ← 板级（8 MB / PSRAM / 自定义分区表 / PSRAM 侧的 NimBLE 分配）
+#       ; sdkconfig.defaults.subdev    ← 仅子设备构建（把角色切到 SUBDEV）
+# ⚠️ IDF 5.x 不会自动叠加 `<target>` 那份 ⇒ 根 CMakeLists 给了可被 -D 覆盖的缺省链；
+#    子设备构建必须在命令行显式给出三份（见 README / 报告里的完整命令）。
+# =============================================================================
 
-# ---- BLE（NimBLE，比 Bluedroid 省 RAM）----
+# ---- BLE（NimBLE）：本工程是**双角色** —— 配网阶段作外设，上云后作中心 ------------
+# 为什么要同时开四种角色位：同一份固件先跑 SDK 的 BLE 配网 GATT（peripheral + broadcaster），
+# 配网成功后 deinit 整栈，再由 oneye-link-sdk 重建 NimBLE 去**扫描 + 连接** T31（observer + central）。
+# ⛔ 不是"两种固件共用一份配置"，而是"一块板先后扮演两种角色"。
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y
-CONFIG_BT_NIMBLE_MAX_CONNECTIONS=4
 CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
 CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
-CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=n
-CONFIG_BT_NIMBLE_ROLE_BROADCASTER=n
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=3
 CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=247
-# 控制器实例数 = 连接数 + 广播/扫描实例（扫描 1 个 → 4+2=6）
-CONFIG_BT_CTRL_BLE_MAX_ACT=6
+# 控制器实例数 = 连接数 + 广播/扫描实例（3 连接 + 广播 1 + 扫描 1 = 5）
+CONFIG_BT_CTRL_BLE_MAX_ACT=5
+# NimBLE 主机任务栈 12 KB：GATT 的 RX 回调跑在这里，配网配对帧与 link 帧都在此上下文
+# （数值取处：devkitc_oneye / korvo2_oneye 两个例程真机验证过的 12288，⛔ 不要压到 4096）。
+# 🔴 2026-10-23 内存批（**旧值逐字留痕，⛔ 不抹**）：`CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=12288`
+#    改成 **8192**：真机 `nimble_port_init 失败: ESP_ERR_NO_MEM`、cloud-start 时
+#    `free_internal=2547 B / largest_internal=2304 B`（日志 `[res] phase=cloud-start`）。
+#    降 4 KB 是**第一档**收益；若真机仍 OOM，再回到 12288 并走"关/挪 dev-sdk 模块"路线。
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=8192
+# MSYS 池：BLE 打开后默认 24/24 会吃紧（源预设的实测结论，照抄教训）
+CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=12
+CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=12
+# Wi-Fi 与 BLE 共存（BLE 扫描期间 Wi-Fi 连接必须稳）
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
 
 # ---- Wi-Fi + MQTT ----
 CONFIG_ESP_WIFI_ENABLED=y
@@ -19,12 +44,109 @@ CONFIG_MQTT_PROTOCOL_311=y
 CONFIG_MQTT_BUFFER_SIZE=2048
 CONFIG_MQTT_TASK_STACK_SIZE=4096
 
+# ---- 🔴 2026-10-23 内存批：oneye-dev-sdk 自身的缓冲（真机 OOM 的另一半来源）---------
+# 读数（改前，build-gw/sdkconfig）：TX_QUEUE=16384 / LOG_BUFFER=32768 / EVENT_OFFLINE=65536 /
+#   ENABLE_MPP=y。本工程能力集 = CAP_NONE（无音视频/无显示）⇒ MPP 整库用不到；
+#   上行只有 100 字节级影子/事件 ⇒ 队列与日志环形缓冲都可压小。
+# ⚠️ 旧值逐字留痕（⛔ 不抹）：`CONFIG_ONEYE_DEV_SDK_TX_QUEUE_BYTES=16384`
+CONFIG_ONEYE_DEV_SDK_TX_QUEUE_BYTES=4096
+# ⚠️ 旧值逐字留痕：`CONFIG_ONEYE_DEV_SDK_LOG_BUFFER_BYTES=32768`
+# 演变（旧值逐字留痕，⛔ 不抹）：
+#   `CONFIG_ONEYE_DEV_SDK_LOG_BUFFER_BYTES=8192`（2026-10-23 内存批第一版）
+#   `CONFIG_ONEYE_DEV_SDK_LOG_BUFFER_BYTES=16384`（同日"观测性"回补版）
+# 🔴 2026-10-23 真机（TLS 重连风暴 `esp-aes: Failed to allocate memory`）：
+#   再回 **8192** 给内部 RAM 腾余量（用户口径）；本工程 gw_child/link 关键日志走 ESP_LOGx
+#   **直写 UART**（`CONFIG_ONEYE_DEV_SDK_LOG_INSTALL_ESP_HOOK=n`，见 build-gw/sdkconfig），
+#   不经 SDK 环形缓冲 ⇒ SDK 日志少一点不影响判读（`[res]`/`[自检]`/`[数据]` 都还能看）。
+CONFIG_ONEYE_DEV_SDK_LOG_BUFFER_BYTES=8192
+# ⚠️ 旧值逐字留痕：`CONFIG_ONEYE_DEV_SDK_EVENT_OFFLINE_BYTES=65536`（运行时 ev_cfg 也显式给 4 KB）
+CONFIG_ONEYE_DEV_SDK_EVENT_OFFLINE_BYTES=4096
+# ⚠️ 旧值逐字留痕：`CONFIG_ONEYE_DEV_SDK_ENABLE_MPP=y` —— 本工程无媒体面，关掉可省一整套
+#    信号/帧缓冲与代码（真机若因 base 内部引用 mpp 符号而链接失败，回填 y 并记录）。
+CONFIG_ONEYE_DEV_SDK_ENABLE_MPP=n
+
 # ---- lwIP / 网络 ----
 CONFIG_LWIP_MAX_SOCKETS=8
-CONFIG_ESP32_WIFI_STATIC_RX_BUFFER_NUM=8
-CONFIG_ESP32_WIFI_DYNAMIC_RX_BUFFER_NUM=16
+# 🔴 2026-10-23 内存批（旧值逐字留痕，⛔ 不抹）：`CONFIG_ESP32_WIFI_STATIC_RX_BUFFER_NUM=8`、
+#    `CONFIG_ESP32_WIFI_DYNAMIC_RX_BUFFER_NUM=16`。静态 RX 缓冲是**内部 RAM 大户**
+#    （每块约 1.6 KB，8 块 ≈13 KB）；本工程单 MQTT + 单 TLS，降到 4/8 即可。
+CONFIG_ESP32_WIFI_STATIC_RX_BUFFER_NUM=4
+CONFIG_ESP32_WIFI_DYNAMIC_RX_BUFFER_NUM=8
+# ⚠️ 与上两条**必须联动**（IDF 5.5.5 有编译期硬检查，实测会直接 `#error`）：
+#   `WIFI_RX_BA_WIN` ⛔ 不得大于 `WIFI_DYNAMIC_RX_BUFFER_NUM`，且 ⛔ 不得大于 2×`WIFI_STATIC_RX_BUFFER_NUM`。
+#   IDF 缺省 16 ⇒ 在 4/8 的组合下必须降到 **4**（≤8 且 ≤8）。BA 窗口每格是一条重排缓冲，降低同样省内部 RAM。
+CONFIG_ESP32_WIFI_RX_BA_WIN=4
+# 🔴 2026-10-23 内存批（新增；此前未显式设置，取 IDF 缺省 SND/WND=5760）：
+#    每连接各 5.6 KB 发送/接收窗口，单 MQTT+TLS 用不到这么大；降到 2880 省 ≈5.7 KB 内部 RAM。
+#    ⚠️ 只影响吞吐（本工程上行是 ~百字节级影子/事件），⛔ 不影响协议正确性。
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=2880
+CONFIG_LWIP_TCP_WND_DEFAULT=2880
 
 # ---- 主任务与日志 ----
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
+
+# =============================================================================
+# ★ 以下为「甲型网关必需项」（2026-10 本批追加）
+#
+# ⚠️ 顺序语义（踩过的坑，照抄教训）：defaults 是**按文件顺序**逐条施加的，而赋值给
+#    "当前不可见的符号"会被 **静默丢弃**。`ONEYE_FW_*` 里凡 `depends on` SDK 开关的项
+#    ⇒ 必须写在 SDK 开关**之后**。故本段的次序是：SDK 开关 → 档位 → 云端点 → 缓冲。
+# =============================================================================
+
+# ---- oneye-dev-sdk 分域库开关（依赖者在前：先 SDK，再 FW）----------------------
+CONFIG_ONEYE_DEV_SDK_ENABLE=y
+CONFIG_ONEYE_DEV_SDK_ENABLE_LINK=y
+CONFIG_ONEYE_DEV_SDK_ENABLE_BLE=y
+# 甲型量产红线：creds 分区缺失/为空时**不许回退**（回退 = 拿公用身份冒充这台设备）。
+# ⚠️ 符号名是 SDK 的 `ONEYE_DEV_CREDS_REQUIRED`（生成物 = CONFIG_ONEYE_DEV_CREDS_REQUIRED），
+#    与本工程 Kconfig 的 `ONEYE_FW_DEV_CRED_REQUIRED`（要不要激活凭证 / prov.pair.ok.cred_req）
+#    是**两个**符号，甲型两者都是 y。
+CONFIG_ONEYE_DEV_CREDS_REQUIRED=y
+# SDK 内部日志级别 3 = info（bring-up 期要能看见 creds/链路结论；量产可回 2）
+CONFIG_ONEYE_DEV_SDK_LOG_LEVEL=3
+
+# ---- 档位与配网通道（甲型）----------------------------------------------------
+CONFIG_ONEYE_FW_ONBOARDING_ROLE_ALPHA=y
+CONFIG_ONEYE_FW_DEV_CRED_REQUIRED=y
+CONFIG_ONEYE_FW_ENABLE_BLE_PROV=y
+CONFIG_ONEYE_FW_BLE_PROV_PAIRING_WINDOW_S=300
+# CONFIG_ONEYE_FW_BLE_PROV_KEY_GATE is not set   # = Kconfig 缺省 n：开机即广播
+# CONFIG_ONEYE_FW_DIAG_PROV_TRACE is not set     # 诊断构建才打开
+
+# ---- 机型 / 身份占位 / 版本 ----------------------------------------------------
+# ⚠️ PRODUCT_KEY 与 DEVICE_ID 都是**占位/机型**，⛔ 不是身份：真实身份只来自 creds 分区
+#    （`oneye_dev_creds_apply()` 覆盖 device_id/username/client_id，link-sdk 亦取分区 node_id）。
+CONFIG_ONEYE_FW_PRODUCT_KEY="OY-GAW-01"
+CONFIG_ONEYE_FW_DEVICE_ID="KORVO2-GAW01"
+CONFIG_ONEYE_FW_VERSION="0.1.0-t31gw"
+# 0 = 按机型查 oneye_status_period.h；OY-GAW-01 不在表里 ⇒ 兜底 300 s（TTL 1800 s）
+CONFIG_ONEYE_FW_STATUS_INTERVAL_S=0
+
+# ---- 云端点 / 承载：**必须钉死**（掉回占位值 = 设备能起来但连不到平台）----------
+CONFIG_ONEYE_FW_TRANSPORT_TLS=y
+CONFIG_ONEYE_FW_CLOUD_HOST="mqtt.oneye.me"
+CONFIG_ONEYE_FW_CLOUD_PORT=18886
+# 生产必须严格校验（信任链来自 creds 分区的 CA）
+# CONFIG_ONEYE_FW_TLS_INSECURE is not set
+
+# ---- MQTT 收发缓冲上界（注入点 = 根 CMakeLists 的 target_compile_definitions）----
+# 用户 2026-10-20 裁定「RX/TXQ 4096｜允许 deinit BLE」；与 devkitc_oneye 同值。
+# 🔴 2026-10-23 内存批（**旧值逐字留痕，⛔ 不抹**）：`=4096` / `=4096` 改为 **2048 / 2048**。
+#    本工程下行只有短命令与 BLE 档案（<1 KB），2048 足够；每项省 2 KB 内部 RAM。
+CONFIG_ONEYE_FW_MQTT_RX_BUF_BYTES=2048
+CONFIG_ONEYE_FW_MQTT_TXQ_BYTES=2048
+
+# ---- 系统任务栈与 mbedTLS 单帧上限（devkitc 真机实测的内存口径，照抄）-----------
+# sys_evt 只做"停广播 + 任务通知"两件常数级动作（重活在 8192 的 wifi_ready 任务）；
+# 4096 是第二道保险（防将来又在 sys_evt 里加东西）。
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
+# mbedtls_ssl_setup() 会一次性各要一整块**连续**缓冲：缺省 16384/4096 在
+# "Wi-Fi + BLE 起停 + SNTP" 之后必然凑不出（真机 0x7F00 = MBEDTLS_ERR_SSL_ALLOC_FAILED）。
+# 入向 4096 与 MQTT RX 4096 同量级；出向 2048 对"设备 → 云"单帧宽裕。
+# 🔴 2026-10-23 内存批（**旧值逐字留痕，⛔ 不抹**）：`IN=4096` / `OUT=2048` 改为 **2048 / 1024**。
+#    下行最大帧 = 命令/档案（<1 KB）⇒ 2048 富余；出向影子/事件 <1 KB ⇒ 1024 够。
+#    ⚠️ 二者是 `mbedtls_ssl_setup()` 的**连续**缓冲，改小直接降低"临时凑不出连续块"的概率。
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=2048
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=1024

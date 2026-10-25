@@ -1,0 +1,99 @@
+#
+# thermometer-t31 — ESP32-S3 目标板级默认（当前联调板：两块 ESP32-S3 + 8 MB PSRAM）
+#
+# 与 korvo2_oneye 同口径（同栈、同代理板），差别是本工程**零音频依赖**：
+#   不进 ADF 组件、不吃 esp-sr / model 分区的模型。
+#
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_IDF_TARGET_ESP32S3=y
+CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240=y
+CONFIG_ESP32S3_DEFAULT_CPU_FREQ_MHZ=240
+
+# ---- flash：8 MB（实测模组 8 MB；勿越 8 MB 线） ----
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="8MB"
+
+# ---- 自定义分区表（creds 必须留在 0x510000，见 partitions.csv） ----
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ---- PSRAM：Korvo-2 板载 Octal PSRAM；TLS 握手 / JSON 缓冲放外部内存 ----
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_BOOT_INIT=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_TYPE_AUTO=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
+
+# ---- ⚠️ 关于「任务栈落 PSRAM」与配网崩溃（2026-10-23 真机定位，⛔ 不要删这段）----
+# 现象：App 配网「获取网络列表」时设备重启，串口逐字
+#   `assert failed: spi_flash_disable_interrupts_caches_and_other_cpu cache_utils.c:127
+#    (esp_task_stack_is_sane_cache_disabled())` + `rst:0xc (RTC_SW_CPU_RST)`。
+# 成因：`oneye-dev-sdk` 的 osal 为了给网络线程腾内部 RAM，**主动**用
+#   `heap_caps_calloc(MALLOC_CAP_SPIRAM)` 申请任务栈（`oneye_osal_idf.c:390`，见该处长注释）；
+#   而 SDK 的 `oneye_prov` 工作任务也走这条路径 ⇒ 它的栈在 PSRAM，Wi-Fi 扫描/存凭据要
+#   **关 cache 做 flash 操作** ⇒ 该断言必然触发。
+# ⇒ 修法**不在 Kconfig**（把 `CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY` 关掉也不行：SDK 是
+#   显式按 caps 申请的，且关掉会撞 SDK 静态任务的 PSRAM 栈断言）—— 修法 = 把 provider 里
+#   会碰 flash 的动作**搬到内部 RAM 栈的任务**上执行，见 `wifi_prov.c` 的
+#   `wifi_prov_call_on_internal_stack()` 与 `wifi_prov_ble.c` 三个 provider 的包装。
+
+
+
+# ---- 系统事件任务栈（Wi-Fi + BLE + TLS 共存） ----
+# 🔴 本批订正（**旧值逐字留痕，⛔ 不抹**）：`CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=3072`
+#    为什么改 4096：devkitc_oneye 真机实测（2002-10-20 → 2026-10-20 COM13 两轮）—— GOT_IP 之后
+#    在 sys_evt 里做重活（AES-GCM 上报 / mbedtls 授时）会直接 `***ERROR*** A stack overflow in
+#    task sys_evt`。本工程已把重活**全部**移到 8192 的 `wifi_ready` 任务，sys_evt 只剩
+#    "停广播 + 任务通知"两件常数级动作；4096 是**第二道**保险（防将来又往 sys_evt 里加东西），
+#    与 devkitc 量产口径同值。
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
+
+# ---- NimBLE 主机侧内存走 PSRAM（本板有 Octal PSRAM）----
+# ⚠️ 为什么写在**这份文件**而不是 `sdkconfig.defaults`：本符号依赖 `CONFIG_SPIRAM`（在上一段才置 y）。
+#    defaults 是**按文件顺序**施加的，赋值给"当时不可见"的符号会被**静默丢弃**
+#    （devkitc_oneye/sdkconfig.defaults.ble 文件头记过这个坑）⇒ 只能放在 SPIRAM 之后。
+# 控制器侧仍在内部 RAM；这里只把 NimBLE **主机**侧分配挪到 PSRAM，给 TLS/MQTT 腾内部堆。
+# 取处：korvo2_oneye/sdkconfig.defaults.ble:65（同板型、同栈，真机验证过）。
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
+
+# ---- 🔴 2026-10-23 内存批：mbedTLS 的缓冲/上下文走 PSRAM（本板 8 MB Octal PSRAM）----
+# 为什么必须放在**这份文件**且**在 SPIRAM 段之后**：同上一条 —— 符号依赖 CONFIG_SPIRAM，
+# 写在 sdkconfig.defaults 里会被静默丢弃。
+# 真机读数（改前）：cloud-start `free_internal=2547 B / largest_internal=2304 B` ⇒
+#   `nimble_port_init 失败: ESP_ERR_NO_MEM`。mbedTLS 的 SSL 上下文与 IN/OUT 缓冲原本都在
+#   内部 RAM 申请；本板 PSRAM 充足、TLS 只在单条 MQTT 上用 ⇒ 挪到 PSRAM 是**最大一档**收益。
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+# 动态缓冲：握手后按需申请（避免一次性预留整块连续内部 RAM），与上一条叠加使用。
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+# ⚠️ 反例留痕（2026-10-23 真机已验证，⛔ 不要"为了省内存"去关它）：
+#   `CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=n` 会撞 SDK 显式按 caps 申请的 PSRAM 栈断言
+#   （见上一段的 assert 记录）⇒ 保持 y。
+
+# =============================================================================
+# 🔴 2026-10-23 真机（TLS 重连风暴）：关 mbedTLS **硬件** AES/MPI
+#
+# 逐字症状：
+#   `E esp-aes: Failed to allocate memory`
+#   `[W] mqtt link down (reason=-6)` → SDK 自动重连 → 立刻又断（attempt 7/8）
+# 根因：TLS 握手走 mbedTLS 硬件 AES 时，`esp-aes` 要申请**内部 RAM 的 DMA 描述符/缓冲**；
+#   本固件在「BLE central + event 库 + 子设备上报」同时在线时内部堆只剩 ~7 KB ⇒ 分配失败
+#   ⇒ 握手失败 ⇒ 无限重连。`CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC` 只挪走了 SSL 上下文/大缓冲，
+#   **挪不动 esp-aes 的 DMA 内存**。
+# 取法（按收益顺序）：
+#   ① 关硬件 AES（本工程 TLS 流量极小，软件 AES 的 CPU 代价可接受）；
+#   ② 关 AES 中断辅助（硬件 AES 关掉后无意义；必须先于 ① 写，符号依赖 HARDWARE_AES）；
+#   ③ 关硬件 MPI（RSA 大数运算走软件；设备侧 TLS 只用 ECDSA/ECDH 时它本来就不参与）。
+# 旧值逐字留痕（⛔ 不抹；build-gw/sdkconfig 改前实测均为 y）：
+#   `CONFIG_MBEDTLS_AES_USE_INTERRUPT=y`
+#   `CONFIG_MBEDTLS_HARDWARE_AES=y`
+#   `CONFIG_MBEDTLS_HARDWARE_MPI=y`
+CONFIG_MBEDTLS_AES_USE_INTERRUPT=n
+CONFIG_MBEDTLS_HARDWARE_AES=n
+CONFIG_MBEDTLS_HARDWARE_MPI=n
+# ⚠️ 若真机仍出现 `esp-aes`（说明还有别的组件直接用硬件 AES，例如 WiFi 侧）：见
+#   `docs/` 批次报告里的替代方案 —— 本工程可再把 TLS IN/OUT 调小、或把 gw_child 栈/队列
+#   进一步压到 PSRAM 换取内部 RAM；⛔ 不要动 `CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y`。
+

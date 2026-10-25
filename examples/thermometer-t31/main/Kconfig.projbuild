@@ -1,41 +1,266 @@
+# =============================================================================
+# thermometer-t31 · 工程配置
+#
+# 两块板同一份固件源码，**编译期**按角色二选一（不需要运行期切换）：
+#   · GATEWAY = COM12 网关（甲型 OY-GAW-01）：BLE 中心连 T31 + App BLE 配网 + 上云
+#   · SUBDEV  = COM13 温感子设备模拟器：BLE 外设（广播名 T31-xxxx / 服务 FFF0 / notify FFF1），
+#               **不连云**
+#
+# 两个角色各用一份 sdkconfig（不同 build 目录）：
+#   idf.py -B build-gw  build                                        # 默认 = GATEWAY
+#   idf.py -B build-sub -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.defaults.subdev" build
+# =============================================================================
+
 menu "thermometer-t31 例程配置"
 
-    config ONEYE_T31_NODE_ID
-        string "网关节点 ID（Oneye 主题用）"
-        default "OE-GW-C6-0001"
+    choice ONEYE_T31_ROLE
+        prompt "本板角色"
+        default ONEYE_T31_ROLE_GATEWAY
+        # ⚠️ Kconfig 坑（本文件实测踩到并已改）：**choice 的成员不能写在 choice 级 `help` 的文字块里** ——
+        #    文字块的缩进只要不早于成员行，kconfiglib 会把成员当正文吞掉，产物是
+        #    "choice 没有成员 ⇒ 所有 `CONFIG_ONEYE_T31_ROLE_*` 全部未定义"，
+        #    而 `#if CONFIG_X` 在未定义时求值为 0 ⇒ **静默编出另一个角色**（构建照样成功）。
+        #    ⇒ 本工程一律用**成员各自的 help**，choice 级不写 help。
+        config ONEYE_T31_ROLE_GATEWAY
+            bool "网关（COM12：BLE 中心连 T31 + 上云）"
+            help
+                甲型 OY-GAW-01 启动序列：BLE 配网 → creds 分区凭据 → 上云（影子/status）
+                → 释放 NimBLE → link-sdk 重建 NimBLE 作中心连 T31 → 用子设备温度代报影子。
+
+        config ONEYE_T31_ROLE_SUBDEV
+            bool "温感子设备模拟器（COM13：BLE 外设 T31）"
+            help
+                **不连云**：只起 NimBLE 外设模拟健奥 T31（广播名 T31-xxxx / 服务 FFF0 /
+                notify FFF1），周期推温度帧（见 main/t31_sim.c）。
+    endchoice
+
+    config ONEYE_T31_SUB_TEMP_REPORT_MS
+        int "子设备温度推送周期(ms)"
+        default 2000
+        range 500 60000
         help
-            该 ID 出现在 MQTT 主题 rmng/dev/{node_id}/event/up 中。
-            每台网关必须唯一。
+            仅 SUBDEV 角色生效：每本周期生成一次模拟温度并用 notify 推送一帧。
+            连接建立后**立即**先推一帧（不等满一个周期）；无连接时不推送、只打日志。
 
-    config ONEYE_T31_MAX_LINKS
-        int "并发连接的 T31 数量"
-        range 1 8
-        default 4
+    config ONEYE_T31_GW_STATE_MIN_MS
+        int "网关最小影子上报间隔(ms)"
+        default 5000
+        range 1000 600000
         help
-            受 CONFIG_BT_CTRL_BLE_MAX_ACT 与内存限制；工程建议 ≤8。
+            仅 GATEWAY 角色生效：两次 `oneye_dev_base_report_state()` 之间的最小间隔。
 
-    config ONEYE_T31_WIFI_SSID
-        string "Wi-Fi SSID（留空 = 不联网，仅本地打印）"
-        default ""
+            ⚠️ **当前没有代码读它**（2026-10-23 起）：用户裁定"子设备是独立实体"后，网关影子
+            只剩 firmwareVersion/model/power(+credSource) 三个**静态**键，温度不再进网关影子
+            ⇒ 不再有"每 2 s 一帧就要节流"的场景。保留该符号只为不破坏既有 sdkconfig
+            （删掉会让旧 sdkconfig 里的这一行变成未知符号告警）。
 
-    config ONEYE_T31_WIFI_PASSWORD
-        string "Wi-Fi 密码"
-        default ""
+            子设备遥测的节流见下面的 ONEYE_T31_GW_SUB_TELE_MIN_MS。
 
-    config ONEYE_T31_MQTT_URI
-        string "MQTT Broker URI"
-        default "mqtt://192.168.1.10:1883"
+    config ONEYE_T31_GW_SUB_TELE_MIN_MS
+        int "子设备遥测(sub.telemetry)最小上报间隔(ms)"
+        # 🔴 2026-10-23 真机（队列满/上报堵）：1000 → **3000**（旧值逐字留痕，⛔ 不抹：`default 1000`）。
+        #    子设备 2 s 一帧；1000 ms 窗口等于"每帧都发"，上报路径一慢就积压。
+        default 3000
+        range 1000 60000
+        help
+            仅 GATEWAY 角色生效：两帧 `event/up` 的 `sub.telemetry` 之间的最小间隔。
 
-    config ONEYE_T31_MQTT_USERNAME
-        string "MQTT 用户名（可空）"
-        default ""
+            为什么必须节流：子设备默认每 2 s 一帧（CONFIG_ONEYE_T31_SUB_TEMP_REPORT_MS），
+            网关最多接 4 条链路 ⇒ 不节流时 event/up 会被同频帧打爆（且云端影子/时序
+            本来就不需要这个频率）。窗口内到达的帧**丢弃并计数**（串口 DEBUG 里可见）。
 
-    config ONEYE_T31_MQTT_PASSWORD
-        string "MQTT 密码（可空）"
-        default ""
+            下限 1000 ms 是硬要求（用户 2026-10-23："例如 ≥1s 一帧"）；
+            上限 60000 是保护值（再长不如不报）。
 
-    config ONEYE_T31_PASSTHROUGH_UNKNOWN
-        bool "未命中档案的子设备也接入（原始帧透传）"
+endmenu
+
+# =============================================================================
+# 甲型（网关）上云 / 配网配置 —— 以 examples/oneye/devkitc_oneye/main/Kconfig.projbuild
+# 为底，**只保留甲型必需项**（⛔ 乙/丙 专用的项一律不引：本工程没有"无 creds"形态）。
+#
+# ⚠️ 依赖顺序提醒：`CONFIG_ONEYE_FW_*` 里凡 `depends on` SDK 开关的（如 ENABLE_BLE_PROV），
+#    在 sdkconfig.defaults 里必须写在 SDK 开关**之后**，否则赋值会被 kconfig **静默丢弃**。
+#    本工程为减少这个坑，下面几项**不写 depends on**（它们是机型能力位，值与 SDK 开关同步由
+#    sdkconfig.defaults 保证；不一致时会在链接期缺符号，而不是静默降级）。
+# =============================================================================
+
+menu "oneye 甲型网关（上云 / BLE 配网）"
+
+    config ONEYE_FW_DEVICE_ID
+        string "设备 node_id（台面占位；真实身份来自 creds 分区）"
+        default "KORVO2-GAW01"
+        help
+            对应契约 topic 中的 {node} 段（rmng/dev/{node}/...）。
+            ⚠️ 它只是**占位**：甲型建云链路时 `oneye_dev_creds_apply()` 会用 creds 分区里的
+            `node_id` 覆盖 `device_id/username/client_id`（见 main/main.c 的 cloud_start_task）；
+            link-sdk 的 `cfg.node_id` 同样取分区里的那个串。
+            ⛔ 不得把它当"这台设备的 SN"用（蓝牙广播的厂商字段只从 creds 取 SN）。
+
+    config ONEYE_FW_PRODUCT_KEY
+        string "产品品类 productKey（机型标识）"
+        default "OY-GAW-01"
+        help
+            网关机型 = **OY-GAW-01**（甲型：一机一密 creds 分区 + App BLE 配网 + 上云）。
+            ⚠️ 不进 `oneye_status_period.h` 的机型表 ⇒ H 取该表兜底 300 s
+            （见下方 ONEYE_FW_STATUS_INTERVAL_S 的 help）。
+
+    config ONEYE_FW_VERSION
+        string "固件版本字符串（进 caps/up 与影子 firmwareVersion）"
+        default "0.1.0-t31gw"
+
+    config ONEYE_FW_STATUS_INTERVAL_S
+        int "status/up 周期 H（秒；0 = 按机型自动）"
+        range 0 3600
+        default 0
+        help
+            cloud 的在线会话键 TTL = **6 × H**，且每条已认证上行都会滑动续期
+            （2026-10-21）⇒ 设备按 ≤ H 的节奏发 `status/up` 就不会被判离线。
+
+            0 = 按 `ONEYE_FW_PRODUCT_KEY` 查 `main/oneye_status_period.h` 的机型表；
+                `OY-GAW-01` **不在**表里 ⇒ 取兜底 **300 s**（TTL 1800 s）。
+            >0 = 显式覆盖（用于与 cloud 临时对齐；⛔ 改了就要同步 cloud 侧该机型的 H）。
+
+            ⛔ 不得把 H 放进 shadow state：`heartbeatIntervalSec` 未进 TSL ⇒ 整帧被拒。
+
+    menu "接入（EMQX / 云端）"
+
+        config ONEYE_FW_CLOUD_HOST
+            string "云端主机（host 或 IP）"
+            default "mqtt.oneye.me"
+
+        config ONEYE_FW_CLOUD_PORT
+            int "端口（0 = 按承载取契约缺省）"
+            range 0 65535
+            default 18886
+            help
+                18886 = 平台 CA（oneye-iot-device-ca）那台 broker 的设备面监听器；
+                与 devkitc_oneye / korvo2_oneye 同口径（⛔ 勿随意改）。
+
+        choice ONEYE_FW_TRANSPORT
+            prompt "承载（契约：tcp 1883 / tls 8883 / ws 8083 / wss 8084）"
+            default ONEYE_FW_TRANSPORT_TLS
+            config ONEYE_FW_TRANSPORT_TCP
+                bool "MQTT over TCP（仅台面联调）"
+            config ONEYE_FW_TRANSPORT_WS
+                bool "MQTT over WebSocket（/mqtt）"
+            config ONEYE_FW_TRANSPORT_TLS
+                bool "MQTT over TLS（生产主承载；甲型用 creds 分区的一机一密材料）"
+            config ONEYE_FW_TRANSPORT_WSS
+                bool "MQTT over WSS（/mqtt）"
+        endchoice
+
+        config ONEYE_FW_TLS_INSECURE
+            bool "TLS 跳过证书校验（仅 dev/产测；生产必须 n）"
+            default n
+            help
+                置 y 时 SDK 会打 WARN。生产形态必须 n：甲型的信任链来自 creds 分区的 CA
+                （`oneye_dev_creds_apply()` 会写 `cfg.tls_ca_pem`）。
+    endmenu
+
+    # ---- Wi-Fi 与 BLE 配网通道（本机型只有 BLE 一条通道；无 SD 卡槽）-----------------
+
+    config ONEYE_FW_ENABLE_BLE_PROV
+        bool "启用 BLE 配网通道 C1/C2（oneye-dev-sdk 自研 GATT + 激活码配对）"
         default y
+        help
+            App（C1）或另一台嵌入式设备（C2）经 BLE 下发 SSID/密码；配网成功后由
+            `wifi_prov.c` 的 GOT_IP 收敛点统一触发"停广播 → 释放 NimBLE → 建云链路 → 移交中心"。
+            ⚠️ 与 `CONFIG_ONEYE_DEV_SDK_ENABLE_BLE=y` 必须同时成立（见 sdkconfig.defaults）。
+
+    choice ONEYE_FW_ONBOARDING_ROLE
+        prompt "设备侧档位（本工程只保留甲型）"
+        default ONEYE_FW_ONBOARDING_ROLE_ALPHA
+        # ⚠️ 同样**不用** choice 级 help（理由见上面 ONEYE_T31_ROLE 的注释）。
+        config ONEYE_FW_ONBOARDING_ROLE_ALPHA
+            bool "甲 ALPHA：有 creds 一机一密 ＋ 能连云"
+            help
+                甲 = 有 creds（一机一密）＋ 能连云 ⇒ `cred_req=true`，
+                `prov.verify.req` **必经**并与自身 `creds.node_id` 逐字比对。
+                本工程**只编这一档**。
+
+        config ONEYE_FW_ONBOARDING_ROLE_BETA
+            bool "乙 BETA（本工程不用：无 creds + 品类级内嵌证书）"
+            help
+                保留该符号的唯一理由：`wifi_prov_ble.c` 的档位判据与编译期 `#error`
+                需要三值 choice 存在。⛔ 本工程没有"无 creds"形态（甲型必有分区凭据）。
+
+        config ONEYE_FW_ONBOARDING_ROLE_GAMMA
+            bool "丙 GAMMA（本工程不用：无 creds + 不连云）"
+            help
+                同上：只为让 `wifi_prov_ble.c` 的三值判据可编译。⛔ 本工程不编丙档。
+    endchoice
+
+    config ONEYE_FW_DEV_CRED_REQUIRED
+        bool "本机型**需要激活凭证**（⇒ 配答应答 prov.pair.ok 的 cred_req=true）"
+        default y
+        help
+            甲型必须 y；与档位不一致时 `wifi_prov_ble.c` 在**编译期** `#error` 拦下
+            （⛔ 不静默选一边）。
+            ⚠️ 与 SDK 的 `ONEYE_DEV_CREDS_REQUIRED`（= "creds 分区缺失时不许回退"，量产红线）
+            是**两个**符号；甲型两者都是 y（见 sdkconfig.defaults）。
+
+    config ONEYE_FW_BLE_PROV_KEY_GATE
+        bool "BLE 配网改由按键进入/退出（本工程缺省 n = 开机即广播）"
+        default n
+        help
+            置 y：开机起栈但不广播，长按 BOOT 才进入配网模式。
+            本工程缺省 n（开机即广播，App 上电就能发现设备）。
+            ⚠️ 无论 gate 取值，**长按 BOOT ≥3 s 永远是"忘记 WiFi + 重启"**（见 main.c 的
+            key_gate_task：link-sdk 没有 stop/deinit ⇒ 重新配网只能走清 NVS + esp_restart()）。
+
+    config ONEYE_FW_BLE_PROV_PAIRING_WINDOW_S
+        int "BLE 配网模式超时（秒；进入后无成功入网则自动退出广播）"
+        range 30 3600
+        default 300
+        help
+            与 SDK 的一次性 challenge 有效期 `CONFIG_ONEYE_DEV_SDK_BLE_CHAL_TTL_S`
+            （缺省 300 s）对齐 ⇒「chal 失效」与「配网窗口关闭」是同一刻。
+
+    config ONEYE_T31_PROV_GRACE_SEC
+        int "配网成功后 BLE 宽限窗（秒；0=关闭宽限=旧行为）"
+        range 0 600
+        # 🔴 2026-10-23 真机反馈（用户逐字「添加成功，但用时很久」）：旧值 60 会让 App 白等约 60 s。
+        #    改 20，且 main.c 增加「App 绑定完成断开 BLE ⇒ 立即提前结束宽限」（最短驻留 5 s）。
+        #    ⚠️ 旧值逐字留痕（⛔ 不抹）：`default 60`
+        default 20
+        help
+            ★ 2026-10-23 用户裁定逐字：「deinit BLE 的时机需要重新设计，要确保给 App
+            返回结果让其能发起绑定请求后才能执行」。
+
+            语义（只在**本次经 BLE 配网成功**时生效；NVS 已有凭据的普通开机⛔ 不走本窗）：
+              ① GOT_IP 时先发 `prov.status{state=connected, ip}` 让 App 拿到结果；
+              ② 随后**保持 BLE 配网通道广播/可连接**共 N 秒（本项），期间不 deinit、
+                 ⛔ 不启动云链路；串口每 5 s 一行 `[prov-grace] 剩余 …s`；
+              ③ **提前结束**：检测到配网会话断开（App 绑定完成会断开 BLE）⇒ 立即结束本窗，
+                 串口 `[prov-grace] 会话断开 ⇒ 提前结束宽限`（最短驻留 = main.c 的
+                 `PROV_GRACE_MIN_S` 5 s，防"刚报 connected 就闪断"把窗口掐死）；
+              ④ 窗满/提前结束 ⇒ `wifi_prov_ble_deinit_after_provisioned()` → SNTP → 建云任务。
+            =0 ⇒ 完全退回旧行为（GOT_IP 即停广播、立刻 deinit）。
+
+    # ---- MQTT 收发缓冲上界（注入方式见根 CMakeLists 的 target_compile_definitions）----
+
+    config ONEYE_FW_MQTT_RX_BUF_BYTES
+        int "MQTT 接收组装缓冲（字节；注入 SDK 的 ONEYE_MQTT_RX_BUF_BYTES）"
+        range 512 65568
+        default 2048
+        help
+            SDK 缺省 = `ONEYE_MQTT_PAYLOAD_MAX + 32` = **65568 B**；本工程 2026-10-20 取 **4096**，
+            🔴 2026-10-23 为给 NimBLE central 腾内部 RAM 降到 **2048**（旧值 4096 逐字留痕，⛔ 不抹）。
+            单帧 > 本值的下行报文装不下；本工程下行只有短命令/档案，2048 足够。
+
+    config ONEYE_FW_MQTT_TXQ_BYTES
+        int "MQTT 发送队列容量（字节；注入 SDK 的 ONEYE_MQTT_TXQ_BYTES）"
+        range 512 65536
+        default 2048
+        help
+            SDK 缺省 **16384 B**；本工程 2026-10-20 取 **4096**，
+            🔴 2026-10-23 降到 **2048**（旧值 4096 逐字留痕，⛔ 不抹）。队列满 ⇒ publish 返回 -7（可见）。
+
+    config ONEYE_FW_DIAG_PROV_TRACE
+        bool "诊断构建：配网链路逐步留痕（默认 n）"
+        default n
+        help
+            打开后把 wifi_prov / wifi_prov_ble / oneye_ble / oneye_link / oneye 五个 tag
+            放宽到 DEBUG，并回显运行期日志级别。⛔ 不含密码 / 激活码 / chal / 令牌。
 
 endmenu

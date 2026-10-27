@@ -77,6 +77,15 @@ void gw_child_on_link_event(const oneye_link_event_t *evt);
 bool gw_child_any_bound(void);
 
 /*
+ * 2026-10-26〔允许丢帧 + 断线清队列〕云链路状态通知（由 main.c 的云事件回调调用）。
+ *   ⚠️ 回调里**只置位**，不调 SDK（避免在 SDK 回调上下文重入）；
+ *   真正的"清空 SDK 事件队列"在 gw_child 自己的任务里执行。
+ *   up=false ⇒ 暂停 sub.telemetry 入队（丢弃并计数）+ 申请清队列；
+ *   up=true  ⇒ 恢复上报并复位节流位（下一帧立刻补报）。
+ */
+void gw_child_on_cloud_state(bool up);
+
+/*
  * ★ 2026-10-23：本工程的**完整自洽 T31 档案**（唯一事实源，main.c 与档案回退共用）。
  *
  * 为什么需要它（真机事故）：link-sdk 内置 `profiles/t31.json` 的 `frame.body_len=8` 且

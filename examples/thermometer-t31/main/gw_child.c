@@ -132,6 +132,12 @@ typedef struct {
     char product_key[GW_CHILD_PK_MAX];
     char model[GW_CHILD_MODEL_MAX];
     char addr[GW_CHILD_ADDR_MAX];   /* 学到的 BLE 地址（配对时云端不知道，首次连上才记） */
+    /*
+     * 2026-10-26〔子设备发现〕App 从"发现候选"里**选中**的那台子设备的 MAC（= `child.pair` 的
+     * `addr` 参数）。非空 ⇒ 本绑定只认这个地址（`bind_resolve` 里锁定），同型号多台不会连错；
+     * 空 ⇒ 老行为（按档案 model 匹配 + 首次连上学习地址）。NVS 键 = "want"。
+     */
+    char want_addr[GW_CHILD_ADDR_MAX];
 } gw_child_bind_t;
 
 /* 队列里的一条子设备事件（回调内定长拷贝，⛔ 不含任何外部指针） */
@@ -158,6 +164,8 @@ typedef struct {
     char   node[GW_CHILD_NODE_MAX];
     char   product_key[GW_CHILD_PK_MAX];
     char   model[GW_CHILD_MODEL_MAX];
+    /* 2026-10-26〔子设备发现〕`child.pair` 的可选 `addr`（App 选中的 MAC；空 = 未指定）。 */
+    char   addr[GW_CHILD_ADDR_MAX];
     bool   has_profile;
     bool   profile_too_large;
     size_t profile_len;
@@ -171,11 +179,55 @@ static QueueHandle_t   s_cmd_q;
 static QueueHandle_t   s_sub_q;
 static TaskHandle_t    s_task;
 
+/* ---------------------------------------------------------------- 子设备发现（2026-10-26） */
+
+#define GW_DISC_MAX         8       /* 附近最多记 8 台（同型号多台也放得下） */
+#define GW_DISC_TTL_MS      120000  /* 超时未再看到即从发现表剔除 */
+/* 2026-10-26〔发现扫描节流 · 真机教训〕：不能"一直扫"也不能"连上就永久停扫"。
+ *   实测现象：子设备连上后 link-sdk 会停扫（共存降载），发现表 120 s 后清空 ⇒
+ *   App 再打开"添加子设备"时云端 candidates 永远是空。
+ *   方案：**每 GW_DISC_REPORT_MS 开一个 GW_DISC_SCAN_WINDOW_MS 的发现窗口**
+ *   （8 s / 30 s ⇒ 平均扫描占空比 ≈0.5%），窗口结束立刻关扫描并汇总上报。 */
+#define GW_DISC_REPORT_MS        30000
+#define GW_DISC_SCAN_WINDOW_MS    8000
+
+typedef struct {
+    bool    used;
+    char    addr[GW_CHILD_ADDR_MAX];
+    char    model[GW_CHILD_MODEL_MAX];
+    char    product_key[GW_CHILD_PK_MAX];
+    int8_t  rssi;
+    int64_t last_ms;
+} gw_disc_t;
+
+static gw_disc_t s_disc[GW_DISC_MAX];
+static int64_t   s_disc_last_report_ms;
+/* 发现窗口：非 0 = 窗口开着，到点关扫描并上报（见 GW_DISC_REPORT_MS 注释）。 */
+static int64_t   s_disc_window_end_ms;
+
+/* 档案里的 productKey 尚未全量随链路下发 ⇒ 先按内置基线映射（T31 档 ↔ OY-THE-01）。
+ * ⚠️ 绑定表里已带 product_key 的机型优先用绑定表的（见 gw_disc_pk_of）。 */
+static const struct {
+    const char *model;
+    const char *pk;
+} s_disc_pk_baseline[] = {
+    { "T31", "OY-THE-01" },
+};
+
 /* sub.telemetry 节流：只在工作任务里读写 ⇒ 不需要临界区 */
 static int64_t  s_last_tele_ms;
 static uint32_t s_tele_dropped;
 static uint32_t s_unbound_dropped;   /* 未配对子设备的帧（丢弃并计数，见 handle_sub） */
 static uint32_t s_sub_q_dropped;     /* 事件队列满而丢弃的帧（2026-10-23 观测性） */
+
+/* 2026-10-26〔允许丢帧 + 断线清队列〕云状态门控：
+ *   现场（mg3mode2 实测）：云断期间 sub.telemetry 继续入 SDK 事件队列 ⇒ txq/slots 塞满、
+ *   堆碎片化到 largest 只剩 4 KB ⇒ TLS 重连需要 13–16 KB 连续块，**必然重连失败**（C 灭后回不来）。
+ *   策略：云断 ⇒ ① 本任务暂停上报（直接丢弃并计数，用户已批准"允许丢帧/补报"）；
+ *               ② 在**普通任务上下文**里清空 SDK 事件队列（不在 SDK 回调里调 SDK，避免重入）。 */
+static volatile bool s_cloud_up = true;
+static volatile bool s_purge_req;
+static uint32_t s_cloud_dropped;
 
 /* ---------------------------------------------------------------- 小工具 */
 
@@ -278,6 +330,11 @@ static esp_err_t nvs_store_bind(size_t idx, const gw_child_bind_t *b)
     bind_key(k, sizeof(k), idx, "addr");
     if (err == ESP_OK) {
         err = nvs_set_str(h, k, b->addr);
+    }
+    /* 2026-10-26〔子设备发现〕选中的目标 MAC（"want"）—— 空串也要写，否则解绑/重配后旧值残留。 */
+    bind_key(k, sizeof(k), idx, "want");
+    if (err == ESP_OK) {
+        err = nvs_set_str(h, k, b->want_addr);
     }
     if (err == ESP_OK) {
         err = nvs_commit(h);
@@ -408,6 +465,12 @@ static size_t nvs_load_binds(void)
         if (nvs_get_str(h, k, s_binds[i].addr, &len) != ESP_OK) {
             s_binds[i].addr[0] = '\0';
         }
+        /* 2026-10-26〔子设备发现〕选中的目标 MAC；老 NVS 没有该键 ⇒ 空串 = 未指定。 */
+        bind_key(k, sizeof(k), i, "want");
+        len = sizeof(s_binds[i].want_addr);
+        if (nvs_get_str(h, k, s_binds[i].want_addr, &len) != ESP_OK) {
+            s_binds[i].want_addr[0] = '\0';
+        }
         s_binds[i].used = true;
         loaded++;
     }
@@ -459,21 +522,58 @@ static bool model_in_use(const char *model, int except_idx)
  * ② 命中且该槽位还没有地址时**顺手学会**地址（多台同型号时后续就按地址区分）。
  * 只在工作任务里调用（会写 NVS）。
  */
+/**
+ * MAC 地址比较（**大小写不敏感**）—— 2026-10-26〔子设备发现〕。
+ *
+ * <p>为什么必须不敏感：云端下发的 `addr` 是**小写**（`device-service` 归一化成小写），
+ * 而 link-sdk 事件里的地址是**大写**（`%02X`）。同一台设备两种写法 ⇒ 用 `strcmp` 会永远不相等，
+ * 锁定就失效（甚至把"只认锁定地址"的槽位判成不匹配而丢帧）。
+ */
+static bool addr_ieq(const char *a, const char *b)
+{
+    if (a == NULL || b == NULL) {
+        return false;
+    }
+    while (*a != '\0' && *b != '\0') {
+        char ca = (*a >= 'a' && *a <= 'z') ? (char)(*a - 'a' + 'A') : *a;
+        char cb = (*b >= 'a' && *b <= 'z') ? (char)(*b - 'a' + 'A') : *b;
+        if (ca != cb) {
+            return false;
+        }
+        a++;
+        b++;
+    }
+    return (*a == '\0' && *b == '\0');
+}
+
 static int bind_resolve(const char *addr, const char *model)
 {
     int by_model = -1;
 
+    /* ② 2026-10-26〔子设备发现〕`want_addr` 锁定优先于一切：
+     *    这是 App 从"发现候选"里**选中**的那一台。锁定槽位只接受该地址，
+     *    ⛔ 不再走 model 回落（否则同型号多台时会把别的设备当成它）。 */
+    if (addr != NULL && addr[0] != '\0') {
+        for (size_t i = 0; i < GW_CHILD_MAX; i++) {
+            if (s_binds[i].used && s_binds[i].want_addr[0] != '\0' &&
+                addr_ieq(s_binds[i].want_addr, addr)) {
+                return (int)i;
+            }
+        }
+    }
     if (addr != NULL && addr[0] != '\0') {
         for (size_t i = 0; i < GW_CHILD_MAX; i++) {
             if (s_binds[i].used && s_binds[i].addr[0] != '\0' &&
-                strcmp(s_binds[i].addr, addr) == 0) {
+                addr_ieq(s_binds[i].addr, addr)) {
                 return (int)i;
             }
         }
     }
     if (model != NULL && model[0] != '\0') {
         for (size_t i = 0; i < GW_CHILD_MAX; i++) {
-            if (s_binds[i].used && strcmp(s_binds[i].model, model) == 0) {
+            /* 锁定到别的地址的槽位不参与 model 匹配（否则会顶替成那台设备）。 */
+            if (s_binds[i].used && strcmp(s_binds[i].model, model) == 0 &&
+                s_binds[i].want_addr[0] == '\0') {
                 by_model = (int)i;
                 break;
             }
@@ -520,6 +620,31 @@ uint8_t gw_child_bound_count(void)
 static void sync_target_links(void)
 {
     oneye_link_set_target_links(gw_child_bound_count());
+}
+
+/* 2026-10-26〔允许丢帧 + 断线清队列〕由 main.c 的云事件回调调用（只置位，⛔ 不调 SDK）：
+ *   云断 ⇒ 暂停 sub.telemetry 入队 + 申请清空 SDK 事件队列；
+ *   云恢复 ⇒ 复位节流位（下一帧立刻补报）。 */
+void gw_child_on_cloud_state(bool up)
+{
+    s_cloud_up = up;
+    if (up) {
+        s_last_tele_ms = 0;   /* 恢复后立刻补报一帧，不用等满节流窗口 */
+        /* 2026-10-26〔子设备发现〕云恢复 ⇒ 尽快开一个发现窗口并补报一次，
+         * 否则链路闪断期间的窗口被丢弃，candidates 会在 App 里"过期"。 */
+        s_disc_last_report_ms = 0;
+    } else {
+        s_purge_req = true;   /* 实际清理在 gw_child_task（普通上下文）里做 */
+    }
+    /* 2026-10-26〔子设备发现〕扫描由**任务里的发现窗口**节制（8 s/30 s）；云断立即关窗+关扫描，
+     * 云恢复不立刻开扫（等下一个窗口，避免刚重连就抢射频）。 */
+    if (!up) {
+        s_disc_window_end_ms = 0;
+        oneye_link_set_discovery(false);
+    }
+    ESP_LOGI(TAG, "云状态 → %s（%s）", up ? "UP" : "DOWN",
+             up ? "恢复 sub.telemetry（节流位已复位）；发现窗口由任务节流"
+                : "暂停 sub.telemetry 入队，并申请清空 SDK 事件队列 ＋ 发现扫描关");
 }
 
 /* ---------------------------------------------------------------- 上报 */
@@ -615,6 +740,115 @@ static bool emit_event(const char *type, const char *data_json)
                  type, oneye_dev_sdk_strerror(rc), (int)rc, (long long)used_ms);
     }
     return false;
+}
+
+/* ---------------------------------------------------------------- 子设备发现（2026-10-26） */
+
+/** model → productKey：绑定表里已有该机型的 product_key 就用它，否则回落内置基线映射。 */
+static const char *gw_disc_pk_of(const char *model)
+{
+    if (model == NULL || model[0] == '\0') {
+        return "";
+    }
+    for (size_t i = 0; i < GW_CHILD_MAX; i++) {
+        if (s_binds[i].used && strcmp(s_binds[i].model, model) == 0 &&
+            s_binds[i].product_key[0] != '\0') {
+            return s_binds[i].product_key;
+        }
+    }
+    for (size_t i = 0; i < sizeof(s_disc_pk_baseline) / sizeof(s_disc_pk_baseline[0]); i++) {
+        if (strcmp(s_disc_pk_baseline[i].model, model) == 0) {
+            return s_disc_pk_baseline[i].pk;
+        }
+    }
+    return "";
+}
+
+/**
+ * link-sdk 扫描发现回调（BLE host 任务上下文）—— 只写小表，⛔ 不做阻塞/上报。
+ * ⚠️ 同一 addr 只保留一条（刷新 RSSI 与 last_ms）；表满时替换最旧的一条。
+ */
+static void gw_disc_on_adv(const char *addr, const char *model, int8_t rssi, void *ctx)
+{
+    (void)ctx;
+    int64_t now = now_ms();
+    int same = -1;
+    int free_i = -1;
+    int oldest = -1;
+
+    for (int i = 0; i < GW_DISC_MAX; i++) {
+        if (s_disc[i].used && strcmp(s_disc[i].addr, addr) == 0) {
+            same = i;
+            break;
+        }
+        if (!s_disc[i].used && free_i < 0) {
+            free_i = i;
+        }
+        if (s_disc[i].used && (oldest < 0 || s_disc[i].last_ms < s_disc[oldest].last_ms)) {
+            oldest = i;
+        }
+    }
+    int idx = (same >= 0) ? same : (free_i >= 0 ? free_i : oldest);
+    if (idx < 0) {
+        return;
+    }
+    memset(&s_disc[idx], 0, sizeof(s_disc[idx]));
+    s_disc[idx].used = true;
+    str_copy(s_disc[idx].addr, sizeof(s_disc[idx].addr), addr);
+    str_copy(s_disc[idx].model, sizeof(s_disc[idx].model), model);
+    str_copy(s_disc[idx].product_key, sizeof(s_disc[idx].product_key), gw_disc_pk_of(model));
+    s_disc[idx].rssi = rssi;
+    s_disc[idx].last_ms = now;
+}
+
+/**
+ * 汇总上报 sub.discovered —— 由 gw_child_task 每 GW_DISC_REPORT_MS 调一次。
+ *
+ * <p>payload：{@code {"items":[{"model","productKey","mac","macLen","rssi"}]}}；
+ * 只含发现元数据，⛔ 不含温度/电量（未配对子设备数据不上报，用户 2026-10-23 口径）。
+ * 空表/云断 ⇒ 直接返回（⛔ 不发空帧浪费配额）。
+ */
+static void gw_disc_report(void)
+{
+    char body[512];
+    size_t used = 0;
+    int n = 0;
+    int64_t now = now_ms();
+
+    if (!s_cloud_up) {
+        return;
+    }
+    used += (size_t)snprintf(body + used, sizeof(body) - used, "{\"items\":[");
+    for (int i = 0; i < GW_DISC_MAX; i++) {
+        if (!s_disc[i].used) {
+            continue;
+        }
+        if (now - s_disc[i].last_ms > GW_DISC_TTL_MS) {
+            s_disc[i].used = false;   /* 超时剔除：网关已经看不到它了 */
+            continue;
+        }
+        if (s_disc[i].product_key[0] == '\0') {
+            continue;                 /* 机型没有 productKey 映射 ⇒ 上报了云端也匹配不了 */
+        }
+        if (used + 96u >= sizeof(body)) {
+            break;
+        }
+        used += (size_t)snprintf(body + used, sizeof(body) - used,
+                                 "%s{\"model\":\"%s\",\"productKey\":\"%s\",\"mac\":\"%s\","
+                                 "\"macLen\":6,\"rssi\":%d}",
+                                 (n > 0) ? "," : "",
+                                 s_disc[i].model, s_disc[i].product_key, s_disc[i].addr,
+                                 (int)s_disc[i].rssi);
+        n++;
+    }
+    (void)snprintf(body + used, sizeof(body) - used, "]}");
+    if (n <= 0) {
+        return;
+    }
+    s_disc_last_report_ms = now;
+    if (emit_event("sub.discovered", body)) {
+        ESP_LOGI(TAG, "子设备发现已上报：%d 台（%s）", n, body);
+    }
 }
 
 /* ---------------------------------------------------------------- 子设备事件处理（工作任务） */
@@ -918,6 +1152,17 @@ static void handle_sub(const gw_sub_evt_t *e)
          *   定位帧**不参与**温度节流（否则 2 s 的温度窗口会把它一起挡掉）。 */
         if (e->has_cmd && e->cmd == 0x02u) {
             gw_gps_on_frame(e);
+            return;
+        }
+
+        /* 2026-10-26〔允许丢帧 + 断线清队列〕云断期间**不再入队**：
+         *   丢弃并计数（云侧影子 TTL + 重连补报兜底），保证 SDK 事件队列不被填满。 */
+        if (!s_cloud_up) {
+            s_cloud_dropped++;
+            if ((s_cloud_dropped % 20u) == 1u) {
+                ESP_LOGD(TAG, "云断 ⇒ 丢弃 sub.telemetry（累计 %u 帧；恢复后自动补报）",
+                         (unsigned)s_cloud_dropped);
+            }
             return;
         }
 
@@ -1484,6 +1729,13 @@ static void do_pair(const gw_cmd_t *c)
     if (s_binds[idx].used) {
         str_copy(nb.addr, sizeof(nb.addr), s_binds[idx].addr);
     }
+    /* 2026-10-26〔子设备发现〕云端带来的"选中地址"（可选）：
+     * 非空 ⇒ 本绑定锁定该 MAC（bind_resolve 只接受它）；空 ⇒ 保留旧锁定值（重配对不会丢锁定）。 */
+    if (c->addr[0] != '\0') {
+        str_copy(nb.want_addr, sizeof(nb.want_addr), c->addr);
+    } else if (s_binds[idx].used) {
+        str_copy(nb.want_addr, sizeof(nb.want_addr), s_binds[idx].want_addr);
+    }
 
     /* ① 先落 NVS（fail-closed：写不进去就不注册档案、也不 ack ok） */
     if (nvs_store_bind((size_t)idx, &nb) != ESP_OK) {
@@ -1529,6 +1781,18 @@ static void do_pair(const gw_cmd_t *c)
         }
         ESP_LOGI(TAG, "已注册档案 model=%s（来源=下发，%u B）",
                  c->model, (unsigned)c->profile_len);
+
+        /* 🔴 2026-10-26 真机踩坑（解绑后重配 ⇒ 云端档覆盖解码档，温度全变 RAW_FRAME）：
+         *   开机顺序本是 内置 → NVS(云端档) → SIM（**SIM 最后注册生效**，自检通过）；
+         *   但 `child.pair` 在运行期把云端档注册成"同 model 最后注册者" ⇒ 解码档被换成云端档，
+         *   本仓 T31 = COM4 模拟器，其帧/字段映射与云端 668 B 档不一致 ⇒ cmd 被解成 0xA6、
+         *   TLV 只剩 RAW_FRAME，云端按"没有温度"丢弃 ⇒ App 显示离线。
+         *   ⇒ 运行期重配后**再注册一次内置完整档**，保证解码口径与开机自检一致（T31 专属）。 */
+        if (strcmp(c->model, "T31") == 0) {
+            size_t rn = register_builtin_t31();
+            ESP_LOGI(TAG, "T31 解码档复位：已重新注册内置完整档（%u B，来源=内置）",
+                     (unsigned)rn);
+        }
     } else {
         size_t bn = register_builtin_t31();
         if (bn == 0) {
@@ -1545,6 +1809,9 @@ static void do_pair(const gw_cmd_t *c)
              nb.node, nb.model, (nb.product_key[0] != '\0') ? nb.product_key : "(未给)",
              idx, use_builtin ? " ⚠️ 下发档案残缺，已回退内置" :
                   ((c->has_profile) ? "" : " ⚠️ 无 linkProfile"));
+    ESP_LOGI(TAG, "  BLE 地址：学到=%s / 锁定=%s（锁定非空 ⇒ 只连该地址）",
+             (nb.addr[0] != '\0') ? nb.addr : "(未学到)",
+             (nb.want_addr[0] != '\0') ? nb.want_addr : "(未指定)");
     /* 2026-10-25〔共存降载〕绑定数 +1 ⇒ 让 link-sdk 重新开扫（直到新子设备连上）。 */
     sync_target_links();
     ack_command(c->id, NULL);
@@ -1619,6 +1886,30 @@ static void gw_child_task(void *arg)
     for (;;) {
         gw_cmd_t cmd;
 
+        /* 2026-10-26：云断清队列申请——在本任务（普通上下文）里执行，⛔ 不在 SDK 回调里调 SDK。 */
+        if (s_purge_req) {
+            s_purge_req = false;
+            uint32_t purged = oneye_dev_sdk_purge_event_queue();
+            ESP_LOGW(TAG, "云断 ⇒ 已清空 SDK 事件队列 %u 帧（把内存让给 TLS 重连）",
+                     (unsigned)purged);
+        }
+
+        /* 2026-10-26〔子设备发现〕发现窗口状态机：开窗（8 s 低占空比扫描）→ 关窗 → 汇总上报。
+         * 云断不动作（on_cloud_state 会关扫描并清窗口），⛔ 断网时白耗射频。 */
+        {
+            int64_t now = now_ms();
+            if (s_disc_window_end_ms != 0 && now >= s_disc_window_end_ms) {
+                s_disc_window_end_ms = 0;
+                oneye_link_set_discovery(false);
+                gw_disc_report();
+            } else if (s_disc_window_end_ms == 0 && s_cloud_up &&
+                       now - s_disc_last_report_ms >= GW_DISC_REPORT_MS) {
+                s_disc_last_report_ms = now;
+                oneye_link_set_discovery(true);
+                s_disc_window_end_ms = now + GW_DISC_SCAN_WINDOW_MS;
+            }
+        }
+
         /* 命令优先（低频、要回执）；最多等一个轮询窗口，随后排空事件队列 */
         if (xQueueReceive(s_cmd_q, &cmd, pdMS_TO_TICKS(GW_CHILD_POLL_MS)) == pdPASS) {
             handle_cmd(&cmd);
@@ -1660,6 +1951,15 @@ bool gw_child_report_start(void)
              (int)GW_CHILD_TASK_STACK, (unsigned)sizeof(gw_cmd_t), (int)GW_CHILD_CMD_Q_DEPTH,
              (unsigned)sizeof(gw_sub_evt_t), (int)GW_CHILD_SUB_Q_DEPTH,
              (int)CONFIG_ONEYE_T31_GW_SUB_TELE_MIN_MS);
+
+    /* 2026-10-26〔子设备发现〕只挂回调；**扫描由任务里的发现窗口节制**（8 s/30 s），
+     * 不再常开（子设备连上后 link-sdk 本来就会停扫，常开也拿不到广播）。 */
+    if (oneye_link_register_disc_cb(gw_disc_on_adv, NULL) == ONEYE_LINK_OK) {
+        ESP_LOGI(TAG, "子设备发现回调已挂（窗口 %d ms / 周期 %d ms）",
+                 GW_DISC_SCAN_WINDOW_MS, GW_DISC_REPORT_MS);
+    } else {
+        ESP_LOGW(TAG, "子设备发现回调注册失败 ⇒ App 侧只能看到已配对子设备");
+    }
     return true;
 }
 
@@ -1732,6 +2032,9 @@ void gw_child_on_command(const void *payload, size_t len)
         json_str(params, "product_key", cmd.product_key, sizeof(cmd.product_key));
     }
     json_str(params, "model", cmd.model, sizeof(cmd.model));
+    /* 2026-10-26〔子设备发现〕App 从"发现候选"里选中的子设备 MAC（可选键 `addr`）：
+     * 有 ⇒ 锁定只连该地址；无 ⇒ 老行为（按 model 匹配 + 首次连上学习地址）。 */
+    json_str(params, "addr", cmd.addr, sizeof(cmd.addr));
 
     /* linkProfile：既可能是**对象**（用户给定的形态），也可能是已序列化的字符串 */
     prof = cJSON_GetObjectItemCaseSensitive(params, "linkProfile");

@@ -122,6 +122,17 @@ static volatile bool s_ui_sub_online;
 static volatile bool s_ui_has_temp;
 static volatile int  s_ui_temp_centi;
 static volatile int  s_ui_battery = -1;
+/* ── 2026-10-26〔分帧属性各自保鲜〕T31 温度/电量/定位分别在不同帧里到达（温度 cmd=0x01、
+ *    电量 0xB1、定位 0x02）。每个属性**各自**粘性更新 + 各自保鲜窗口：
+ *      · 帧里没带该属性 ⇒ ⛔ 不清值（保留上次）；
+ *      · 超过保鲜窗口没再收到 ⇒ 视为未知（屏上回到 "--" / "--%"）；
+ *      · 子设备离线 ⇒ 全部立即回到未知（用户口径：断开后要回到 --%）。
+ *    这样"某帧只带温度"不会把电量清掉，反之亦然。 */
+static volatile int64_t s_ui_temp_ms;
+static volatile int64_t s_ui_batt_ms;
+/* 保鲜窗口（ms）：温度帧 2 s 一帧 ⇒ 15 s 足够宽松；电量为低频帧 ⇒ 给 10 分钟。 */
+#define UI_TEMP_TTL_MS  (15 * 1000)
+#define UI_BATT_TTL_MS  (10 * 60 * 1000)
 static volatile bool s_ui_cloud_up;
 static char          s_ui_model[32] = "T31";   /* link 事件里整体覆盖写，UI 侧只读（长度对齐 evt->model） */
 
@@ -301,6 +312,8 @@ static void on_dev_event(oneye_dev_event_t evt, const void *payload, size_t len,
         ESP_LOGI(TAG, "云链路已建立（CLOUD_LINK_UP）⇒ 立刻补报一次当前影子");
         s_ui_cloud_up = true;                    /* 2026-10-25：屏上 CLOUD 指示 */
         s_last_report_ms = 0;                    /* 补报不受节流限制 */
+        /* 2026-10-26〔允许丢帧 + 断线清队列〕恢复子设备上报（节流位复位 ⇒ 下一帧立刻补报） */
+        gw_child_on_cloud_state(true);
         if (s_state_task != NULL) {
             (void)xTaskNotifyGive(s_state_task);
         }
@@ -320,6 +333,10 @@ static void on_dev_event(oneye_dev_event_t evt, const void *payload, size_t len,
         }
         s_down_cnt++;
         s_ui_cloud_up = false;                   /* 2026-10-25：屏上 CLOUD 指示 */
+        /* 2026-10-26〔允许丢帧 + 断线清队列〕云断 ⇒ 暂停 sub.telemetry 入队 +
+         *   在 gw_child 自己的任务里清空 SDK 事件队列（回收内存给 TLS 重连）。
+         *   本回调在 SDK 上下文，⛔ 这里只置位（gw_child_on_cloud_state 内部只写 volatile）。 */
+        gw_child_on_cloud_state(false);
         ESP_LOGW(TAG, "云链路断开（CLOUD_LINK_DOWN）⇒ SDK 自动重连；重连成功后补报影子"
                       "（60 s 窗口内第 %u 次）", (unsigned)s_down_cnt);
         if (s_down_cnt >= 3u) {
@@ -408,8 +425,21 @@ static void gw_on_sub_data(const oneye_link_event_t *evt, const char *addr)
     if (has_temp) {
         s_ui_has_temp = true;
         s_ui_temp_centi = (int)(temp_c * 100.0f + ((temp_c >= 0) ? 0.5f : -0.5f));
+        s_ui_temp_ms = esp_timer_get_time() / 1000;   /* 本属性自己的"最后到达时间" */
     }
-    s_ui_battery = (batt >= 0) ? batt : -1;
+    /* 🔴 2026-10-26〔屏上电量频繁 "--%" 修复〕电量必须**粘性**：只有本帧真的带了
+     *   BATTERY_PCT(0x08) 才更新；没带就**保留上一次的值**。
+     *   现场：T31 只在电量帧（cmd=0xB1）里带电量，温度帧（cmd=0x01）不带 ⇒ 旧代码
+     *   `s_ui_battery = (batt >= 0) ? batt : -1;` 会在每个温度帧把电量清成 -1，
+     *   屏上就在"46%"和"--%"之间反复跳（但连接其实一直正常）。
+     *   旧值逐字留痕（⛔ 不删）：`s_ui_battery = (batt >= 0) ? batt : -1;` */
+    /* ⚠️ 0xFF(255) = 协议里的"电量未知" ⇒ ⛔ 不能当有效值写进 UI（否则屏上会显示 "255%"）。
+     *   🔴 2026-10-26〔分帧〕只有本帧带有效电量才更新 + 刷新本属性到达时间；
+     *   温度帧不带电量时**保留**上次值（屏上不再跳 --%）。 */
+    if (batt >= 0 && batt <= 100) {
+        s_ui_battery = batt;
+        s_ui_batt_ms = esp_timer_get_time() / 1000;
+    }
 
     if (!has_temp) {
         /* 没解出温度：只留日志（可能是透传帧 —— 真 T31 的 cmd=0x01 body 编码未解出时就是这样） */
@@ -460,6 +490,14 @@ static void on_link_event(const oneye_link_event_t *evt, void *ctx)
         ESP_LOGW(TAG, "[离线] %s model=%s（⛔ 不改 power；只保留最后一次影子值）",
                  addr, evt->model);
         s_ui_sub_online = false;                                 /* 2026-10-25 屏上 SUB 指示 */
+        /* 2026-10-26〔分帧属性 · 离端口径〕子设备断开 ⇒ 屏上所有"实时属性"回到未知：
+         *   温度 → "--"、电量 → "--%"（用户明确要求"断开 sub 后需要回到 --%"）。
+         *   ⚠️ 云侧**影子**不受此影响（影子按"最后一次可读值"保留，见上一行注释）。 */
+        s_ui_has_temp = false;
+        s_ui_temp_centi = 0;
+        s_ui_temp_ms = 0;
+        s_ui_battery = -1;
+        s_ui_batt_ms = 0;
         break;
     case ONEYE_LINK_EVT_SUB_DATA:
         gw_on_sub_data(evt, addr);
@@ -699,7 +737,32 @@ static void cloud_start_task(void *arg)
          *   导致云链路闪断。子设备只有 T31 一台、且连上后就不再需要扫描 ⇒ 降到 10% 足够，
          *   首次连接最多晚 ~1 s，换来 Wi-Fi 稳定。 */
         lcfg.scan_window_ms = 100;
-        lcfg.cache_entries = 512;
+        /* 🔴 2026-10-26〔MG3 化 · 缓存按资源可配〕断网缓存条数**不再写死 512**（旧值逐字留痕：
+         *   原代码 `lcfg.cache_entries = 512;`），改在初始化处按**本机资源**决定：
+         *     · 有 PSRAM 且空闲 ≥ 256 KB ⇒ 512 条（可承受较长断网补传）；
+         *     · 无 PSRAM、内部空闲 ≥ 80 KB ⇒ 64 条（约覆盖 2–3 分钟 2 s 帧）；
+         *     · 否则 ⇒ **0（关闭）**：缓存每条 topic/json 都是堆分配，会和 BLE+TLS 抢内存，
+         *       反而让"云掉线后 TLS 重连"分不到 13–16 KB 连续块（现场已复现）。
+         *   语义：`cache_entries=0` ⇒ 断网期间子设备数据直接丢弃，由云侧影子 TTL + 重连补报兜底。
+         *   ⚠️ 这是产品已批准的"允许丢帧/补报"口径（用户 2026-10-26 裁定）。 */
+        {
+            size_t psram_free = 0;
+            size_t int_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+#if CONFIG_SPIRAM
+            psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+#endif
+            uint32_t cache_n = 0;
+            if (psram_free >= 256u * 1024u) {
+                cache_n = 512;      /* 有 PSRAM：可承受较长断网补传 */
+            }
+            /* 无 PSRAM（C6-GEEK）⇒ 0：实测 BLE 连接 + TLS 会话后 largest 只剩 5–10 KB，
+             * 断网缓存一旦堆积就会挤掉 TLS 重连所需的 13–16 KB 连续块 ⇒ 优先保"能重连"，
+             * 断网数据靠云侧影子 TTL + 重连补报兜底（用户已批准"允许丢帧/补报"口径）。 */
+            lcfg.cache_entries = cache_n;
+            ESP_LOGI(TAG, "断网缓存策略（按资源自适应）：psram_free=%u B / internal_free=%u B "
+                          "⇒ cache_entries=%u（0=关闭，断网数据丢弃靠云侧影子兜底）",
+                     (unsigned)psram_free, (unsigned)int_free, (unsigned)cache_n);
+        }
         /* 🔴 2026-10-25 真机订正：从 true 改成 **false**。
          *   原值 true = 「广播里有名字/服务就接」，现场环境里那些无关 BLE 设备（耳机/iBeacon 等）
          *   也会被接进 4 个槽位 ⇒ 槽位被占满后 `ble_scan_start()` 因 `free_slot_count()<=0`
@@ -1180,11 +1243,31 @@ static void lcd_ui_task(void *arg)
         st.wifi_connected = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK);
         st.wifi_rssi = st.wifi_connected ? (int)ap.rssi : 0;
         st.cloud_up = s_ui_cloud_up;
+        const int64_t now_ms = esp_timer_get_time() / 1000;
         st.sub_online = s_ui_sub_online;
-        st.has_temp = s_ui_has_temp;
+        /* 2026-10-26〔分帧属性各自保鲜〕温度/电量分别按**自己的到达时间**判断新鲜度：
+         *   · 某帧没带该属性 ⇒ 不清值（保留上次）；
+         *   · 超过保鲜窗口 ⇒ 显示未知（-- / --%）；
+         *   · 子设备离线 ⇒ 上面 on_link_event 已把两属性清零，这里再受 sub_online 门控。 */
+        st.has_temp = st.sub_online && s_ui_has_temp &&
+                      (now_ms - s_ui_temp_ms) <= UI_TEMP_TTL_MS;
         st.temp_centi = s_ui_temp_centi;
-        st.battery = s_ui_battery;
+        st.battery = (st.sub_online && s_ui_battery >= 0 &&
+                      (now_ms - s_ui_batt_ms) <= UI_BATT_TTL_MS) ? s_ui_battery : -1;
         st.sub_model = s_ui_model;
+        if (st.battery < 0 && st.sub_online) {
+            /* 2026-10-26〔屏显 --% 修复 · 兜底〕若 TLV 路径还没拿到过电量（例如电量帧先于 UI 任务
+             *   就绪），回退读 link-sdk 的"最近一次电量"（子设备表项里对连接是粘性的）。
+             *   ⚠️ 用固定上界 8（= 本工程 max_links 5 + 余量），避免依赖未公开的 capacity()。 */
+            for (size_t i = 0; i < 8u; i++) {
+                oneye_link_subdev_info_t info;
+                if (oneye_link_subdev_get(i, &info) && info.state == ONEYE_LINK_SUB_ONLINE &&
+                    info.battery <= 100u) {
+                    st.battery = (int)info.battery;
+                    break;
+                }
+            }
+        }
 
         const int rssi_bucket = st.wifi_rssi / 5;
         /* 重绘判据包含 RSSI 分桶（信号每变 5 dBm 刷一次）；**打日志只认状态变化**

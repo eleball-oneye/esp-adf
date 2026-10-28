@@ -80,6 +80,7 @@ static const char *TAG = "t31sub";
 #define T31_CMD_TEMP         0x01u
 #define T31_CMD_BATT         0xB1u
 #define T31_CMD_GPS          0x02u   /* 🔴 2026-10-25 本仓扩展：GNSS 定位（见文件头） */
+#define T31_CMD_TLV          0x03u   /* 🔴 2026-10-28 本仓扩展：通用 TLV 透传（网关不解析标签） */
 
 #define T31_SIM_PI           3.14159265f
 /* 模拟温度区间（℃ ×100）：36.00 – 37.50（用户口径） */
@@ -180,14 +181,16 @@ static void t31_notify(const uint8_t *buf, size_t len)
 
 /*
  * 🔴 2026-10-25：GNSS 定位帧（cmd 0x02）—— 本仓对 T31 模拟器的**扩展命令**。
+ * 🔴 2026-10-28：新增 **cmd 0x03 通用 TLV 透传帧**；`gnssState` 由子设备直接编成 TLV
+ *    （`0x56 01 state`），网关**不解析标签**，只把这段 TLV 原样并进 `sub.telemetry`
+ *    ⇒ 新物模型属性只要子设备会编 TLV，网关固件不用改。
  *
  * 为什么单独一帧、而不是并进温度帧：
- *   · 温度帧 8 B / 本帧 18 B，都 ≤ BLE 默认 MTU 的 20 B 载荷上限 ⇒ **不依赖 MTU 协商**；
+ *   · 温度帧 8 B / GPS 帧 18 B / TLV 帧 7 B，都 ≤ BLE 默认 MTU 的 20 B 载荷上限 ⇒ **不依赖 MTU 协商**；
  *   · 定位 1 Hz、温度 2 s 一帧，两者节奏不同（且室内可能整场无有效定位）；
- *   · 网关侧把最近一次定位**并进温度帧的 TLV** 上报（见 gw_child.c），云端无温度缺帧风险。
+ *   · 网关侧把最近一次定位/TLV **并进温度帧的 TLV** 上报（见 gw_child.c），云端无温度缺帧风险。
  *
- * ⚠️ payload 全部 **LE**（与本模拟器既有帧一致）；上游 TLV 是 **BE**，转换在网关做。
- * 未定位（fix=0）时仍发帧：sats/fix 字段让云端知道"模组在、但没信号"，经纬度填 0。
+ * ⚠️ 0x02 payload 全部 **LE**；0x03 payload 是**与云端 TLV 同字节序（大端）**的原始标签流。
  */
 #if CONFIG_ONEYE_GNSS_ENABLE
 static void t31_emit_gps(void)
@@ -202,22 +205,17 @@ static void t31_emit_gps(void)
     uint16_t spd = 0;
     uint8_t sats;
     uint8_t fix;
+    bool has;
     size_t len;
 
     if (s_conn == BLE_HS_CONN_HANDLE_NONE || !s_subscribed) {
         return;   /* 与温度同口径：无连接/未订阅不推送（只由温度帧留日志） */
     }
-    if (!gnss_get(&g)) {
-        if ((gps_no % 30u) == 0u) {
-            ESP_LOGI(TAG, "[gnss→ble] 尚无 NMEA ⇒ 本周期不发 GPS 帧（累计尝试 %u）", gps_no + 1u);
-        }
-        gps_no++;
-        return;
-    }
 
-    sats = g.sats;
-    fix = g.fix ? g.fix_type : 0u;
-    if (g.fix) {
+    has = gnss_get(&g);
+    sats = has ? g.sats : 0u;
+    fix = (has && g.fix) ? g.fix_type : 0u;
+    if (has && g.fix) {
         lat = g.lat_e7;
         lon = g.lon_e7;
         alt = g.alt_m;
@@ -252,6 +250,42 @@ static void t31_emit_gps(void)
                  (double)lat / 1e7, (double)lon / 1e7, (int)alt, (unsigned)len);
     }
 }
+
+/*
+ * 通用 TLV 透传帧（cmd 0x03）：payload 就是云端 `sub.telemetry` 的 TLV 字节流（大端）。
+ * 当前只放 `0x56 01 <state>`；以后新增属性只要在这里 append 标签，**网关固件不用改**。
+ * 帧上限 20 B ⇒ TLV ≤ 16 B（本帧 7 B）。
+ */
+static void t31_emit_tlv(void)
+{
+    static unsigned tlv_no;
+    gnss_fix_t g;
+    uint8_t tlv[16];
+    uint8_t frame[24];
+    size_t n = 0;
+    size_t len;
+    uint8_t state;
+
+    if (s_conn == BLE_HS_CONN_HANDLE_NONE || !s_subscribed) {
+        return;
+    }
+    state = gnss_get(&g) ? g.state : (uint8_t)GNSS_STATE_NO_DATA;
+
+    tlv[n++] = 0x56u;   /* GNSS_STATE */
+    tlv[n++] = 1u;
+    tlv[n++] = state;
+
+    len = t31_build_frame(T31_CMD_TLV, tlv, n, frame, sizeof(frame));
+    if (len == 0) {
+        return;
+    }
+    t31_notify(frame, len);
+    tlv_no++;
+    if ((tlv_no % 10u) == 1u) {
+        ESP_LOGI(TAG, "→ notify TLV 帧 #%u：0x56 gnssState=%u（%u B；网关原样转发）",
+                 tlv_no, (unsigned)state, (unsigned)len);
+    }
+}
 #endif /* CONFIG_ONEYE_GNSS_ENABLE */
 
 
@@ -270,6 +304,8 @@ static void t31_emit_once(void)
 #if CONFIG_ONEYE_GNSS_ENABLE
     /* 定位帧先发（独立 cmd/独立缓冲）：温度帧仍是 FFF1 READ 的"最近一帧" */
     t31_emit_gps();
+    /* 通用 TLV 再发：gnssState 等新属性由子设备编 TLV，网关不解析标签 */
+    t31_emit_tlv();
 #endif
 
     centi = t31_sim_temp_centi();

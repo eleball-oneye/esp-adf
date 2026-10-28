@@ -53,6 +53,8 @@ static const char *TAG = "gnss";
 #define GNSS_ALIVE_WINDOW_MS 5000
 /* 定位有效期：10 s 内没有新的有效位置 ⇒ 对外报告"定位丢失"（模组 1 Hz） */
 #define GNSS_FIX_STALE_MS    10000
+/* 数据有效期：5 s 内没有合法 NMEA ⇒ gnssState=NO_DATA（模组 1 Hz） */
+#define GNSS_DATA_STALE_MS   5000
 
 /* ---------------------------------------------------------------- 状态 */
 
@@ -68,7 +70,19 @@ static bool     s_rmc_valid;               /* RMC 状态位 = A */
 static uint8_t  s_gga_quality;             /* GGA 第 6 字段（0=未定位） */
 static uint8_t  s_gsa_fix;                 /* GSA 第 2 字段（1=未定位 2=2D 3=3D） */
 static uint8_t  s_gga_sats;                /* GGA 参与定位卫星数 */
-static uint8_t  s_gsv_sats;                /* GSV 可见卫星总数 */
+static uint8_t  s_gsv_sats;                /* GSV 可见卫星总数（按星座累加，见 parse_gsv） */
+
+/* GSV 每条语句只带“本星座”的可见总数；$GPGSV / $BDGSV / $GLGSV 会各来一句。
+ * ⛔ 不能用“最后一句覆盖”：北斗 0 会把 GPS 的可见数冲掉（真机 2026-10-28 已复现）。
+ * 这里按 talker 各记一份，求和；超过 5 s 没更新的条目视为过期。 */
+#define GNSS_GSV_TALKERS 6
+typedef struct {
+    char    talker[2];
+    uint8_t total;
+    int64_t ms;
+} gsv_talker_t;
+static gsv_talker_t s_gsv[GNSS_GSV_TALKERS];
+static uint8_t      s_gsv_used;
 
 /* ---------------------------------------------------------------- 小工具 */
 
@@ -213,17 +227,20 @@ static size_t split_fields(char *s, char **f, size_t cap)
     return n;
 }
 
-/* 取 `$GNRMC` 这类语句的**最后 3 个字符**（RMC/GGA/GSA/GSV/VTG/TXT…），
- * 不区分 $GN/$GP/$BD/$GL 前缀 ⇒ 双模/北斗模式都能认。 */
+/* 取 `$GNRMC` / `GNRMC` 这类语句名的**最后 3 个字符**（RMC/GGA/GSA/GSV/VTG/TXT…），
+ * 不区分 $GN/$GP/$BD/$GL 前缀 ⇒ 双模/北斗模式都能认。
+ * ⚠️ 2026-10-28 真机修复：旧实现把**整行**传进来，取到的是行尾字段（如 `,,,`），
+ *    导致 RMC/GGA/GSA/GSV 一个都没被分发 ⇒ fix/sats 永远停在默认 0。现在由 handle_line
+ *    先 split_fields，再把 f[0]（语句名）传进来。 */
 static bool sentence_kind(const char *name, char kind[4])
 {
     size_t n;
 
-    if (name == NULL || name[0] != '$') {
+    if (name == NULL || name[0] == '\0') {
         return false;
     }
     n = strlen(name);
-    if (n < 6) {
+    if (n < 3) {
         return false;
     }
     kind[0] = name[n - 3];
@@ -312,21 +329,95 @@ static void parse_gsa(char **f, size_t n)
 
 static void parse_gsv(char **f, size_t n)
 {
+    int total;
+    int idx = -1;
+    int64_t now;
+    unsigned sum = 0;
+
     if (n < 4 || f[3][0] == '\0') {
         return;
     }
+    if (strlen(f[0]) < 5) {
+        return;
+    }
+    total = atoi(f[3]);
+    if (total < 0 || total > 64) {
+        return;
+    }
+
     portENTER_CRITICAL(&s_lock);
-    {
-        int total = atoi(f[3]);
-        if (total >= 0 && total <= 64) {
-            s_gsv_sats = (uint8_t)total;
+    now = now_ms();
+
+    /* 按 talker（GP/BD/GL/GA/GN…）找条目；找不到就追加。f[0] 是 "GPGSV"（无 `$`），
+     * talker = f[0][0..1]。 */
+    for (uint8_t i = 0; i < s_gsv_used; i++) {
+        if (s_gsv[i].talker[0] == f[0][0] && s_gsv[i].talker[1] == f[0][1]) {
+            idx = i;
+            break;
         }
     }
+    if (idx < 0 && s_gsv_used < GNSS_GSV_TALKERS) {
+        idx = s_gsv_used++;
+        s_gsv[idx].talker[0] = f[0][0];
+        s_gsv[idx].talker[1] = f[0][1];
+    }
+    if (idx >= 0) {
+        s_gsv[idx].total = (uint8_t)total;
+        s_gsv[idx].ms = now;
+    }
+
+    for (uint8_t i = 0; i < s_gsv_used; i++) {
+        if (s_gsv[i].ms != 0 && (now - s_gsv[i].ms) <= 5000) {
+            sum += s_gsv[i].total;
+        }
+    }
+    s_gsv_sats = (sum > 64u) ? 64u : (uint8_t)sum;
+
     /* 可见星数只影响"未定位时也有的读数"，⛔ 不改 fix 判定 */
     if (!s_fix.fix) {
         s_fix.sats = (s_gga_sats > 0u) ? s_gga_sats : s_gsv_sats;
     }
     portEXIT_CRITICAL(&s_lock);
+
+#ifdef CONFIG_ONEYE_GNSS_LOG_RAW
+    /* 只在"某星座真的看到星"时打一条，验证按星座累加后的 sats（2026-10-28 真机排障用）。 */
+    if (total > 0) {
+        ESP_LOGI(TAG, "[gnss] GSV %c%c total=%d ⇒ sats=%u（按星座累加）",
+                 f[0][0], f[0][1], total, (unsigned)s_fix.sats);
+    }
+#endif
+}
+
+/* `$GPTXT,01,01,01,ANTENNA OK|OPEN|SHORT` —— 只认天线状态，其余 TXT 忽略 */
+static void parse_txt(char **f, size_t n)
+{
+    uint8_t state = 0;
+
+    for (size_t i = 0; i < n; i++) {
+        if (strstr(f[i], "ANTENNA OPEN") != NULL) {
+            state = 2;
+            break;
+        }
+        if (strstr(f[i], "ANTENNA SHORT") != NULL) {
+            state = 3;
+            break;
+        }
+        if (strstr(f[i], "ANTENNA OK") != NULL) {
+            state = 1;
+            break;
+        }
+    }
+    if (state == 0) {
+        return;
+    }
+    portENTER_CRITICAL(&s_lock);
+    bool changed = (s_fix.antenna != state);
+    s_fix.antenna = state;
+    portEXIT_CRITICAL(&s_lock);
+    if (changed) {
+        ESP_LOGI(TAG, "[gnss] 天线状态：%s",
+                 state == 1 ? "OK" : (state == 2 ? "OPEN（未接/线断）" : "SHORT（短路）"));
+    }
 }
 
 /* 一条完整 NMEA 行（已含 `$`/`*hh`，不含 CRLF） */
@@ -348,12 +439,12 @@ static void handle_line(char *line, size_t len)
     if (star != NULL) {
         *star = '\0';                 /* 只留 `$TYPE,f1,f2...` */
     }
-    if (!sentence_kind(line, kind)) {
-        return;
-    }
 
     nf = split_fields(line + 1, f, GNSS_FIELD_MAX);   /* f[0] = 语句名 */
     if (nf < 2) {
+        return;
+    }
+    if (!sentence_kind(f[0], kind)) {
         return;
     }
 
@@ -371,6 +462,8 @@ static void handle_line(char *line, size_t len)
         parse_gsa(f, nf);
     } else if (strcmp(kind, "GSV") == 0) {
         parse_gsv(f, nf);
+    } else if (strcmp(kind, "TXT") == 0) {
+        parse_txt(f, nf);
     }
     /* 其它语句（VTG/GLL/ZDA/TXT…）本模块不解：⛔ 不要因为"不认识"丢整条流 */
 }
@@ -414,6 +507,20 @@ bool gnss_get(gnss_fix_t *out)
     if (out->fix && out->fix_ms != 0 && (now_ms() - out->fix_ms) > GNSS_FIX_STALE_MS) {
         out->fix = false;
         out->fix_type = 0;
+    }
+    /* gnssState：先判"有没有数据"，再判天线/定位；与云端 TSL 0..4 逐值一致 */
+    if (!out->valid || out->updated_ms == 0 ||
+        (now_ms() - out->updated_ms) > GNSS_DATA_STALE_MS) {
+        out->state = GNSS_STATE_NO_DATA;
+        out->fix = false;
+        out->fix_type = 0;
+        out->sats = 0;
+    } else if (out->antenna == 2 || out->antenna == 3) {
+        out->state = GNSS_STATE_ANTENNA_FAULT;
+    } else if (out->fix) {
+        out->state = (out->fix_type == 1) ? GNSS_STATE_FIX_2D : GNSS_STATE_FIX_3D;
+    } else {
+        out->state = GNSS_STATE_NO_FIX;
     }
     return out->valid;
 }
@@ -465,7 +572,7 @@ static void gnss_task(void *arg)
     char line[GNSS_LINE_MAX];
     size_t used = 0;
     uint8_t buf[128];
-    int64_t last_summary_ms = 0;
+    int64_t last_summary_ms = now_ms();
     bool alive_logged = false;
     bool first_fix_logged = false;
 
@@ -585,6 +692,19 @@ esp_err_t gnss_start(void)
         };
         (void)gpio_config(&io);
         s_pps_level = (uint8_t)gpio_get_level((gpio_num_t)GNSS_PPS_GPIO);
+    }
+#endif
+
+#ifdef CONFIG_ONEYE_GNSS_LOG_RAW
+    /* 2026-10-28 自检（仅 raw 诊断构建）：不依赖天空，验证 GSV 按星座累加。
+     * GPGSV 见 1 颗、BDGSV 见 0 颗 ⇒ 期望 sats=1（旧实现最后一句覆盖会得 0）。 */
+    {
+        char gp[] = "$GPGSV,1,1,01,28,,,21*71";
+        char bd[] = "$BDGSV,1,1,00*68";
+
+        handle_line(gp, strlen(gp));
+        handle_line(bd, strlen(bd));
+        ESP_LOGI(TAG, "[gnss] 自检 GSV：GP=1 / BD=0 ⇒ sats=%u（期望 1）", (unsigned)s_fix.sats);
     }
 #endif
 

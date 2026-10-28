@@ -91,6 +91,12 @@ static const char *TAG = "gw_child";
 #define GW_TLV_GNSS_FIX        0x55u /* u8 0=未定位 1=2D 2=3D */
 #define GW_TLV_GNSS_BYTES      26u   /* 有定位时的全部 GPS 标签字节数（6+6+4+4+3+3） */
 
+/* 通用 TLV 透传（子设备 cmd=0x03）：网关**不解析标签**，只缓存并原样并进 telemetry。
+ * 这样新增物模型属性（如 gnssState 0x56）只改子设备 + 云端 TSL，⛔ 不用改网关固件。 */
+#define GW_CMD_TLV             0x03u
+#define GW_EXTRA_TLV_CAP       64u
+#define GW_EXTRA_TLV_FRESH_MS  30000
+
 /* 队列深度：命令很罕见（配对/解绑），子设备事件每 2 s 一帧 */
 #define GW_CHILD_CMD_Q_DEPTH   2
 /* 🔴 2026-10-23 真机：队列 8 起来后出现 `子设备事件队列满`（上报任务没出队时积压 16 s）。
@@ -138,6 +144,10 @@ typedef struct {
      * 空 ⇒ 老行为（按档案 model 匹配 + 首次连上学习地址）。NVS 键 = "want"。
      */
     char want_addr[GW_CHILD_ADDR_MAX];
+    /* 2026-10-28：子设备 cmd=0x03 通用 TLV 的最近一帧（网关不解析标签，原样并进 telemetry） */
+    uint8_t extra_tlv[GW_EXTRA_TLV_CAP];
+    uint8_t extra_tlv_len;
+    int64_t extra_tlv_ms;
 } gw_child_bind_t;
 
 /* 队列里的一条子设备事件（回调内定长拷贝，⛔ 不含任何外部指针） */
@@ -866,7 +876,7 @@ static void gw_disc_report(void)
  *     并进去，既不额外增加 event/up 频率，又保证"有温度就有定位（若有）"。
  *   · 未定位（fix=0）时只并 sats/fix 两个标签：云端影子能看出"模组在、没信号"，
  *     ⛔ 不会用 0/0 的假经纬度污染地图。
- * ★ 云端标签口径（0x50–0x55）见 oneye-link-sdk/docs/TLV-REGISTRY.md §5；单位/大端与
+ * ★ 云端标签口径（0x50–0x55；0x56 走 cmd=0x03 通用 TLV 透传）见 oneye-link-sdk/docs/TLV-REGISTRY.md §5；单位/大端与
  *   TLV 编码一致（i32/i16/u16 均大端，与温度 0x10 同族）。
  * ======================================================================== */
 
@@ -1093,6 +1103,45 @@ static bool build_telemetry_json(char *out, size_t cap, const char *node, const 
     return true;
 }
 
+/* 通用 TLV 结构校验（**不认识任何标签**，只看 tag/len 边界是否自洽）。
+ * 这样网关不依赖具体物模型；新标签只要子设备按 TLV 编码就能原样转发。 */
+static bool gw_tlv_walk_ok(const uint8_t *p, size_t n)
+{
+    size_t off = 0;
+
+    while (off + 2u <= n) {
+        uint8_t len = p[off + 1u];
+        if (off + 2u + len > n) {
+            return false;
+        }
+        off += 2u + len;
+    }
+    return off == n;
+}
+
+/* 子设备 cmd=0x03：缓存最近一帧通用 TLV（按 bind 分开，⛔ 不串台）。 */
+static void gw_extra_tlv_on_frame(const gw_sub_evt_t *e, int idx)
+{
+    size_t n;
+    const uint8_t *p;
+
+    if (idx < 0 || e->raw_len < 6u || e->raw[0] != 0xA6u || e->raw[1] != GW_CMD_TLV ||
+        e->raw[e->raw_len - 1u] != 0x6Au) {
+        return;
+    }
+    p = e->raw + 2;
+    n = (size_t)e->raw_len - 4u;   /* 去掉 A6 / cmd / checksum / 6A */
+    if (n == 0u || n > sizeof(s_binds[idx].extra_tlv) || !gw_tlv_walk_ok(p, n)) {
+        ESP_LOGW(TAG, "子设备通用 TLV 非法/超长（%u B）⇒ 丢弃本帧", (unsigned)n);
+        return;
+    }
+    memcpy(s_binds[idx].extra_tlv, p, n);
+    s_binds[idx].extra_tlv_len = (uint8_t)n;
+    s_binds[idx].extra_tlv_ms = now_ms();
+    ESP_LOGD(TAG, "子设备通用 TLV 已缓存：%u B（网关不解析标签，随下一帧温度原样转发）",
+             (unsigned)n);
+}
+
 static void handle_sub(const gw_sub_evt_t *e)
 {
     /* 🔴 2026-10-23（真机 `event/up sub.telemetry 失败：invalid argument`）：载荷**瘦身**——
@@ -1146,6 +1195,14 @@ static void handle_sub(const gw_sub_evt_t *e)
     case GW_SUB_KIND_TELEMETRY: {
         const int64_t now = now_ms();
 
+        /* 2026-10-28：cmd=0x03 = 子设备通用 TLV 透传（gnssState 等新属性）。
+         *   ⛔ 不当成一条 telemetry 上报（云端要求本帧必须有温度）；只缓存，
+         *   随下一帧温度原样并入 TLV。网关**不解析标签** ⇒ 新物模型不用改网关。 */
+        if (e->has_cmd && e->cmd == GW_CMD_TLV) {
+            gw_extra_tlv_on_frame(e, idx);
+            return;
+        }
+
         /* 🔴 2026-10-25：cmd=0x02 = 子设备的 GNSS 定位帧（本仓对 T31 模拟器的扩展命令）。
          *   ⛔ 不当成一条 telemetry 上报 —— 云端 decodeT31 要求"这一帧必须有温度"，
          *   单独一帧 GPS 会被整帧丢弃；⇒ 只解出来缓存，随下一帧温度并入 TLV。
@@ -1178,7 +1235,8 @@ static void handle_sub(const gw_sub_evt_t *e)
             return;
         }
 
-        /* 2026-10-25：TLV = 档案解出的温度/电池 TLV +（有则）GPS 标签 0x50–0x55。
+        /* 2026-10-25：TLV = 档案解出的温度/电池 TLV +（有则）GPS 标签 0x50–0x55
+         * +（有则）子设备 cmd=0x03 的通用 TLV（原样转发，网关不解析标签）。
          * 🔴 2026-10-23 真机收尾修复保留：手写拼串遇到引号/反斜杠会产出非法 JSON ⇒
          *   这里用 build_telemetry_json()（内置转义），⛔ 不再走 cJSON（C6 无 PSRAM，
          *   Wi-Fi 重连时堆只剩 ~10 KB，真机在这段出现过 `cJSON OOM ⇒ 本帧丢弃`）。 */
@@ -1187,17 +1245,29 @@ static void handle_sub(const gw_sub_evt_t *e)
             size_t tlv_used = (e->tlv_len < sizeof(tlvbuf)) ? e->tlv_len : sizeof(tlvbuf);
             size_t gps_need = 0;
             bool have_gps = s_gps.valid && (now - s_gps.ms) <= GW_GPS_FRESH_MS;
+            bool have_extra = s_binds[idx].extra_tlv_len > 0u &&
+                              (now - s_binds[idx].extra_tlv_ms) <= GW_EXTRA_TLV_FRESH_MS;
             size_t n;
             bool cut;
 
             memcpy(tlvbuf, e->tlv, tlv_used);
             if (have_gps) {
-                gps_need = (s_gps.fix != 0u) ? GW_TLV_GNSS_BYTES : 6u;
+                gps_need = (s_gps.fix != 0u) ? GW_TLV_GNSS_BYTES : 6u;   /* 26 / (sats+fix) 6 */
                 if (tlv_used + gps_need <= sizeof(tlvbuf)) {
                     tlv_used = gw_tlv_append_gps(tlvbuf, tlv_used, &s_gps);
                 } else {
                     ESP_LOGW(TAG, "TLV 放不下 GPS（%u + %u > %u）⇒ 本帧只报温度",
                              (unsigned)tlv_used, (unsigned)gps_need, (unsigned)sizeof(tlvbuf));
+                }
+            }
+            if (have_extra) {
+                size_t extra_need = s_binds[idx].extra_tlv_len;
+                if (tlv_used + extra_need <= sizeof(tlvbuf)) {
+                    memcpy(tlvbuf + tlv_used, s_binds[idx].extra_tlv, extra_need);
+                    tlv_used += extra_need;
+                } else {
+                    ESP_LOGW(TAG, "TLV 放不下子设备通用 TLV（%u + %u > %u）⇒ 本帧丢弃该段",
+                             (unsigned)tlv_used, (unsigned)extra_need, (unsigned)sizeof(tlvbuf));
                 }
             }
             n = (tlv_used < TELE_TLV_MAX) ? tlv_used : (size_t)TELE_TLV_MAX;
@@ -1213,8 +1283,9 @@ static void handle_sub(const gw_sub_evt_t *e)
             if (have_gps) {
                 s_gps_merged++;
                 if ((s_gps_merged % 10u) == 1u) {
-                    ESP_LOGI(TAG, "[gnss] 已并入 TLV：fix=%u sats=%u（tlv=%u B）",
-                             (unsigned)s_gps.fix, (unsigned)s_gps.sats, (unsigned)tlv_used);
+                    ESP_LOGI(TAG, "[gnss] 已并入 GPS TLV：fix=%u sats=%u（tlv=%u B）",
+                             (unsigned)s_gps.fix, (unsigned)s_gps.sats,
+                             (unsigned)tlv_used);
                 }
             }
         }

@@ -40,12 +40,23 @@
 extern "C" {
 #endif
 
+/* GNSS 数据状态（与云端 TSL gnssState 枚举逐值一致，⛔ 不要改顺序/码值） */
+typedef enum {
+    GNSS_STATE_NO_DATA = 0,        /* 5 s 内没有合法 NMEA（模块没接/掉电/线松/波特率不对） */
+    GNSS_STATE_NO_FIX = 1,         /* 有 NMEA，但未定位 */
+    GNSS_STATE_FIX_2D = 2,         /* 2D 定位 */
+    GNSS_STATE_FIX_3D = 3,         /* 3D 定位 */
+    GNSS_STATE_ANTENNA_FAULT = 4,  /* $GPTXT 报 ANTENNA OPEN/SHORT */
+} gnss_state_t;
+
 /* 一帧定位快照（单位在字段名里写死，⛔ 不要在别处再乘一次缩放） */
 typedef struct {
     bool     valid;       /* 本快照是否曾收到过合法 NMEA（与"是否定位成功"无关） */
     bool     fix;         /* 定位是否有效（RMC=A 或 GGA 质量>0） */
     uint8_t  fix_type;    /* 0=未定位 / 1=2D / 2=3D（GSA 优先，GGA 质量兜底） */
     uint8_t  sats;        /* 参与定位卫星数（GGA）或可见卫星数（GSV）兜底 */
+    uint8_t  state;       /* gnss_state_t：0 无数据 / 1 未定位 / 2 2D / 3 3D / 4 天线异常 */
+    uint8_t  antenna;     /* 0=未知 / 1=OK / 2=OPEN / 3=SHORT（$GPTXT） */
     int32_t  lat_e7;      /* 纬度 ×1e7（南纬为负） */
     int32_t  lon_e7;      /* 经度 ×1e7（西经为负） */
     int16_t  alt_m;       /* 海拔（米，GGA 第 9 字段） */

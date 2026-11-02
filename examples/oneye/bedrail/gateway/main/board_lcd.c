@@ -175,6 +175,53 @@ static void fb_fill(int x, int y, int w, int h, uint16_t c)
     }
 }
 
+/**
+ * 霍尔锁图标（2026-11-02）：闭锁 = 锁梁两侧都接到锁体；开锁 = 锁梁右侧抬起、与锁体留缝。
+ * 只用矩形像素，不引入字体/图片资源；`w×h` 约 30×32，放在卡片 C 的 61 px 宽度内。
+ */
+static void fb_lock_icon(int x, int y, int w, int h, bool closed, uint16_t c)
+{
+    int post = w / 6;
+    int body_x = x + w / 8;
+    int body_w = w - w / 4;
+    int body_y = y + h * 11 / 20;
+    int body_h = h - (h * 11 / 20);
+    int left = x + w / 5;
+    int right = x + w * 3 / 5;
+    int top_h = h / 8;
+    int lift = closed ? 0 : h / 4;
+
+    if (post < 3) {
+        post = 3;
+    }
+    if (top_h < 2) {
+        top_h = 2;
+    }
+
+    /* 锁梁 */
+    fb_fill(left, y - lift, post, body_y - (y - lift), c);
+    if (closed) {
+        fb_fill(right, y, post, body_y - y, c);
+        fb_fill(left, y, right + post - left, top_h, c);
+    } else {
+        fb_fill(left, y - lift, right + post - left, top_h, c);
+        fb_fill(right, y - lift, post, top_h * 2, c);
+    }
+
+    /* 锁体 */
+    fb_fill(body_x, body_y, body_w, body_h, c);
+
+    /* 锁孔：用背景色（黑）挖出钥匙孔 */
+    {
+        int kh = body_h / 4;
+        if (kh < 2) {
+            kh = 2;
+        }
+        fb_fill(x + w / 2 - post / 2, body_y + body_h / 4, post, kh, COL_BLACK);
+        fb_fill(x + w / 2 - post, body_y + body_h / 2, post * 2, kh, COL_BLACK);
+    }
+}
+
 /* 半透明压暗（给前景提供对比度，同时保留 logo 可见） */
 /* 注：2026-10-25 改成卡片排版后，整块压暗不再使用（卡片内部走 `fb_panel` 的两级 darken），
  *   原 `fb_darken()` 已删除以免 `-Wunused-function`。若以后要做"整块压暗"，
@@ -499,26 +546,18 @@ void board_lcd_render(const lcd_status_t *st)
                               conn ? COL_CREAM : COL_GREY);
             }
 
-            /* ---- 卡片 C（右，略小）：SUB / 霍尔 On-Off / 云+子设备灯 ---- */
+            /* ---- 卡片 C（右，略小）：SUB / 霍尔锁图标 / 云+子设备灯 ---- */
             fb_panel(70, 152, LCD_W - 74, 86);
             (void)fb_text(74, 156, model, 1, COL_CREAM);
             {
-                /* 2026-11-02〔bedrail〕霍尔状态用 Locked / Unlocked：
-                 *   1 = 有磁/闭合 ⇒ "Locked"；0 = 无磁/打开 ⇒ "Unlocked"；未知 ⇒ "--"。
+                /* 2026-11-02〔bedrail〕霍尔状态用**锁图标**（不再写 Locked/Unlocked 文本）：
+                 *   1 = 有磁/闭合 ⇒ 闭锁；0 = 无磁/打开 ⇒ 开锁；未知 ⇒ 灰色锁。
                  *   ⛔ 不再显示电量百分比（电量仍由子设备 TSL 上报，只是不上这块屏）。 */
-                const char *hall_txt;
-                uint16_t hall_col;
-                if (st->hall_state == 1) {
-                    hall_txt = "Locked";
-                    hall_col = COL_CREAM;
-                } else if (st->hall_state == 0) {
-                    hall_txt = "Unlocked";
-                    hall_col = COL_WHITE;
-                } else {
-                    hall_txt = "--";
-                    hall_col = COL_GREY;
-                }
-                (void)fb_text(74, 176, hall_txt, 2, hall_col);
+                bool closed = st->hall_state == 1;
+                uint16_t hall_col = (st->hall_state == 1) ? COL_CREAM
+                                   : (st->hall_state == 0) ? COL_WHITE
+                                                           : COL_GREY;
+                fb_lock_icon(82, 168, 30, 32, closed, hall_col);
             }
             fb_fill(74, 216, 8, 8, st->cloud_up ? COL_CREAM : COL_GREY);
             (void)fb_text(84, 212, "C", 1, COL_GREY);

@@ -1,0 +1,30 @@
+# =============================================================================
+# thermometer-t31 —— **ESP32-C6-GEEK**（网关目标板）板级预设
+#
+# 叠加顺序（与 esp32s3 那份**互斥**，⛔ 不要同时给）：
+#   sdkconfig.defaults ; sdkconfig.defaults.esp32c6      ← 网关（C6-GEEK）
+#   sdkconfig.defaults ; sdkconfig.defaults.esp32s3      ← 网关（Korvo-2 / 双 S3 联调）
+#   sdkconfig.defaults ; sdkconfig.defaults.esp32s3 ; sdkconfig.defaults.subdev  ← 子设备
+#
+# 🔴 为什么必须有这份文件（2026-10-25 换板批）：
+#   ① 缺 `<target>` 那份时 IDF 5.5 **不会**自动叠加 ⇒ 退回 2 MB 缺省 flash、**没有 creds 分区**；
+#   ② C6 **没有 PSRAM**（IDF 的 esp32c6 soc_caps 里没有 SOC_SPIRAM_SUPPORTED）⇒ esp32s3 那份
+#      里成组的 `CONFIG_SPIRAM_*` / `*_EXTERNAL_MEM_ALLOC` / PSRAM 侧 NimBLE 分配**全部不适用**，
+#      栈与 TLS 缓冲只能落在内部 RAM（真机实测稳态 free_internal≈44 KB，见
+#      logs/th-20261025-c6-smoke/EVIDENCE-C6-20261025.md §5 的内存阶梯）。
+# =============================================================================
+
+CONFIG_IDF_TARGET="esp32c6"
+CONFIG_IDF_TARGET_ESP32C6=y
+
+# ---- Flash：C6-GEEK 板载 16 MB NOR ----
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+
+# ---- 分区表：沿用工程 partitions.csv（creds 必须留在 0x510000）----
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ---- 板载 LCD（ST7789 1.14" 240x135）：简易 GUI ----
+CONFIG_ONEYE_T31_LCD_ENABLE=y
+CONFIG_ONEYE_T31_LCD_ROT=0

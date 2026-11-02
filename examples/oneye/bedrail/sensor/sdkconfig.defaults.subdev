@@ -1,0 +1,24 @@
+# =============================================================================
+# thermometer-t31 · **子设备角色（SUBDEV）** 预设
+#
+# 叠加顺序（最后一份，覆盖前面所有文件里的同名项）：
+#   sdkconfig.defaults
+#     ; sdkconfig.defaults.esp32s3
+#       ; sdkconfig.defaults.subdev      ← 本文件
+#
+# 构建命令（本文件**不会**被自动叠加，必须显式给出整条链）：
+#   idf.py -B build-sub -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.defaults.subdev" set-target esp32s3
+#   idf.py -B build-sub build
+#
+# ★ 子设备的物理事实（本批用户口径）：
+#   COM13 = **温感子设备模拟器**，模拟健奥 T31 体温贴：广播名 T31-xxxx / 服务 FFF0 /
+#   notify 特征 FFF1 / 周期推温度帧。**⛔ 不连云**（不读 creds、不建 MQTT、不做 BLE 配网）。
+#   ⇒ 只切换角色位；其余配置（BLE 双角色位、内存口径、mbedtls/事件栈）**沿用**上面的文件 ——
+#     本文件**有意不重复**它们（一份预设只答一个机型问题；重复会让"这一项到底属于谁"不可读）。
+# =============================================================================
+
+# ---- 角色：本板 = 温感子设备模拟器（编译期分派，见 main/main.c）------------------
+CONFIG_ONEYE_T31_ROLE_SUBDEV=y
+
+# ---- 子设备温度推送周期（每帧生成一次模拟温度；连接后立即先推一帧）--------------
+CONFIG_ONEYE_T31_SUB_TEMP_REPORT_MS=2000

@@ -94,8 +94,10 @@ static const char *TAG = "gw_child";
 /* 通用 TLV 透传（子设备 cmd=0x03）：网关**不解析标签**，只缓存并原样并进 telemetry。
  * 这样新增物模型属性（如 gnssState 0x56）只改子设备 + 云端 TSL，⛔ 不用改网关固件。 */
 #define GW_CMD_TLV             0x03u
+#define GW_CMD_BATTERY         0xB1u
 #define GW_EXTRA_TLV_CAP       64u
 #define GW_EXTRA_TLV_FRESH_MS  30000
+#define GW_BATTERY_TLV_FRESH_MS (10 * 60 * 1000)
 
 /* 队列深度：命令很罕见（配对/解绑），子设备事件每 2 s 一帧 */
 #define GW_CHILD_CMD_Q_DEPTH   2
@@ -148,6 +150,10 @@ typedef struct {
     uint8_t extra_tlv[GW_EXTRA_TLV_CAP];
     uint8_t extra_tlv_len;
     int64_t extra_tlv_ms;
+    /* 2026-11-02：cmd=0xB1 电量帧单独缓存，随后续温度帧合并，减少 event 上报次数 */
+    uint8_t battery_tlv[GW_EXTRA_TLV_CAP];
+    uint8_t battery_tlv_len;
+    int64_t battery_tlv_ms;
 } gw_child_bind_t;
 
 /* 队列里的一条子设备事件（回调内定长拷贝，⛔ 不含任何外部指针） */
@@ -1147,6 +1153,28 @@ static void gw_extra_tlv_on_frame(const gw_sub_evt_t *e, int idx)
              (unsigned)n);
 }
 
+/* 2026-11-02：电量帧（cmd=0xB1）缓存，随后续温度帧合并；避免电量单独占一条 event/up。 */
+static void gw_battery_tlv_on_frame(const gw_sub_evt_t *e, int idx)
+{
+    size_t n;
+    const uint8_t *p;
+
+    if (idx < 0 || !e->has_cmd || e->cmd != GW_CMD_BATTERY || e->raw_len < 6u ||
+        e->raw[0] != 0xA6u || e->raw[e->raw_len - 1u] != 0x6Au) {
+        return;
+    }
+    p = e->raw + 2;
+    n = (size_t)e->raw_len - 4u;
+    if (n == 0u || n > sizeof(s_binds[idx].battery_tlv) || !gw_tlv_walk_ok(p, n)) {
+        ESP_LOGW(TAG, "子设备电量 TLV 非法/超长（%u B）⇒ 丢弃本帧", (unsigned)n);
+        return;
+    }
+    memcpy(s_binds[idx].battery_tlv, p, n);
+    s_binds[idx].battery_tlv_len = (uint8_t)n;
+    s_binds[idx].battery_tlv_ms = now_ms();
+    ESP_LOGD(TAG, "子设备电量 TLV 已缓存：%u B（合并到下一帧温度）", (unsigned)n);
+}
+
 static void handle_sub(const gw_sub_evt_t *e)
 {
     /* 🔴 2026-10-23（真机 `event/up sub.telemetry 失败：invalid argument`）：载荷**瘦身**——
@@ -1221,6 +1249,16 @@ static void handle_sub(const gw_sub_evt_t *e)
             }
         }
 
+        /* 2026-11-02：电量帧（0xB1）先缓存；若最近 5 s 有温度帧，直接并入下一帧温度，
+         *   不再单独发一条 event/up。只有“无温度帧”的机型才单独上报电量。 */
+        if (e->has_cmd && e->cmd == GW_CMD_BATTERY) {
+            gw_battery_tlv_on_frame(e, idx);
+            if (s_last_temp_frame_ms != 0 &&
+                (now - s_last_temp_frame_ms) <= 5000) {
+                return;
+            }
+        }
+
         /* 🔴 2026-10-25：cmd=0x02 = 子设备的 GNSS 定位帧（本仓对 T31 模拟器的扩展命令）。
          *   ⛔ 不当成一条 telemetry 上报 —— 云端 decodeT31 要求"这一帧必须有温度"，
          *   单独一帧 GPS 会被整帧丢弃；⇒ 只解出来缓存，随下一帧温度并入 TLV。
@@ -1265,6 +1303,8 @@ static void handle_sub(const gw_sub_evt_t *e)
             bool have_gps = s_gps.valid && (now - s_gps.ms) <= GW_GPS_FRESH_MS;
             bool have_extra = s_binds[idx].extra_tlv_len > 0u &&
                               (now - s_binds[idx].extra_tlv_ms) <= GW_EXTRA_TLV_FRESH_MS;
+            bool have_battery = s_binds[idx].battery_tlv_len > 0u &&
+                                (now - s_binds[idx].battery_tlv_ms) <= GW_BATTERY_TLV_FRESH_MS;
             size_t n;
             bool cut;
 
@@ -1286,6 +1326,16 @@ static void handle_sub(const gw_sub_evt_t *e)
                 } else {
                     ESP_LOGW(TAG, "TLV 放不下子设备通用 TLV（%u + %u > %u）⇒ 本帧丢弃该段",
                              (unsigned)tlv_used, (unsigned)extra_need, (unsigned)sizeof(tlvbuf));
+                }
+            }
+            if (have_battery) {
+                size_t battery_need = s_binds[idx].battery_tlv_len;
+                if (tlv_used + battery_need <= sizeof(tlvbuf)) {
+                    memcpy(tlvbuf + tlv_used, s_binds[idx].battery_tlv, battery_need);
+                    tlv_used += battery_need;
+                } else {
+                    ESP_LOGW(TAG, "TLV 放不下子设备电量 TLV（%u + %u > %u）⇒ 本帧丢弃该段",
+                             (unsigned)tlv_used, (unsigned)battery_need, (unsigned)sizeof(tlvbuf));
                 }
             }
             n = (tlv_used < TELE_TLV_MAX) ? tlv_used : (size_t)TELE_TLV_MAX;

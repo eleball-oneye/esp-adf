@@ -80,4 +80,5 @@ I (xxx) oneye_link.up: event/up 已提交（sub.telemetry cmd=0x03 tlv=…570101
 - 网关 LCD 卡片 C：设备名固定显示 **SUB**，原电量百分数位置改为霍尔状态
   **On**（有磁/闭合）/ **Off**（无磁/打开）/ **--**（未知）；温度/Wi-Fi 仍照常显示。
   温度是子设备上报的模拟值，不是网关自身测量，不影响上云与子设备代传。
-- `sub.telemetry` 的 `cmd` 可能是 `0x01`（温度，TLV 已并 GPS + 霍尔）或 `0x03`（gnssState+hallState 直出）；云端不依赖 `cmd`，只解 TLV。
+- `sub.telemetry` 的 `cmd` 可能是 `0x01`（温度，TLV 已并 GPS + 霍尔 + 电量）或 `0x03`（gnssState+hallState 直出）；云端不依赖 `cmd`，只解 TLV。
+- 2026-11-02 起网关做**同周期聚合**：`0x02` GNSS 只缓存并入温度帧；`0x03` 在最近 5 s 有温度帧时不再单独发；`0xB1` 电量缓存后并入下一帧温度。正常连接时子设备约 **1 条 event/up : 2 s**（温度帧），电量/霍尔/GNSS 都在同一 TLV 里；只有“无温度帧”的机型才让 `0x03`/`0xB1` 独立上报。

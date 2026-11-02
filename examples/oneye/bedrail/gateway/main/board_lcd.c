@@ -503,16 +503,16 @@ void board_lcd_render(const lcd_status_t *st)
             fb_panel(70, 152, LCD_W - 74, 86);
             (void)fb_text(74, 156, model, 1, COL_CREAM);
             {
-                /* 2026-11-02〔bedrail〕原电量百分数位置改显示霍尔开关状态：
-                 *   1 = 有磁/闭合 ⇒ "On"；0 = 无磁/打开 ⇒ "Off"；未知 ⇒ "--"。
+                /* 2026-11-02〔bedrail〕霍尔状态用 Locked / Unlocked：
+                 *   1 = 有磁/闭合 ⇒ "Locked"；0 = 无磁/打开 ⇒ "Unlocked"；未知 ⇒ "--"。
                  *   ⛔ 不再显示电量百分比（电量仍由子设备 TSL 上报，只是不上这块屏）。 */
                 const char *hall_txt;
                 uint16_t hall_col;
                 if (st->hall_state == 1) {
-                    hall_txt = "On";
+                    hall_txt = "Locked";
                     hall_col = COL_CREAM;
                 } else if (st->hall_state == 0) {
-                    hall_txt = "Off";
+                    hall_txt = "Unlocked";
                     hall_col = COL_WHITE;
                 } else {
                     hall_txt = "--";

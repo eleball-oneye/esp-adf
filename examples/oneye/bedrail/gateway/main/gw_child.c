@@ -197,9 +197,11 @@ static TaskHandle_t    s_task;
  *   实测现象：子设备连上后 link-sdk 会停扫（共存降载），发现表 120 s 后清空 ⇒
  *   App 再打开"添加子设备"时云端 candidates 永远是空。
  *   方案：**每 GW_DISC_REPORT_MS 开一个 GW_DISC_SCAN_WINDOW_MS 的发现窗口**
- *   （8 s / 30 s ⇒ 平均扫描占空比 ≈0.5%），窗口结束立刻关扫描并汇总上报。 */
+ *   （2 s / 30 s ⇒ 平均扫描占空比 ≈6.7%）。2026-11-02 从 8 s 降到 2 s：
+ *   C6 单天线共存下 8 s 扫描会把 Wi‑Fi beacon 挤丢，MQTT TLS 写超时后整条云链路闪断，
+ *   反而让发现结果也上不去；2 s 足够扫到床边设备，同时把空口让给云链路。 */
 #define GW_DISC_REPORT_MS        30000
-#define GW_DISC_SCAN_WINDOW_MS    8000
+#define GW_DISC_SCAN_WINDOW_MS    2000
 
 typedef struct {
     bool    used;
@@ -226,6 +228,7 @@ static const struct {
 
 /* sub.telemetry 节流：只在工作任务里读写 ⇒ 不需要临界区 */
 static int64_t  s_last_tele_ms;
+static int64_t  s_last_temp_frame_ms;
 static uint32_t s_tele_dropped;
 static uint32_t s_unbound_dropped;   /* 未配对子设备的帧（丢弃并计数，见 handle_sub） */
 static uint32_t s_sub_q_dropped;     /* 事件队列满而丢弃的帧（2026-10-23 观测性） */
@@ -1197,6 +1200,13 @@ static void handle_sub(const gw_sub_evt_t *e)
     case GW_SUB_KIND_TELEMETRY: {
         const int64_t now = now_ms();
 
+        /* 2026-11-02〔降载〕温度帧 0x01 本身会并入本周期 0x03 的通用 TLV（hall/gnss）；
+         *   ⇒ 同一周期内**不再单独发 0x03**，否则 2 帧/2 s 会把 event 面/发送槽打满。
+         *   仅当最近 5 s 没有温度帧（霍尔-only 机型）时才让 0x03 独立上报。 */
+        if (e->has_cmd && e->cmd == 0x01u) {
+            s_last_temp_frame_ms = now;
+        }
+
         /* 2026-10-28：cmd=0x03 = 子设备通用 TLV 透传（gnssState 等新属性）。
          * 2026-11-02〔bedrail〕：**不再 return** —— 床护栏子设备没有温度帧，霍尔状态
          *   只能靠 0x03 帧上报。这里先缓存本帧 TLV，再让它继续走下面的 sub.telemetry
@@ -1204,6 +1214,11 @@ static void handle_sub(const gw_sub_evt_t *e)
          *   ⛔ 网关仍不解析任何标签；hallState 的语义只在云端 TSL / decodeT31。 */
         if (e->has_cmd && e->cmd == GW_CMD_TLV) {
             gw_extra_tlv_on_frame(e, idx);
+            if (s_last_temp_frame_ms != 0 &&
+                (now - s_last_temp_frame_ms) <= 5000) {
+                /* 本周期已有温度帧：它的 TLV 会带上刚缓存的 0x03 内容 ⇒ 不再重复入队 */
+                return;
+            }
         }
 
         /* 🔴 2026-10-25：cmd=0x02 = 子设备的 GNSS 定位帧（本仓对 T31 模拟器的扩展命令）。

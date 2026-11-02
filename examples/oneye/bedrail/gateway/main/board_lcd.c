@@ -189,7 +189,7 @@ static void fb_lock_icon(int x, int y, int w, int h, bool closed, uint16_t c)
     int left = x + w / 5;
     int right = x + w * 3 / 5;
     int top_h = h / 8;
-    int lift = closed ? 0 : h / 4;
+    int lift = closed ? 0 : h / 6;
 
     if (post < 3) {
         post = 3;
@@ -557,7 +557,7 @@ void board_lcd_render(const lcd_status_t *st)
                 uint16_t hall_col = (st->hall_state == 1) ? COL_CREAM
                                    : (st->hall_state == 0) ? COL_WHITE
                                                            : COL_GREY;
-                fb_lock_icon(82, 168, 30, 32, closed, hall_col);
+                fb_lock_icon(86, 176, 24, 26, closed, hall_col);
             }
             fb_fill(74, 216, 8, 8, st->cloud_up ? COL_CREAM : COL_GREY);
             (void)fb_text(84, 212, "C", 1, COL_GREY);

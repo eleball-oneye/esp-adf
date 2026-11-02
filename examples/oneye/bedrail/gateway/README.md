@@ -77,6 +77,7 @@ I (xxx) oneye_link.up: event/up 已提交（sub.telemetry cmd=0x03 tlv=…570101
 ## 6. 已知限制
 
 - 仍然最多 5 条 BLE 链路；床护栏单子设备场景足够。
-- 网关 LCD 仍显示温度/Wi-Fi（复用了 thermometer-t31 的 UI）；温度是子设备上报的模拟值，
-  不是网关自身测量，不影响上云与子设备代传。
+- 网关 LCD 卡片 C：设备名固定显示 **SUB**，原电量百分数位置改为霍尔状态
+  **On**（有磁/闭合）/ **Off**（无磁/打开）/ **--**（未知）；温度/Wi-Fi 仍照常显示。
+  温度是子设备上报的模拟值，不是网关自身测量，不影响上云与子设备代传。
 - `sub.telemetry` 的 `cmd` 可能是 `0x01`（温度，TLV 已并 GPS + 霍尔）或 `0x03`（gnssState+hallState 直出）；云端不依赖 `cmd`，只解 TLV。

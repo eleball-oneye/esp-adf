@@ -388,7 +388,9 @@ void board_lcd_render(const lcd_status_t *st)
     }
     s_rendering = true;
 
-    const char *model = (st->sub_model != NULL && st->sub_model[0] != '\0') ? st->sub_model : "T31";
+    /* 2026-11-02〔bedrail〕卡片 C 的设备名固定显示 "SUB"（空口/云端型号仍是 T31）。
+     * ⛔ 不再显示子设备型号原串，避免屏上继续出现 "T31"。 */
+    const char *model = "SUB";
 
     /* 温度文本：**整数/小数分开**（整数 4 倍字、小数 2 倍字）——135 px 宽屏上「36.5」整串 4 倍
      *   会到 144 px 放不下；分开后总宽 108 px，既够大又不裁字。
@@ -497,17 +499,26 @@ void board_lcd_render(const lcd_status_t *st)
                               conn ? COL_CREAM : COL_GREY);
             }
 
-            /* ---- 卡片 C（右，略小）：机型 / 电量 / 云+子设备灯 ---- */
+            /* ---- 卡片 C（右，略小）：SUB / 霍尔 On-Off / 云+子设备灯 ---- */
             fb_panel(70, 152, LCD_W - 74, 86);
             (void)fb_text(74, 156, model, 1, COL_CREAM);
             {
-                char bat[12];
-                if (st->battery >= 0) {
-                    (void)snprintf(bat, sizeof(bat), "%d%%", st->battery);
+                /* 2026-11-02〔bedrail〕原电量百分数位置改显示霍尔开关状态：
+                 *   1 = 有磁/闭合 ⇒ "On"；0 = 无磁/打开 ⇒ "Off"；未知 ⇒ "--"。
+                 *   ⛔ 不再显示电量百分比（电量仍由子设备 TSL 上报，只是不上这块屏）。 */
+                const char *hall_txt;
+                uint16_t hall_col;
+                if (st->hall_state == 1) {
+                    hall_txt = "On";
+                    hall_col = COL_CREAM;
+                } else if (st->hall_state == 0) {
+                    hall_txt = "Off";
+                    hall_col = COL_WHITE;
                 } else {
-                    (void)snprintf(bat, sizeof(bat), "--%%");
+                    hall_txt = "--";
+                    hall_col = COL_GREY;
                 }
-                (void)fb_text(74, 176, bat, 2, COL_WHITE);
+                (void)fb_text(74, 176, hall_txt, 2, hall_col);
             }
             fb_fill(74, 216, 8, 8, st->cloud_up ? COL_CREAM : COL_GREY);
             (void)fb_text(84, 212, "C", 1, COL_GREY);

@@ -126,6 +126,9 @@ static volatile bool s_ui_sub_online;
 static volatile bool s_ui_has_temp;
 static volatile int  s_ui_temp_centi;
 static volatile int  s_ui_battery = -1;
+/* 2026-11-02〔bedrail〕霍尔开关量（TLV 0x57）：-1 未知 / 0 无磁(Off/打开) / 1 有磁(On/闭合)。
+ *   与电量同样是"粘性 + 各自保鲜"：帧里没带就保留上次，超时/离线回未知。 */
+static volatile int  s_ui_hall = -1;
 /* ── 2026-10-26〔分帧属性各自保鲜〕T31 温度/电量/定位分别在不同帧里到达（温度 cmd=0x01、
  *    电量 0xB1、定位 0x02）。每个属性**各自**粘性更新 + 各自保鲜窗口：
  *      · 帧里没带该属性 ⇒ ⛔ 不清值（保留上次）；
@@ -134,9 +137,12 @@ static volatile int  s_ui_battery = -1;
  *    这样"某帧只带温度"不会把电量清掉，反之亦然。 */
 static volatile int64_t s_ui_temp_ms;
 static volatile int64_t s_ui_batt_ms;
-/* 保鲜窗口（ms）：温度帧 2 s 一帧 ⇒ 15 s 足够宽松；电量为低频帧 ⇒ 给 10 分钟。 */
+static volatile int64_t s_ui_hall_ms;
+/* 保鲜窗口（ms）：温度帧 2 s 一帧 ⇒ 15 s 足够宽松；电量为低频帧 ⇒ 给 10 分钟；
+ *   霍尔帧 2 s 一帧（本仓子设备每周期发 0x03）⇒ 与温度同档 15 s。 */
 #define UI_TEMP_TTL_MS  (15 * 1000)
 #define UI_BATT_TTL_MS  (10 * 60 * 1000)
+#define UI_HALL_TTL_MS  (15 * 1000)
 static volatile bool s_ui_cloud_up;
 static char          s_ui_model[32] = "T31";   /* link 事件里整体覆盖写，UI 侧只读（长度对齐 evt->model） */
 
@@ -382,6 +388,7 @@ static void gw_on_sub_data(const oneye_link_event_t *evt, const char *addr)
     bool has_temp = false;
     float temp_c = 0.0f;
     int batt = -1;
+    int hall = -1;
     char pretty[192] = { 0 };
     char raw_hex[49] = { 0 };       /* 2026-10-23 诊断：原始帧 hex，最多 24 B（49 = 48+1） */
     char state[GW_STATE_MAX];
@@ -420,6 +427,33 @@ static void gw_on_sub_data(const oneye_link_event_t *evt, const char *addr)
             has_temp = true;
         } else if (type == ONEYE_TLV_BATTERY_PCT && vlen >= 1 && val != NULL) {
             batt = (int)val[0];
+        } else if (type == ONEYE_TLV_HALL_STATE && vlen >= 1 && val != NULL) {
+            /* 0 = 无磁/打开，1 = 有磁/闭合；其它值忽略（⛔ 不猜） */
+            if (val[0] <= 1u) {
+                hall = (int)val[0];
+            }
+        }
+    }
+
+    /* 2026-11-02〔bedrail〕cmd=0x03 的霍尔 TLV 藏在**原始帧体**里：
+     *   `evt->tlv` 对未知 cmd 只有 RAW_FRAME(0x80)，不展开 0x56/0x57；
+     *   gw_child 会在对云 telemetry 里再拼一次，但本回调（屏 UI）拿不到那份拼装结果。
+     *   ⇒ 直接从 raw `A6 03 <TLV…> sum 6A` 的帧体再走一遍 TLV reader。 */
+    if (hall < 0 && evt->has_cmd && evt->cmd == 0x03u &&
+        evt->raw != NULL && evt->raw_len >= 6u &&
+        evt->raw[0] == 0xA6u && evt->raw[evt->raw_len - 1u] == 0x6Au) {
+        oneye_link_tlv_reader_t rd_raw;
+        uint16_t raw_type = 0;
+        const uint8_t *raw_val = NULL;
+        uint8_t raw_len = 0;
+
+        oneye_link_tlv_reader_init(&rd_raw, evt->raw + 2, (size_t)evt->raw_len - 4u);
+        while (oneye_link_tlv_next(&rd_raw, &raw_type, &raw_val, &raw_len)) {
+            if (raw_type == ONEYE_TLV_HALL_STATE && raw_len >= 1u && raw_val != NULL &&
+                raw_val[0] <= 1u) {
+                hall = (int)raw_val[0];
+                break;
+            }
         }
     }
 
@@ -443,6 +477,12 @@ static void gw_on_sub_data(const oneye_link_event_t *evt, const char *addr)
     if (batt >= 0 && batt <= 100) {
         s_ui_battery = batt;
         s_ui_batt_ms = esp_timer_get_time() / 1000;
+    }
+    /* 2026-11-02〔bedrail〕霍尔：本帧带了 0x57 才更新（粘性），并刷新到达时间。
+     *   子设备每周期发 0x03（含 0x57），网关把它并进 temp 帧 TLV；两种帧都可能带。 */
+    if (hall >= 0) {
+        s_ui_hall = hall;
+        s_ui_hall_ms = esp_timer_get_time() / 1000;
     }
 
     if (!has_temp) {
@@ -502,6 +542,8 @@ static void on_link_event(const oneye_link_event_t *evt, void *ctx)
         s_ui_temp_ms = 0;
         s_ui_battery = -1;
         s_ui_batt_ms = 0;
+        s_ui_hall = -1;
+        s_ui_hall_ms = 0;
         break;
     case ONEYE_LINK_EVT_SUB_DATA:
         gw_on_sub_data(evt, addr);
@@ -1231,6 +1273,7 @@ static void lcd_ui_task(void *arg)
     int  last_temp = INT32_MIN;
     int  last_rssi_bucket = INT32_MIN;
     int  last_batt = INT32_MIN;
+    int  last_hall = INT32_MIN;
     bool last_wifi = false;
     bool last_sub = false;
     bool last_cloud = false;
@@ -1258,6 +1301,9 @@ static void lcd_ui_task(void *arg)
         st.temp_centi = s_ui_temp_centi;
         st.battery = (st.sub_online && s_ui_battery >= 0 &&
                       (now_ms - s_ui_batt_ms) <= UI_BATT_TTL_MS) ? s_ui_battery : -1;
+        /* 2026-11-02：霍尔状态（0 Off/打开，1 On/闭合，-1 未知）。 */
+        st.hall_state = (st.sub_online && s_ui_hall >= 0 &&
+                         (now_ms - s_ui_hall_ms) <= UI_HALL_TTL_MS) ? s_ui_hall : -1;
         st.sub_model = s_ui_model;
         if (st.battery < 0 && st.sub_online) {
             /* 2026-10-26〔屏显 --% 修复 · 兜底〕若 TLV 路径还没拿到过电量（例如电量帧先于 UI 任务
@@ -1283,14 +1329,16 @@ static void lcd_ui_task(void *arg)
                                st.sub_online != last_sub ||
                                st.has_temp != last_has_temp ||
                                st.temp_centi != last_temp ||
-                               st.battery != last_batt;
+                               st.battery != last_batt ||
+                               st.hall_state != last_hall;
         const bool state_changed = first ||
                                    st.wifi_connected != last_wifi ||
                                    st.cloud_up != last_cloud ||
                                    st.sub_online != last_sub ||
                                    st.has_temp != last_has_temp ||
                                    st.temp_centi != last_temp ||
-                                   st.battery != last_batt;
+                                   st.battery != last_batt ||
+                                   st.hall_state != last_hall;
 
         if (need_draw) {
             board_lcd_render(&st);
@@ -1303,11 +1351,13 @@ static void lcd_ui_task(void *arg)
             last_has_temp = st.has_temp;
             last_temp = st.temp_centi;
             last_batt = st.battery;
+            last_hall = st.hall_state;
             if (state_changed) {
                 /* 只在状态变化时打一行（也是"屏到底有没有在刷新"的判据） */
-                ESP_LOGI(TAG, "[lcd] 刷新 #%u：wifi=%d rssi=%d cloud=%d sub=%d temp=%d.%02d batt=%d",
+                ESP_LOGI(TAG, "[lcd] 刷新 #%u：wifi=%d rssi=%d cloud=%d sub=%d temp=%d.%02d batt=%d hall=%d",
                          (unsigned)renders, (int)st.wifi_connected, st.wifi_rssi, (int)st.cloud_up,
-                         (int)st.sub_online, st.temp_centi / 100, abs(st.temp_centi % 100), st.battery);
+                         (int)st.sub_online, st.temp_centi / 100, abs(st.temp_centi % 100),
+                         st.battery, st.hall_state);
             }
         }
         vTaskDelay(pdMS_TO_TICKS(500));

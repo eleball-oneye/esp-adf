@@ -35,8 +35,9 @@ typedef struct {
     bool sub_online;       /* 温感子设备是否在线（link 已连上） */
     bool has_temp;         /* 是否已收到过温度帧 */
     int  temp_centi;       /* 温度，单位 0.01 ℃（3652 = 36.52℃） */
-    int  battery;          /* 子设备电量 %；-1 = 未知 */
-    const char *sub_model; /* 子设备档案型号（可 NULL，默认 "T31"） */
+    int  battery;          /* 子设备电量 %；-1 = 未知（2026-11-02 起卡片 C 不再显示） */
+    int  hall_state;       /* 霍尔：-1 未知 / 0 无磁(Off/打开) / 1 有磁(On/闭合) */
+    const char *sub_model; /* 子设备档案型号（可 NULL；卡片 C 固定显示 "SUB"） */
 } lcd_status_t;
 
 /*

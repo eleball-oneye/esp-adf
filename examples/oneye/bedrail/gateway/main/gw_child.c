@@ -838,6 +838,25 @@ static void gw_disc_report(void)
         return;
     }
     used += (size_t)snprintf(body + used, sizeof(body) - used, "{\"items\":[");
+    /* 2026-11-02：已配对/已连接子设备**不会广播** ⇒ 扫描表里没有它，旧逻辑会报空，
+     *   App 的 candidates 10 分钟后过期，表现就是“网关屏幕有子设备、App 发现不了”。
+     *   这里把绑定表里的已知子设备也作为候选上报（mac 来自配对/学习到的地址），
+     *   保证网关在线时 App 仍能发现它；⛔ 不上报温度/电量，只报身份元数据。 */
+    for (int i = 0; i < GW_CHILD_MAX; i++) {
+        if (!s_binds[i].used || s_binds[i].addr[0] == '\0' ||
+            s_binds[i].product_key[0] == '\0') {
+            continue;
+        }
+        if (used + 96u >= sizeof(body)) {
+            break;
+        }
+        used += (size_t)snprintf(body + used, sizeof(body) - used,
+                                 "%s{\"model\":\"%s\",\"productKey\":\"%s\",\"mac\":\"%s\","
+                                 "\"macLen\":6,\"rssi\":0}",
+                                 (n > 0) ? "," : "", s_binds[i].model,
+                                 s_binds[i].product_key, s_binds[i].addr);
+        n++;
+    }
     for (int i = 0; i < GW_DISC_MAX; i++) {
         if (!s_disc[i].used) {
             continue;
@@ -848,6 +867,20 @@ static void gw_disc_report(void)
         }
         if (s_disc[i].product_key[0] == '\0') {
             continue;                 /* 机型没有 productKey 映射 ⇒ 上报了云端也匹配不了 */
+        }
+        /* 已知绑定已经占了一行（同 MAC）⇒ 不重复上报 */
+        {
+            bool dup = false;
+            for (int k = 0; k < GW_CHILD_MAX; k++) {
+                if (s_binds[k].used && s_binds[k].addr[0] != '\0' &&
+                    strcmp(s_binds[k].addr, s_disc[i].addr) == 0) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) {
+                continue;
+            }
         }
         if (used + 96u >= sizeof(body)) {
             break;

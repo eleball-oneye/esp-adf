@@ -126,8 +126,21 @@ static volatile bool s_ui_sub_online;
 static volatile bool s_ui_has_temp;
 static volatile int  s_ui_temp_centi;
 static volatile int  s_ui_battery = -1;
-/* 2026-11-02〔bedrail〕霍尔开关量（TLV 0x57）：-1 未知 / 0 无磁(Off/打开) / 1 有磁(On/闭合)。
- *   与电量同样是"粘性 + 各自保鲜"：帧里没带就保留上次，超时/离线回未知。 */
+/* 2026-11-02〔多子设备霍尔聚合〕每台子设备各自保留最近一次 0x57：
+ *   · 没有任何子设备在保鲜窗口内报过 hallState ⇒ -1（屏上 "--"）
+ *   · 任意一台报 0（无磁/打开）           ⇒ 0（开锁图标）
+ *   · 其余（至少一台报 1）                 ⇒ 1（闭锁图标）
+ *   不能再用一个全局 s_ui_hall —— 多台子设备会互相覆盖，最后一条决定屏幕。 */
+#define UI_HALL_SLOTS 8
+typedef struct {
+    bool    used;
+    char    addr[32];
+    int8_t  state;
+    int64_t ms;
+} ui_hall_slot_t;
+static ui_hall_slot_t s_ui_halls[UI_HALL_SLOTS];
+static portMUX_TYPE   s_ui_hall_mux = portMUX_INITIALIZER_UNLOCKED;
+/* 兼容旧日志字段：仅表示“聚合结果”，由 ui_hall_snapshot() 统一计算。 */
 static volatile int  s_ui_hall = -1;
 /* ── 2026-10-26〔分帧属性各自保鲜〕T31 温度/电量/定位分别在不同帧里到达（温度 cmd=0x01、
  *    电量 0xB1、定位 0x02）。每个属性**各自**粘性更新 + 各自保鲜窗口：
@@ -143,6 +156,81 @@ static volatile int64_t s_ui_hall_ms;
 #define UI_TEMP_TTL_MS  (15 * 1000)
 #define UI_BATT_TTL_MS  (10 * 60 * 1000)
 #define UI_HALL_TTL_MS  (15 * 1000)
+
+/* 记一台子设备的最近一次 hallState（0x57）；addr 为空则丢弃。 */
+static void ui_hall_note(const char *addr, int state)
+{
+    if (addr == NULL || addr[0] == '\0' || state < 0 || state > 1) {
+        return;
+    }
+    const int64_t now = esp_timer_get_time() / 1000;
+    taskENTER_CRITICAL(&s_ui_hall_mux);
+    int slot = -1;
+    int free_slot = -1;
+    int oldest = 0;
+    for (int i = 0; i < UI_HALL_SLOTS; i++) {
+        if (!s_ui_halls[i].used) {
+            if (free_slot < 0) {
+                free_slot = i;
+            }
+            continue;
+        }
+        if (strcmp(s_ui_halls[i].addr, addr) == 0) {
+            slot = i;
+            break;
+        }
+        if (s_ui_halls[i].ms < s_ui_halls[oldest].ms) {
+            oldest = i;
+        }
+    }
+    if (slot < 0) {
+        slot = (free_slot >= 0) ? free_slot : oldest;
+    }
+    s_ui_halls[slot].used = true;
+    (void)snprintf(s_ui_halls[slot].addr, sizeof(s_ui_halls[slot].addr), "%s", addr);
+    s_ui_halls[slot].state = (int8_t)state;
+    s_ui_halls[slot].ms = now;
+    taskEXIT_CRITICAL(&s_ui_hall_mux);
+}
+
+/* 子设备离线：只清这一台；addr 为空（总线离线）则全部清。 */
+static void ui_hall_clear(const char *addr)
+{
+    taskENTER_CRITICAL(&s_ui_hall_mux);
+    for (int i = 0; i < UI_HALL_SLOTS; i++) {
+        if (!s_ui_halls[i].used) {
+            continue;
+        }
+        if (addr == NULL || addr[0] == '\0' || strcmp(s_ui_halls[i].addr, addr) == 0) {
+            s_ui_halls[i].used = false;
+            s_ui_halls[i].state = -1;
+            s_ui_halls[i].ms = 0;
+        }
+    }
+    taskEXIT_CRITICAL(&s_ui_hall_mux);
+}
+
+/* 聚合：没有新鲜 hallState ⇒ -1；任意一台 0 ⇒ 0；否则至少一台 1 ⇒ 1。 */
+static int ui_hall_snapshot(int64_t now)
+{
+    int result = -1;
+    taskENTER_CRITICAL(&s_ui_hall_mux);
+    for (int i = 0; i < UI_HALL_SLOTS; i++) {
+        if (!s_ui_halls[i].used || s_ui_halls[i].state < 0 ||
+            (now - s_ui_halls[i].ms) > UI_HALL_TTL_MS) {
+            continue;
+        }
+        if (s_ui_halls[i].state == 0) {
+            result = 0;   /* 任意一台打开 ⇒ 未锁 */
+            break;
+        }
+        result = 1;       /* 至少一台闭合，且没有打开 */
+    }
+    taskEXIT_CRITICAL(&s_ui_hall_mux);
+    s_ui_hall = result;   /* 仅诊断日志兼容，不参与显示判定 */
+    s_ui_hall_ms = now;
+    return result;
+}
 static volatile bool s_ui_cloud_up;
 static char          s_ui_model[32] = "T31";   /* link 事件里整体覆盖写，UI 侧只读（长度对齐 evt->model） */
 
@@ -481,8 +569,7 @@ static void gw_on_sub_data(const oneye_link_event_t *evt, const char *addr)
     /* 2026-11-02〔bedrail〕霍尔：本帧带了 0x57 才更新（粘性），并刷新到达时间。
      *   子设备每周期发 0x03（含 0x57），网关把它并进 temp 帧 TLV；两种帧都可能带。 */
     if (hall >= 0) {
-        s_ui_hall = hall;
-        s_ui_hall_ms = esp_timer_get_time() / 1000;
+        ui_hall_note(addr, hall);
     }
 
     if (!has_temp) {
@@ -542,8 +629,7 @@ static void on_link_event(const oneye_link_event_t *evt, void *ctx)
         s_ui_temp_ms = 0;
         s_ui_battery = -1;
         s_ui_batt_ms = 0;
-        s_ui_hall = -1;
-        s_ui_hall_ms = 0;
+        ui_hall_clear(addr);
         break;
     case ONEYE_LINK_EVT_SUB_DATA:
         gw_on_sub_data(evt, addr);
@@ -1301,9 +1387,9 @@ static void lcd_ui_task(void *arg)
         st.temp_centi = s_ui_temp_centi;
         st.battery = (st.sub_online && s_ui_battery >= 0 &&
                       (now_ms - s_ui_batt_ms) <= UI_BATT_TTL_MS) ? s_ui_battery : -1;
-        /* 2026-11-02：霍尔状态（0 Off/打开，1 On/闭合，-1 未知）。 */
-        st.hall_state = (st.sub_online && s_ui_hall >= 0 &&
-                         (now_ms - s_ui_hall_ms) <= UI_HALL_TTL_MS) ? s_ui_hall : -1;
+        /* 2026-11-02〔多子设备〕任意一台 hallState=0 ⇒ 未锁；否则至少一台=1 ⇒ 已锁；
+         *   没有任何子设备在保鲜窗口内报过 0x57 ⇒ -1（屏上 "--"）。 */
+        st.hall_state = ui_hall_snapshot(now_ms);
         st.sub_model = s_ui_model;
         if (st.battery < 0 && st.sub_online) {
             /* 2026-10-26〔屏显 --% 修复 · 兜底〕若 TLV 路径还没拿到过电量（例如电量帧先于 UI 任务

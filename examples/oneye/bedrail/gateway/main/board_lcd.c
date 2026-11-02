@@ -550,14 +550,18 @@ void board_lcd_render(const lcd_status_t *st)
             fb_panel(70, 152, LCD_W - 74, 86);
             (void)fb_text(74, 156, model, 1, COL_CREAM);
             {
-                /* 2026-11-02〔bedrail〕霍尔状态用**锁图标**（不再写 Locked/Unlocked 文本）：
-                 *   1 = 有磁/闭合 ⇒ 闭锁；0 = 无磁/打开 ⇒ 开锁；未知 ⇒ 灰色锁。
-                 *   ⛔ 不再显示电量百分比（电量仍由子设备 TSL 上报，只是不上这块屏）。 */
-                bool closed = st->hall_state == 1;
-                uint16_t hall_col = (st->hall_state == 1) ? COL_CREAM
-                                   : (st->hall_state == 0) ? COL_WHITE
-                                                           : COL_GREY;
-                fb_lock_icon(86, 176, 24, 26, closed, hall_col);
+                /* 2026-11-02〔多子设备聚合〕：
+                 *   -1 = 没有任何子设备在保鲜窗口内报过 hallState ⇒ "--"
+                 *    0 = 任意一台报 0（未锁）⇒ 开锁图标
+                 *    1 = 至少一台报 1 且没有 0（已锁）⇒ 闭锁图标
+                 */
+                if (st->hall_state < 0) {
+                    (void)fb_text(94, 181, "--", 2, COL_GREY);
+                } else {
+                    bool closed = st->hall_state == 1;
+                    uint16_t hall_col = closed ? COL_CREAM : COL_WHITE;
+                    fb_lock_icon(86, 176, 24, 26, closed, hall_col);
+                }
             }
             fb_fill(74, 216, 8, 8, st->cloud_up ? COL_CREAM : COL_GREY);
             (void)fb_text(84, 212, "C", 1, COL_GREY);

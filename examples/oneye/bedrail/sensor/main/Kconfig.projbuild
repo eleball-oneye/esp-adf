@@ -92,10 +92,11 @@ menu "bedrail/sensor 例程配置"
     config ONEYE_BEDRAIL_BUZZER_FREQ_HZ
         int "无源蜂鸣器 PWM 频率 (Hz)"
         depends on ONEYE_BEDRAIL_BUZZER_ENABLE
-        default 2700
+        default 2048
         range 1000 5000
         help
-            通用无源蜂鸣器谐振点通常在 2–3 kHz；默认 2700 Hz。
+            12095 无源蜂鸣器的谐振频率为 2048 Hz；默认 2048 Hz。
+            偏离谐振点会明显变轻并增大电流。
 
     config ONEYE_T31_GW_STATE_MIN_MS
         int "网关最小影子上报间隔(ms)"

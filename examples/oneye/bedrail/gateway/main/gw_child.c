@@ -1301,16 +1301,10 @@ static void handle_sub(const gw_sub_evt_t *e)
             return;
         }
 
-        /* 2026-10-26〔允许丢帧 + 断线清队列〕云断期间**不再入队**：
-         *   丢弃并计数（云侧影子 TTL + 重连补报兜底），保证 SDK 事件队列不被填满。 */
-        if (!s_cloud_up) {
-            s_cloud_dropped++;
-            if ((s_cloud_dropped % 20u) == 1u) {
-                ESP_LOGD(TAG, "云断 ⇒ 丢弃 sub.telemetry（累计 %u 帧；恢复后自动补报）",
-                         (unsigned)s_cloud_dropped);
-            }
-            return;
-        }
+        /* 🔴 2026-11-03〔单一状态源〕：业务层不再判 s_cloud_up。
+         *   SDK 的 event_report 在真断链时会返回 ERR_NOT_CONNECTED；队列满会返回 QUEUE_FULL。
+         *   以前这里维护一份独立的 s_cloud_up，边沿事件一丢就会“永久认为云断”，
+         *   把子设备 telemetry 在 emit 前静默丢掉（网关 status 仍在线，App 却永远离线）。 */
 
         /* 节流：同频上报没有意义（子设备 2 s 一帧 × 多子设备会把 event/up 打爆）。
          * 失败**不推进**节流位 ⇒ 下一帧立刻重试，不用等满一个窗口。 */

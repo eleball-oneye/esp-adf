@@ -63,6 +63,7 @@
 
 #include "t31_sim.h"
 #include "hall_drv.h"
+#include "buzzer_drv.h"
 
 #if CONFIG_ONEYE_GNSS_ENABLE
 #include "gnss_atgm336x.h"
@@ -290,9 +291,14 @@ static void t31_emit_tlv(void)
         hall = hall_drv_read();
         hall_changed = (hall != last_hall);
         if (hall_changed) {
+            bool unlocked = (last_hall == HALL_STATE_CLOSED && hall == HALL_STATE_OPEN);
             last_hall = hall;
             ESP_LOGI(TAG, "霍尔状态变化 ⇒ hallState=%u（%s）",
                      (unsigned)hall, hall_state_name(hall));
+            if (unlocked) {
+                /* 床护栏解锁：hallState 1 → 0，两声短鸣（非阻塞） */
+                buzzer_drv_unlock_alert();
+            }
         }
         tlv[n++] = 0x57u;   /* HALL_STATE（床护栏） */
         tlv[n++] = 1u;

@@ -105,6 +105,7 @@ static esp_err_t boot_nvs_init(void)
 #else  /* ======== 子设备角色：只依赖 NimBLE 外设模拟器 ======== */
 #include "t31_sim.h"
 #include "hall_drv.h"          /* 床护栏 DRV5032FB（2026-11-02 追加） */
+#include "buzzer_drv.h"        /* 无源蜂鸣器：解锁两声短鸣（2026-11-03 追加） */
 #include "gnss_atgm336x.h"     /* ATGM336H-5N（UART1 NMEA）—— 仅 CONFIG_ONEYE_GNSS_ENABLE 时有实现 */
 #endif /* CONFIG_ONEYE_T31_ROLE_GATEWAY（头文件分派） */
 
@@ -1591,6 +1592,14 @@ void app_main(void)
         ESP_LOGW(TAG, "霍尔初始化失败（%s）⇒ 本板只发温度/定位，hallState 不参与",
                  esp_err_to_name(err));
     }
+
+#if CONFIG_ONEYE_BEDRAIL_BUZZER_ENABLE
+    /* 无源蜂鸣器：失败只 WARN（不阻塞温度/定位） */
+    err = buzzer_drv_init(CONFIG_ONEYE_BEDRAIL_BUZZER_GPIO);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "蜂鸣器初始化失败（%s）⇒ 解锁提示音不可用", esp_err_to_name(err));
+    }
+#endif
 
 #if CONFIG_ONEYE_GNSS_ENABLE
     /* GNSS 先起（UART 与 BLE 互不依赖；失败只 WARN —— 本板仍是一台可用的温感子设备） */

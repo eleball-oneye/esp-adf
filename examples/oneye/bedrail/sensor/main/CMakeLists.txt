@@ -24,6 +24,7 @@ idf_component_register(
          "board_lcd.c"
          "gnss_atgm336x.c"
          "hall_drv.c"
+         "buzzer_drv.c"
     INCLUDE_DIRS "."
     REQUIRES oneye-link-sdk
              oneye-dev-sdk

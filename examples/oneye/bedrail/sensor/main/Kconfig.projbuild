@@ -66,6 +66,37 @@ menu "bedrail/sensor 例程配置"
             ⇒ 默认 y：GPIO 读到 0 = 有磁 = hallState 1（护栏闭合/拉起）。
             机械结构相反时可关掉本项反相。
 
+    # =========================================================================
+    # 床护栏 · 无源蜂鸣器（2026-11-03 追加）
+    # 接线：GPIO3 → 1kΩ → NPN 基极；NPN 发射极 → GND；集电极 → 蜂鸣器 −；
+    #       蜂鸣器 + → 3V3。电磁式蜂鸣器两端并联反向续流二极管。
+    # =========================================================================
+    config ONEYE_BEDRAIL_BUZZER_ENABLE
+        bool "解锁时蜂鸣器两声短鸣"
+        depends on ONEYE_T31_ROLE_SUBDEV
+        default y
+        help
+            hallState 从 1（有磁/闭合）变 0（无磁/打开）时，响两声：
+            120 ms 响 → 100 ms 停 → 120 ms 响。
+
+    config ONEYE_BEDRAIL_BUZZER_GPIO
+        int "无源蜂鸣器 PWM GPIO"
+        depends on ONEYE_BEDRAIL_BUZZER_ENABLE
+        default 3
+        range 0 48
+        help
+            C6-ZERO 推荐 GPIO3；避开霍尔 GPIO1、GNSS GPIO20/21/22、
+            strapping GPIO4/5/8/9/15、USB GPIO12/13、JTAG GPIO6/7、
+            UART0 console GPIO16/17。GPIO3 经三极管驱动蜂鸣器。
+
+    config ONEYE_BEDRAIL_BUZZER_FREQ_HZ
+        int "无源蜂鸣器 PWM 频率 (Hz)"
+        depends on ONEYE_BEDRAIL_BUZZER_ENABLE
+        default 2700
+        range 1000 5000
+        help
+            通用无源蜂鸣器谐振点通常在 2–3 kHz；默认 2700 Hz。
+
     config ONEYE_T31_GW_STATE_MIN_MS
         int "网关最小影子上报间隔(ms)"
         default 5000

@@ -17,7 +17,8 @@ static const char *TAG = "buzzer";
 #define BUZZER_LEDC_TIMER     LEDC_TIMER_0
 #define BUZZER_LEDC_CHANNEL   LEDC_CHANNEL_0
 #define BUZZER_LEDC_RES       LEDC_TIMER_10_BIT
-#define BUZZER_DUTY_ON        512u   /* 10-bit 50% */
+/* 10-bit 满量程 1023；直接 GPIO 驱动时 30% 占空比限制平均电流/发热。 */
+#define BUZZER_DUTY_ON        ((1023u * CONFIG_ONEYE_BEDRAIL_BUZZER_DUTY_PCT) / 100u)
 
 static bool s_ready;
 static volatile bool s_busy;

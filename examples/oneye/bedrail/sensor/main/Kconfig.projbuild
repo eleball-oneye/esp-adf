@@ -98,6 +98,15 @@ menu "bedrail/sensor 例程配置"
             12095 无源蜂鸣器的谐振频率为 2048 Hz；默认 2048 Hz。
             偏离谐振点会明显变轻并增大电流。
 
+    config ONEYE_BEDRAIL_BUZZER_DUTY_PCT
+        int "无源蜂鸣器 PWM 占空比 (%)"
+        depends on ONEYE_BEDRAIL_BUZZER_ENABLE
+        default 30
+        range 10 50
+        help
+            直接 GPIO 驱动时的降功率手段：占空比越低，平均电流和发热越小，
+            但声音也会变轻。默认 30%；加三极管后可用 50%。
+
     config ONEYE_T31_GW_STATE_MIN_MS
         int "网关最小影子上报间隔(ms)"
         default 5000

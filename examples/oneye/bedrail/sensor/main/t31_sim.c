@@ -255,6 +255,36 @@ static void t31_emit_gps(void)
 #endif /* CONFIG_ONEYE_GNSS_ENABLE */
 
 /*
+ * 霍尔状态只在周期任务里采样一次：既用于 0x57 TLV，也用于本地解锁提示音。
+ * 2026-11-03：蜂鸣器必须本地生效，⛔ 不能等到 BLE 已连接才判断边沿。
+ */
+static hall_state_t s_hall_last = HALL_STATE_OPEN;
+static hall_state_t s_hall_latest = HALL_STATE_OPEN;
+static bool s_hall_latest_ready;
+
+static void t31_hall_tick(void)
+{
+    if (!hall_drv_ready()) {
+        return;
+    }
+
+    s_hall_latest_ready = true;
+    s_hall_latest = hall_drv_read();
+    if (s_hall_latest == s_hall_last) {
+        return;
+    }
+
+    bool unlocked = (s_hall_last == HALL_STATE_CLOSED && s_hall_latest == HALL_STATE_OPEN);
+    s_hall_last = s_hall_latest;
+    ESP_LOGI(TAG, "霍尔状态变化 ⇒ hallState=%u（%s）",
+             (unsigned)s_hall_latest, hall_state_name(s_hall_latest));
+    if (unlocked) {
+        /* 床护栏解锁：hallState 1 → 0，两声短鸣（非阻塞） */
+        buzzer_drv_unlock_alert();
+    }
+}
+
+/*
  * 通用 TLV 透传帧（cmd 0x03）：payload 就是云端 `sub.telemetry` 的 TLV 字节流（大端）。
  * 2026-11-02〔bedrail〕：本帧固定带 **0x57 霍尔状态**；GNSS 启用时再带 `0x56 gnssState`。
  * 以后新增属性只要在这里 append 标签，**网关固件不用改**。
@@ -268,10 +298,9 @@ static void t31_emit_tlv(void)
     size_t n = 0;
     size_t len;
     uint8_t gnss_state = 0u;
-    hall_state_t hall = HALL_STATE_OPEN;
-    bool hall_ready = hall_drv_ready();
+    hall_state_t hall = s_hall_latest;
+    bool hall_ready = s_hall_latest_ready;
     bool hall_changed = false;
-    static hall_state_t last_hall = HALL_STATE_OPEN;
 
     if (s_conn == BLE_HS_CONN_HANDLE_NONE || !s_subscribed) {
         return;
@@ -288,18 +317,6 @@ static void t31_emit_tlv(void)
 #endif
 
     if (hall_ready) {
-        hall = hall_drv_read();
-        hall_changed = (hall != last_hall);
-        if (hall_changed) {
-            bool unlocked = (last_hall == HALL_STATE_CLOSED && hall == HALL_STATE_OPEN);
-            last_hall = hall;
-            ESP_LOGI(TAG, "霍尔状态变化 ⇒ hallState=%u（%s）",
-                     (unsigned)hall, hall_state_name(hall));
-            if (unlocked) {
-                /* 床护栏解锁：hallState 1 → 0，两声短鸣（非阻塞） */
-                buzzer_drv_unlock_alert();
-            }
-        }
         tlv[n++] = 0x57u;   /* HALL_STATE（床护栏） */
         tlv[n++] = 1u;
         tlv[n++] = (uint8_t)hall;
@@ -340,6 +357,9 @@ static void t31_emit_once(void)
     int16_t centi;
     size_t len;
     bool online = (s_conn != BLE_HS_CONN_HANDLE_NONE);
+
+    /* 本地霍尔边沿：即使 BLE 未连接也响；同时更新 0x57 的缓存值 */
+    t31_hall_tick();
 
 #if CONFIG_ONEYE_GNSS_ENABLE
     /* 定位帧先发（独立 cmd/独立缓冲）：温度帧仍是 FFF1 READ 的"最近一帧" */

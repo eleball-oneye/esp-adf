@@ -89,7 +89,7 @@ static bool s_hid_connected;
 static uint8_t s_hall_map[3] = {PIN_HALL_INDEX, PIN_HALL_MIDDLE, PIN_HALL_RING};
 static int s_report_count;
 static float s_gain = CURSOR_GAIN_DEFAULT;
-static bool s_recenter_on = false;          /* opt-in: pull cursor to screen center on engage */
+static bool s_recenter_on = true;           /* pull cursor to screen center on engage */
 static bool s_recenter_pending = false;
 static int s_screen_w = 1920;
 static int s_screen_h = 1080;

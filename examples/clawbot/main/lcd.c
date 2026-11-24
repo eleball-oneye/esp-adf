@@ -16,7 +16,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "font8x16.h"
+#include "font12x24.h"
+#include "font16x32.h"
 
 static const char *TAG = "lcd";
 
@@ -121,9 +122,10 @@ static void fb_round(int x, int y, int w, int h, int r, uint16_t fill, uint16_t 
     }
 }
 
-static void fb_text(int x, int y, const char *s, uint16_t c, int scale)
+static void fb_glyphs(int x, int y, const char *s, const uint8_t *font,
+                      int gw, int gh, uint16_t c)
 {
-    if (!s_fb) {
+    if (!s_fb || !font) {
         return;
     }
     for (; *s; s++) {
@@ -131,30 +133,36 @@ static void fb_text(int x, int y, const char *s, uint16_t c, int scale)
         if (ch < 32 || ch > 126) {
             ch = '?';
         }
-        const uint8_t *g = font8x16[ch - 32];
-        for (int row = 0; row < 16; row++) {
+        const uint8_t *g = font + (size_t)(ch - 32) * gh;
+        for (int row = 0; row < gh; row++) {
             uint8_t bits = g[row];
             int col = 0;
-            while (col < 8) {
-                if (!(bits & (1 << (7 - col)))) {
+            while (col < gw) {
+                if (!(bits & (1 << (gw - 1 - col)))) {
                     col++;
                     continue;
                 }
                 int start = col;
-                while (col < 8 && (bits & (1 << (7 - col)))) {
+                while (col < gw && (bits & (1 << (gw - 1 - col)))) {
                     col++;
                 }
-                fb_rect(x + start * scale, y + row * scale, (col - start) * scale, scale, c);
+                fb_rect(x + start, y + row, col - start, 1, c);
             }
         }
-        x += 8 * scale;
+        x += gw;
     }
 }
 
-static int text_w(const char *s, int scale)
+static void text12(int x, int y, const char *s, uint16_t c)
 {
-    return (int)strlen(s) * 8 * scale;
+    fb_glyphs(x, y, s, (const uint8_t *)font12x24, 12, 24, c);
 }
+
+static void text16(int x, int y, const char *s, uint16_t c)
+{
+    fb_glyphs(x, y, s, (const uint8_t *)font16x32, 16, 32, c);
+}
+
 
 /* ---------------- page ---------------- */
 
@@ -175,64 +183,33 @@ static void draw_page(void)
 
     fb_rect(0, 0, LCD_H_RES, LCD_V_RES, COL_BG);
 
-    /* header */
-    fb_text(12, 8, "CLAWBOT", COL_FG, 1);
-    fb_rect(196, 14, 8, 8, s_view.hall[2] ? COL_TEAL : COL_LINE);
-    fb_text(210, 10, "BLE", COL_DIM, 1);
+    /* header: name + bias */
+    text12(12, 8, "CLAWBOT", COL_FG);
+    snprintf(buf, sizeof(buf), "%.1f", (double)s_view.bias);
+    text12(196, 8, buf, COL_DIM);
 
-    /* hall cards */
+    /* three hall cards: big letter + dot */
     static const char *labs[3] = { "I", "M", "R" };
     for (int i = 0; i < 3; i++) {
         int x = 12 + i * 74;
-        fb_round(x, 34, 66, 46, 8, COL_CARD, COL_LINE);
-        fb_rect(x + 8, 44, 12, 12, s_view.hall[i] ? COL_TEAL : COL_LINE);
-        fb_text(x + 26, 42, labs[i], COL_FG, 1);
-        fb_text(x + 8, 60, s_view.hall[i] ? "on" : "open", COL_DIM, 1);
+        fb_round(x, 40, 66, 64, 10, COL_CARD, COL_LINE);
+        fb_rect(x + 8, 48, 10, 10, s_view.hall[i] ? COL_TEAL : COL_LINE);
+        text16(x + 25, 58, labs[i], s_view.hall[i] ? COL_TEAL : COL_FG);
     }
 
-    /* clutch card */
-    fb_round(12, 90, 106, 66, 10, COL_CARD, COL_LINE);
-    fb_text(20, 96, "CLUTCH", COL_DIM, 1);
-    fb_rect(20, 116, 14, 14, s_view.clutch ? COL_TEAL : COL_RED);
-    fb_text(40, 108, s_view.clutch ? "ON" : "OFF", s_view.clutch ? COL_TEAL : COL_RED, 2);
+    /* clutch */
+    fb_round(12, 112, 216, 64, 12, COL_CARD, COL_LINE);
+    text12(22, 122, "CLUTCH", COL_DIM);
+    text16(150, 124, s_view.clutch ? "ON" : "OFF", s_view.clutch ? COL_TEAL : COL_RED);
 
-    /* state card */
-    fb_round(126, 90, 102, 66, 10, COL_CARD, COL_LINE);
-    fb_text(134, 96, "STATE", COL_DIM, 1);
+    /* state */
+    fb_round(12, 184, 216, 56, 12, COL_CARD, COL_LINE);
+    text12(22, 192, "STATE", COL_DIM);
     uint16_t sc = (s_view.state == 2) ? COL_TEAL : (s_view.state == 3 ? COL_AMBER : COL_FG);
-    fb_text(134, 112, state_name(s_view.state), sc, 2);
-
-    /* bias / rate card */
-    fb_round(12, 164, 216, 34, 10, COL_CARD, COL_LINE);
-    fb_text(20, 172, "BIAS", COL_DIM, 1);
-    snprintf(buf, sizeof(buf), "%.1f", (double)s_view.bias);
-    fb_text(62, 168, buf, COL_FG, 1);
-    fb_text(96, 176, "dps", COL_DIM, 1);
-    fb_text(150, 172, "RATE", COL_DIM, 1);
-    snprintf(buf, sizeof(buf), "%.1f", (double)fmaxf(fabsf(s_view.roll), fabsf(s_view.pitch)));
-    fb_text(186, 168, buf, COL_FG, 1);
-
-    /* bars */
-    fb_text(12, 206, "ROLL", COL_DIM, 1);
-    fb_round(46, 206, 182, 10, 5, COL_TRACK, 0);
-    fb_rect(137, 206, 2, 10, COL_DIM);
-    int half = 88;
-    int len = (int)(half * fminf(1.0f, fabsf(s_view.roll) / BAR_FULL));
-    if (len > 0) {
-        fb_rect(s_view.roll >= 0 ? 138 : 138 - len, 208, len, 6, COL_TEAL);
-    }
-
-    fb_text(12, 222, "PITCH", COL_DIM, 1);
-    fb_round(46, 222, 182, 10, 5, COL_TRACK, 0);
-    fb_rect(137, 222, 2, 10, COL_DIM);
-    len = (int)(half * fminf(1.0f, fabsf(s_view.pitch) / BAR_FULL));
-    if (len > 0) {
-        fb_rect(s_view.pitch >= 0 ? 138 : 138 - len, 224, len, 6, COL_AMBER);
-    }
+    text16(110, 196, state_name(s_view.state), sc);
 
     /* footer */
-    fb_text(12, 246, "BOOT  screen", COL_DIM, 1);
-    fb_text(120, 246, "HOLD  sleep", COL_DIM, 1);
+    text12(6, 250, "BOOT=LCD HOLD=SLEEP", COL_DIM);
 }
 
 static void flush_fb(void)

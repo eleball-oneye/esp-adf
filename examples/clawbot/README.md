@@ -56,7 +56,7 @@ idf.py -p COM10 flash monitor
 - 食指 → 鼠标左键，中指 → 右键；
 - 无名指：短按无位移（<300 ms，累计角位移 ≤6°）→ 切换离合；
   按住产生 >6° 位移 → 滚动（俯仰映射滚轮）；按住 >300 ms 仍无位移 → 滚动待命，松开不切离合；
-- 光标：离合接合且非滚动时，由陀螺积分产生相对位移（`CURSOR_GAIN` 可调）；
+- 光标：离合接合且非滚动时，由陀螺积分产生相对位移，灵敏度默认 **20 px/deg**（`gain N` 可调）；
 - 断开/重连：BLE 断开后自动重新广播。
 
 ## 4. CSV 数据流
@@ -103,7 +103,12 @@ python tools\log_serial.py COM10 data\P2_S01_2026-12-04.csv
 | `ble status` | 查询状态 | `EVT,ble,<enabled>,<connected>` |
 | `csv on` / `csv off` | 打开/关闭 CSV 流 | `EVT,csv,1/0` |
 | `cal` | 重新做 100 帧静止校准 | `EVT,cal,bias=...` |
+| `gain` | 查询当前灵敏度 | `EVT,gain,20.0` |
+| `gain 30` | 设置灵敏度（px/deg，1–100） | `EVT,gain,30.0` |
+| `hid test` | 已连接时让光标右移 50 px | `EVT,hid,test` / `EVT,hid,not-connected` |
 | `help` | 命令列表 | `EVT,help,...` |
+
+启动日志里会有 `EVT,adv,1`（广播已开）或 `EVT,adv,err=...`、`EVT,hidd,err=...`，用于判断 HID 是否注册成功。
 
 网页工具：`tools/cursor-sim/index.html`（虚拟光标 + 指标导出，见其 README）。
 

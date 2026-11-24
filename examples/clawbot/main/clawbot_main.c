@@ -11,6 +11,7 @@
  */
 
 #include <math.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -50,7 +51,7 @@ static const char *TAG = "clawbot";
 #define SCROLL_DEG          6.0f    /* displacement that turns a press into scroll */
 #define STANDBY_MS          300.0f  /* hold without motion -> standby (no toggle) */
 #define WHEEL_DEG_PER_TICK  6.0f
-#define CURSOR_GAIN         1.2f    /* pixels per degree, tune on the bench */
+#define CURSOR_GAIN_DEFAULT 20.0f   /* pixels per degree, tunable at runtime */
 #define CURSOR_MAX_STEP     40.0f
 
 /* Set to 1 to print the CSV stream, 0 to keep the console quiet. */
@@ -87,6 +88,7 @@ static bool s_hid_connected;
 
 static uint8_t s_hall_map[3] = {PIN_HALL_INDEX, PIN_HALL_MIDDLE, PIN_HALL_RING};
 static int s_report_count;
+static float s_gain = CURSOR_GAIN_DEFAULT;
 
 /* Runtime switches (serial commands). */
 static bool s_ble_enabled = true;
@@ -134,8 +136,11 @@ static void ble_start_adv(void)
         return;
     }
     esp_err_t err = esp_ble_gap_start_advertising(&hidd_adv_params);
-    if (err != ESP_OK) {
+    if (err == ESP_OK) {
+        printf("EVT,adv,1\n");
+    } else {
         ESP_LOGW(TAG, "start advertising failed: %s", esp_err_to_name(err));
+        printf("EVT,adv,err=%d\n", (int)err);
     }
 }
 
@@ -196,7 +201,11 @@ static void ble_hid_init(void)
     ESP_ERROR_CHECK(esp_bluedroid_init());
     ESP_ERROR_CHECK(esp_bluedroid_enable());
 
-    ESP_ERROR_CHECK(esp_hidd_profile_init());
+    esp_err_t hidd_err = esp_hidd_profile_init();
+    if (hidd_err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_hidd_profile_init failed: %s", esp_err_to_name(hidd_err));
+        printf("EVT,hidd,err=%d\n", (int)hidd_err);
+    }
     esp_ble_gap_register_callback(gap_event_handler);
     esp_hidd_register_callbacks(hidd_event_callback);
 
@@ -378,8 +387,8 @@ static void clawbot_task(void *arg)
 
                 /* Cursor: only when clutch is engaged and not scrolling. */
                 if (s_clutch && s_state != G_SCROLL) {
-                    s_cursor_x += s_roll_rate * dt * CURSOR_GAIN;
-                    s_cursor_y += s_pitch_rate * dt * CURSOR_GAIN;
+                    s_cursor_x += s_roll_rate * dt * s_gain;
+                    s_cursor_y += s_pitch_rate * dt * s_gain;
                 } else {
                     s_cursor_x = s_cursor_y = 0;
                 }
@@ -494,7 +503,7 @@ static void imu_recalibrate(void)
 static void handle_command(const char *cmd)
 {
     if (!strcmp(cmd, "help")) {
-        printf("EVT,help,ble on|off|status;csv on|off;cal\n");
+        printf("EVT,help,ble on|off|status;csv on|off;cal;gain <px/deg>;hid test\n");
     } else if (!strcmp(cmd, "ble on")) {
         s_ble_enabled = true;
         ble_start_adv();
@@ -514,6 +523,21 @@ static void handle_command(const char *cmd)
     } else if (!strcmp(cmd, "csv off")) {
         s_csv_enabled = false;
         printf("EVT,csv,0\n");
+    } else if (!strcmp(cmd, "gain")) {
+        printf("EVT,gain,%.1f\n", s_gain);
+    } else if (!strncmp(cmd, "gain ", 5)) {
+        float v = (float)atof(cmd + 5);
+        if (v < 1.0f) v = 1.0f;
+        if (v > 100.0f) v = 100.0f;
+        s_gain = v;
+        printf("EVT,gain,%.1f\n", s_gain);
+    } else if (!strcmp(cmd, "hid test")) {
+        if (s_ble_enabled && s_hid_connected && s_hid_secure) {
+            esp_hidd_send_mouse_value_ex(s_hid_conn_id, 0, 50, 0, 0);
+            printf("EVT,hid,test\n");
+        } else {
+            printf("EVT,hid,not-connected\n");
+        }
     } else if (!strcmp(cmd, "cal")) {
         imu_recalibrate();
     } else if (cmd[0]) {

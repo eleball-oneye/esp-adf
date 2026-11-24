@@ -108,48 +108,81 @@ static void fb_rect(int x, int y, int w, int h, uint16_t c)
 
 static uint16_t blend(uint16_t a, uint16_t b, int pct);
 
+#define CORNER_R 14
+static uint8_t s_corner[CORNER_R][CORNER_R];
+
+static void corner_init(void)
+{
+    const int sub = 4;
+    for (int j = 0; j < CORNER_R; j++) {
+        for (int i = 0; i < CORNER_R; i++) {
+            int inside = 0;
+            for (int sy = 0; sy < sub; sy++) {
+                for (int sx = 0; sx < sub; sx++) {
+                    float px = (float)i + ((float)sx + 0.5f) / (float)sub;
+                    float py = (float)j + ((float)sy + 0.5f) / (float)sub;
+                    float dx = (float)CORNER_R - px;
+                    float dy = (float)CORNER_R - py;
+                    if (dx * dx + dy * dy <= (float)(CORNER_R * CORNER_R)) {
+                        inside++;
+                    }
+                }
+            }
+            s_corner[j][i] = (uint8_t)(inside * 255 / (sub * sub));
+        }
+    }
+}
+
 static void fb_round(int x, int y, int w, int h, int r, uint16_t fill, uint16_t line)
 {
     if (r < 1) {
         r = 1;
     }
-    for (int yy = 0; yy < h; yy++) {
-        float inset = 0.0f;
-        if (yy < r) {
-            float dy = (float)(r - yy);
-            inset = (float)r - sqrtf((float)(r * r) - dy * dy);
-        } else if (yy >= h - r) {
-            float dy = (float)(r - (h - 1 - yy));
-            inset = (float)r - sqrtf((float)(r * r) - dy * dy);
-        }
-        int i0 = (int)ceilf(inset);
-        float cov = 1.0f - (float)i0 + inset;   /* coverage of the edge pixel */
-        if (cov < 0.0f) cov = 0.0f;
-        if (cov > 1.0f) cov = 1.0f;
-
-        int x0 = x + i0;
-        int x1 = x + w - i0;
-        if (x0 >= x1) {
-            continue;
-        }
-
-        /* sample the background before painting, so AA matches the gradient */
-        uint16_t bg_l = s_fb[(y + yy) * LCD_H_RES + (x0 - 1)];
-        uint16_t bg_r = s_fb[(y + yy) * LCD_H_RES + x1];
-
-        fb_rect(x0, y + yy, x1 - x0, 1, fill);
-        if (i0 > 0) {
-            fb_px(x0 - 1, y + yy, blend(bg_l, fill, (int)(cov * 100.0f)));
-            fb_px(x1, y + yy, blend(bg_r, fill, (int)(cov * 100.0f)));
-        }
+    if (r != CORNER_R) {
+        /* fallback: plain rectangles for unusual radii */
+        fb_rect(x, y, w, h, fill);
         if (line) {
-            fb_px(x0, y + yy, line);
-            fb_px(x1 - 1, y + yy, line);
+            fb_rect(x, y, w, 1, line);
+            fb_rect(x, y + h - 1, w, 1, line);
+            fb_rect(x, y, 1, h, line);
+            fb_rect(x + w - 1, y, 1, h, line);
+        }
+        return;
+    }
+
+    /* body */
+    fb_rect(x + r, y, w - 2 * r, h, fill);
+    fb_rect(x, y + r, w, h - 2 * r, fill);
+
+    /* corners with supersampled coverage */
+    for (int j = 0; j < r; j++) {
+        for (int i = 0; i < r; i++) {
+            uint8_t a = s_corner[j][i];
+            if (a == 0) {
+                continue;
+            }
+            int pct = a * 100 / 255;
+            int xs[2] = { x + i, x + w - 1 - i };
+            int ys[2] = { y + j, y + h - 1 - j };
+            for (int yi = 0; yi < 2; yi++) {
+                for (int xi = 0; xi < 2; xi++) {
+                    int px = xs[xi], py = ys[yi];
+                    uint16_t bg = s_fb[py * LCD_H_RES + px];
+                    uint16_t c = blend(bg, fill, pct);
+                    if (line && a < 255 && a > 40) {
+                        c = blend(c, line, 55);
+                    }
+                    fb_px(px, py, c);
+                }
+            }
         }
     }
+
     if (line) {
         fb_rect(x + r, y, w - 2 * r, 1, line);
         fb_rect(x + r, y + h - 1, w - 2 * r, 1, line);
+        fb_rect(x, y + r, 1, h - 2 * r, line);
+        fb_rect(x + w - 1, y + r, 1, h - 2 * r, line);
     }
 }
 
@@ -394,6 +427,8 @@ esp_err_t lcd_init(void)
     };
     ESP_ERROR_CHECK(gpio_config(&bl));
     gpio_set_level(PIN_LCD_BL, 0);
+
+    corner_init();
 
     s_fb = heap_caps_malloc((size_t)LCD_H_RES * LCD_V_RES * sizeof(uint16_t), MALLOC_CAP_INTERNAL);
     if (!s_fb) {

@@ -16,8 +16,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "font20x26.h"
-#include "font22x34.h"
+#include "font18x26.h"
+#include "font20x34.h"
 
 static const char *TAG = "lcd";
 
@@ -106,24 +106,32 @@ static void fb_rect(int x, int y, int w, int h, uint16_t c)
 
 static void fb_round(int x, int y, int w, int h, int r, uint16_t fill, uint16_t line)
 {
-    fb_rect(x + r, y, w - 2 * r, h, fill);
-    fb_rect(x, y + r, w, h - 2 * r, fill);
-    for (int i = 0; i < r; i++) {
-        int dx = r - i;
-        int span = (int)(sqrtf((float)(r * r - dx * dx)));
-        fb_rect(x + r - span, y + i, span * 2, 1, fill);
-        fb_rect(x + r - span, y + h - 1 - i, span * 2, 1, fill);
+    if (r < 1) {
+        r = 1;
+    }
+    for (int yy = 0; yy < h; yy++) {
+        int inset = 0;
+        if (yy < r) {
+            float dy = (float)(r - yy);
+            inset = r - (int)sqrtf((float)(r * r) - dy * dy);
+        } else if (yy >= h - r) {
+            float dy = (float)(r - (h - 1 - yy));
+            inset = r - (int)sqrtf((float)(r * r) - dy * dy);
+        }
+        fb_rect(x + inset, y + yy, w - 2 * inset, 1, fill);
+        if (line) {
+            fb_px(x + inset, y + yy, line);
+            fb_px(x + w - 1 - inset, y + yy, line);
+        }
     }
     if (line) {
         fb_rect(x + r, y, w - 2 * r, 1, line);
         fb_rect(x + r, y + h - 1, w - 2 * r, 1, line);
-        fb_rect(x, y + r, 1, h - 2 * r, line);
-        fb_rect(x + w - 1, y + r, 1, h - 2 * r, line);
     }
 }
 
 static void fb_glyphs(int x, int y, const char *s, const uint16_t *font,
-                      int gw, int gh, uint16_t c)
+                      const uint8_t *widths, int gh, uint16_t c)
 {
     if (!s_fb || !font) {
         return;
@@ -133,17 +141,18 @@ static void fb_glyphs(int x, int y, const char *s, const uint16_t *font,
         if (ch < 32 || ch > 126) {
             ch = '?';
         }
+        int gw = widths[ch - 32] + 2;
         const uint16_t *g = font + (size_t)(ch - 32) * gh;
         for (int row = 0; row < gh; row++) {
             uint16_t bits = g[row];
             int col = 0;
             while (col < gw) {
-                if (!(bits & (1 << (gw - 1 - col)))) {
+                if (!(bits & (1u << (gw - 1 - col)))) {
                     col++;
                     continue;
                 }
                 int start = col;
-                while (col < gw && (bits & (1 << (gw - 1 - col)))) {
+                while (col < gw && (bits & (1u << (gw - 1 - col)))) {
                     col++;
                 }
                 fb_rect(x + start, y + row, col - start, 1, c);
@@ -153,14 +162,25 @@ static void fb_glyphs(int x, int y, const char *s, const uint16_t *font,
     }
 }
 
-static void text20(int x, int y, const char *s, uint16_t c)
+static int text_width(const uint8_t *widths, const char *s)
 {
-    fb_glyphs(x, y, s, (const uint16_t *)font20x26, 20, 26, c);
+    int w = 0;
+    for (; *s; s++) {
+        unsigned ch = (unsigned char)*s;
+        if (ch < 32 || ch > 126) ch = '?';
+        w += widths[ch - 32] + 2;
+    }
+    return w;
 }
 
-static void text22(int x, int y, const char *s, uint16_t c)
+static void text18(int x, int y, const char *s, uint16_t c)
 {
-    fb_glyphs(x, y, s, (const uint16_t *)font22x34, 22, 34, c);
+    fb_glyphs(x, y, s, (const uint16_t *)font18x26, font18x26_w, 26, c);
+}
+
+static void text20(int x, int y, const char *s, uint16_t c)
+{
+    fb_glyphs(x, y, s, (const uint16_t *)font20x34, font20x34_w, 34, c);
 }
 
 static uint16_t blend(uint16_t a, uint16_t b, int pct)
@@ -237,9 +257,9 @@ static void draw_page(void)
     }
 
     /* header */
-    text20(14, 8, "CLAWBOT", COL_FG);
+    text18(14, 8, "CLAWBOT", COL_FG);
     snprintf(buf, sizeof(buf), "%.1f", (double)s_view.bias);
-    text20(172, 8, buf, COL_DIM);
+    text18(172, 8, buf, COL_DIM);
 
     /* gradient accent line */
     for (int i = 0; i < 212; i++) {
@@ -254,8 +274,9 @@ static void draw_page(void)
         if (s_view.hall[i]) {
             glow_rect(x, 48, 64, 72, 14, COL_TEAL, pulse);
         }
-        fb_rect(x + 12, 60, 10, 10, s_view.hall[i] ? COL_TEAL : COL_LINE);
-        text22(x + 21, 76, labs[i], s_view.hall[i] ? COL_TEAL : COL_FG);
+        fb_rect(x + 12, 58, 10, 10, s_view.hall[i] ? COL_TEAL : COL_LINE);
+        int lw = text_width(font20x34_w, labs[i]);
+        text20(x + (64 - lw) / 2, 74, labs[i], s_view.hall[i] ? COL_TEAL : COL_FG);
     }
 
     /* clutch: label above, value below */
@@ -265,15 +286,16 @@ static void draw_page(void)
     if (s_view.clutch) {
         glow_rect(16, 128, 208, 78, 14, COL_TEAL, pulse);
     }
-    text20(28, 136, "CLUTCH", COL_DIM);
-    text22(28, 166, s_view.clutch ? "ON" : "OFF", acc);
+    text18(28, 134, "CLUTCH", COL_DIM);
+    text20(28, 164, s_view.clutch ? "ON" : "OFF", acc);
 
     /* state: value only, centred */
     uint16_t sc = (s_view.state == 2) ? COL_TEAL : (s_view.state == 3 ? COL_AMBER : COL_FG);
     fb_round(16, 212, 208, 58, 14, blend(COL_CARD, sc, 10), COL_LINE);
     fb_rect(16, 224, 3, 36, sc);
-    int sw = (int)strlen(state_name(s_view.state)) * 22;
-    text22((240 - sw) / 2, 224, state_name(s_view.state), sc);
+    const char *sn = state_name(s_view.state);
+    int sw = text_width(font20x34_w, sn);
+    text20((240 - sw) / 2, 224, sn, sc);
 }
 
 static void flush_fb(void)

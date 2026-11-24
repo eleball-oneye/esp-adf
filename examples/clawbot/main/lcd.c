@@ -77,7 +77,7 @@ esp_err_t lcd_init(void)
     ESP_ERROR_CHECK(esp_lcd_panel_reset(s_panel));
     ESP_ERROR_CHECK(esp_lcd_panel_init(s_panel));
     ESP_ERROR_CHECK(esp_lcd_panel_set_gap(s_panel, 0, 20));
-    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(s_panel, false));
+    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(s_panel, true)); /* ST7789 needs INVON */
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true));
 
     gpio_config_t bl = {
@@ -88,6 +88,11 @@ esp_err_t lcd_init(void)
     gpio_set_level(PIN_LCD_BL, 1);
 
     lcd_fill(COL_BG);
+    /* 1 px frame: lets us see whether the gap/offset clips the edges. */
+    lcd_rect(0, 0, LCD_H_RES, 1, COL_FG);
+    lcd_rect(0, LCD_V_RES - 1, LCD_H_RES, 1, COL_FG);
+    lcd_rect(0, 0, 1, LCD_V_RES, COL_FG);
+    lcd_rect(LCD_H_RES - 1, 0, 1, LCD_V_RES, COL_FG);
     memset(&s_last, 0, sizeof(s_last));
     s_last.bias = -1;
     s_last.state = -1;

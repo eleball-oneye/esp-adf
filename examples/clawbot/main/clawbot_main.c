@@ -178,11 +178,14 @@ static void hidd_event_callback(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *
         s_peer_valid = true;
         s_hid_connected = true;
         ESP_LOGI(TAG, "BLE connected (conn_id=%u)", s_hid_conn_id);
+        printf("EVT,hid,connect\n");
+        esp_ble_gap_set_prefer_conn_params(s_peer_bda, 6, 12, 0, 400);
         break;
     case ESP_HIDD_EVENT_BLE_DISCONNECT:
         s_hid_secure = false;
         s_hid_connected = false;
         ESP_LOGI(TAG, "BLE disconnected, re-advertising");
+        printf("EVT,hid,disconnect\n");
         ble_start_adv();
         break;
     default:
@@ -216,6 +219,7 @@ static void ble_hid_init(void)
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_bt_controller_init(&bt_cfg));
     ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_BLE));
+    esp_bt_sleep_disable();   /* keep the radio awake: fewer dropped HID reports */
     ESP_ERROR_CHECK(esp_bluedroid_init());
     ESP_ERROR_CHECK(esp_bluedroid_enable());
 

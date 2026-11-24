@@ -16,8 +16,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "font18x24.h"
-#include "font20x32.h"
+#include "font20x26.h"
+#include "font22x34.h"
 
 static const char *TAG = "lcd";
 
@@ -153,14 +153,14 @@ static void fb_glyphs(int x, int y, const char *s, const uint16_t *font,
     }
 }
 
-static void text18(int x, int y, const char *s, uint16_t c)
-{
-    fb_glyphs(x, y, s, (const uint16_t *)font18x24, 18, 24, c);
-}
-
 static void text20(int x, int y, const char *s, uint16_t c)
 {
-    fb_glyphs(x, y, s, (const uint16_t *)font20x32, 20, 32, c);
+    fb_glyphs(x, y, s, (const uint16_t *)font20x26, 20, 26, c);
+}
+
+static void text22(int x, int y, const char *s, uint16_t c)
+{
+    fb_glyphs(x, y, s, (const uint16_t *)font22x34, 22, 34, c);
 }
 
 static uint16_t blend(uint16_t a, uint16_t b, int pct)
@@ -214,40 +214,65 @@ static const char *state_name(int s)
 static void draw_page(void)
 {
     char buf[16];
-    int pulse = (int)((esp_timer_get_time() / 200000) % 5) * 8 + 30;
+    int pulse = (int)((esp_timer_get_time() / 200000) % 5) * 8 + 26;
 
+    /* background: diagonal gradient + soft colour wash */
     for (int y = 0; y < LCD_V_RES; y++) {
-        uint16_t c = blend(rgb(18, 26, 44), rgb(5, 7, 11), (y * 100) / LCD_V_RES);
-        fb_rect(0, y, LCD_H_RES, 1, c);
+        for (int x = 0; x < LCD_H_RES; x++) {
+            int t2 = (y * 100) / LCD_V_RES;
+            uint16_t c = blend(rgb(20, 28, 52), rgb(4, 6, 10), t2);
+            int dx = x - 30, dy = y - 30;
+            int d = (int)sqrtf((float)(dx * dx + dy * dy));
+            if (d < 220) {
+                c = blend(c, rgb(0, 180, 160), (220 - d) / 12);
+            }
+            dx = x - 230; dy = y - 300;
+            d = (int)sqrtf((float)(dx * dx + dy * dy));
+            if (d < 200) {
+                c = blend(c, rgb(120, 100, 230), (200 - d) / 14);
+            }
+            fb_px(x, y, c);
+        }
     }
 
-    text18(14, 8, "CLAWBOT", COL_FG);
+    /* header */
+    text20(14, 8, "CLAWBOT", COL_FG);
     snprintf(buf, sizeof(buf), "%.1f", (double)s_view.bias);
-    text18(172, 8, buf, COL_DIM);
-    fb_rect(14, 36, 212, 2, blend(COL_TEAL, COL_BG, 55));
+    text20(172, 8, buf, COL_DIM);
 
+    /* gradient accent line */
+    for (int i = 0; i < 212; i++) {
+        fb_rect(14 + i, 38, 1, 2, blend(COL_TEAL, rgb(140, 120, 255), (i * 100) / 212));
+    }
+
+    /* three hall cards */
     static const char *labs[3] = { "I", "M", "R" };
     for (int i = 0; i < 3; i++) {
         int x = 16 + i * 72;
-        fb_round(x, 46, 64, 72, 14, COL_CARD, COL_LINE);
+        fb_round(x, 48, 64, 72, 14, s_view.hall[i] ? blend(COL_CARD, COL_TEAL, 14) : COL_CARD, COL_LINE);
         if (s_view.hall[i]) {
-            glow_rect(x, 46, 64, 72, 14, COL_TEAL, pulse);
+            glow_rect(x, 48, 64, 72, 14, COL_TEAL, pulse);
         }
-        fb_rect(x + 12, 58, 10, 10, s_view.hall[i] ? COL_TEAL : COL_LINE);
-        text20(x + 22, 74, labs[i], s_view.hall[i] ? COL_TEAL : COL_FG);
+        fb_rect(x + 12, 60, 10, 10, s_view.hall[i] ? COL_TEAL : COL_LINE);
+        text22(x + 21, 76, labs[i], s_view.hall[i] ? COL_TEAL : COL_FG);
     }
 
-    fb_round(16, 126, 208, 68, 14, COL_CARD, COL_LINE);
+    /* clutch */
+    uint16_t acc = s_view.clutch ? COL_TEAL : COL_RED;
+    fb_round(16, 128, 208, 68, 14, blend(COL_CARD, acc, 12), COL_LINE);
+    fb_rect(16, 142, 3, 40, acc);
     if (s_view.clutch) {
-        glow_rect(16, 126, 208, 68, 14, COL_TEAL, pulse);
+        glow_rect(16, 128, 208, 68, 14, COL_TEAL, pulse);
     }
-    text18(24, 134, "CLUTCH", COL_DIM);
-    text20(146, 142, s_view.clutch ? "ON" : "OFF", s_view.clutch ? COL_TEAL : COL_RED);
+    text20(28, 136, "CLUTCH", COL_DIM);
+    text22(146, 144, s_view.clutch ? "ON" : "OFF", acc);
 
-    fb_round(16, 202, 208, 60, 14, COL_CARD, COL_LINE);
-    text18(24, 210, "STATE", COL_DIM);
+    /* state */
     uint16_t sc = (s_view.state == 2) ? COL_TEAL : (s_view.state == 3 ? COL_AMBER : COL_FG);
-    text20(112, 214, state_name(s_view.state), sc);
+    fb_round(16, 204, 208, 60, 14, blend(COL_CARD, sc, 10), COL_LINE);
+    fb_rect(16, 216, 3, 36, sc);
+    text20(28, 212, "STATE", COL_DIM);
+    text20(106, 216, state_name(s_view.state), sc);
 }
 
 static void flush_fb(void)

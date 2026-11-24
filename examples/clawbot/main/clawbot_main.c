@@ -603,6 +603,10 @@ static void handle_command(const char *cmd)
         if (v > 100.0f) v = 100.0f;
         s_gain = v;
         printf("EVT,gain,%.1f\n", s_gain);
+    } else if (!strcmp(cmd, "lcd on")) {
+        lcd_set_power(true);
+    } else if (!strcmp(cmd, "lcd off")) {
+        lcd_set_power(false);
     } else if (!strcmp(cmd, "sleep on")) {
         s_auto_sleep = true;
         printf("EVT,sleep,auto-on\n");

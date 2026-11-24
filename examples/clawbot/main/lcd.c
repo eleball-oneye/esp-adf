@@ -10,6 +10,7 @@
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -178,6 +179,7 @@ void lcd_set_power(bool on)
         return;
     }
     s_on = on;
+    int64_t t_us = esp_timer_get_time();
     if (on) {
         /* The frame was kept up to date while off: just enable and light up. */
         gpio_hold_dis(PIN_LCD_BL);
@@ -188,6 +190,7 @@ void lcd_set_power(bool on)
         gpio_set_level(PIN_LCD_BL, 0);
         esp_lcd_panel_disp_on_off(s_panel, false);
     }
+    printf("EVT,lcd,%d,%lld\n", on ? 1 : 0, (esp_timer_get_time() - t_us) / 1000);
 }
 
 bool lcd_is_on(void)

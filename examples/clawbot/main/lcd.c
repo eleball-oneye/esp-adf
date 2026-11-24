@@ -37,7 +37,7 @@ static uint16_t rgb(int r, int g, int b)
     return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
 }
 
-#define COL_BG      rgb(10, 14, 20)
+#define COL_BG      rgb(10, 8, 20)
 #define COL_CARD    rgb(28, 36, 50)
 #define COL_LINE    rgb(62, 78, 102)
 #define COL_FG      rgb(232, 238, 248)
@@ -108,81 +108,42 @@ static void fb_rect(int x, int y, int w, int h, uint16_t c)
 
 static uint16_t blend(uint16_t a, uint16_t b, int pct);
 
-#define CORNER_R 14
-static uint8_t s_corner[CORNER_R][CORNER_R];
-
-static void corner_init(void)
-{
-    const int sub = 4;
-    for (int j = 0; j < CORNER_R; j++) {
-        for (int i = 0; i < CORNER_R; i++) {
-            int inside = 0;
-            for (int sy = 0; sy < sub; sy++) {
-                for (int sx = 0; sx < sub; sx++) {
-                    float px = (float)i + ((float)sx + 0.5f) / (float)sub;
-                    float py = (float)j + ((float)sy + 0.5f) / (float)sub;
-                    float dx = (float)CORNER_R - px;
-                    float dy = (float)CORNER_R - py;
-                    if (dx * dx + dy * dy <= (float)(CORNER_R * CORNER_R)) {
-                        inside++;
-                    }
-                }
-            }
-            s_corner[j][i] = (uint8_t)(inside * 255 / (sub * sub));
-        }
-    }
-}
-
 static void fb_round(int x, int y, int w, int h, int r, uint16_t fill, uint16_t line)
 {
     if (r < 1) {
         r = 1;
     }
-    if (r != CORNER_R) {
-        /* fallback: plain rectangles for unusual radii */
-        fb_rect(x, y, w, h, fill);
-        if (line) {
-            fb_rect(x, y, w, 1, line);
-            fb_rect(x, y + h - 1, w, 1, line);
-            fb_rect(x, y, 1, h, line);
-            fb_rect(x + w - 1, y, 1, h, line);
+    /* solid corners: integer scanlines, no blending */
+    for (int yy = 0; yy < h; yy++) {
+        int inset = 0;
+        if (yy < r) {
+            float dy = (float)(r - yy) - 0.5f;
+            inset = (int)((float)r - sqrtf((float)(r * r) - dy * dy) + 0.5f);
+        } else if (yy >= h - r) {
+            float dy = (float)(r - (h - 1 - yy)) - 0.5f;
+            inset = (int)((float)r - sqrtf((float)(r * r) - dy * dy) + 0.5f);
         }
-        return;
-    }
-
-    /* body */
-    fb_rect(x + r, y, w - 2 * r, h, fill);
-    fb_rect(x, y + r, w, h - 2 * r, fill);
-
-    /* corners with supersampled coverage */
-    for (int j = 0; j < r; j++) {
-        for (int i = 0; i < r; i++) {
-            uint8_t a = s_corner[j][i];
-            if (a == 0) {
-                continue;
-            }
-            int pct = a * 100 / 255;
-            int xs[2] = { x + i, x + w - 1 - i };
-            int ys[2] = { y + j, y + h - 1 - j };
-            for (int yi = 0; yi < 2; yi++) {
-                for (int xi = 0; xi < 2; xi++) {
-                    int px = xs[xi], py = ys[yi];
-                    uint16_t bg = s_fb[py * LCD_H_RES + px];
-                    uint16_t c = blend(bg, fill, pct);
-                    if (line && a < 255 && a > 40) {
-                        c = blend(c, line, 55);
-                    }
-                    fb_px(px, py, c);
-                }
-            }
-        }
+        if (inset > r) inset = r;
+        fb_rect(x + inset, y + yy, w - 2 * inset, 1, fill);
     }
 
     if (line) {
-        fb_rect(x + r, y, w - 2 * r, 1, line);
-        fb_rect(x + r, y + h - 1, w - 2 * r, 1, line);
-        fb_rect(x, y + r, 1, h - 2 * r, line);
-        fb_rect(x + w - 1, y + r, 1, h - 2 * r, line);
+        /* 2 px solid border following the same outline */
+        for (int yy = 0; yy < h; yy++) {
+            int inset = 0;
+            if (yy < r) {
+                float dy = (float)(r - yy) - 0.5f;
+                inset = (int)((float)r - sqrtf((float)(r * r) - dy * dy) + 0.5f);
+            } else if (yy >= h - r) {
+                float dy = (float)(r - (h - 1 - yy)) - 0.5f;
+                inset = (int)((float)r - sqrtf((float)(r * r) - dy * dy) + 0.5f);
+            }
+            if (inset > r) inset = r;
+            fb_rect(x + inset, y + yy, 2, 1, line);
+            fb_rect(x + w - 2 - inset, y + yy, 2, 1, line);
+        }
+        fb_rect(x + r, y, w - 2 * r, 2, line);
+        fb_rect(x + r, y + h - 2, w - 2 * r, 2, line);
     }
 }
 
@@ -249,29 +210,7 @@ static uint16_t blend(uint16_t a, uint16_t b, int pct)
     return (uint16_t)((r << 11) | (g << 5) | bl);
 }
 
-static void fb_outline_round(int x, int y, int w, int h, int r, uint16_t c)
-{
-    fb_rect(x + r, y, w - 2 * r, 1, c);
-    fb_rect(x + r, y + h - 1, w - 2 * r, 1, c);
-    fb_rect(x, y + r, 1, h - 2 * r, c);
-    fb_rect(x + w - 1, y + r, 1, h - 2 * r, c);
-    for (int i = 0; i < r; i++) {
-        int dy = r - i;
-        int span = (int)(sqrtf((float)(r * r - dy * dy)));
-        fb_px(x + r - span, y + i, c);
-        fb_px(x + w - 1 - r + span, y + i, c);
-        fb_px(x + r - span, y + h - 1 - i, c);
-        fb_px(x + w - 1 - r + span, y + h - 1 - i, c);
-    }
-}
 
-static void glow_rect(int x, int y, int w, int h, int r, uint16_t c, int strength)
-{
-    for (int i = 3; i >= 1; i--) {
-        uint16_t col = blend(c, COL_BG, strength / (i + 1));
-        fb_outline_round(x - i, y - i, w + 2 * i, h + 2 * i, r + i, col);
-    }
-}
 
 
 /* ---------------- page ---------------- */
@@ -290,7 +229,6 @@ static const char *state_name(int s)
 static void draw_page(void)
 {
     char buf[16];
-    int pulse = (int)((esp_timer_get_time() / 200000) % 5) * 8 + 20;
 
     /* background: per-row gradient, corner washes limited to their radius */
     for (int y = 0; y < LCD_V_RES; y++) {
@@ -330,10 +268,9 @@ static void draw_page(void)
     static const char *labs[3] = { "I", "M", "R" };
     for (int i = 0; i < 3; i++) {
         int x = 16 + i * 72;
-        fb_round(x, 48, 64, 72, 14, s_view.hall[i] ? blend(COL_CARD, COL_TEAL, 14) : COL_CARD, COL_LINE);
-        if (s_view.hall[i]) {
-            glow_rect(x, 48, 64, 72, 14, COL_TEAL, pulse);
-        }
+        fb_round(x, 48, 64, 72, 8,
+                 s_view.hall[i] ? blend(COL_CARD, COL_TEAL, 14) : COL_CARD,
+                 s_view.hall[i] ? COL_TEAL : COL_LINE);
         fb_rect(x + 12, 58, 10, 10, s_view.hall[i] ? COL_TEAL : rgb(104, 120, 148));
         int lw = text_width(font20x34_w, labs[i]);
         text20(x + (64 - lw) / 2, 78, labs[i], s_view.hall[i] ? COL_TEAL : COL_FG);
@@ -341,17 +278,16 @@ static void draw_page(void)
 
     /* clutch: label above, value below */
     uint16_t acc = s_view.clutch ? COL_TEAL : COL_RED;
-    fb_round(16, 128, 208, 78, 14, blend(COL_CARD, acc, 12), COL_LINE);
+    fb_round(16, 128, 208, 78, 8, blend(COL_CARD, acc, 12),
+             s_view.clutch ? COL_TEAL : COL_LINE);
     fb_rect(16, 146, 3, 46, acc);
-    if (s_view.clutch) {
-        glow_rect(16, 128, 208, 78, 14, COL_TEAL, pulse);
-    }
     text18(28, 138, "CLUTCH", COL_DIM);
     text20(28, 166, s_view.clutch ? "ON" : "OFF", acc);
 
     /* state: same label/value alignment as the clutch card */
     uint16_t sc = (s_view.state == 2) ? COL_TEAL : (s_view.state == 3 ? COL_AMBER : COL_FG);
-    fb_round(16, 212, 208, 62, 14, blend(COL_CARD, sc, 10), COL_LINE);
+    fb_round(16, 212, 208, 62, 8, blend(COL_CARD, sc, 10),
+             (s_view.state == 2 || s_view.state == 3) ? sc : COL_LINE);
     fb_rect(16, 226, 3, 38, sc);
     text18(28, 218, "STATE", COL_DIM);
     text20(28, 242, state_name(s_view.state), sc);
@@ -427,8 +363,6 @@ esp_err_t lcd_init(void)
     };
     ESP_ERROR_CHECK(gpio_config(&bl));
     gpio_set_level(PIN_LCD_BL, 0);
-
-    corner_init();
 
     s_fb = heap_caps_malloc((size_t)LCD_H_RES * LCD_V_RES * sizeof(uint16_t), MALLOC_CAP_INTERNAL);
     if (!s_fb) {

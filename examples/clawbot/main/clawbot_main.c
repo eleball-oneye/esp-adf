@@ -34,7 +34,7 @@ static const char *TAG = "clawbot";
 
 /* ---------------- board wiring ---------------- */
 #define PIN_HALL_INDEX   2
-#define PIN_HALL_MIDDLE  3
+#define PIN_HALL_MIDDLE  18  /* GPIO3 is a strapping pin, avoid it */
 #define PIN_HALL_RING    17
 #define PIN_IMU_SDA      11
 #define PIN_IMU_SCL      10

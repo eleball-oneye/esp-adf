@@ -12,7 +12,7 @@ POC 数据采集固件：3 路磁接近按键 + 板载 QMI8658C IMU + BLE HID �
 | 信号 | 开发板引脚 | 接到 | 说明 |
 |---|---|---|---|
 | HALL_INDEX（食指） | **GPIO2** | 食指传感板 OUT | 内部上拉已开 |
-| HALL_MIDDLE（中指） | **GPIO3** | 中指传感板 OUT | 内部上拉已开 |
+| HALL_MIDDLE（中指） | **GPIO18** | 中指传感板 OUT | 内部上拉已开；GPIO3 是 strapping 脚，留空 |
 | HALL_RING（无名指） | **GPIO17** | 无名指传感板 OUT | 内部上拉已开 |
 | 3V3 | 排针 `3V3` | 三块传感板 VCC | 与霍尔 pin1 相连 |
 | GND | 排针 `GND` | 三块传感板 GND | 与霍尔 pin3 相连 |

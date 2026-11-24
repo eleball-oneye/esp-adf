@@ -71,6 +71,7 @@ esp_err_t lcd_init(void)
     esp_lcd_panel_dev_config_t dev = {
         .reset_gpio_num = PIN_LCD_RST,
         .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
+        .data_endian = LCD_RGB_DATA_ENDIAN_LITTLE,
         .bits_per_pixel = 16,
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(io, &dev, &s_panel));

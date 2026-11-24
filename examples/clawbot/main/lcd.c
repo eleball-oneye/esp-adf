@@ -9,6 +9,8 @@
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 static const char *TAG = "lcd";
 
@@ -31,6 +33,7 @@ static const char *TAG = "lcd";
 #define BAR_FULL    100.0f
 
 static esp_lcd_panel_handle_t s_panel;
+static SemaphoreHandle_t s_flush_done;
 static uint16_t s_band[LCD_H_RES * BAND_ROWS];
 
 /* Last drawn values, so we can repaint only what changed. */
@@ -43,6 +46,16 @@ static struct {
     int pitch_bucket;
     bool valid;
 } s_last;
+
+static bool on_color_done(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_io_event_data_t *edata, void *user_ctx)
+{
+    (void)panel_io;
+    (void)edata;
+    (void)user_ctx;
+    BaseType_t hp = pdFALSE;
+    xSemaphoreGiveFromISR(s_flush_done, &hp);
+    return hp == pdTRUE;
+}
 
 esp_err_t lcd_init(void)
 {
@@ -67,6 +80,14 @@ esp_err_t lcd_init(void)
         .trans_queue_depth = 10,
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI2_HOST, &io_cfg, &io));
+
+    s_flush_done = xSemaphoreCreateBinary();
+    configASSERT(s_flush_done);
+
+    esp_lcd_panel_io_callbacks_t io_cb = {
+        .on_color_trans_done = on_color_done,
+    };
+    ESP_ERROR_CHECK(esp_lcd_panel_io_register_event_callbacks(io, &io_cb, NULL));
 
     esp_lcd_panel_dev_config_t dev = {
         .reset_gpio_num = PIN_LCD_RST,
@@ -129,6 +150,8 @@ void lcd_rect(int x, int y, int w, int h, uint16_t color)
             s_band[i] = color;
         }
         esp_lcd_panel_draw_bitmap(s_panel, x, y0, x + w, y0 + n, s_band);
+        /* Wait until this band is really on the wire before reusing s_band. */
+        xSemaphoreTake(s_flush_done, pdMS_TO_TICKS(100));
         y0 += n;
     }
 }

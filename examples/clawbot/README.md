@@ -87,7 +87,9 @@ python tools\log_serial.py COM10 data\P2_S01_2026-12-04.csv
 
 ## 6. LCD 调试页
 
-240×280 ST7789，10 Hz 局部刷新（只重画变化的块，静态背景不重绘；分 32 行带 DMA 传输）：
+240×280 ST7789，10 Hz 局部刷新（只重画变化的块，静态背景不重绘；分 32 行带 DMA 传输）。下面是固件绘制逻辑在 `hall=000 / clutch=接合 / state=0 / bias=4` 时的渲染预览：
+
+![LCD debug page](docs/lcd-page.png)
 
 | 区域 | 含义 |
 |---|---|

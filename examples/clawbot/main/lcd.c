@@ -121,23 +121,33 @@ static void fb_round(int x, int y, int w, int h, int r, uint16_t fill, uint16_t 
             inset = (float)r - sqrtf((float)(r * r) - dy * dy);
         }
         int i0 = (int)ceilf(inset);
-        int frac = (int)((inset - (float)(i0 - 1)) * 100.0f);
-        if (frac < 0) frac = 0;
-        if (frac > 100) frac = 100;
+        float cov = 1.0f - (float)i0 + inset;   /* coverage of the edge pixel */
+        if (cov < 0.0f) cov = 0.0f;
+        if (cov > 1.0f) cov = 1.0f;
 
         int x0 = x + i0;
         int x1 = x + w - i0;
+        if (x0 >= x1) {
+            continue;
+        }
+
+        /* sample the background before painting, so AA matches the gradient */
+        uint16_t bg_l = s_fb[(y + yy) * LCD_H_RES + (x0 - 1)];
+        uint16_t bg_r = s_fb[(y + yy) * LCD_H_RES + x1];
+
         fb_rect(x0, y + yy, x1 - x0, 1, fill);
         if (i0 > 0) {
-            fb_px(x0 - 1, y + yy, blend(COL_BG, fill, 100 - frac));
-            fb_px(x1, y + yy, blend(COL_BG, fill, 100 - frac));
+            fb_px(x0 - 1, y + yy, blend(bg_l, fill, (int)(cov * 100.0f)));
+            fb_px(x1, y + yy, blend(bg_r, fill, (int)(cov * 100.0f)));
+        }
+        if (line) {
+            fb_px(x0, y + yy, line);
+            fb_px(x1 - 1, y + yy, line);
         }
     }
     if (line) {
         fb_rect(x + r, y, w - 2 * r, 1, line);
         fb_rect(x + r, y + h - 1, w - 2 * r, 1, line);
-        fb_rect(x, y + r, 1, h - 2 * r, line);
-        fb_rect(x + w - 1, y + r, 1, h - 2 * r, line);
     }
 }
 

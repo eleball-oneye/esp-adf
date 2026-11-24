@@ -19,6 +19,13 @@ POC 数据采集固件：3 路磁接近按键 + 板载 QMI8658C IMU + BLE HID �
 | IMU | 板载 | — | I²C：SDA=GPIO11，SCL=GPIO10（与触摸/RTC 共用） |
 | USB | USB-C | PC（COM10） | 供电 + 串口 + 烧录 |
 
+**两种引出方式，编号不一样，别混用**：
+
+1. **12P FFC 连接器**（`hardware/ESP32-S3-Touch-LCD-1.69/Pinout.png`）：从上到下 `GPIO18 / GPIO17 / GPIO16 / GPIO3 / GPIO2 / SDA / SCL / U0TXD / U0RXD / 3.3 / GND / 5V`；GPIO16 只在这个连接器上出现。
+2. **TP1–TP11 测试点**（原理图）：`TP8=GPIO2、TP9=GPIO3、TP10=GPIO17、TP11=GPIO18、TP3=3V3、TP2=GND`。
+
+焊接前先用万用表确认 `3.3–GND` 为 3.3 V，并确认连接器 1 脚方向（丝印圆点/三角）。
+
 **DRV5032AJDBZR（SOT-23-3）引脚**：`1=VCC`、`2=OUT`、`3=GND`。
 不要把 DU 版本的接法套上来（DU 的 pin2/pin3 不同）。
 

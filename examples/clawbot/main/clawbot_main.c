@@ -18,6 +18,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
+#include "esp_sleep.h"
 #include "driver/usb_serial_jtag.h"
 #include "esp_bt.h"
 #include "esp_bt_main.h"
@@ -95,6 +96,8 @@ static int s_screen_w = 1920;
 static int s_screen_h = 1080;
 static float s_abs_x = 16383.5f;   /* HID absolute position, 0..32767 */
 static float s_abs_y = 16383.5f;
+#define ADV_WAIT_MS (120 * 1000)   /* advertise for 2 min, then sleep */
+static int64_t s_adv_since;
 
 /* Runtime switches (serial commands). */
 static bool s_ble_enabled = true;
@@ -155,6 +158,7 @@ static void ble_start_adv(void)
     }
     esp_err_t err = esp_ble_gap_start_advertising(&hidd_adv_params);
     if (err == ESP_OK) {
+        s_adv_since = esp_timer_get_time();
         printf("EVT,adv,1\n");
     } else {
         ESP_LOGW(TAG, "start advertising failed: %s", esp_err_to_name(err));
@@ -179,6 +183,7 @@ static void hidd_event_callback(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *
         s_hid_connected = true;
         ESP_LOGI(TAG, "BLE connected (conn_id=%u)", s_hid_conn_id);
         printf("EVT,hid,connect\n");
+        s_adv_since = 0;
         esp_ble_gap_set_prefer_conn_params(s_peer_bda, 6, 12, 0, 400);
         break;
     case ESP_HIDD_EVENT_BLE_DISCONNECT:
@@ -429,6 +434,16 @@ static void clawbot_task(void *arg)
                     }
                 }
             }
+        }
+
+        /* Pairing window: no host within 2 min -> deep sleep, wake on BOOT (GPIO0 low). */
+        if (s_ble_enabled && !s_hid_connected && s_adv_since != 0 &&
+            (now - s_adv_since) > (int64_t)ADV_WAIT_MS * 1000) {
+            printf("EVT,sleep,timeout\n");
+            gpio_set_level(GPIO_NUM_15, 0);   /* LCD backlight off before sleep */
+            esp_ble_gap_stop_advertising();
+            esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);
+            esp_deep_sleep_start();
         }
 
         /* Hall at 20 Hz */

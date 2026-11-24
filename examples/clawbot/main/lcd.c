@@ -130,7 +130,7 @@ static void fb_round(int x, int y, int w, int h, int r, uint16_t fill, uint16_t 
     }
 }
 
-static void fb_glyphs(int x, int y, const char *s, const uint16_t *font,
+static void fb_glyphs(int x, int y, const char *s, const uint32_t *font,
                       const uint8_t *widths, int gh, uint16_t c)
 {
     if (!s_fb || !font) {
@@ -142,9 +142,9 @@ static void fb_glyphs(int x, int y, const char *s, const uint16_t *font,
             ch = '?';
         }
         int gw = widths[ch - 32] + 2;
-        const uint16_t *g = font + (size_t)(ch - 32) * gh;
+        const uint32_t *g = font + (size_t)(ch - 32) * gh;
         for (int row = 0; row < gh; row++) {
-            uint16_t bits = g[row];
+            uint32_t bits = g[row];
             int col = 0;
             while (col < gw) {
                 if (!(bits & (1u << (gw - 1 - col)))) {
@@ -175,12 +175,12 @@ static int text_width(const uint8_t *widths, const char *s)
 
 static void text18(int x, int y, const char *s, uint16_t c)
 {
-    fb_glyphs(x, y, s, (const uint16_t *)font18x26, font18x26_w, 26, c);
+    fb_glyphs(x, y, s, (const uint32_t *)font18x26, font18x26_w, 20, c);
 }
 
 static void text20(int x, int y, const char *s, uint16_t c)
 {
-    fb_glyphs(x, y, s, (const uint16_t *)font20x34, font20x34_w, 34, c);
+    fb_glyphs(x, y, s, (const uint32_t *)font20x34, font20x34_w, 22, c);
 }
 
 static uint16_t blend(uint16_t a, uint16_t b, int pct)
@@ -276,7 +276,7 @@ static void draw_page(void)
         }
         fb_rect(x + 12, 58, 10, 10, s_view.hall[i] ? COL_TEAL : COL_LINE);
         int lw = text_width(font20x34_w, labs[i]);
-        text20(x + (64 - lw) / 2, 74, labs[i], s_view.hall[i] ? COL_TEAL : COL_FG);
+        text20(x + (64 - lw) / 2, 78, labs[i], s_view.hall[i] ? COL_TEAL : COL_FG);
     }
 
     /* clutch: label above, value below */
@@ -286,8 +286,8 @@ static void draw_page(void)
     if (s_view.clutch) {
         glow_rect(16, 128, 208, 78, 14, COL_TEAL, pulse);
     }
-    text18(28, 134, "CLUTCH", COL_DIM);
-    text20(28, 164, s_view.clutch ? "ON" : "OFF", acc);
+    text18(28, 138, "CLUTCH", COL_DIM);
+    text20(28, 166, s_view.clutch ? "ON" : "OFF", acc);
 
     /* state: value only, centred */
     uint16_t sc = (s_view.state == 2) ? COL_TEAL : (s_view.state == 3 ? COL_AMBER : COL_FG);
@@ -295,7 +295,7 @@ static void draw_page(void)
     fb_rect(16, 224, 3, 36, sc);
     const char *sn = state_name(s_view.state);
     int sw = text_width(font20x34_w, sn);
-    text20((240 - sw) / 2, 224, sn, sc);
+    text20((240 - sw) / 2, 226, sn, sc);
 }
 
 static void flush_fb(void)

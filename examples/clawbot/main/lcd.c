@@ -38,8 +38,8 @@ static uint16_t rgb(int r, int g, int b)
 }
 
 #define COL_BG      rgb(10, 14, 20)
-#define COL_CARD    rgb(22, 28, 38)
-#define COL_LINE    rgb(40, 50, 66)
+#define COL_CARD    rgb(28, 36, 50)
+#define COL_LINE    rgb(62, 78, 102)
 #define COL_FG      rgb(232, 238, 248)
 #define COL_DIM     rgb(140, 155, 178)
 #define COL_TEAL    rgb(0, 229, 192)
@@ -285,7 +285,7 @@ static void draw_page(void)
         if (s_view.hall[i]) {
             glow_rect(x, 48, 64, 72, 14, COL_TEAL, pulse);
         }
-        fb_rect(x + 12, 58, 10, 10, s_view.hall[i] ? COL_TEAL : COL_LINE);
+        fb_rect(x + 12, 58, 10, 10, s_view.hall[i] ? COL_TEAL : rgb(104, 120, 148));
         int lw = text_width(font20x34_w, labs[i]);
         text20(x + (64 - lw) / 2, 78, labs[i], s_view.hall[i] ? COL_TEAL : COL_FG);
     }

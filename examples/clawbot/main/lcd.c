@@ -1,11 +1,13 @@
 #include "lcd.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
-#include "esp_lcd_panel_ops.h"
+#include "esp_heap_caps.h"
+#include "esp_system.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
@@ -14,6 +16,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "font8x16.h"
 
 static const char *TAG = "lcd";
 
@@ -24,34 +27,45 @@ static const char *TAG = "lcd";
 #define PIN_LCD_RST  8
 #define PIN_LCD_BL   15
 
-#define COL_BG      0x0000
-#define COL_FG      0xFFFF
-#define COL_DIM     0x4208
-#define COL_GREEN   0x07E0
-#define COL_RED     0xF800
-#define COL_YELLOW  0xFFE0
-#define COL_BLUE    0x001F
-
 #define BAND_ROWS   96
 #define BAR_FULL    100.0f
+#define PAGE_MS     200
+
+static uint16_t rgb(int r, int g, int b)
+{
+    return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+}
+
+#define COL_BG      rgb(10, 14, 20)
+#define COL_CARD    rgb(22, 28, 38)
+#define COL_LINE    rgb(40, 50, 66)
+#define COL_FG      rgb(232, 238, 248)
+#define COL_DIM     rgb(140, 155, 178)
+#define COL_TEAL    rgb(0, 229, 192)
+#define COL_AMBER   rgb(255, 196, 84)
+#define COL_RED     rgb(255, 99, 99)
+#define COL_TRACK   rgb(30, 38, 50)
 
 static esp_lcd_panel_handle_t s_panel;
 static SemaphoreHandle_t s_flush_done;
 static bool s_on = true;
 static uint16_t s_band[LCD_H_RES * BAND_ROWS];
+static uint16_t *s_fb;
+static int64_t s_last_page_us;
 
-/* Last drawn values, so we can repaint only what changed. */
-static struct {
+typedef struct {
     bool hall[3];
     bool clutch;
     int state;
-    int bias;
-    int roll_bucket;
-    int pitch_bucket;
-    bool valid;
-} s_last;
+    float bias;
+    float roll;
+    float pitch;
+} view_t;
 
-static bool on_color_done(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_io_event_data_t *edata, void *user_ctx)
+static view_t s_view = { .clutch = true, .state = 0 };
+
+static bool on_color_done(esp_lcd_panel_io_handle_t panel_io,
+                          esp_lcd_panel_io_event_data_t *edata, void *user_ctx)
 {
     (void)panel_io;
     (void)edata;
@@ -60,6 +74,181 @@ static bool on_color_done(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_io_e
     xSemaphoreGiveFromISR(s_flush_done, &hp);
     return hp == pdTRUE;
 }
+
+/* ---------------- framebuffer primitives ---------------- */
+
+static void fb_px(int x, int y, uint16_t c)
+{
+    if (x < 0 || y < 0 || x >= LCD_H_RES || y >= LCD_V_RES || !s_fb) {
+        return;
+    }
+    s_fb[y * LCD_H_RES + x] = c;
+}
+
+static void fb_rect(int x, int y, int w, int h, uint16_t c)
+{
+    if (!s_fb) {
+        return;
+    }
+    for (int yy = y; yy < y + h; yy++) {
+        if (yy < 0 || yy >= LCD_V_RES) {
+            continue;
+        }
+        for (int xx = x; xx < x + w; xx++) {
+            if (xx < 0 || xx >= LCD_H_RES) {
+                continue;
+            }
+            s_fb[yy * LCD_H_RES + xx] = c;
+        }
+    }
+}
+
+static void fb_round(int x, int y, int w, int h, int r, uint16_t fill, uint16_t line)
+{
+    fb_rect(x + r, y, w - 2 * r, h, fill);
+    fb_rect(x, y + r, w, h - 2 * r, fill);
+    for (int i = 0; i < r; i++) {
+        int dx = r - i;
+        int span = (int)(sqrtf((float)(r * r - dx * dx)));
+        fb_rect(x + r - span, y + i, span * 2, 1, fill);
+        fb_rect(x + r - span, y + h - 1 - i, span * 2, 1, fill);
+    }
+    if (line) {
+        fb_rect(x + r, y, w - 2 * r, 1, line);
+        fb_rect(x + r, y + h - 1, w - 2 * r, 1, line);
+        fb_rect(x, y + r, 1, h - 2 * r, line);
+        fb_rect(x + w - 1, y + r, 1, h - 2 * r, line);
+    }
+}
+
+static void fb_text(int x, int y, const char *s, uint16_t c, int scale)
+{
+    if (!s_fb) {
+        return;
+    }
+    for (; *s; s++) {
+        unsigned ch = (unsigned char)*s;
+        if (ch < 32 || ch > 126) {
+            ch = '?';
+        }
+        const uint8_t *g = font8x16[ch - 32];
+        for (int row = 0; row < 16; row++) {
+            uint8_t bits = g[row];
+            int col = 0;
+            while (col < 8) {
+                if (!(bits & (1 << (7 - col)))) {
+                    col++;
+                    continue;
+                }
+                int start = col;
+                while (col < 8 && (bits & (1 << (7 - col)))) {
+                    col++;
+                }
+                fb_rect(x + start * scale, y + row * scale, (col - start) * scale, scale, c);
+            }
+        }
+        x += 8 * scale;
+    }
+}
+
+static int text_w(const char *s, int scale)
+{
+    return (int)strlen(s) * 8 * scale;
+}
+
+/* ---------------- page ---------------- */
+
+static const char *state_name(int s)
+{
+    switch (s) {
+    case 0: return "IDLE";
+    case 1: return "PEND";
+    case 2: return "SCROLL";
+    case 3: return "READY";
+    default: return "?";
+    }
+}
+
+static void draw_page(void)
+{
+    char buf[16];
+
+    fb_rect(0, 0, LCD_H_RES, LCD_V_RES, COL_BG);
+
+    /* header */
+    fb_text(12, 8, "CLAWBOT", COL_FG, 1);
+    fb_rect(196, 14, 8, 8, s_view.hall[2] ? COL_TEAL : COL_LINE);
+    fb_text(210, 10, "BLE", COL_DIM, 1);
+
+    /* hall cards */
+    static const char *labs[3] = { "I", "M", "R" };
+    for (int i = 0; i < 3; i++) {
+        int x = 12 + i * 74;
+        fb_round(x, 34, 66, 46, 8, COL_CARD, COL_LINE);
+        fb_rect(x + 8, 44, 12, 12, s_view.hall[i] ? COL_TEAL : COL_LINE);
+        fb_text(x + 26, 42, labs[i], COL_FG, 1);
+        fb_text(x + 8, 60, s_view.hall[i] ? "on" : "open", COL_DIM, 1);
+    }
+
+    /* clutch card */
+    fb_round(12, 90, 106, 66, 10, COL_CARD, COL_LINE);
+    fb_text(20, 96, "CLUTCH", COL_DIM, 1);
+    fb_rect(20, 116, 14, 14, s_view.clutch ? COL_TEAL : COL_RED);
+    fb_text(40, 108, s_view.clutch ? "ON" : "OFF", s_view.clutch ? COL_TEAL : COL_RED, 2);
+
+    /* state card */
+    fb_round(126, 90, 102, 66, 10, COL_CARD, COL_LINE);
+    fb_text(134, 96, "STATE", COL_DIM, 1);
+    uint16_t sc = (s_view.state == 2) ? COL_TEAL : (s_view.state == 3 ? COL_AMBER : COL_FG);
+    fb_text(134, 112, state_name(s_view.state), sc, 2);
+
+    /* bias / rate card */
+    fb_round(12, 164, 216, 34, 10, COL_CARD, COL_LINE);
+    fb_text(20, 172, "BIAS", COL_DIM, 1);
+    snprintf(buf, sizeof(buf), "%.1f", (double)s_view.bias);
+    fb_text(62, 168, buf, COL_FG, 1);
+    fb_text(96, 176, "dps", COL_DIM, 1);
+    fb_text(150, 172, "RATE", COL_DIM, 1);
+    snprintf(buf, sizeof(buf), "%.1f", (double)fmaxf(fabsf(s_view.roll), fabsf(s_view.pitch)));
+    fb_text(186, 168, buf, COL_FG, 1);
+
+    /* bars */
+    fb_text(12, 206, "ROLL", COL_DIM, 1);
+    fb_round(46, 206, 182, 10, 5, COL_TRACK, 0);
+    fb_rect(137, 206, 2, 10, COL_DIM);
+    int half = 88;
+    int len = (int)(half * fminf(1.0f, fabsf(s_view.roll) / BAR_FULL));
+    if (len > 0) {
+        fb_rect(s_view.roll >= 0 ? 138 : 138 - len, 208, len, 6, COL_TEAL);
+    }
+
+    fb_text(12, 222, "PITCH", COL_DIM, 1);
+    fb_round(46, 222, 182, 10, 5, COL_TRACK, 0);
+    fb_rect(137, 222, 2, 10, COL_DIM);
+    len = (int)(half * fminf(1.0f, fabsf(s_view.pitch) / BAR_FULL));
+    if (len > 0) {
+        fb_rect(s_view.pitch >= 0 ? 138 : 138 - len, 224, len, 6, COL_AMBER);
+    }
+
+    /* footer */
+    fb_text(12, 246, "BOOT  screen", COL_DIM, 1);
+    fb_text(120, 246, "HOLD  sleep", COL_DIM, 1);
+}
+
+static void flush_fb(void)
+{
+    if (!s_fb || !s_panel) {
+        return;
+    }
+    for (int y = 0; y < LCD_V_RES; y += BAND_ROWS) {
+        int n = (LCD_V_RES - y) < BAND_ROWS ? (LCD_V_RES - y) : BAND_ROWS;
+        memcpy(s_band, &s_fb[y * LCD_H_RES], (size_t)n * LCD_H_RES * sizeof(uint16_t));
+        esp_lcd_panel_draw_bitmap(s_panel, 0, y, LCD_H_RES, y + n, s_band);
+        xSemaphoreTake(s_flush_done, pdMS_TO_TICKS(100));
+    }
+}
+
+/* ---------------- public API ---------------- */
 
 esp_err_t lcd_init(void)
 {
@@ -106,9 +295,8 @@ esp_err_t lcd_init(void)
     ESP_ERROR_CHECK(esp_lcd_panel_reset(s_panel));
     ESP_ERROR_CHECK(esp_lcd_panel_init(s_panel));
     ESP_ERROR_CHECK(esp_lcd_panel_set_gap(s_panel, 0, 20));
-    /* The board is mounted upside down for use: rotate the image 180 deg. */
     ESP_ERROR_CHECK(esp_lcd_panel_mirror(s_panel, true, true));
-    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(s_panel, true)); /* ST7789 needs INVON */
+    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(s_panel, true));
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true));
 
     gpio_config_t bl = {
@@ -116,61 +304,57 @@ esp_err_t lcd_init(void)
         .mode = GPIO_MODE_OUTPUT,
     };
     ESP_ERROR_CHECK(gpio_config(&bl));
-    gpio_set_level(PIN_LCD_BL, 1);
+    gpio_set_level(PIN_LCD_BL, 0);
 
-    lcd_fill(COL_BG);
-    /* 1 px frame: lets us see whether the gap/offset clips the edges. */
-    lcd_rect(0, 0, LCD_H_RES, 1, COL_FG);
-    lcd_rect(0, LCD_V_RES - 1, LCD_H_RES, 1, COL_FG);
-    lcd_rect(0, 0, 1, LCD_V_RES, COL_FG);
-    lcd_rect(LCD_H_RES - 1, 0, 1, LCD_V_RES, COL_FG);
-    memset(&s_last, 0, sizeof(s_last));
-    s_last.bias = -1;
-    s_last.state = -1;
-    s_last.roll_bucket = 9999;
-    s_last.pitch_bucket = 9999;
-    s_last.valid = true;
-    ESP_LOGI(TAG, "ST7789 %dx%d ready", LCD_H_RES, LCD_V_RES);
+    s_fb = heap_caps_malloc((size_t)LCD_H_RES * LCD_V_RES * sizeof(uint16_t), MALLOC_CAP_INTERNAL);
+    if (!s_fb) {
+        ESP_LOGE(TAG, "framebuffer alloc failed (%d bytes)", LCD_H_RES * LCD_V_RES * 2);
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGI(TAG, "ST7789 240x280 ready, fb=%p free_heap=%u", s_fb,
+             (unsigned)esp_get_free_heap_size());
+
+    draw_page();
+    flush_fb();
+    gpio_set_level(PIN_LCD_BL, 1);
+    s_last_page_us = esp_timer_get_time();
     return ESP_OK;
+}
+
+void lcd_status_page(const bool hall[3], bool clutch, int state,
+                     float bias_dps, float roll_rate, float pitch_rate)
+{
+    if (!s_fb) {
+        return;
+    }
+    s_view.hall[0] = hall[0];
+    s_view.hall[1] = hall[1];
+    s_view.hall[2] = hall[2];
+    s_view.clutch = clutch;
+    s_view.state = state;
+    s_view.bias = bias_dps;
+    s_view.roll = roll_rate;
+    s_view.pitch = pitch_rate;
+
+    int64_t now = esp_timer_get_time();
+    if (now - s_last_page_us < PAGE_MS * 1000) {
+        return;
+    }
+    s_last_page_us = now;
+    draw_page();
+    if (s_on) {
+        flush_fb();
+    }
+}
+
+void lcd_fill(uint16_t color)
+{
+    fb_rect(0, 0, LCD_H_RES, LCD_V_RES, color);
 }
 
 void lcd_rect(int x, int y, int w, int h, uint16_t color)
 {
-    if (!s_panel || w <= 0 || h <= 0) {
-        return;
-    }
-    if (x < 0) { w += x; x = 0; }
-    if (y < 0) { h += y; y = 0; }
-    if (x + w > LCD_H_RES) { w = LCD_H_RES - x; }
-    if (y + h > LCD_V_RES) { h = LCD_V_RES - y; }
-    if (w <= 0 || h <= 0) {
-        return;
-    }
-
-    for (int i = 0; i < w; i++) {
-        s_band[i] = color;
-    }
-    int band = h < BAND_ROWS ? h : BAND_ROWS;
-    int y0 = y;
-    while (y0 < y + h) {
-        int n = (y + h - y0) < band ? (y + h - y0) : band;
-        int count = w * n;
-        for (int i = 0; i < count; i++) {
-            s_band[i] = color;
-        }
-        esp_lcd_panel_draw_bitmap(s_panel, x, y0, x + w, y0 + n, s_band);
-        /* Wait until this band is really on the wire before reusing s_band. */
-        xSemaphoreTake(s_flush_done, pdMS_TO_TICKS(100));
-        y0 += n;
-    }
-}
-
-static void lcd_frame(void)
-{
-    lcd_rect(0, 0, LCD_H_RES, 1, COL_FG);
-    lcd_rect(0, LCD_V_RES - 1, LCD_H_RES, 1, COL_FG);
-    lcd_rect(0, 0, 1, LCD_V_RES, COL_FG);
-    lcd_rect(LCD_H_RES - 1, 0, 1, LCD_V_RES, COL_FG);
+    fb_rect(x, y, w, h, color);
 }
 
 void lcd_set_power(bool on)
@@ -179,9 +363,8 @@ void lcd_set_power(bool on)
         return;
     }
     s_on = on;
-    int64_t t_us = esp_timer_get_time();
     if (on) {
-        /* The frame was kept up to date while off: just enable and light up. */
+        flush_fb();
         gpio_hold_dis(PIN_LCD_BL);
         esp_lcd_panel_disp_on_off(s_panel, true);
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -190,7 +373,7 @@ void lcd_set_power(bool on)
         gpio_set_level(PIN_LCD_BL, 0);
         esp_lcd_panel_disp_on_off(s_panel, false);
     }
-    printf("EVT,lcd,%d,%lld\n", on ? 1 : 0, (esp_timer_get_time() - t_us) / 1000);
+    printf("EVT,lcd,%d,0\n", on ? 1 : 0);
 }
 
 bool lcd_is_on(void)
@@ -204,110 +387,6 @@ void lcd_sleep(void)
         esp_lcd_panel_disp_on_off(s_panel, false);
     }
     gpio_set_level(PIN_LCD_BL, 0);
-    gpio_hold_en(PIN_LCD_BL);          /* keep the backlight off through deep sleep */
+    gpio_hold_en(PIN_LCD_BL);
     gpio_deep_sleep_hold_en();
-}
-
-void lcd_fill(uint16_t color)
-{
-    lcd_rect(0, 0, LCD_H_RES, LCD_V_RES, color);
-}
-
-/* 7-segment digit. */
-static const uint8_t SEG_MAP[10] = {
-    0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F,
-};
-
-static void seg7(int x, int y, int w, int h, int digit, uint16_t color)
-{
-    if (digit < 0 || digit > 9) {
-        digit = 0;
-    }
-    uint8_t m = SEG_MAP[digit];
-    int t = (w > h ? h : w) / 7;
-    if (t < 3) {
-        t = 3;
-    }
-    if (m & 0x01) lcd_rect(x, y, w, t, color);
-    if (m & 0x02) lcd_rect(x + w - t, y, t, h / 2, color);
-    if (m & 0x04) lcd_rect(x + w - t, y + h / 2, t, h / 2, color);
-    if (m & 0x08) lcd_rect(x, y + h - t, w, t, color);
-    if (m & 0x10) lcd_rect(x, y + h / 2, t, h / 2, color);
-    if (m & 0x20) lcd_rect(x, y, t, h / 2, color);
-    if (m & 0x40) lcd_rect(x, y + h / 2, w, t, color);
-}
-
-static void bar(int x, int y, int w, int h, float value, uint16_t color)
-{
-    int mid = x + w / 2;
-    int max_half = w / 2 - 2;
-    float v = value / BAR_FULL;
-    if (v > 1.0f) v = 1.0f;
-    if (v < -1.0f) v = -1.0f;
-    int len = (int)(max_half * fabsf(v));
-
-    lcd_rect(x, y, w, h, COL_DIM);
-    if (len > 0) {
-        if (v >= 0) {
-            lcd_rect(mid, y + 2, len, h - 4, color);
-        } else {
-            lcd_rect(mid - len, y + 2, len, h - 4, color);
-        }
-    }
-    lcd_rect(mid, y, 1, h, COL_FG);
-}
-
-static int bucket(float v)
-{
-    return (int)(v / 2.0f); /* 2 dps per bucket */
-}
-
-void lcd_status_page(const bool hall[3], bool clutch, int state,
-                     float bias_dps, float roll_rate, float pitch_rate)
-{
-    if (!s_panel) {
-        return;
-    }
-
-    /* Hall squares: only repaint the ones that changed. */
-    for (int i = 0; i < 3; i++) {
-        if (s_last.hall[i] == hall[i]) {
-            continue;
-        }
-        int x = 16 + i * 74;
-        lcd_rect(x, 16, 58, 58, hall[i] ? COL_GREEN : COL_DIM);
-        s_last.hall[i] = hall[i];
-    }
-
-    if (s_last.clutch != clutch) {
-        lcd_rect(16, 96, 58, 58, clutch ? COL_GREEN : COL_RED);
-        s_last.clutch = clutch;
-    }
-
-    if (s_last.state != state) {
-        lcd_rect(110, 96, 58, 96, COL_BG);
-        seg7(110, 96, 58, 96, state, COL_YELLOW);
-        s_last.state = state;
-    }
-
-    int b = (int)(bias_dps + 0.5f);
-    if (b > 99) b = 99;
-    if (b < 0) b = 0;
-    if (s_last.bias != b) {
-        lcd_rect(16, 176, 88, 64, COL_BG);
-        seg7(16, 176, 40, 64, b / 10, COL_BLUE);
-        seg7(64, 176, 40, 64, b % 10, COL_BLUE);
-        s_last.bias = b;
-    }
-
-    int rb = bucket(roll_rate);
-    int pb = bucket(pitch_rate);
-    if (s_last.roll_bucket != rb) {
-        bar(16, 250, 208, 10, roll_rate, COL_GREEN);
-        s_last.roll_bucket = rb;
-    }
-    if (s_last.pitch_bucket != pb) {
-        bar(16, 264, 208, 10, pitch_rate, COL_YELLOW);
-        s_last.pitch_bucket = pb;
-    }
 }

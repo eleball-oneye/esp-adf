@@ -98,7 +98,7 @@ static float s_abs_x = 16383.5f;   /* HID absolute position, 0..32767 */
 static float s_abs_y = 16383.5f;
 #define ADV_WAIT_MS (120 * 1000)   /* advertise for 2 min, then sleep */
 static int64_t s_adv_since;
-static bool s_auto_sleep = true;
+static bool s_auto_sleep = false;  /* dev default: no auto sleep; enable with 'sleep on' */
 
 /* Runtime switches (serial commands). */
 static bool s_ble_enabled = true;

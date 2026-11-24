@@ -92,7 +92,22 @@ python tools\log_serial.py COM10 data\P2_S01_2026-12-04.csv
 - 桌面参考平面由重力定义，但轴符号/增益仍是初值（`CURSOR_GAIN`），需按佩戴方向标定；
 - ADF 仓库为浅克隆（depth 1），只用于本示例开发，不用于 ADF 自身的音频构建。
 
-## 6. LCD 调试页
+## 6. 串口命令（USB Serial/JTAG）
+
+在串口终端（idf.py monitor、串口助手或 `tools/cursor-sim` 网页）里输入：
+
+| 命令 | 作用 | 返回 |
+|---|---|---|
+| `ble on` | 允许 BLE 广播/连接 | `EVT,ble,1` |
+| `ble off` | 停止广播并断开当前主机 | `EVT,ble,0` |
+| `ble status` | 查询状态 | `EVT,ble,<enabled>,<connected>` |
+| `csv on` / `csv off` | 打开/关闭 CSV 流 | `EVT,csv,1/0` |
+| `cal` | 重新做 100 帧静止校准 | `EVT,cal,bias=...` |
+| `help` | 命令列表 | `EVT,help,...` |
+
+网页工具：`tools/cursor-sim/index.html`（虚拟光标 + 指标导出，见其 README）。
+
+## 7. LCD 调试页
 
 240×280 ST7789，10 Hz 局部刷新（只重画变化的块，静态背景不重绘；分 32 行带 DMA 传输）。下面是固件绘制逻辑在 `hall=000 / clutch=接合 / state=0 / bias=4` 时的渲染预览：
 
@@ -106,7 +121,7 @@ python tools\log_serial.py COM10 data\P2_S01_2026-12-04.csv
 | 蓝色两位数字 | 当前陀螺零偏（dps，0–99） |
 | 底部两条横条 | roll（绿）/ pitch（黄），±100 dps |
 
-## 7. 下一步
+## 8. 下一步
 
 1. 标定轴符号与增益：把板子按实际佩戴方向固定，滚转/俯仰各做 10 次，确认光标方向；
 2. 采 P1/P2 数据（`patent/applications/DATA-COLLECTION-REQUIREMENTS.md`）；

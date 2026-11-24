@@ -17,6 +17,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
+#include "driver/usb_serial_jtag.h"
 #include "esp_bt.h"
 #include "esp_bt_main.h"
 #include "esp_gap_ble_api.h"
@@ -53,7 +54,6 @@ static const char *TAG = "clawbot";
 #define CURSOR_MAX_STEP     40.0f
 
 /* Set to 1 to print the CSV stream, 0 to keep the console quiet. */
-#define CSV_ENABLE          1
 
 /* ---------------- state ---------------- */
 typedef enum {
@@ -88,6 +88,13 @@ static bool s_hid_connected;
 static uint8_t s_hall_map[3] = {PIN_HALL_INDEX, PIN_HALL_MIDDLE, PIN_HALL_RING};
 static int s_report_count;
 
+/* Runtime switches (serial commands). */
+static bool s_ble_enabled = true;
+static bool s_csv_enabled = true;
+static esp_bd_addr_t s_peer_bda;
+static bool s_peer_valid;
+static int s_wheel_pending;
+
 /* ---------------- BLE HID plumbing ---------------- */
 #define HIDD_DEVICE_NAME "clawbot-mouse"
 
@@ -121,6 +128,17 @@ static esp_ble_adv_params_t hidd_adv_params = {
     .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
 };
 
+static void ble_start_adv(void)
+{
+    if (!s_ble_enabled) {
+        return;
+    }
+    esp_err_t err = esp_ble_gap_start_advertising(&hidd_adv_params);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "start advertising failed: %s", esp_err_to_name(err));
+    }
+}
+
 static void hidd_event_callback(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param)
 {
     switch (event) {
@@ -133,6 +151,8 @@ static void hidd_event_callback(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *
         break;
     case ESP_HIDD_EVENT_BLE_CONNECT:
         s_hid_conn_id = param->connect.conn_id;
+        memcpy(s_peer_bda, param->connect.remote_bda, sizeof(esp_bd_addr_t));
+        s_peer_valid = true;
         s_hid_connected = true;
         ESP_LOGI(TAG, "BLE connected (conn_id=%u)", s_hid_conn_id);
         break;
@@ -140,18 +160,19 @@ static void hidd_event_callback(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *
         s_hid_secure = false;
         s_hid_connected = false;
         ESP_LOGI(TAG, "BLE disconnected, re-advertising");
-        esp_ble_gap_start_advertising(&hidd_adv_params);
+        ble_start_adv();
         break;
     default:
         break;
     }
 }
 
+
 static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
 {
     switch (event) {
     case ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT:
-        esp_ble_gap_start_advertising(&hidd_adv_params);
+        ble_start_adv();
         break;
     case ESP_GAP_BLE_SEC_REQ_EVT:
         esp_ble_gap_security_rsp(param->ble_security.ble_req.bd_addr, true);
@@ -353,6 +374,7 @@ static void clawbot_task(void *arg)
                 imu_first = false;
             } else {
                 int8_t wheel = gesture_update(dt, s_roll_rate, s_pitch_rate);
+                s_wheel_pending += wheel;
 
                 /* Cursor: only when clutch is engaged and not scrolling. */
                 if (s_clutch && s_state != G_SCROLL) {
@@ -362,7 +384,7 @@ static void clawbot_task(void *arg)
                     s_cursor_x = s_cursor_y = 0;
                 }
 
-                if (s_hid_connected && s_hid_secure) {
+                if (s_ble_enabled && s_hid_connected && s_hid_secure) {
                     int8_t dx = 0, dy = 0;
                     if (s_cursor_x >= 1.0f || s_cursor_x <= -1.0f) {
                         dx = (int8_t)fmaxf(-CURSOR_MAX_STEP, fminf(CURSOR_MAX_STEP, s_cursor_x));
@@ -418,7 +440,7 @@ static void clawbot_task(void *arg)
         if ((now - last_report) >= REPORT_PERIOD_MS * 1000) {
             last_report = now;
 
-            if (s_hid_connected && s_hid_secure && s_buttons && !s_cursor_x && !s_cursor_y) {
+            if (s_ble_enabled && s_hid_connected && s_hid_secure && s_buttons && !s_cursor_x && !s_cursor_y) {
                 esp_hidd_send_mouse_value_ex(s_hid_conn_id, s_buttons, 0, 0, 0);
             }
 
@@ -433,18 +455,101 @@ static void clawbot_task(void *arg)
                                 motion_bias_mag(&s_motion), s_roll_rate, s_pitch_rate);
             }
 
-#if CSV_ENABLE
-            printf("CSV,%lld,%u,%u,%u,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%d,%d,%u,0,%.2f,%.2f,%.2f,%.2f\n",
+            if (s_csv_enabled) {
+            printf("CSV,%lld,%u,%u,%u,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%d,%d,%u,%d,%.2f,%.2f,%.2f,%.2f\n",
                    (long long)t_ms,
                    s_hall_level[0], s_hall_level[1], s_hall_level[2],
                    imu_sample.ax, imu_sample.ay, imu_sample.az,
                    imu_sample.gx, imu_sample.gy, imu_sample.gz,
                    s_clutch ? 1 : 0, (int)s_state, s_buttons,
+                   (int)s_wheel_pending,
                    s_roll_rate, s_pitch_rate, s_yaw_rate, motion_bias_mag(&s_motion));
-#endif
+            s_wheel_pending = 0;
+            }
         }
 
         vTaskDelay(pdMS_TO_TICKS(2));
+    }
+}
+
+
+static void imu_recalibrate(void)
+{
+    if (!s_imu_ok) {
+        return;
+    }
+    static qmi8658_sample_t cal[100];
+    int n = 0;
+    for (int i = 0; i < 100; i++) {
+        qmi8658_raw_t raw;
+        if (qmi8658_read_raw(&s_imu, &raw) == ESP_OK) {
+            qmi8658_to_sample(&raw, &cal[n++]);
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    motion_init(&s_motion, cal, n);
+    printf("EVT,cal,bias=%.2f\n", motion_bias_mag(&s_motion));
+}
+
+static void handle_command(const char *cmd)
+{
+    if (!strcmp(cmd, "help")) {
+        printf("EVT,help,ble on|off|status;csv on|off;cal\n");
+    } else if (!strcmp(cmd, "ble on")) {
+        s_ble_enabled = true;
+        ble_start_adv();
+        printf("EVT,ble,1\n");
+    } else if (!strcmp(cmd, "ble off")) {
+        s_ble_enabled = false;
+        esp_ble_gap_stop_advertising();
+        if (s_peer_valid) {
+            esp_ble_gap_disconnect(s_peer_bda);
+        }
+        printf("EVT,ble,0\n");
+    } else if (!strcmp(cmd, "ble status")) {
+        printf("EVT,ble,%d,%d\n", s_ble_enabled ? 1 : 0, s_hid_connected ? 1 : 0);
+    } else if (!strcmp(cmd, "csv on")) {
+        s_csv_enabled = true;
+        printf("EVT,csv,1\n");
+    } else if (!strcmp(cmd, "csv off")) {
+        s_csv_enabled = false;
+        printf("EVT,csv,0\n");
+    } else if (!strcmp(cmd, "cal")) {
+        imu_recalibrate();
+    } else if (cmd[0]) {
+        printf("EVT,unknown,%s\n", cmd);
+    }
+}
+
+static void command_task(void *arg)
+{
+    (void)arg;
+    char line[64];
+    int len = 0;
+    uint8_t ch;
+
+    if (!usb_serial_jtag_is_driver_installed()) {
+        usb_serial_jtag_driver_config_t cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+        if (usb_serial_jtag_driver_install(&cfg) != ESP_OK) {
+            ESP_LOGW(TAG, "usb_serial_jtag driver install failed");
+        }
+    }
+
+    printf("EVT,ready,ble on|off|status;csv on|off;cal\n");
+    while (true) {
+        int n = usb_serial_jtag_read_bytes(&ch, 1, pdMS_TO_TICKS(20));
+        if (n == 1) {
+            if (ch == '\r') {
+                continue;
+            }
+            if (ch == '\n') {
+                line[len] = '\0';
+                handle_command(line);
+                len = 0;
+            } else if (len < (int)sizeof(line) - 1) {
+                line[len++] = (char)ch;
+            }
+        }
     }
 }
 
@@ -463,18 +568,7 @@ void app_main(void)
     if (qmi8658_init(&s_imu, PIN_IMU_SDA, PIN_IMU_SCL) == ESP_OK) {
         s_imu_ok = true;
         /* Boot calibration: the board must be still for ~1 s. */
-        static qmi8658_sample_t cal[100];
-        int n = 0;
-        for (int i = 0; i < 100; i++) {
-            qmi8658_raw_t raw;
-            if (qmi8658_read_raw(&s_imu, &raw) == ESP_OK) {
-                qmi8658_to_sample(&raw, &cal[n++]);
-            }
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
-        motion_init(&s_motion, cal, n);
-        ESP_LOGI(TAG, "IMU calibrated: bias=%.2f dps, up=(%.2f,%.2f,%.2f)",
-                 motion_bias_mag(&s_motion), s_motion.n[0], s_motion.n[1], s_motion.n[2]);
+        imu_recalibrate();
     } else {
         ESP_LOGW(TAG, "IMU not found, running hall-only");
     }
@@ -483,4 +577,5 @@ void app_main(void)
     csv_header();
 
     xTaskCreate(clawbot_task, "clawbot", 4096, NULL, 5, NULL);
+    xTaskCreate(command_task, "cmd", 3072, NULL, 4, NULL);
 }

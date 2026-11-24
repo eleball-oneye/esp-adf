@@ -17,7 +17,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "font12x24.h"
-#include "font16x32.h"
+#include "font10x20.h"
 
 static const char *TAG = "lcd";
 
@@ -158,9 +158,9 @@ static void text12(int x, int y, const char *s, uint16_t c)
     fb_glyphs(x, y, s, (const uint8_t *)font12x24, 12, 24, c);
 }
 
-static void text16(int x, int y, const char *s, uint16_t c)
+static void text10(int x, int y, const char *s, uint16_t c)
 {
-    fb_glyphs(x, y, s, (const uint8_t *)font16x32, 16, 32, c);
+    fb_glyphs(x, y, s, (const uint8_t *)font10x20, 10, 20, c);
 }
 
 
@@ -183,33 +183,34 @@ static void draw_page(void)
 
     fb_rect(0, 0, LCD_H_RES, LCD_V_RES, COL_BG);
 
-    /* header: name + bias */
-    text12(12, 8, "CLAWBOT", COL_FG);
-    snprintf(buf, sizeof(buf), "%.1f", (double)s_view.bias);
-    text12(196, 8, buf, COL_DIM);
+    /* header */
+    text12(16, 12, "CLAWBOT", COL_FG);
+    text10(196, 16, "POC", COL_DIM);
 
-    /* three hall cards: big letter + dot */
+    /* three hall cards: dot + letter, generous spacing */
     static const char *labs[3] = { "I", "M", "R" };
     for (int i = 0; i < 3; i++) {
-        int x = 12 + i * 74;
-        fb_round(x, 40, 66, 64, 10, COL_CARD, COL_LINE);
-        fb_rect(x + 8, 48, 10, 10, s_view.hall[i] ? COL_TEAL : COL_LINE);
-        text16(x + 25, 58, labs[i], s_view.hall[i] ? COL_TEAL : COL_FG);
+        int x = 16 + i * 72;
+        fb_round(x, 52, 64, 64, 12, COL_CARD, COL_LINE);
+        fb_rect(x + 10, 62, 10, 10, s_view.hall[i] ? COL_TEAL : COL_LINE);
+        text12(x + 26, 76, labs[i], s_view.hall[i] ? COL_TEAL : COL_FG);
     }
 
     /* clutch */
-    fb_round(12, 112, 216, 64, 12, COL_CARD, COL_LINE);
-    text12(22, 122, "CLUTCH", COL_DIM);
-    text16(150, 124, s_view.clutch ? "ON" : "OFF", s_view.clutch ? COL_TEAL : COL_RED);
+    fb_round(16, 128, 208, 60, 12, COL_CARD, COL_LINE);
+    text10(26, 136, "CLUTCH", COL_DIM);
+    fb_rect(26, 158, 12, 12, s_view.clutch ? COL_TEAL : COL_RED);
+    text12(150, 142, s_view.clutch ? "ON" : "OFF", s_view.clutch ? COL_TEAL : COL_RED);
 
     /* state */
-    fb_round(12, 184, 216, 56, 12, COL_CARD, COL_LINE);
-    text12(22, 192, "STATE", COL_DIM);
+    fb_round(16, 200, 208, 52, 12, COL_CARD, COL_LINE);
+    text10(26, 208, "STATE", COL_DIM);
     uint16_t sc = (s_view.state == 2) ? COL_TEAL : (s_view.state == 3 ? COL_AMBER : COL_FG);
-    text16(110, 196, state_name(s_view.state), sc);
+    text12(120, 208, state_name(s_view.state), sc);
 
     /* footer */
-    text12(6, 250, "BOOT=LCD HOLD=SLEEP", COL_DIM);
+    text10(16, 258, "BOOT LCD", COL_DIM);
+    text10(120, 258, "HOLD SLEEP", COL_DIM);
 }
 
 static void flush_fb(void)

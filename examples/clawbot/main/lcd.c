@@ -5,6 +5,7 @@
 
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
+#include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
@@ -156,6 +157,16 @@ void lcd_rect(int x, int y, int w, int h, uint16_t color)
         xSemaphoreTake(s_flush_done, pdMS_TO_TICKS(100));
         y0 += n;
     }
+}
+
+void lcd_sleep(void)
+{
+    if (s_panel) {
+        esp_lcd_panel_disp_on_off(s_panel, false);
+    }
+    gpio_set_level(PIN_LCD_BL, 0);
+    gpio_hold_en(PIN_LCD_BL);          /* keep the backlight off through deep sleep */
+    gpio_deep_sleep_hold_en();
 }
 
 void lcd_fill(uint16_t color)

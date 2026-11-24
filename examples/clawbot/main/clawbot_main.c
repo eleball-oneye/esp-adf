@@ -166,6 +166,15 @@ static void ble_start_adv(void)
     }
 }
 
+static void enter_sleep(const char *why)
+{
+    printf("EVT,sleep,%s\n", why);
+    lcd_sleep();
+    esp_ble_gap_stop_advertising();
+    esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);
+    esp_deep_sleep_start();
+}
+
 static void hidd_event_callback(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param)
 {
     switch (event) {
@@ -439,11 +448,7 @@ static void clawbot_task(void *arg)
         /* Pairing window: no host within 2 min -> deep sleep, wake on BOOT (GPIO0 low). */
         if (s_ble_enabled && !s_hid_connected && s_adv_since != 0 &&
             (now - s_adv_since) > (int64_t)ADV_WAIT_MS * 1000) {
-            printf("EVT,sleep,timeout\n");
-            gpio_set_level(GPIO_NUM_15, 0);   /* LCD backlight off before sleep */
-            esp_ble_gap_stop_advertising();
-            esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);
-            esp_deep_sleep_start();
+            enter_sleep("timeout");
         }
 
         /* Hall at 20 Hz */
@@ -544,7 +549,7 @@ static void imu_recalibrate(void)
 static void handle_command(const char *cmd)
 {
     if (!strcmp(cmd, "help")) {
-        printf("EVT,help,ble on|off|status;csv on/off;cal;gain N;screen W H;recenter on/off/now;hid test\n");
+        printf("EVT,help,ble on|off|status;csv on/off;cal;gain N;screen W H;recenter on/off/now;hid test;sleep\n");
     } else if (!strcmp(cmd, "ble on")) {
         s_ble_enabled = true;
         ble_start_adv();
@@ -572,6 +577,8 @@ static void handle_command(const char *cmd)
         if (v > 100.0f) v = 100.0f;
         s_gain = v;
         printf("EVT,gain,%.1f\n", s_gain);
+    } else if (!strcmp(cmd, "sleep")) {
+        enter_sleep("manual");
     } else if (!strcmp(cmd, "recenter on")) {
         s_recenter_on = true;
         printf("EVT,recenter,on\n");

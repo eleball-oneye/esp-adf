@@ -3,7 +3,7 @@
 #include <math.h>
 #include <string.h>
 
-#define STILL_GYRO_DPS     1.5f
+#define STILL_GYRO_DPS     6.0f  /* wide enough to re-lock after a bad boot bias */
 #define STILL_ACC_MIN_G    0.90f
 #define STILL_ACC_MAX_G    1.10f
 #define STILL_SAMPLES      40
@@ -146,6 +146,18 @@ void motion_rates(const motion_t *m, const qmi8658_sample_t *s,
     *roll_rate = dot3(g, m->fwd);
     *pitch_rate = dot3(g, m->right);
     *yaw_rate = dot3(g, m->n);
+
+    /* Deadband: reject residual bias / hand tremor so the cursor does not creep. */
+    const float dead = 0.8f;
+    if (fabsf(*roll_rate) < dead) {
+        *roll_rate = 0.0f;
+    }
+    if (fabsf(*pitch_rate) < dead) {
+        *pitch_rate = 0.0f;
+    }
+    if (fabsf(*yaw_rate) < dead) {
+        *yaw_rate = 0.0f;
+    }
 }
 
 float motion_bias_mag(const motion_t *m)

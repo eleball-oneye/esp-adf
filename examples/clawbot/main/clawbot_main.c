@@ -98,6 +98,7 @@ static float s_abs_x = 16383.5f;   /* HID absolute position, 0..32767 */
 static float s_abs_y = 16383.5f;
 #define ADV_WAIT_MS (120 * 1000)   /* advertise for 2 min, then sleep */
 static int64_t s_adv_since;
+static bool s_auto_sleep = true;
 
 /* Runtime switches (serial commands). */
 static bool s_ble_enabled = true;
@@ -456,7 +457,7 @@ static void clawbot_task(void *arg)
         }
 
         /* Pairing window: no host within 2 min -> deep sleep, wake on BOOT (GPIO0 low). */
-        if (s_ble_enabled && !s_hid_connected && s_adv_since != 0 &&
+        if (s_auto_sleep && s_ble_enabled && !s_hid_connected && s_adv_since != 0 &&
             (now - s_adv_since) > (int64_t)ADV_WAIT_MS * 1000) {
             enter_sleep("timeout");
         }
@@ -574,7 +575,7 @@ static void imu_recalibrate(void)
 static void handle_command(const char *cmd)
 {
     if (!strcmp(cmd, "help")) {
-        printf("EVT,help,ble on|off|status;csv on/off;cal;gain N;screen W H;recenter on/off/now;hid test;sleep\n");
+        printf("EVT,help,ble on|off|status;csv on/off;cal;gain N;screen W H;recenter on/off/now;hid test;sleep on/off/now\n");
     } else if (!strcmp(cmd, "ble on")) {
         s_ble_enabled = true;
         ble_start_adv();
@@ -602,6 +603,12 @@ static void handle_command(const char *cmd)
         if (v > 100.0f) v = 100.0f;
         s_gain = v;
         printf("EVT,gain,%.1f\n", s_gain);
+    } else if (!strcmp(cmd, "sleep on")) {
+        s_auto_sleep = true;
+        printf("EVT,sleep,auto-on\n");
+    } else if (!strcmp(cmd, "sleep off")) {
+        s_auto_sleep = false;
+        printf("EVT,sleep,auto-off\n");
     } else if (!strcmp(cmd, "sleep")) {
         enter_sleep("manual");
     } else if (!strcmp(cmd, "recenter on")) {

@@ -31,7 +31,7 @@ static const char *TAG = "lcd";
 #define COL_YELLOW  0xFFE0
 #define COL_BLUE    0x001F
 
-#define BAND_ROWS   32
+#define BAND_ROWS   96
 #define BAR_FULL    100.0f
 
 static esp_lcd_panel_handle_t s_panel;
@@ -179,19 +179,14 @@ void lcd_set_power(bool on)
     }
     s_on = on;
     if (on) {
-        /* Repaint while the backlight is still off, then enable display and
-           finally the backlight: avoids the stale/white frame flash. */
+        /* The frame was kept up to date while off: just enable and light up. */
         gpio_hold_dis(PIN_LCD_BL);
-        gpio_set_level(PIN_LCD_BL, 0);
-        lcd_fill(COL_BG);
-        lcd_frame();
-        memset(&s_last, 0xFF, sizeof(s_last));
         esp_lcd_panel_disp_on_off(s_panel, true);
-        vTaskDelay(pdMS_TO_TICKS(20));
+        vTaskDelay(pdMS_TO_TICKS(10));
         gpio_set_level(PIN_LCD_BL, 1);
     } else {
-        esp_lcd_panel_disp_on_off(s_panel, false);
         gpio_set_level(PIN_LCD_BL, 0);
+        esp_lcd_panel_disp_on_off(s_panel, false);
     }
 }
 
@@ -267,7 +262,7 @@ static int bucket(float v)
 void lcd_status_page(const bool hall[3], bool clutch, int state,
                      float bias_dps, float roll_rate, float pitch_rate)
 {
-    if (!s_panel || !s_on) {
+    if (!s_panel) {
         return;
     }
 

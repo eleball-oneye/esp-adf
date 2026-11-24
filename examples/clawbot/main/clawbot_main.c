@@ -137,31 +137,35 @@ static esp_ble_adv_params_t hidd_adv_params = {
 static void hid_center_cursor(void)
 {
     if (!(s_ble_enabled && s_hid_connected && s_hid_secure)) {
+        printf("EVT,recenter,not-connected\n");
         return;
     }
-    /* Relative-only HID has no absolute position: pin to the top-left corner by
-       saturating negative deltas, then push a known offset to the center. */
-    int neg_x = (s_screen_w / 120) + 3;
-    int neg_y = (s_screen_h / 120) + 3;
+    const int step = 100;
+    int neg_x = (s_screen_w / step) + 4;
+    int neg_y = (s_screen_h / step) + 4;
     for (int i = 0; i < neg_x; i++) {
-        esp_hidd_send_mouse_value_ex(s_hid_conn_id, s_buttons, -120, 0, 0);
+        esp_hidd_send_mouse_value_ex(s_hid_conn_id, s_buttons, -step, 0, 0);
+        vTaskDelay(pdMS_TO_TICKS(2));
     }
     for (int i = 0; i < neg_y; i++) {
-        esp_hidd_send_mouse_value_ex(s_hid_conn_id, s_buttons, 0, -120, 0);
+        esp_hidd_send_mouse_value_ex(s_hid_conn_id, s_buttons, 0, -step, 0);
+        vTaskDelay(pdMS_TO_TICKS(2));
     }
     int left = s_screen_w / 2;
     while (left > 0) {
-        int d = left > 120 ? 120 : left;
+        int d = left > step ? step : left;
         esp_hidd_send_mouse_value_ex(s_hid_conn_id, s_buttons, (int8_t)d, 0, 0);
+        vTaskDelay(pdMS_TO_TICKS(2));
         left -= d;
     }
     left = s_screen_h / 2;
     while (left > 0) {
-        int d = left > 120 ? 120 : left;
+        int d = left > step ? step : left;
         esp_hidd_send_mouse_value_ex(s_hid_conn_id, s_buttons, 0, (int8_t)d, 0);
+        vTaskDelay(pdMS_TO_TICKS(2));
         left -= d;
     }
-    printf("EVT,recenter,%d,%d\n", s_screen_w, s_screen_h);
+    printf("EVT,recenter,done,%d,%d\n", s_screen_w, s_screen_h);
 }
 
 static void ble_start_adv(void)

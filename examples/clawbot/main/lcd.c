@@ -99,6 +99,8 @@ esp_err_t lcd_init(void)
     ESP_ERROR_CHECK(esp_lcd_panel_reset(s_panel));
     ESP_ERROR_CHECK(esp_lcd_panel_init(s_panel));
     ESP_ERROR_CHECK(esp_lcd_panel_set_gap(s_panel, 0, 20));
+    /* The board is mounted upside down for use: rotate the image 180 deg. */
+    ESP_ERROR_CHECK(esp_lcd_panel_mirror(s_panel, true, true));
     ESP_ERROR_CHECK(esp_lcd_panel_invert_color(s_panel, true)); /* ST7789 needs INVON */
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true));
 

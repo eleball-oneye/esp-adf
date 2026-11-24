@@ -387,7 +387,7 @@ static void clawbot_task(void *arg)
 
                 /* Cursor: only when clutch is engaged and not scrolling. */
                 if (s_clutch && s_state != G_SCROLL) {
-                    s_cursor_x += s_roll_rate * dt * s_gain;
+                    s_cursor_x += -s_roll_rate * dt * s_gain; /* roll right -> cursor left on this mount */
                     s_cursor_y += s_pitch_rate * dt * s_gain;
                 } else {
                     s_cursor_x = s_cursor_y = 0;

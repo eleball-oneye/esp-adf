@@ -93,6 +93,8 @@ static bool s_recenter_on = false;          /* opt-in: pull cursor to screen cen
 static bool s_recenter_pending = false;
 static int s_screen_w = 1920;
 static int s_screen_h = 1080;
+static float s_abs_x = 16383.5f;   /* HID absolute position, 0..32767 */
+static float s_abs_y = 16383.5f;
 
 /* Runtime switches (serial commands). */
 static bool s_ble_enabled = true;
@@ -140,32 +142,10 @@ static void hid_center_cursor(void)
         printf("EVT,recenter,not-connected\n");
         return;
     }
-    const int step = 100;
-    int neg_x = (s_screen_w / step) + 4;
-    int neg_y = (s_screen_h / step) + 4;
-    for (int i = 0; i < neg_x; i++) {
-        esp_hidd_send_mouse_value_ex(s_hid_conn_id, s_buttons, -step, 0, 0);
-        vTaskDelay(pdMS_TO_TICKS(2));
-    }
-    for (int i = 0; i < neg_y; i++) {
-        esp_hidd_send_mouse_value_ex(s_hid_conn_id, s_buttons, 0, -step, 0);
-        vTaskDelay(pdMS_TO_TICKS(2));
-    }
-    int left = s_screen_w / 2;
-    while (left > 0) {
-        int d = left > step ? step : left;
-        esp_hidd_send_mouse_value_ex(s_hid_conn_id, s_buttons, (int8_t)d, 0, 0);
-        vTaskDelay(pdMS_TO_TICKS(2));
-        left -= d;
-    }
-    left = s_screen_h / 2;
-    while (left > 0) {
-        int d = left > step ? step : left;
-        esp_hidd_send_mouse_value_ex(s_hid_conn_id, s_buttons, 0, (int8_t)d, 0);
-        vTaskDelay(pdMS_TO_TICKS(2));
-        left -= d;
-    }
-    printf("EVT,recenter,done,%d,%d\n", s_screen_w, s_screen_h);
+    s_abs_x = 16383.5f;
+    s_abs_y = 16383.5f;
+    esp_hidd_send_mouse_abs(s_hid_conn_id, s_buttons, 16383, 16383, 0);
+    printf("EVT,recenter,center\n");
 }
 
 static void ble_start_adv(void)
@@ -426,26 +406,22 @@ static void clawbot_task(void *arg)
                 int8_t wheel = gesture_update(dt, s_roll_rate, s_pitch_rate);
                 s_wheel_pending += wheel;
 
-                /* Cursor: only when clutch is engaged and not scrolling. */
+                /* Cursor: absolute HID position, updated only while engaged. */
+                bool moved = false;
                 if (s_clutch && s_state != G_SCROLL) {
-                    s_cursor_x += -s_roll_rate * dt * s_gain; /* roll right -> cursor left on this mount */
-                    s_cursor_y += s_pitch_rate * dt * s_gain;
-                } else {
-                    s_cursor_x = s_cursor_y = 0;
+                    s_abs_x += (-s_roll_rate * dt * s_gain) * 32767.0f / (float)s_screen_w;
+                    s_abs_y += (s_pitch_rate * dt * s_gain) * 32767.0f / (float)s_screen_h;
+                    if (s_abs_x < 0) s_abs_x = 0;
+                    if (s_abs_x > 32767) s_abs_x = 32767;
+                    if (s_abs_y < 0) s_abs_y = 0;
+                    if (s_abs_y > 32767) s_abs_y = 32767;
+                    moved = (s_roll_rate != 0.0f || s_pitch_rate != 0.0f);
                 }
 
                 if (s_ble_enabled && s_hid_connected && s_hid_secure) {
-                    int8_t dx = 0, dy = 0;
-                    if (s_cursor_x >= 1.0f || s_cursor_x <= -1.0f) {
-                        dx = (int8_t)fmaxf(-CURSOR_MAX_STEP, fminf(CURSOR_MAX_STEP, s_cursor_x));
-                        s_cursor_x -= dx;
-                    }
-                    if (s_cursor_y >= 1.0f || s_cursor_y <= -1.0f) {
-                        dy = (int8_t)fmaxf(-CURSOR_MAX_STEP, fminf(CURSOR_MAX_STEP, s_cursor_y));
-                        s_cursor_y -= dy;
-                    }
-                    if (dx || dy || wheel || s_buttons) {
-                        esp_hidd_send_mouse_value_ex(s_hid_conn_id, s_buttons, dx, dy, wheel);
+                    if (moved || wheel || s_buttons) {
+                        esp_hidd_send_mouse_abs(s_hid_conn_id, s_buttons,
+                                                (uint16_t)s_abs_x, (uint16_t)s_abs_y, wheel);
                     }
                 }
             }
@@ -596,7 +572,9 @@ static void handle_command(const char *cmd)
         }
     } else if (!strcmp(cmd, "hid test")) {
         if (s_ble_enabled && s_hid_connected && s_hid_secure) {
-            esp_hidd_send_mouse_value_ex(s_hid_conn_id, 0, 50, 0, 0);
+            s_abs_x += 1500.0f;
+            if (s_abs_x > 32767) s_abs_x = 32767;
+            esp_hidd_send_mouse_abs(s_hid_conn_id, 0, (uint16_t)s_abs_x, (uint16_t)s_abs_y, 0);
             printf("EVT,hid,test\n");
         } else {
             printf("EVT,hid,not-connected\n");

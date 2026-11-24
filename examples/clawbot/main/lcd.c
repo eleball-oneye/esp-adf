@@ -65,6 +65,8 @@ typedef struct {
 
 static view_t s_view = { .clutch = true, .state = 0 };
 
+static void lcd_task(void *arg);
+
 static bool on_color_done(esp_lcd_panel_io_handle_t panel_io,
                           esp_lcd_panel_io_event_data_t *edata, void *user_ctx)
 {
@@ -257,23 +259,27 @@ static void draw_page(void)
     char buf[16];
     int pulse = (int)((esp_timer_get_time() / 200000) % 5) * 8 + 20;
 
-    /* background: vertical gradient + faint corner washes */
+    /* background: per-row gradient, corner washes limited to their radius */
     for (int y = 0; y < LCD_V_RES; y++) {
         int t2 = (y * 100) / LCD_V_RES;
-        uint16_t row = blend(rgb(18, 26, 48), rgb(4, 6, 10), t2);
-        for (int x = 0; x < LCD_H_RES; x++) {
-            uint16_t c = row;
+        fb_rect(0, y, LCD_H_RES, 1, blend(rgb(18, 26, 48), rgb(4, 6, 10), t2));
+    }
+    for (int y = 0; y < 140; y++) {
+        for (int x = 0; x < 140; x++) {
             int dx = x - 20, dy = y - 20;
-            int d = (int)sqrtf((float)(dx * dx + dy * dy));
-            if (d < 180) {
-                c = blend(c, rgb(0, 170, 150), (180 - d) / 9);
-            }
-            dx = x - 240; dy = y - 300;
-            d = (int)sqrtf((float)(dx * dx + dy * dy));
-            if (d < 160) {
-                c = blend(c, rgb(110, 90, 220), (160 - d) / 11);
-            }
-            fb_px(x, y, c);
+            int d2 = dx * dx + dy * dy;
+            if (d2 > 140 * 140) continue;
+            uint16_t c = s_fb[y * LCD_H_RES + x];
+            fb_px(x, y, blend(c, rgb(0, 170, 150), (140 - (int)sqrtf((float)d2)) / 12));
+        }
+    }
+    for (int y = LCD_V_RES - 130; y < LCD_V_RES; y++) {
+        for (int x = LCD_H_RES - 130; x < LCD_H_RES; x++) {
+            int dx = x - 240, dy = y - 300;
+            int d2 = dx * dx + dy * dy;
+            if (d2 > 130 * 130) continue;
+            uint16_t c = s_fb[y * LCD_H_RES + x];
+            fb_px(x, y, blend(c, rgb(110, 90, 220), (130 - (int)sqrtf((float)d2)) / 13));
         }
     }
 
@@ -400,16 +406,13 @@ esp_err_t lcd_init(void)
     draw_page();
     flush_fb();
     gpio_set_level(PIN_LCD_BL, 1);
-    s_last_page_us = esp_timer_get_time();
+    xTaskCreatePinnedToCore(lcd_task, "lcd", 4096, NULL, 2, NULL, 1);
     return ESP_OK;
 }
 
 void lcd_status_page(const bool hall[3], bool clutch, int state,
                      float bias_dps, float roll_rate, float pitch_rate)
 {
-    if (!s_fb) {
-        return;
-    }
     s_view.hall[0] = hall[0];
     s_view.hall[1] = hall[1];
     s_view.hall[2] = hall[2];
@@ -418,15 +421,20 @@ void lcd_status_page(const bool hall[3], bool clutch, int state,
     s_view.bias = bias_dps;
     s_view.roll = roll_rate;
     s_view.pitch = pitch_rate;
+}
 
-    int64_t now = esp_timer_get_time();
-    if (now - s_last_page_us < PAGE_MS * 1000) {
-        return;
-    }
-    s_last_page_us = now;
-    draw_page();
-    if (s_on) {
-        flush_fb();
+static void lcd_task(void *arg)
+{
+    (void)arg;
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(PAGE_MS));
+        if (!s_fb) {
+            continue;
+        }
+        draw_page();
+        if (s_on) {
+            flush_fb();
+        }
     }
 }
 

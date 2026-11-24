@@ -104,29 +104,40 @@ static void fb_rect(int x, int y, int w, int h, uint16_t c)
     }
 }
 
+static uint16_t blend(uint16_t a, uint16_t b, int pct);
+
 static void fb_round(int x, int y, int w, int h, int r, uint16_t fill, uint16_t line)
 {
     if (r < 1) {
         r = 1;
     }
     for (int yy = 0; yy < h; yy++) {
-        int inset = 0;
+        float inset = 0.0f;
         if (yy < r) {
             float dy = (float)(r - yy);
-            inset = r - (int)sqrtf((float)(r * r) - dy * dy);
+            inset = (float)r - sqrtf((float)(r * r) - dy * dy);
         } else if (yy >= h - r) {
             float dy = (float)(r - (h - 1 - yy));
-            inset = r - (int)sqrtf((float)(r * r) - dy * dy);
+            inset = (float)r - sqrtf((float)(r * r) - dy * dy);
         }
-        fb_rect(x + inset, y + yy, w - 2 * inset, 1, fill);
-        if (line) {
-            fb_px(x + inset, y + yy, line);
-            fb_px(x + w - 1 - inset, y + yy, line);
+        int i0 = (int)ceilf(inset);
+        int frac = (int)((inset - (float)(i0 - 1)) * 100.0f);
+        if (frac < 0) frac = 0;
+        if (frac > 100) frac = 100;
+
+        int x0 = x + i0;
+        int x1 = x + w - i0;
+        fb_rect(x0, y + yy, x1 - x0, 1, fill);
+        if (i0 > 0) {
+            fb_px(x0 - 1, y + yy, blend(COL_BG, fill, 100 - frac));
+            fb_px(x1, y + yy, blend(COL_BG, fill, 100 - frac));
         }
     }
     if (line) {
         fb_rect(x + r, y, w - 2 * r, 1, line);
         fb_rect(x + r, y + h - 1, w - 2 * r, 1, line);
+        fb_rect(x, y + r, 1, h - 2 * r, line);
+        fb_rect(x + w - 1, y + r, 1, h - 2 * r, line);
     }
 }
 
@@ -289,13 +300,12 @@ static void draw_page(void)
     text18(28, 138, "CLUTCH", COL_DIM);
     text20(28, 166, s_view.clutch ? "ON" : "OFF", acc);
 
-    /* state: value only, centred */
+    /* state: same label/value alignment as the clutch card */
     uint16_t sc = (s_view.state == 2) ? COL_TEAL : (s_view.state == 3 ? COL_AMBER : COL_FG);
-    fb_round(16, 212, 208, 58, 14, blend(COL_CARD, sc, 10), COL_LINE);
-    fb_rect(16, 224, 3, 36, sc);
-    const char *sn = state_name(s_view.state);
-    int sw = text_width(font20x34_w, sn);
-    text20((240 - sw) / 2, 226, sn, sc);
+    fb_round(16, 212, 208, 62, 14, blend(COL_CARD, sc, 10), COL_LINE);
+    fb_rect(16, 226, 3, 38, sc);
+    text18(28, 218, "STATE", COL_DIM);
+    text20(28, 242, state_name(s_view.state), sc);
 }
 
 static void flush_fb(void)

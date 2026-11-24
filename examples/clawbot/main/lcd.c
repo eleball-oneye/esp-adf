@@ -1,7 +1,7 @@
 #include "lcd.h"
 
 #include <math.h>
-#include <stdlib.h>
+#include <string.h>
 
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
@@ -27,8 +27,22 @@ static const char *TAG = "lcd";
 #define COL_YELLOW  0xFFE0
 #define COL_BLUE    0x001F
 
+#define BAND_ROWS   32
+#define BAR_FULL    100.0f
+
 static esp_lcd_panel_handle_t s_panel;
-static uint16_t s_line[LCD_H_RES];
+static uint16_t s_band[LCD_H_RES * BAND_ROWS];
+
+/* Last drawn values, so we can repaint only what changed. */
+static struct {
+    bool hall[3];
+    bool clutch;
+    int state;
+    int bias;
+    int roll_bucket;
+    int pitch_bucket;
+    bool valid;
+} s_last;
 
 esp_err_t lcd_init(void)
 {
@@ -38,7 +52,7 @@ esp_err_t lcd_init(void)
         .sclk_io_num = PIN_LCD_SCLK,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = LCD_H_RES * 80 * sizeof(uint16_t),
+        .max_transfer_sz = LCD_H_RES * BAND_ROWS * sizeof(uint16_t),
     };
     ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus, SPI_DMA_CH_AUTO));
 
@@ -62,7 +76,7 @@ esp_err_t lcd_init(void)
     ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(io, &dev, &s_panel));
     ESP_ERROR_CHECK(esp_lcd_panel_reset(s_panel));
     ESP_ERROR_CHECK(esp_lcd_panel_init(s_panel));
-    ESP_ERROR_CHECK(esp_lcd_panel_set_gap(s_panel, 0, 20)); /* 240x280 panel inside the 240x320 controller RAM */
+    ESP_ERROR_CHECK(esp_lcd_panel_set_gap(s_panel, 0, 20));
     ESP_ERROR_CHECK(esp_lcd_panel_invert_color(s_panel, false));
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true));
 
@@ -74,6 +88,12 @@ esp_err_t lcd_init(void)
     gpio_set_level(PIN_LCD_BL, 1);
 
     lcd_fill(COL_BG);
+    memset(&s_last, 0, sizeof(s_last));
+    s_last.bias = -1;
+    s_last.state = -1;
+    s_last.roll_bucket = 9999;
+    s_last.pitch_bucket = 9999;
+    s_last.valid = true;
     ESP_LOGI(TAG, "ST7789 %dx%d ready", LCD_H_RES, LCD_V_RES);
     return ESP_OK;
 }
@@ -90,12 +110,20 @@ void lcd_rect(int x, int y, int w, int h, uint16_t color)
     if (w <= 0 || h <= 0) {
         return;
     }
-    int chunk = w > LCD_H_RES ? LCD_H_RES : w;
-    for (int i = 0; i < chunk; i++) {
-        s_line[i] = color;
+
+    for (int i = 0; i < w; i++) {
+        s_band[i] = color;
     }
-    for (int row = 0; row < h; row++) {
-        esp_lcd_panel_draw_bitmap(s_panel, x, y + row, x + chunk, y + row + 1, s_line);
+    int band = h < BAND_ROWS ? h : BAND_ROWS;
+    int y0 = y;
+    while (y0 < y + h) {
+        int n = (y + h - y0) < band ? (y + h - y0) : band;
+        int count = w * n;
+        for (int i = 0; i < count; i++) {
+            s_band[i] = color;
+        }
+        esp_lcd_panel_draw_bitmap(s_panel, x, y0, x + w, y0 + n, s_band);
+        y0 += n;
     }
 }
 
@@ -104,7 +132,7 @@ void lcd_fill(uint16_t color)
     lcd_rect(0, 0, LCD_H_RES, LCD_V_RES, color);
 }
 
-/* 7-segment digit, segments a..g. */
+/* 7-segment digit. */
 static const uint8_t SEG_MAP[10] = {
     0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F,
 };
@@ -115,27 +143,28 @@ static void seg7(int x, int y, int w, int h, int digit, uint16_t color)
         digit = 0;
     }
     uint8_t m = SEG_MAP[digit];
-    int t = (w > h ? h : w) / 7; /* segment thickness */
+    int t = (w > h ? h : w) / 7;
     if (t < 3) {
         t = 3;
     }
-    if (m & 0x01) lcd_rect(x, y, w, t, color);                              /* a */
-    if (m & 0x02) lcd_rect(x + w - t, y, t, h / 2, color);                  /* b */
-    if (m & 0x04) lcd_rect(x + w - t, y + h / 2, t, h / 2, color);          /* c */
-    if (m & 0x08) lcd_rect(x, y + h - t, w, t, color);                      /* d */
-    if (m & 0x10) lcd_rect(x, y + h / 2, t, h / 2, color);                  /* e */
-    if (m & 0x20) lcd_rect(x, y, t, h / 2, color);                          /* f */
-    if (m & 0x40) lcd_rect(x, y + h / 2, w, t, color);                      /* g */
+    if (m & 0x01) lcd_rect(x, y, w, t, color);
+    if (m & 0x02) lcd_rect(x + w - t, y, t, h / 2, color);
+    if (m & 0x04) lcd_rect(x + w - t, y + h / 2, t, h / 2, color);
+    if (m & 0x08) lcd_rect(x, y + h - t, w, t, color);
+    if (m & 0x10) lcd_rect(x, y + h / 2, t, h / 2, color);
+    if (m & 0x20) lcd_rect(x, y, t, h / 2, color);
+    if (m & 0x40) lcd_rect(x, y + h / 2, w, t, color);
 }
 
-static void bar(int x, int y, int w, int h, float value, float full_scale, uint16_t color)
+static void bar(int x, int y, int w, int h, float value, uint16_t color)
 {
     int mid = x + w / 2;
     int max_half = w / 2 - 2;
-    float v = value / full_scale;
+    float v = value / BAR_FULL;
     if (v > 1.0f) v = 1.0f;
     if (v < -1.0f) v = -1.0f;
     int len = (int)(max_half * fabsf(v));
+
     lcd_rect(x, y, w, h, COL_DIM);
     if (len > 0) {
         if (v >= 0) {
@@ -147,6 +176,11 @@ static void bar(int x, int y, int w, int h, float value, float full_scale, uint1
     lcd_rect(mid, y, 1, h, COL_FG);
 }
 
+static int bucket(float v)
+{
+    return (int)(v / 2.0f); /* 2 dps per bucket */
+}
+
 void lcd_status_page(const bool hall[3], bool clutch, int state,
                      float bias_dps, float roll_rate, float pitch_rate)
 {
@@ -154,25 +188,45 @@ void lcd_status_page(const bool hall[3], bool clutch, int state,
         return;
     }
 
-    /* Clear and draw the three hall squares. */
-    lcd_fill(COL_BG);
+    /* Hall squares: only repaint the ones that changed. */
     for (int i = 0; i < 3; i++) {
+        if (s_last.hall[i] == hall[i]) {
+            continue;
+        }
         int x = 16 + i * 74;
         lcd_rect(x, 16, 58, 58, hall[i] ? COL_GREEN : COL_DIM);
-        lcd_rect(x + 4, 78, 50, 4, COL_FG); /* underline marker */
+        s_last.hall[i] = hall[i];
     }
 
-    /* Clutch indicator + state digit. */
-    lcd_rect(16, 96, 58, 58, clutch ? COL_GREEN : COL_RED);
-    seg7(110, 96, 58, 96, state, COL_YELLOW);
+    if (s_last.clutch != clutch) {
+        lcd_rect(16, 96, 58, 58, clutch ? COL_GREEN : COL_RED);
+        s_last.clutch = clutch;
+    }
 
-    /* Gyro bias (integer, 0..99) as two digits. */
+    if (s_last.state != state) {
+        lcd_rect(110, 96, 58, 96, COL_BG);
+        seg7(110, 96, 58, 96, state, COL_YELLOW);
+        s_last.state = state;
+    }
+
     int b = (int)(bias_dps + 0.5f);
     if (b > 99) b = 99;
-    seg7(16, 176, 40, 64, b / 10, COL_BLUE);
-    seg7(64, 176, 40, 64, b % 10, COL_BLUE);
+    if (b < 0) b = 0;
+    if (s_last.bias != b) {
+        lcd_rect(16, 176, 88, 64, COL_BG);
+        seg7(16, 176, 40, 64, b / 10, COL_BLUE);
+        seg7(64, 176, 40, 64, b % 10, COL_BLUE);
+        s_last.bias = b;
+    }
 
-    /* Roll / pitch bars, +-100 dps full scale. */
-    bar(16, 250, 208, 10, roll_rate, 100.0f, COL_GREEN);
-    bar(16, 264, 208, 10, pitch_rate, 100.0f, COL_YELLOW);
+    int rb = bucket(roll_rate);
+    int pb = bucket(pitch_rate);
+    if (s_last.roll_bucket != rb) {
+        bar(16, 250, 208, 10, roll_rate, COL_GREEN);
+        s_last.roll_bucket = rb;
+    }
+    if (s_last.pitch_bucket != pb) {
+        bar(16, 264, 208, 10, pitch_rate, COL_YELLOW);
+        s_last.pitch_bucket = pb;
+    }
 }

@@ -167,9 +167,9 @@ static uint16_t blend(uint16_t a, uint16_t b, int pct)
 {
     int ar = (a >> 11) & 0x1F, ag = (a >> 5) & 0x3F, ab = a & 0x1F;
     int br = (b >> 11) & 0x1F, bg = (b >> 5) & 0x3F, bb = b & 0x1F;
-    int r = (ar * pct + br * (100 - pct)) / 100;
-    int g = (ag * pct + bg * (100 - pct)) / 100;
-    int bl = (ab + 0) * pct / 100 + bb * (100 - pct) / 100;
+    int r = (ar * (100 - pct) + br * pct) / 100;
+    int g = (ag * (100 - pct) + bg * pct) / 100;
+    int bl = (ab * (100 - pct) + bb * pct) / 100;
     return (uint16_t)((r << 11) | (g << 5) | bl);
 }
 
@@ -214,22 +214,23 @@ static const char *state_name(int s)
 static void draw_page(void)
 {
     char buf[16];
-    int pulse = (int)((esp_timer_get_time() / 200000) % 5) * 8 + 26;
+    int pulse = (int)((esp_timer_get_time() / 200000) % 5) * 8 + 20;
 
-    /* background: diagonal gradient + soft colour wash */
+    /* background: vertical gradient + faint corner washes */
     for (int y = 0; y < LCD_V_RES; y++) {
+        int t2 = (y * 100) / LCD_V_RES;
+        uint16_t row = blend(rgb(18, 26, 48), rgb(4, 6, 10), t2);
         for (int x = 0; x < LCD_H_RES; x++) {
-            int t2 = (y * 100) / LCD_V_RES;
-            uint16_t c = blend(rgb(20, 28, 52), rgb(4, 6, 10), t2);
-            int dx = x - 30, dy = y - 30;
+            uint16_t c = row;
+            int dx = x - 20, dy = y - 20;
             int d = (int)sqrtf((float)(dx * dx + dy * dy));
-            if (d < 220) {
-                c = blend(c, rgb(0, 180, 160), (220 - d) / 12);
+            if (d < 180) {
+                c = blend(c, rgb(0, 170, 150), (180 - d) / 9);
             }
-            dx = x - 230; dy = y - 300;
+            dx = x - 240; dy = y - 300;
             d = (int)sqrtf((float)(dx * dx + dy * dy));
-            if (d < 200) {
-                c = blend(c, rgb(120, 100, 230), (200 - d) / 14);
+            if (d < 160) {
+                c = blend(c, rgb(110, 90, 220), (160 - d) / 11);
             }
             fb_px(x, y, c);
         }
@@ -257,22 +258,22 @@ static void draw_page(void)
         text22(x + 21, 76, labs[i], s_view.hall[i] ? COL_TEAL : COL_FG);
     }
 
-    /* clutch */
+    /* clutch: label above, value below */
     uint16_t acc = s_view.clutch ? COL_TEAL : COL_RED;
-    fb_round(16, 128, 208, 68, 14, blend(COL_CARD, acc, 12), COL_LINE);
-    fb_rect(16, 142, 3, 40, acc);
+    fb_round(16, 128, 208, 78, 14, blend(COL_CARD, acc, 12), COL_LINE);
+    fb_rect(16, 146, 3, 46, acc);
     if (s_view.clutch) {
-        glow_rect(16, 128, 208, 68, 14, COL_TEAL, pulse);
+        glow_rect(16, 128, 208, 78, 14, COL_TEAL, pulse);
     }
     text20(28, 136, "CLUTCH", COL_DIM);
-    text22(146, 144, s_view.clutch ? "ON" : "OFF", acc);
+    text22(28, 166, s_view.clutch ? "ON" : "OFF", acc);
 
-    /* state */
+    /* state: value only, centred */
     uint16_t sc = (s_view.state == 2) ? COL_TEAL : (s_view.state == 3 ? COL_AMBER : COL_FG);
-    fb_round(16, 204, 208, 60, 14, blend(COL_CARD, sc, 10), COL_LINE);
-    fb_rect(16, 216, 3, 36, sc);
-    text20(28, 212, "STATE", COL_DIM);
-    text20(106, 216, state_name(s_view.state), sc);
+    fb_round(16, 212, 208, 58, 14, blend(COL_CARD, sc, 10), COL_LINE);
+    fb_rect(16, 224, 3, 36, sc);
+    int sw = (int)strlen(state_name(s_view.state)) * 22;
+    text22((240 - sw) / 2, 224, state_name(s_view.state), sc);
 }
 
 static void flush_fb(void)

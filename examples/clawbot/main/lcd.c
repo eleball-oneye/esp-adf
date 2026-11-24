@@ -12,6 +12,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 
 static const char *TAG = "lcd";
 
@@ -178,12 +179,16 @@ void lcd_set_power(bool on)
     }
     s_on = on;
     if (on) {
+        /* Repaint while the backlight is still off, then enable display and
+           finally the backlight: avoids the stale/white frame flash. */
         gpio_hold_dis(PIN_LCD_BL);
-        gpio_set_level(PIN_LCD_BL, 1);
-        esp_lcd_panel_disp_on_off(s_panel, true);
+        gpio_set_level(PIN_LCD_BL, 0);
         lcd_fill(COL_BG);
         lcd_frame();
         memset(&s_last, 0xFF, sizeof(s_last));
+        esp_lcd_panel_disp_on_off(s_panel, true);
+        vTaskDelay(pdMS_TO_TICKS(20));
+        gpio_set_level(PIN_LCD_BL, 1);
     } else {
         esp_lcd_panel_disp_on_off(s_panel, false);
         gpio_set_level(PIN_LCD_BL, 0);

@@ -395,6 +395,16 @@ static void clawbot_task(void *arg)
     bool imu_first = true;
     qmi8658_sample_t imu_sample = {0};
 
+    /* BOOT button (GPIO0): short press = screen on/off, long press = deep sleep. */
+    gpio_config_t boot_cfg = {
+        .pin_bit_mask = 1ULL << GPIO_NUM_0,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+    };
+    gpio_config(&boot_cfg);
+    bool boot_prev = false;
+    int64_t boot_since = 0;
+
     printf("clawbot: hall GPIO %d/%d/%d, IMU %s\n",
            PIN_HALL_INDEX, PIN_HALL_MIDDLE, PIN_HALL_RING,
            s_imu_ok ? "ready" : "MISSING");
@@ -450,6 +460,21 @@ static void clawbot_task(void *arg)
             (now - s_adv_since) > (int64_t)ADV_WAIT_MS * 1000) {
             enter_sleep("timeout");
         }
+
+        /* BOOT button: short press toggles the LCD, long press sleeps. */
+        bool boot_now = (gpio_get_level(GPIO_NUM_0) == 0);
+        if (boot_now && !boot_prev) {
+            boot_since = now;
+        } else if (!boot_now && boot_prev) {
+            int64_t held_ms = (now - boot_since) / 1000;
+            if (held_ms >= 1500) {
+                enter_sleep("button");
+            } else if (held_ms >= 40) {
+                lcd_set_power(!lcd_is_on());
+                printf("EVT,lcd,%d\n", lcd_is_on() ? 1 : 0);
+            }
+        }
+        boot_prev = boot_now;
 
         /* Hall at 20 Hz */
         if ((now - last_hall) >= HALL_PERIOD_MS * 1000) {

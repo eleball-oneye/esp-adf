@@ -14,6 +14,8 @@ extern "C" {
 
 esp_err_t lcd_init(void);
 void lcd_sleep(void);   /* panel off + backlight low + output hold */
+void lcd_set_power(bool on);
+bool lcd_is_on(void);
 void lcd_fill(uint16_t color);
 void lcd_rect(int x, int y, int w, int h, uint16_t color);
 

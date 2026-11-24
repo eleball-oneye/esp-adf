@@ -35,6 +35,7 @@ static const char *TAG = "lcd";
 
 static esp_lcd_panel_handle_t s_panel;
 static SemaphoreHandle_t s_flush_done;
+static bool s_on = true;
 static uint16_t s_band[LCD_H_RES * BAND_ROWS];
 
 /* Last drawn values, so we can repaint only what changed. */
@@ -80,6 +81,9 @@ esp_err_t lcd_init(void)
         .spi_mode = 0,
         .trans_queue_depth = 10,
     };
+    gpio_hold_dis(PIN_LCD_BL);
+    gpio_deep_sleep_hold_dis();
+
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI2_HOST, &io_cfg, &io));
 
     s_flush_done = xSemaphoreCreateBinary();
@@ -159,6 +163,38 @@ void lcd_rect(int x, int y, int w, int h, uint16_t color)
     }
 }
 
+static void lcd_frame(void)
+{
+    lcd_rect(0, 0, LCD_H_RES, 1, COL_FG);
+    lcd_rect(0, LCD_V_RES - 1, LCD_H_RES, 1, COL_FG);
+    lcd_rect(0, 0, 1, LCD_V_RES, COL_FG);
+    lcd_rect(LCD_H_RES - 1, 0, 1, LCD_V_RES, COL_FG);
+}
+
+void lcd_set_power(bool on)
+{
+    if (!s_panel || on == s_on) {
+        return;
+    }
+    s_on = on;
+    if (on) {
+        gpio_hold_dis(PIN_LCD_BL);
+        gpio_set_level(PIN_LCD_BL, 1);
+        esp_lcd_panel_disp_on_off(s_panel, true);
+        lcd_fill(COL_BG);
+        lcd_frame();
+        memset(&s_last, 0xFF, sizeof(s_last));
+    } else {
+        esp_lcd_panel_disp_on_off(s_panel, false);
+        gpio_set_level(PIN_LCD_BL, 0);
+    }
+}
+
+bool lcd_is_on(void)
+{
+    return s_on;
+}
+
 void lcd_sleep(void)
 {
     if (s_panel) {
@@ -226,7 +262,7 @@ static int bucket(float v)
 void lcd_status_page(const bool hall[3], bool clutch, int state,
                      float bias_dps, float roll_rate, float pitch_rate)
 {
-    if (!s_panel) {
+    if (!s_panel || !s_on) {
         return;
     }
 

@@ -106,6 +106,9 @@ python tools\log_serial.py COM10 data\P2_S01_2026-12-04.csv
 | `gain` | 查询当前灵敏度 | `EVT,gain,20.0` |
 | `gain 30` | 设置灵敏度（px/deg，1–100） | `EVT,gain,30.0` |
 | `hid test` | 已连接时让光标右移 50 px | `EVT,hid,test` / `EVT,hid,not-connected` |
+| `screen 1920 1080` | 告知屏幕分辨率（回中用） | `EVT,screen,1920,1080` |
+| `recenter on/off` | 离合接合时是否自动把光标拉回屏幕中心 | `EVT,recenter,on/off` |
+| `recenter now` | 立即回中一次 | `EVT,recenter,1920,1080` |
 | `help` | 命令列表 | `EVT,help,...` |
 
 启动日志里会有 `EVT,adv,1`（广播已开）或 `EVT,adv,err=...`、`EVT,hidd,err=...`，用于判断 HID 是否注册成功。

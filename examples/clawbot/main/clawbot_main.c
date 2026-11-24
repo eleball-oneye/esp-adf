@@ -89,6 +89,10 @@ static bool s_hid_connected;
 static uint8_t s_hall_map[3] = {PIN_HALL_INDEX, PIN_HALL_MIDDLE, PIN_HALL_RING};
 static int s_report_count;
 static float s_gain = CURSOR_GAIN_DEFAULT;
+static bool s_recenter_on = false;          /* opt-in: pull cursor to screen center on engage */
+static bool s_recenter_pending = false;
+static int s_screen_w = 1920;
+static int s_screen_h = 1080;
 
 /* Runtime switches (serial commands). */
 static bool s_ble_enabled = true;
@@ -129,6 +133,36 @@ static esp_ble_adv_params_t hidd_adv_params = {
     .channel_map = ADV_CHNL_ALL,
     .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
 };
+
+static void hid_center_cursor(void)
+{
+    if (!(s_ble_enabled && s_hid_connected && s_hid_secure)) {
+        return;
+    }
+    /* Relative-only HID has no absolute position: pin to the top-left corner by
+       saturating negative deltas, then push a known offset to the center. */
+    int neg_x = (s_screen_w / 120) + 3;
+    int neg_y = (s_screen_h / 120) + 3;
+    for (int i = 0; i < neg_x; i++) {
+        esp_hidd_send_mouse_value_ex(s_hid_conn_id, s_buttons, -120, 0, 0);
+    }
+    for (int i = 0; i < neg_y; i++) {
+        esp_hidd_send_mouse_value_ex(s_hid_conn_id, s_buttons, 0, -120, 0);
+    }
+    int left = s_screen_w / 2;
+    while (left > 0) {
+        int d = left > 120 ? 120 : left;
+        esp_hidd_send_mouse_value_ex(s_hid_conn_id, s_buttons, (int8_t)d, 0, 0);
+        left -= d;
+    }
+    left = s_screen_h / 2;
+    while (left > 0) {
+        int d = left > 120 ? 120 : left;
+        esp_hidd_send_mouse_value_ex(s_hid_conn_id, s_buttons, 0, (int8_t)d, 0);
+        left -= d;
+    }
+    printf("EVT,recenter,%d,%d\n", s_screen_w, s_screen_h);
+}
 
 static void ble_start_adv(void)
 {
@@ -254,6 +288,9 @@ static void gesture_release(void)
         /* short press without motion -> toggle clutch */
         if (s_press_ms < STANDBY_MS && s_disp_deg <= SCROLL_DEG) {
             s_clutch = !s_clutch;
+            if (s_clutch && s_recenter_on) {
+                s_recenter_pending = true;
+            }
             ESP_LOGI(TAG, "clutch %s", s_clutch ? "ENGAGED" : "DISENGAGED");
         }
         break;
@@ -449,6 +486,11 @@ static void clawbot_task(void *arg)
         if ((now - last_report) >= REPORT_PERIOD_MS * 1000) {
             last_report = now;
 
+            if (s_recenter_pending) {
+                s_recenter_pending = false;
+                hid_center_cursor();
+            }
+
             if (s_ble_enabled && s_hid_connected && s_hid_secure && s_buttons && !s_cursor_x && !s_cursor_y) {
                 esp_hidd_send_mouse_value_ex(s_hid_conn_id, s_buttons, 0, 0, 0);
             }
@@ -503,7 +545,7 @@ static void imu_recalibrate(void)
 static void handle_command(const char *cmd)
 {
     if (!strcmp(cmd, "help")) {
-        printf("EVT,help,ble on|off|status;csv on|off;cal;gain <px/deg>;hid test\n");
+        printf("EVT,help,ble on|off|status;csv on/off;cal;gain N;screen W H;recenter on/off/now;hid test\n");
     } else if (!strcmp(cmd, "ble on")) {
         s_ble_enabled = true;
         ble_start_adv();
@@ -531,6 +573,23 @@ static void handle_command(const char *cmd)
         if (v > 100.0f) v = 100.0f;
         s_gain = v;
         printf("EVT,gain,%.1f\n", s_gain);
+    } else if (!strcmp(cmd, "recenter on")) {
+        s_recenter_on = true;
+        printf("EVT,recenter,on\n");
+    } else if (!strcmp(cmd, "recenter off")) {
+        s_recenter_on = false;
+        printf("EVT,recenter,off\n");
+    } else if (!strcmp(cmd, "recenter now")) {
+        hid_center_cursor();
+    } else if (!strncmp(cmd, "screen ", 7)) {
+        int w = 0, h = 0;
+        if (sscanf(cmd + 7, "%d %d", &w, &h) == 2 && w > 0 && h > 0) {
+            s_screen_w = w;
+            s_screen_h = h;
+            printf("EVT,screen,%d,%d\n", w, h);
+        } else {
+            printf("EVT,screen,invalid\n");
+        }
     } else if (!strcmp(cmd, "hid test")) {
         if (s_ble_enabled && s_hid_connected && s_hid_secure) {
             esp_hidd_send_mouse_value_ex(s_hid_conn_id, 0, 50, 0, 0);

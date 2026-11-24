@@ -26,6 +26,8 @@
 
 #include "esp_hidd_prf_api.h"
 #include "hid_dev.h"
+#include "lcd.h"
+#include "motion.h"
 #include "qmi8658.h"
 
 static const char *TAG = "clawbot";
@@ -62,7 +64,9 @@ typedef enum {
 } gesture_state_t;
 
 static qmi8658_t s_imu;
+static motion_t s_motion;
 static bool s_imu_ok;
+static float s_roll_rate, s_pitch_rate, s_yaw_rate;
 
 static uint8_t s_hall_level[3];        /* debounced level: 1 = magnet present (OUT low) */
 static uint8_t s_hall_raw_prev[3];
@@ -82,6 +86,7 @@ static bool s_hid_secure;
 static bool s_hid_connected;
 
 static uint8_t s_hall_map[3] = {PIN_HALL_INDEX, PIN_HALL_MIDDLE, PIN_HALL_RING};
+static int s_report_count;
 
 /* ---------------- BLE HID plumbing ---------------- */
 #define HIDD_DEVICE_NAME "clawbot-mouse"
@@ -235,7 +240,7 @@ static void gesture_release(void)
 }
 
 /* returns the wheel delta to emit this tick (0 if none) */
-static int8_t gesture_update(float dt_s, const qmi8658_sample_t *imu)
+static int8_t gesture_update(float dt_s, float roll_rate, float pitch_rate)
 {
     int8_t wheel = 0;
 
@@ -246,7 +251,7 @@ static int8_t gesture_update(float dt_s, const qmi8658_sample_t *imu)
     float dt_ms = dt_s * 1000.0f;
     s_press_ms += dt_ms;
 
-    float omega = sqrtf(imu->gx * imu->gx + imu->gy * imu->gy);
+    float omega = sqrtf(roll_rate * roll_rate + pitch_rate * pitch_rate);
     if (s_press_ms > STABLE_MS) {
         s_disp_deg += omega * dt_s;
     }
@@ -267,7 +272,7 @@ static int8_t gesture_update(float dt_s, const qmi8658_sample_t *imu)
         }
         break;
     case G_SCROLL:
-        s_wheel_accum += imu->gx * dt_s; /* pitch -> vertical wheel */
+        s_wheel_accum += pitch_rate * dt_s; /* pitch -> vertical wheel */
         while (s_wheel_accum >= WHEEL_DEG_PER_TICK) {
             wheel++;
             s_wheel_accum -= WHEEL_DEG_PER_TICK;
@@ -307,7 +312,7 @@ static bool hall_update(uint8_t idx)
 static void csv_header(void)
 {
     printf("# clawbot POC firmware, CSV fields:\n");
-    printf("# t_ms,h_all,h_mid,h_ring,ax,ay,az,gx,gy,gz,clutch,state,btn,wheel\n");
+    printf("# t_ms,h_all,h_mid,h_ring,ax,ay,az,gx,gy,gz,clutch,state,btn,wheel,roll,pitch,yaw,bias\n");
 }
 
 /* ---------------- main task ---------------- */
@@ -340,17 +345,19 @@ static void clawbot_task(void *arg)
                 qmi8658_raw_t raw;
                 if (qmi8658_read_raw(&s_imu, &raw) == ESP_OK) {
                     qmi8658_to_sample(&raw, &imu_sample);
+                    motion_update(&s_motion, &imu_sample, dt);
+                    motion_rates(&s_motion, &imu_sample, &s_roll_rate, &s_pitch_rate, &s_yaw_rate);
                 }
             }
             if (imu_first) {
                 imu_first = false;
             } else {
-                int8_t wheel = gesture_update(dt, &imu_sample);
+                int8_t wheel = gesture_update(dt, s_roll_rate, s_pitch_rate);
 
                 /* Cursor: only when clutch is engaged and not scrolling. */
                 if (s_clutch && s_state != G_SCROLL) {
-                    s_cursor_x += -imu_sample.gy * dt * CURSOR_GAIN;
-                    s_cursor_y += -imu_sample.gx * dt * CURSOR_GAIN;
+                    s_cursor_x += s_roll_rate * dt * CURSOR_GAIN;
+                    s_cursor_y += s_pitch_rate * dt * CURSOR_GAIN;
                 } else {
                     s_cursor_x = s_cursor_y = 0;
                 }
@@ -415,13 +422,25 @@ static void clawbot_task(void *arg)
                 esp_hidd_send_mouse_value_ex(s_hid_conn_id, s_buttons, 0, 0, 0);
             }
 
+            /* LCD debug page at 10 Hz. */
+            if ((s_report_count++ % 5) == 0) {
+                bool hall[3] = {
+                    s_hall_level[0] != 0,
+                    s_hall_level[1] != 0,
+                    s_hall_level[2] != 0,
+                };
+                lcd_status_page(hall, s_clutch, (int)s_state,
+                                motion_bias_mag(&s_motion), s_roll_rate, s_pitch_rate);
+            }
+
 #if CSV_ENABLE
-            printf("CSV,%lld,%u,%u,%u,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%d,%d,%u,0\n",
+            printf("CSV,%lld,%u,%u,%u,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%d,%d,%u,0,%.2f,%.2f,%.2f,%.2f\n",
                    (long long)t_ms,
                    s_hall_level[0], s_hall_level[1], s_hall_level[2],
                    imu_sample.ax, imu_sample.ay, imu_sample.az,
                    imu_sample.gx, imu_sample.gy, imu_sample.gz,
-                   s_clutch ? 1 : 0, (int)s_state, s_buttons);
+                   s_clutch ? 1 : 0, (int)s_state, s_buttons,
+                   s_roll_rate, s_pitch_rate, s_yaw_rate, motion_bias_mag(&s_motion));
 #endif
         }
 
@@ -438,10 +457,24 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
+    lcd_init();
     hall_init();
 
     if (qmi8658_init(&s_imu, PIN_IMU_SDA, PIN_IMU_SCL) == ESP_OK) {
         s_imu_ok = true;
+        /* Boot calibration: the board must be still for ~1 s. */
+        static qmi8658_sample_t cal[100];
+        int n = 0;
+        for (int i = 0; i < 100; i++) {
+            qmi8658_raw_t raw;
+            if (qmi8658_read_raw(&s_imu, &raw) == ESP_OK) {
+                qmi8658_to_sample(&raw, &cal[n++]);
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        motion_init(&s_motion, cal, n);
+        ESP_LOGI(TAG, "IMU calibrated: bias=%.2f dps, up=(%.2f,%.2f,%.2f)",
+                 motion_bias_mag(&s_motion), s_motion.n[0], s_motion.n[1], s_motion.n[2]);
     } else {
         ESP_LOGW(TAG, "IMU not found, running hall-only");
     }

@@ -57,13 +57,18 @@ idf.py -p COM10 flash monitor
 串口（USB Serial/JTAG）每 50 ms 输出一行：
 
 ```text
-CSV,t_ms,h_all,h_mid,h_ring,ax,ay,az,gx,gy,gz,clutch,state,btn,wheel
+CSV,t_ms,h_all,h_mid,h_ring,ax,ay,az,gx,gy,gz,clutch,state,btn,wheel,roll,pitch,yaw,bias
 ```
 
 - `h_*`：1 = 磁铁靠近（霍尔 OUT 低），0 = 离开；
-- `ax..az`：g；`gx..gz`：dps；
+- `ax..az`：g；`gx..gz`：原始 dps（未减零偏）；
 - `clutch`：1 接合 / 0 脱开；`state`：0 IDLE / 1 PENDING / 2 SCROLL / 3 STANDBY；
-- `btn`：HID 按键位（bit0 左键，bit1 右键）。
+- `btn`：HID 按键位（bit0 左键，bit1 右键）；
+- `roll/pitch/yaw`：减零偏后、投影到重力平面坐标系的角速度（dps），yaw 不进入光标；
+- `bias`：当前陀螺零偏幅值（dps）。
+
+**上电校准**：固件启动后约 1 s 内采集 100 帧，要求板子静止；这决定初始零偏与水平面。
+静止时固件会持续微调零偏（`bias` 会缓慢收敛）。
 
 主机侧采集：
 
@@ -77,12 +82,23 @@ python tools\log_serial.py COM10 data\P2_S01_2026-12-04.csv
 
 - 板载 IMU 与 LCD/触摸同板，功耗数据不代表最终产品（LCD 背光关闭后仍有 RTC/触摸等静态电流）；
 - 开发板绑在手背时重量/惯量偏大，手感数据只用于算法与交互验证，不做结构结论；
-- 桌面参考平面目前用固定轴映射（`CURSOR_GAIN`、轴符号），重力建平面的完整实现留到下一步；
+- 桌面参考平面由重力定义，但轴符号/增益仍是初值（`CURSOR_GAIN`），需按佩戴方向标定；
 - ADF 仓库为浅克隆（depth 1），只用于本示例开发，不用于 ADF 自身的音频构建。
 
-## 6. 下一步
+## 6. LCD 调试页
 
-1. 校轴：静止时读重力方向，确认 X/Y/Z 与手背坐标一致；
-2. 加桌面参考平面：用加速度计重力方向建平面，滚转/俯仰入映射，偏航排除；
-3. 加 LCD 调试页（霍尔状态、姿态、状态机）；
-4. 按 `patent/applications/DATA-COLLECTION-REQUIREMENTS.md` 采 P1/P2 数据。
+240×280 ST7789，10 Hz 刷新：
+
+| 区域 | 含义 |
+|---|---|
+| 顶部三个方块（左→右） | 食指 / 中指 / 无名指霍尔；绿色 = 有磁 |
+| 左侧方块（第二行） | 离合：绿 = 接合，红 = 脱开 |
+| 黄色数字 | 状态机：0 IDLE / 1 PENDING / 2 SCROLL / 3 STANDBY |
+| 蓝色两位数字 | 当前陀螺零偏（dps，0–99） |
+| 底部两条横条 | roll（绿）/ pitch（黄），±100 dps |
+
+## 7. 下一步
+
+1. 标定轴符号与增益：把板子按实际佩戴方向固定，滚转/俯仰各做 10 次，确认光标方向；
+2. 采 P1/P2 数据（`patent/applications/DATA-COLLECTION-REQUIREMENTS.md`）；
+3. 需要时再把 LCD 页换成文字版（当前为省 Flash 用色块 + 7 段数字）。

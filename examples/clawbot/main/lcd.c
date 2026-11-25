@@ -227,8 +227,8 @@ esp_err_t lcd_init(void)
         .monochrome = false,
         .rotation = {
             .swap_xy = false,
-            .mirror_x = false,
-            .mirror_y = false,
+            .mirror_x = true,
+            .mirror_y = true,
         },
         .flags = {
             .buff_dma = true,

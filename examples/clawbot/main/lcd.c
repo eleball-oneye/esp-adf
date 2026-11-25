@@ -135,30 +135,15 @@ static void build_ui(void)
     s_bias_lbl = label(chip, 0, 0, "4.0", &lv_font_montserrat_16, COL_TEAL);
     lv_obj_center(s_bias_lbl);
 
-    /* tech rule: teal -> blue gradient with a bright leading dot */
+    /* rule: teal -> blue horizontal gradient */
     lv_obj_t *rule = lv_obj_create(scr);
     lv_obj_remove_style_all(rule);
-    lv_obj_set_pos(rule, 18, 44);
-    lv_obj_set_size(rule, 208, 3);
-    lv_obj_set_style_radius(rule, 2, 0);
+    lv_obj_set_pos(rule, 14, 44);
+    lv_obj_set_size(rule, 212, 2);
     lv_obj_set_style_bg_color(rule, lv_color_hex(COL_TEAL), 0);
     lv_obj_set_style_bg_grad_color(rule, lv_color_hex(0x3B82F6), 0);
     lv_obj_set_style_bg_grad_dir(rule, LV_GRAD_DIR_HOR, 0);
     lv_obj_set_style_bg_opa(rule, LV_OPA_COVER, 0);
-    lv_obj_set_style_shadow_width(rule, 6, 0);
-    lv_obj_set_style_shadow_opa(rule, 50, 0);
-    lv_obj_set_style_shadow_color(rule, lv_color_hex(COL_TEAL), 0);
-
-    lv_obj_t *led = lv_obj_create(scr);
-    lv_obj_remove_style_all(led);
-    lv_obj_set_pos(led, 14, 42);
-    lv_obj_set_size(led, 7, 7);
-    lv_obj_set_style_radius(led, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_color(led, lv_color_hex(0xB8FFF2), 0);
-    lv_obj_set_style_bg_opa(led, LV_OPA_COVER, 0);
-    lv_obj_set_style_shadow_width(led, 10, 0);
-    lv_obj_set_style_shadow_opa(led, 80, 0);
-    lv_obj_set_style_shadow_color(led, lv_color_hex(COL_TEAL), 0);
 
     /* hall cards */
     static const char *names[3] = { "I", "M", "R" };
@@ -182,13 +167,13 @@ static void build_ui(void)
 
     /* clutch */
     s_clutch_card = card(scr, 16, 136, 208, 78, 18);
-    s_clutch_bar = bar(scr, 17, 148, 4, 54, COL_TEAL);
+    s_clutch_bar = bar(scr, 20, 154, 4, 44, COL_TEAL);
     label(scr, 38, 146, "CLUTCH", &lv_font_montserrat_16, COL_DIM);
     s_clutch_lbl = label(scr, 38, 168, "ON", &lv_font_montserrat_28, COL_TEAL);
 
     /* state */
     s_state_card = card(scr, 16, 222, 208, 52, 16);
-    s_state_bar = bar(scr, 17, 232, 4, 32, COL_LINE);
+    s_state_bar = bar(scr, 20, 234, 4, 30, COL_LINE);
     label(scr, 38, 228, "STATE", &lv_font_montserrat_16, COL_DIM);
     s_state_lbl = label(scr, 110, 232, "IDLE", &lv_font_montserrat_24, COL_FG);
 }

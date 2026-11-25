@@ -195,6 +195,19 @@ enum
     BAS_IDX_NB,
 };
 
+/// Device Information Service Attributes Indexes
+enum
+{
+    DIS_IDX_SVC,
+    DIS_IDX_MANUFACTURER_CHAR,
+    DIS_IDX_MANUFACTURER_VAL,
+    DIS_IDX_MODEL_CHAR,
+    DIS_IDX_MODEL_VAL,
+    DIS_IDX_PNP_CHAR,
+    DIS_IDX_PNP_VAL,
+    DIS_IDX_NB,
+};
+
 #define HI_UINT16(a) (((a) >> 8) & 0xFF)
 #define LO_UINT16(a) ((a) & 0xFF)
 #define PROFILE_NUM            1
@@ -324,6 +337,25 @@ static const esp_gatts_attr_db_t bas_att_db[BAS_IDX_NB] =
 
 
 /// Full Hid device Database Description - Used to add attributes into the database
+static const uint16_t dis_svc_uuid = 0x180A;
+static const uint16_t dis_manufacturer_uuid = 0x2A29;
+static const uint16_t dis_model_uuid = 0x2A24;
+static const uint16_t dis_pnp_uuid = 0x2A50;
+static uint8_t dis_manufacturer[] = "ELEBALL";
+static uint8_t dis_model[] = "EB-CB01";
+static uint8_t dis_pnp[] = { 0x02, 0xEB, 0x00, 0x01, 0xCB, 0x00, 0x01 };
+
+static const esp_gatts_attr_db_t dis_att_db[DIS_IDX_NB] =
+{
+    [DIS_IDX_SVC] = {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&primary_service_uuid, ESP_GATT_PERM_READ, sizeof(uint16_t), sizeof(dis_svc_uuid), (uint8_t *)&dis_svc_uuid}},
+    [DIS_IDX_MANUFACTURER_CHAR] = {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&character_declaration_uuid, ESP_GATT_PERM_READ, CHAR_DECLARATION_SIZE, CHAR_DECLARATION_SIZE, (uint8_t *)&char_prop_read}},
+    [DIS_IDX_MANUFACTURER_VAL] = {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&dis_manufacturer_uuid, ESP_GATT_PERM_READ, sizeof(dis_manufacturer)-1, sizeof(dis_manufacturer)-1, dis_manufacturer}},
+    [DIS_IDX_MODEL_CHAR] = {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&character_declaration_uuid, ESP_GATT_PERM_READ, CHAR_DECLARATION_SIZE, CHAR_DECLARATION_SIZE, (uint8_t *)&char_prop_read}},
+    [DIS_IDX_MODEL_VAL] = {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&dis_model_uuid, ESP_GATT_PERM_READ, sizeof(dis_model)-1, sizeof(dis_model)-1, dis_model}},
+    [DIS_IDX_PNP_CHAR] = {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&character_declaration_uuid, ESP_GATT_PERM_READ, CHAR_DECLARATION_SIZE, CHAR_DECLARATION_SIZE, (uint8_t *)&char_prop_read}},
+    [DIS_IDX_PNP_VAL] = {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&dis_pnp_uuid, ESP_GATT_PERM_READ, sizeof(dis_pnp), sizeof(dis_pnp), dis_pnp}},
+};
+
 static esp_gatts_attr_db_t hidd_le_gatt_db[HIDD_LE_IDX_NB] =
 {
             // HID Service Declaration
@@ -631,6 +663,10 @@ void esp_hidd_prf_cb_hdl(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
                 ESP_LOGI(HID_LE_PRF_TAG, "hid svc handle = %x", hidd_le_env.hidd_inst.att_tbl[HIDD_LE_IDX_SVC]);
                 hid_add_id_tbl();
                 esp_ble_gatts_start_service(hidd_le_env.hidd_inst.att_tbl[HIDD_LE_IDX_SVC]);
+                esp_ble_gatts_create_attr_tab(dis_att_db, gatts_if, DIS_IDX_NB, 0);
+            } else if (param->add_attr_tab.num_handle == DIS_IDX_NB) {
+                esp_ble_gatts_start_service(param->add_attr_tab.handles[DIS_IDX_SVC]);
+                ESP_LOGI(HID_LE_PRF_TAG, "DIS started (handle=%d)", param->add_attr_tab.handles[DIS_IDX_SVC]);
             } else {
                 ESP_LOGW(HID_LE_PRF_TAG, "ATTR_TAB_EVT unexpected num_handle=%d",
                          param->add_attr_tab.num_handle);
@@ -649,6 +685,11 @@ void hidd_le_create_service(esp_gatt_if_t gatts_if)
        After finish to added the battery service then can added the hid service. */
     esp_ble_gatts_create_attr_tab(bas_att_db, gatts_if, BAS_IDX_NB, 0);
 
+}
+
+void esp_hidd_set_battery_level(uint8_t level)
+{
+    battary_lev = level;
 }
 
 void hidd_le_init(void)

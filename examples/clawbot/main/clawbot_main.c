@@ -20,6 +20,9 @@
 #include "driver/gpio.h"
 #include "esp_sleep.h"
 #include "driver/usb_serial_jtag.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
 #include "esp_bt.h"
 #include "esp_bt_main.h"
 #include "esp_gap_ble_api.h"
@@ -680,6 +683,40 @@ static void command_task(void *arg)
     }
 }
 
+
+static void battery_monitor_task(void *arg)
+{
+    (void)arg;
+    adc_oneshot_unit_handle_t adc = NULL;
+    adc_cali_handle_t cali = NULL;
+    adc_oneshot_unit_init_cfg_t unit_cfg = { .unit_id = ADC_UNIT_1 };
+    bool ok = false;
+    if (adc_oneshot_new_unit(&unit_cfg, &adc) == ESP_OK) {
+        adc_oneshot_chan_cfg_t ch = { .atten = ADC_ATTEN_DB_12, .bitwidth = ADC_BITWIDTH_12 };
+        if (adc_oneshot_config_channel(adc, ADC_CHANNEL_0, &ch) == ESP_OK) {
+            adc_cali_curve_fitting_config_t cal = {
+                .unit_id = ADC_UNIT_1, .atten = ADC_ATTEN_DB_12, .bitwidth = ADC_BITWIDTH_12,
+            };
+            adc_cali_create_scheme_curve_fitting(&cal, &cali);
+            ok = true;
+        }
+    }
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(30000));
+        if (!ok) continue;
+        int raw = 0;
+        if (adc_oneshot_read(adc, ADC_CHANNEL_0, &raw) != ESP_OK) continue;
+        int mv = 0;
+        if (cali) adc_cali_raw_to_voltage(cali, raw, &mv);
+        else mv = raw * 3300 / 4095;
+        int bat_mv = mv * 3;              /* 200k / 100k divider */
+        int pct = (bat_mv - 3300) * 100 / (4200 - 3300);
+        if (pct < 0) pct = 0;
+        if (pct > 100) pct = 100;
+        esp_hidd_set_battery_level((uint8_t)pct);
+    }
+}
+
 void app_main(void)
 {
     esp_err_t ret = nvs_flash_init();
@@ -705,4 +742,5 @@ void app_main(void)
 
     xTaskCreate(clawbot_task, "clawbot", 4096, NULL, 5, NULL);
     xTaskCreate(command_task, "cmd", 3072, NULL, 4, NULL);
+    xTaskCreate(battery_monitor_task, "batt", 3072, NULL, 2, NULL);
 }

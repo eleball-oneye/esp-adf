@@ -90,8 +90,11 @@ static void build_ui(void)
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
-    label(scr, 14, 10, "CLAWBOT", &lv_font_montserrat_20, COL_FG);
-    s_bias_lbl = label(scr, 176, 14, "4.0", &lv_font_montserrat_16, COL_DIM);
+    lv_obj_t *title = label(scr, 14, 10, "CLAWBOT", &lv_font_montserrat_20, COL_FG);
+    s_bias_lbl = label(scr, 0, 0, "4.0", &lv_font_montserrat_16, COL_DIM);
+    lv_obj_align_to(s_bias_lbl, title, LV_ALIGN_OUT_RIGHT_MID, 0, 0);
+    lv_obj_set_x(s_bias_lbl, 226 - lv_obj_get_width(s_bias_lbl));
+    lv_obj_set_y(s_bias_lbl, 14);
 
     lv_obj_t *rule = lv_obj_create(scr);
     lv_obj_remove_style_all(rule);
@@ -122,8 +125,8 @@ static void build_ui(void)
     s_clutch_lbl = label(scr, 28, 164, "ON", &lv_font_montserrat_28, COL_TEAL);
 
     s_state_card = card(scr, 16, 216, 208, 56, 14);
-    label(scr, 28, 224, "STATE", &lv_font_montserrat_16, COL_DIM);
-    s_state_lbl = label(scr, 110, 226, "IDLE", &lv_font_montserrat_24, COL_FG);
+    label(scr, 28, 220, "STATE", &lv_font_montserrat_16, COL_DIM);
+    s_state_lbl = label(scr, 28, 238, "IDLE", &lv_font_montserrat_24, COL_FG);
 }
 
 void lcd_status_page(const bool hall[3], bool clutch, int state,

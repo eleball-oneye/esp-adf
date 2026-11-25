@@ -24,16 +24,14 @@ static const char *TAG = "lcd";
 #define PIN_LCD_RST  8
 #define PIN_LCD_BL   15
 
-#define COL_BG_TOP   0x0E1626
-#define COL_BG_BOT   0x05070C
-#define COL_CARD_TOP 0x222B3D
-#define COL_CARD_BOT 0x151B28
-#define COL_LINE     0x33415A
-#define COL_FG       0xE8EEF8
-#define COL_DIM      0x8C9BB2
-#define COL_TEAL     0x00E5C0
-#define COL_AMBER    0xFFC454
-#define COL_RED      0xFF6363
+#define COL_BG      0x0B0F14
+#define COL_CARD    0x1C2333
+#define COL_LINE    0x3E4E66
+#define COL_FG      0xE8EEF8
+#define COL_DIM     0x8C9BB2
+#define COL_TEAL    0x00E5C0
+#define COL_AMBER   0xFFC454
+#define COL_RED     0xFF6363
 
 static esp_lcd_panel_handle_t s_panel;
 static esp_lcd_panel_io_handle_t s_io;
@@ -43,10 +41,8 @@ static bool s_on = true;
 static lv_obj_t *s_hall_card[3];
 static lv_obj_t *s_hall_dot[3];
 static lv_obj_t *s_clutch_card;
-static lv_obj_t *s_clutch_bar;
 static lv_obj_t *s_clutch_lbl;
 static lv_obj_t *s_state_card;
-static lv_obj_t *s_state_bar;
 static lv_obj_t *s_state_lbl;
 static lv_obj_t *s_bias_lbl;
 
@@ -61,29 +57,18 @@ static const char *state_name(int s)
     }
 }
 
-static void card_style(lv_obj_t *o, int radius)
-{
-    lv_obj_set_style_bg_color(o, lv_color_hex(COL_CARD_TOP), 0);
-    lv_obj_set_style_bg_grad_color(o, lv_color_hex(COL_CARD_BOT), 0);
-    lv_obj_set_style_bg_grad_dir(o, LV_GRAD_DIR_VER, 0);
-    lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(o, radius, 0);
-    lv_obj_set_style_border_width(o, 1, 0);
-    lv_obj_set_style_border_color(o, lv_color_hex(COL_LINE), 0);
-    lv_obj_set_style_shadow_width(o, 10, 0);
-    lv_obj_set_style_shadow_opa(o, 40, 0);
-    lv_obj_set_style_shadow_color(o, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_shadow_ofs_y(o, 3, 0);
-}
-
 static lv_obj_t *card(lv_obj_t *parent, int x, int y, int w, int h, int radius)
 {
     lv_obj_t *o = lv_obj_create(parent);
     lv_obj_remove_style_all(o);
     lv_obj_set_pos(o, x, y);
     lv_obj_set_size(o, w, h);
+    lv_obj_set_style_radius(o, radius, 0);
+    lv_obj_set_style_bg_color(o, lv_color_hex(COL_CARD), 0);
+    lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(o, 2, 0);
+    lv_obj_set_style_border_color(o, lv_color_hex(COL_LINE), 0);
     lv_obj_set_style_pad_all(o, 0, 0);
-    card_style(o, radius);
     return o;
 }
 
@@ -98,84 +83,52 @@ static lv_obj_t *label(lv_obj_t *parent, int x, int y, const char *text,
     return l;
 }
 
-static lv_obj_t *bar(lv_obj_t *parent, int x, int y, int w, int h, uint32_t color)
-{
-    lv_obj_t *o = lv_obj_create(parent);
-    lv_obj_remove_style_all(o);
-    lv_obj_set_pos(o, x, y);
-    lv_obj_set_size(o, w, h);
-    lv_obj_set_style_radius(o, w / 2, 0);
-    lv_obj_set_style_bg_color(o, lv_color_hex(color), 0);
-    lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
-    return o;
-}
-
 static void build_ui(void)
 {
     lv_obj_t *scr = lv_scr_act();
-    lv_obj_set_style_bg_color(scr, lv_color_hex(COL_BG_TOP), 0);
-    lv_obj_set_style_bg_grad_color(scr, lv_color_hex(COL_BG_BOT), 0);
-    lv_obj_set_style_bg_grad_dir(scr, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_color(scr, lv_color_hex(COL_BG), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* header */
     lv_obj_t *title = label(scr, 14, 10, "CLAWBOT", &lv_font_montserrat_20, COL_FG);
-    lv_obj_set_style_text_letter_space(title, 3, 0);
+    s_bias_lbl = label(scr, 0, 0, "4.0", &lv_font_montserrat_16, COL_DIM);
+    lv_obj_align_to(s_bias_lbl, title, LV_ALIGN_OUT_RIGHT_MID, 0, 0);
+    lv_obj_set_x(s_bias_lbl, 226 - lv_obj_get_width(s_bias_lbl));
+    lv_obj_set_y(s_bias_lbl, 14);
 
-    lv_obj_t *chip = lv_obj_create(scr);
-    lv_obj_remove_style_all(chip);
-    lv_obj_set_pos(chip, 166, 8);
-    lv_obj_set_size(chip, 60, 28);
-    lv_obj_set_style_radius(chip, 14, 0);
-    lv_obj_set_style_bg_color(chip, lv_color_hex(0x1A2233), 0);
-    lv_obj_set_style_bg_opa(chip, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(chip, 1, 0);
-    lv_obj_set_style_border_color(chip, lv_color_hex(COL_LINE), 0);
-    s_bias_lbl = label(chip, 0, 0, "4.0", &lv_font_montserrat_16, COL_TEAL);
-    lv_obj_center(s_bias_lbl);
-
-    /* rule: teal -> blue horizontal gradient */
     lv_obj_t *rule = lv_obj_create(scr);
     lv_obj_remove_style_all(rule);
-    lv_obj_set_pos(rule, 14, 44);
+    lv_obj_set_pos(rule, 14, 42);
     lv_obj_set_size(rule, 212, 2);
     lv_obj_set_style_bg_color(rule, lv_color_hex(COL_TEAL), 0);
     lv_obj_set_style_bg_grad_color(rule, lv_color_hex(0x3B82F6), 0);
     lv_obj_set_style_bg_grad_dir(rule, LV_GRAD_DIR_HOR, 0);
     lv_obj_set_style_bg_opa(rule, LV_OPA_COVER, 0);
 
-    /* hall cards */
     static const char *names[3] = { "I", "M", "R" };
     for (int i = 0; i < 3; i++) {
         int x = 16 + i * 72;
-        s_hall_card[i] = card(scr, x, 54, 64, 74, 16);
+        s_hall_card[i] = card(scr, x, 52, 64, 72, 12);
 
         s_hall_dot[i] = lv_obj_create(scr);
         lv_obj_remove_style_all(s_hall_dot[i]);
-        lv_obj_set_pos(s_hall_dot[i], x + 12, 66);
-        lv_obj_set_size(s_hall_dot[i], 12, 12);
+        lv_obj_set_pos(s_hall_dot[i], x + 12, 64);
+        lv_obj_set_size(s_hall_dot[i], 10, 10);
         lv_obj_set_style_radius(s_hall_dot[i], LV_RADIUS_CIRCLE, 0);
-        lv_obj_set_style_bg_color(s_hall_dot[i], lv_color_hex(0x0F1520), 0);
+        lv_obj_set_style_bg_color(s_hall_dot[i], lv_color_hex(COL_LINE), 0);
         lv_obj_set_style_bg_opa(s_hall_dot[i], LV_OPA_COVER, 0);
-        lv_obj_set_style_border_width(s_hall_dot[i], 2, 0);
-        lv_obj_set_style_border_color(s_hall_dot[i], lv_color_hex(COL_LINE), 0);
 
         lv_obj_t *t = label(scr, 0, 0, names[i], &lv_font_montserrat_28, COL_FG);
-        lv_obj_align_to(t, s_hall_card[i], LV_ALIGN_CENTER, 0, 10);
+        lv_obj_align_to(t, s_hall_card[i], LV_ALIGN_CENTER, 0, 8);
     }
 
-    /* clutch */
-    s_clutch_card = card(scr, 16, 136, 208, 78, 18);
-    s_clutch_bar = bar(scr, 20, 154, 4, 44, COL_TEAL);
-    label(scr, 38, 146, "CLUTCH", &lv_font_montserrat_16, COL_DIM);
-    s_clutch_lbl = label(scr, 38, 168, "ON", &lv_font_montserrat_28, COL_TEAL);
+    s_clutch_card = card(scr, 16, 132, 208, 78, 14);
+    label(scr, 28, 142, "CLUTCH", &lv_font_montserrat_16, COL_DIM);
+    s_clutch_lbl = label(scr, 28, 164, "ON", &lv_font_montserrat_28, COL_TEAL);
 
-    /* state */
-    s_state_card = card(scr, 16, 222, 208, 52, 16);
-    s_state_bar = bar(scr, 20, 234, 4, 30, COL_LINE);
-    label(scr, 38, 228, "STATE", &lv_font_montserrat_16, COL_DIM);
-    s_state_lbl = label(scr, 110, 232, "IDLE", &lv_font_montserrat_24, COL_FG);
+    s_state_card = card(scr, 16, 216, 208, 56, 14);
+    label(scr, 28, 220, "STATE", &lv_font_montserrat_16, COL_DIM);
+    s_state_lbl = label(scr, 28, 238, "IDLE", &lv_font_montserrat_24, COL_FG);
 }
 
 void lcd_status_page(const bool hall[3], bool clutch, int state,
@@ -189,29 +142,21 @@ void lcd_status_page(const bool hall[3], bool clutch, int state,
     if (!lvgl_port_lock(20)) {
         return;
     }
-
     for (int i = 0; i < 3; i++) {
-        lv_obj_set_style_border_color(s_hall_dot[i],
-                                      lv_color_hex(hall[i] ? COL_TEAL : COL_LINE), 0);
         lv_obj_set_style_bg_color(s_hall_dot[i],
-                                  lv_color_hex(hall[i] ? COL_TEAL : 0x0F1520), 0);
-        lv_obj_set_style_shadow_width(s_hall_dot[i], hall[i] ? 12 : 0, 0);
-        lv_obj_set_style_shadow_opa(s_hall_dot[i], 60, 0);
-        lv_obj_set_style_shadow_color(s_hall_dot[i], lv_color_hex(COL_TEAL), 0);
+                                  lv_color_hex(hall[i] ? COL_TEAL : COL_LINE), 0);
         lv_obj_set_style_border_color(s_hall_card[i],
                                       lv_color_hex(hall[i] ? COL_TEAL : COL_LINE), 0);
     }
 
     lv_label_set_text(s_clutch_lbl, clutch ? "ON" : "OFF");
     lv_obj_set_style_text_color(s_clutch_lbl, lv_color_hex(clutch ? COL_TEAL : COL_RED), 0);
-    lv_obj_set_style_bg_color(s_clutch_bar, lv_color_hex(clutch ? COL_TEAL : COL_RED), 0);
     lv_obj_set_style_border_color(s_clutch_card,
                                   lv_color_hex(clutch ? COL_TEAL : COL_LINE), 0);
 
     lv_label_set_text(s_state_lbl, state_name(state));
     uint32_t sc = (state == 2) ? COL_TEAL : (state == 3 ? COL_AMBER : COL_FG);
     lv_obj_set_style_text_color(s_state_lbl, lv_color_hex(sc), 0);
-    lv_obj_set_style_bg_color(s_state_bar, lv_color_hex(sc), 0);
     lv_obj_set_style_border_color(s_state_card,
                                   lv_color_hex((state == 2 || state == 3) ? sc : COL_LINE), 0);
 

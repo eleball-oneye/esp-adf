@@ -296,8 +296,9 @@ menu "oneye 甲型网关（上云 / BLE 配网）"
         help
             置 y：开机起栈但不广播，长按 BOOT 才进入配网模式。
             本工程缺省 n（开机即广播，App 上电就能发现设备）。
-            ⚠️ 无论 gate 取值，**长按 BOOT ≥3 s 永远是"忘记 WiFi + 重启"**（见 main.c 的
-            key_gate_task：link-sdk 没有 stop/deinit ⇒ 重新配网只能走清 NVS + esp_restart()）。
+            ⚠️ 无论 gate 取值，**长按 BOOT ≥3 s = 重启进入 BLE 配网广播（保留 WiFi 凭据）**
+            （见 main.c 的 prov_boot_request_set / gw_wifi_prov_boot：link-sdk 没有 stop/deinit
+             ⇒ 运行期无法原地退回 peripheral，只能重启到配网启动模式）。
 
     config ONEYE_FW_BLE_PROV_PAIRING_WINDOW_S
         int "BLE 配网模式超时（秒；进入后无成功入网则自动退出广播）"

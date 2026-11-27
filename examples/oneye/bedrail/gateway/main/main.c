@@ -103,6 +103,7 @@ static esp_err_t boot_nvs_init(void)
 #include "wifi_prov.h"          /* Wi-Fi 生命周期 + 入网后**唯一收敛点** */
 #include "wifi_prov_ble.h"      /* BLE 配网通道；配网后 deinit 整栈 */
 #include "board_key.h"          /* Korvo-2(DU1906) 板载 ADC 按键（任意键长按 ≥3 s = 重新配网）；C6-GEEK 走 BOOT(GPIO9) */
+#include "prov_boot.h"          /* 长按 → 请求下次启动进入 BLE 配网广播（RTC 保留标志） */
 #include "board_lcd.h"          /* C6-GEEK 板载 ST7789 简易 GUI（温度 + WiFi 图标），⛔ 不引 LVGL */
 #include "gw_child.h"           /* 子设备绑定（child.pair/unpair）+ sub.* 事件上报 */
 
@@ -998,6 +999,14 @@ static void cloud_start_task(void *arg)
                 ev_cfg.track_enabled = false;
                 ev_cfg.queue_bytes = 4u * 1024u;
                 ev_cfg.offline_bytes = 4u * 1024u;
+                /* 2026-11-04〔C6 共存降载 · 恢复〕子设备 2 s 一轮产 4 条 sub.telemetry；
+                 * 200 ms 窗口 ⇒ 每轮 4 次 QoS1/TLS 写，真机实测每 ~55 s 就撞一次
+                 * `flush 发送失败 rc=-4（超时 5000 ms）` ⇒ 链路 DOWN。
+                 * 1.5 s 窗口把同一轮合成 1 帧，TLS 写次数降到约 1/4。
+                 * ⚠️ 之前的“证书混入 event/up”已定位为 T31 云端档重复注册/free
+                 *   （profile 悬垂），不是批量窗口；该根因已在 gw_child.c 用
+                 *   `t31_builtin_only` 修掉，且有 SDK 层 event/up 信封哨兵兜底。 */
+                ev_cfg.batch_window_ms = 1500;
                 ev_cfg.event_cb = on_dev_event;
                 ev_cfg.user_ctx = NULL;
 
@@ -1035,6 +1044,8 @@ static void cloud_start_task(void *arg)
  * ============================================================================ */
 static TaskHandle_t s_ready_task;
 static bool s_cloud_started;
+/* 本次启动是否处于「按键请求的 BLE 配网广播模式」：成功入网后清掉，供 10 min 兜底任务判断。 */
+static volatile bool s_prov_boot_mode;
 
 /* `s_ble_fresh_prov` 的**定义**在 cloud_start_task 之前（那里要用它打"上云路径"日志）；
  * 这里是它的**写入点**说明，⛔ 不要在此重复定义。 */
@@ -1190,6 +1201,8 @@ static void ready_worker_start(void)
 /* 收敛点本体：**运行在 sys_evt** ⇒ 只许常数级动作 */
 static void on_wifi_ready(void)
 {
+    /* 已入网 ⇒ 退出“按键请求的配网广播模式”，10 min 兜底任务不再重启。 */
+    s_prov_boot_mode = false;
     if (!s_cloud_started && wifi_ready_is_ble_fresh()) {
         /* ★ 宽限窗：⛔ 不停广播 —— App 收到 prov.status{connected} 后要**再连一次设备**
          *   发绑定请求；此刻停广播它就找不到设备（用户 2026-10-23 逐字裁定）。
@@ -1227,12 +1240,74 @@ static void on_wifi_disconnected(void)
  *    这个符号在本工程根本不存在 ⇒ C3 凭据文件那一段编不进来（不是"忘了打开"）。
  * ⛔ 本函数**不做任何"入网后"动作**：那些全在 on_wifi_ready() 的收敛点下游。
  * ============================================================================ */
+/* ============================================================================
+ * 11b. 按键请求的「下次启动进入 BLE 配网广播」
+ *
+ * 为什么不能即时起广播：配网完成后 NimBLE 已被 `wifi_prov_ble_deinit_after_provisioned()`
+ * 交给 link-sdk 做中心（连接 T31）；link-sdk 没有 stop/deinit ⇒ 只能重启到配网启动模式。
+ * 🔴 2026-11-04 实测：`RTC_DATA_ATTR` 在 C6 的 `esp_restart()` 后**没有可靠保留**（长按重启
+ *    直接连回 WiFi）⇒ 改用 **NVS 一次性键**（复位/断电都不丢；读完即擦）。
+ * ============================================================================ */
+#define GW_PROV_NVS_NS  "oneye_prov"
+#define GW_PROV_NVS_KEY "boot_adv"
+
+void prov_boot_request_set(void)
+{
+    nvs_handle_t h;
+    esp_err_t rc = nvs_open(GW_PROV_NVS_NS, NVS_READWRITE, &h);
+    if (rc == ESP_OK) {
+        rc = nvs_set_u8(h, GW_PROV_NVS_KEY, 1u);
+        if (rc == ESP_OK) {
+            rc = nvs_commit(h);
+        }
+        nvs_close(h);
+    }
+    ESP_LOGW(TAG, "已置位：下次启动进入 BLE 配网广播（NVS %s/%s，rc=%d；⛔ 不擦 WiFi 凭据）",
+             GW_PROV_NVS_NS, GW_PROV_NVS_KEY, (int)rc);
+}
+
+bool prov_boot_request_take(void)
+{
+    nvs_handle_t h;
+    uint8_t v = 0u;
+    bool valid = false;
+
+    if (nvs_open(GW_PROV_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        if (nvs_get_u8(h, GW_PROV_NVS_KEY, &v) == ESP_OK && v == 1u) {
+            valid = true;
+        }
+        (void)nvs_erase_key(h, GW_PROV_NVS_KEY);
+        (void)nvs_commit(h);
+        nvs_close(h);
+    }
+    return valid;
+}
+
+/* 配网广播模式兜底：10 min 内没入网 ⇒ 重启回正常 WiFi（否则设备一直不上云）。 */
+static void prov_boot_fallback_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(10u * 60u * 1000u));
+    if (s_prov_boot_mode) {
+        ESP_LOGW(TAG, "配网广播 10 min 未完成入网 ⇒ 重启回正常 WiFi");
+        esp_restart();
+    }
+    vTaskDelete(NULL);
+}
+
 static void gw_wifi_prov_boot(void)
 {
     char ssid[WIFI_PROV_SSID_MAX] = { 0 };
     char pass[WIFI_PROV_PASS_MAX] = { 0 };
+    const bool force_prov = prov_boot_request_take();
 
-    if (wifi_prov_load_nvs(ssid, sizeof(ssid), pass, sizeof(pass)) == ESP_OK && ssid[0] != '\0') {
+    ESP_LOGI(TAG, "[prov-boot] force_prov=%d（NVS 一次性键 %s/%s；0=正常 WiFi，1=按键要求广播）",
+             (int)force_prov, GW_PROV_NVS_NS, GW_PROV_NVS_KEY);
+    if (force_prov) {
+        ESP_LOGW(TAG, "按键请求生效：**本次跳过 NVS WiFi 连接，直接进入 BLE 配网广播**"
+                      "（WiFi 凭据保留；10 min 未入网则自动重启回正常 WiFi）");
+    } else if (wifi_prov_load_nvs(ssid, sizeof(ssid), pass, sizeof(pass)) == ESP_OK &&
+               ssid[0] != '\0') {
         if (wifi_prov_submit_credentials(ssid, pass, WIFI_PROV_CHAN_NVS) == ESP_OK) {
             ESP_LOGI(TAG, "NVS 记忆的 Wi-Fi 入网成功（ssid=%s）⇒ **本次不进 BLE 配网广播**；"
                           "上云链路由收敛点下游自动启动", ssid);
@@ -1245,13 +1320,33 @@ static void gw_wifi_prov_boot(void)
 #if CONFIG_ONEYE_FW_ENABLE_BLE_PROV
     wifi_prov_ble_set_autostart(true);    /* 开机即广播（本工程缺省不按键门控） */
     if (wifi_prov_ble_start() == ESP_OK) {
+        /* 只要本次靠 BLE 配网广播启动（按键请求 或 NVS 无可用 WiFi），就进入“配网模式”：
+         * ① Wi-Fi 自愈看门狗不得在 180 s 时重启（会打断 300 s 配网窗口）；
+         * ② 10 min 兜底重启，避免设备永久停在广播态。 */
+        s_prov_boot_mode = true;
+        if (xTaskCreate(prov_boot_fallback_task, "gw_prov_fb", 3072, NULL, 3, NULL) != pdPASS) {
+            ESP_LOGW(TAG, "配网广播兜底任务创建失败（内存不足）⇒ 需手动复位退出配网模式");
+        }
+        if (force_prov) {
+            ESP_LOGW(TAG, "★ 长按触发的 BLE 配网广播已开启：App 现在可扫描 **ONEYE-<后缀>**"
+                          "（窗口 %d s；成功入网或 10 min 超时后退出）",
+                     (int)CONFIG_ONEYE_FW_BLE_PROV_PAIRING_WINDOW_S);
+        } else {
+            ESP_LOGW(TAG, "无可用 NVS WiFi ⇒ 已进入 BLE 配网广播（窗口 %d s；10 min 未入网自动重启）",
+                     (int)CONFIG_ONEYE_FW_BLE_PROV_PAIRING_WINDOW_S);
+        }
         ESP_LOGW(TAG, "下一步：手机 App 扫描并连接 **ONEYE-<广播名后缀>**，"
                       "配对凭据 = **一次性 chal**（⛔ 配对阶段不判 code）；"
                       "本机档位 甲 ALPHA ⇒ prov.verify.req **必经**（与 creds.node_id 逐字比对）");
-        ESP_LOGW(TAG, "长按 BOOT(GPIO0) ≥ %u ms = **忘记 WiFi + 重启**（重新配网的唯一路径）",
+        ESP_LOGW(TAG, "长按 BOOT ≥ %u ms = **重启进入 BLE 配网广播**（保留 WiFi 凭据）",
                  (unsigned)GW_KEY_HOLD_MS);
         res_report("ble-ready（NimBLE 已起栈；入网前）");
         return;
+    }
+    if (force_prov) {
+        ESP_LOGE(TAG, "按键请求的 BLE 配网广播启动失败 ⇒ 重启回正常 WiFi");
+        vTaskDelay(pdMS_TO_TICKS(500));
+        esp_restart();
     }
     ESP_LOGE(TAG, "BLE 配网通道启动失败 ⇒ 本次启动不会上云（本机型没有第二条配网通道）");
 #else
@@ -1261,12 +1356,12 @@ static void gw_wifi_prov_boot(void)
 }
 
 /* ============================================================================
- * 12. 按键：**长按 BOOT ≥3 s = 忘记 WiFi + esp_restart()**
+ * 12. 按键：**长按 BOOT ≥3 s = 重启进入 BLE 配网广播（保留 WiFi 凭据）**
  *
  * 为什么是"重启"而不是"就地重新配网"（本工程的硬约束）：
  *   `oneye-link-sdk` **没有 stop/deinit** ⇒ 一旦 NimBLE 被它接管作中心，就无法在运行期
- *   退回 peripheral 重新配网。⇒ 重新配网 = 清 NVS Wi-Fi 凭据 + `esp_restart()`，
- *   下次上电走完整启动序列（NVS 无凭据 ⇒ 进 BLE 广播）。⛔ 不新增 SDK API。
+ *   退回 peripheral 重新配网。⇒ 重新配网 = 置 RTC 请求标志 + `esp_restart()`；
+ *   下次启动 `gw_wifi_prov_boot()` 跳过 NVS WiFi、直接起 BLE 广播。⛔ 不新增 SDK API。
  * ⚠️ 短按（< 3 s）无副作用；RESET = 硬件复位。
  * ============================================================================ */
 /* ⚠️ 2026-10-25 C6 换板后清理：本段（`key_gate_*`，监听 **GPIO0**）是 S3/Korvo-2 时代的实现，
@@ -1600,6 +1695,12 @@ static void wifi_heal_task(void *arg)
 
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(5000));
+        /* 按键请求的配网广播模式下没有 WiFi 是预期状态：⛔ 不要触发 Wi-Fi 自愈重启，
+         * 否则 180 s 就会把 300 s 的配网窗口打断。 */
+        if (s_prov_boot_mode) {
+            down_s = 0;
+            continue;
+        }
         wifi_ap_record_t ap;
         if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
             if (down_s >= 60) {

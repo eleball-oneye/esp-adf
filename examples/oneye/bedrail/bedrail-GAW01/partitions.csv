@@ -1,0 +1,29 @@
+# =============================================================================
+# thermometer-t31 分区表（双角色：网关 / 温感子设备模拟器）
+#
+# 🔴 硬约束：`creds` 必须留在 0x510000（与 korvo2_oneye 完全同布局）
+#   板上已按该偏移烧好甲型 per-device 凭据（creds 分区 16 KiB）。
+#   挪动该分区 = 把真机身份弄丢（固件按"名字+类型"找分区，但烧写/产线直写按偏移）。
+#
+# 布局（与 examples/oneye/korvo2_oneye/partitions.csv 逐行一致，便于两工程互烧）：
+#   nvs      24 KB   phy_init 4 KB   factory 4 MB   model 1 MB
+#   creds    16 KB @0x510000          storage 1 MB @0x514000
+#
+# 为什么要自定义分区表（⛔ 不是照抄）：
+#   ① IDF 缺省 factory 只有 1 MB，本固件的 app 镜像（BLE 中心 + oneye-dev-sdk
+#      六库 + Wi-Fi 配网 + 本地面）会超过它；
+#   ② 必须有一个 **creds** 分区（甲型凭据分区契约，偏移不可变）；
+#   ③ `model` 分区本工程**不用**（无 esp-sr），但保留它才能把 `creds` 固定在
+#      0x510000 —— 空分区不占 flash（未烧写即空白），删掉它反而会让后面的
+#      分区整体前移，破坏 ①/② 两条约束。
+#
+# 注意：改 factory/model/storage/creds 任一偏移 ⇒ 必须同步 tools/provision-device.ps1
+#      的烧写偏移（该脚本会读本文件核对，不一致直接退出码 2 拒绝动作）。
+# =============================================================================
+# Name,   Type, SubType, Offset,  Size, Flags
+nvs,      data, nvs,     0x9000,  0x6000,
+phy_init, data, phy,     0xf000,  0x1000,
+factory,  app,  factory, 0x10000, 4M,
+model,    data, spiffs,  0x410000, 1M,
+creds,    data, 0x40,    0x510000, 16K,
+storage,  data, spiffs,  0x514000, 1M,

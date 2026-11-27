@@ -28,3 +28,10 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # ---- 板载 LCD（ST7789 1.14" 240x135）：简易 GUI ----
 CONFIG_ONEYE_T31_LCD_ENABLE=y
 CONFIG_ONEYE_T31_LCD_ROT=0
+
+# ---- 2026-11-04: task hang 自愈（真机出现上线后无日志/无云，直到人工断电） ----
+CONFIG_ESP_TASK_WDT_PANIC=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+
+# 2026-11-04: 子设备遥测 2 s→5 s，降低 event/up QoS1 写次数，避免 txq 满后饿死 status/up
+CONFIG_ONEYE_T31_GW_SUB_TELE_MIN_MS=5000

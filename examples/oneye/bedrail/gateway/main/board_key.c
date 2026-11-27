@@ -1,5 +1,5 @@
 /*
- * board_key.c —— 板载按键：**长按 ≥3 s = 忘记 WiFi + 重启（重新进入 BLE 配网流程）**
+ * board_key.c —— 板载按键：**长按 ≥3 s = 重启进入 BLE 配网广播（保留 WiFi 凭据）**
  *
  * 用户口径（逐字留痕，⛔ 不删）：
  *   「需要板子上有按键触发进入配网广播流程」「korvo2 的板子有 RESET 和 SET 键可用」
@@ -25,7 +25,8 @@
  *
  * 口径（两块板一致，刻意最简，⛔ 不引入 esp-adf 的 audio_board / input_key_service 依赖）：
  *   · 只判「有没有键被按下」；
- *   · 长按 ≥ `BOARD_KEY_LONG_PRESS_MS`（3 s）→ `wifi_prov_forget_wifi()` + `esp_restart()`；
+ *   · 长按 ≥ `BOARD_KEY_LONG_PRESS_MS`（3 s）→ `prov_boot_request_set()` + `esp_restart()`
+ *     （下次启动跳过 NVS WiFi、直接开 BLE 配网广播；⛔ 不擦 WiFi 凭据）；
  *   · 短按不做事；按住期间每 500 ms 打一行日志（便于换板/换电阻梯时校准阈值）。
  *   ⚠️ 本文件只服务「台面联调」；量产按键语义（哪个键做什么）不在本批范围。
  */
@@ -42,6 +43,7 @@
 
 #include "wifi_prov.h"
 #include "board_key.h"
+#include "prov_boot.h"
 
 static const char *TAG = "boardkey";
 
@@ -94,12 +96,10 @@ static void board_key_task(void *arg)
                          (long long)((now_us - press_start_us) / 1000), BOARD_KEY_LONG_PRESS_MS);
             }
             if ((now_us - press_start_us) / 1000 >= BOARD_KEY_LONG_PRESS_MS) {
-                ESP_LOGW(TAG, "★ 长按 ≥ %d ms ⇒ 忘记 WiFi 并重启（下次启动进入 BLE 配网广播）",
+                ESP_LOGW(TAG, "★ 长按 ≥ %d ms ⇒ 重启进入 BLE 配网广播（保留 WiFi 凭据）",
                          BOARD_KEY_LONG_PRESS_MS);
-                esp_err_t rc = wifi_prov_forget_wifi("board-key-long-press");
-                ESP_LOGW(TAG, "wifi_prov_forget_wifi rc=%d(%s) ⇒ 1 s 后重启",
-                         (int)rc, esp_err_to_name(rc));
-                vTaskDelay(pdMS_TO_TICKS(1000));
+                prov_boot_request_set();
+                vTaskDelay(pdMS_TO_TICKS(500));
                 esp_restart();
             }
         }
@@ -122,8 +122,8 @@ esp_err_t board_key_start(void)
                  (int)rc, esp_err_to_name(rc));
         return rc;
     }
-    ESP_LOGI(TAG, "板载 BOOT 按键已启动：GPIO%d（低有效），采样 %d ms，长按 %d ms = 忘记 WiFi + 重启"
-                  "（重新进入 BLE 配网流程）；当前 level=%d",
+    ESP_LOGI(TAG, "板载 BOOT 按键已启动：GPIO%d（低有效），采样 %d ms，长按 %d ms = 重启进入 BLE 配网广播"
+                  "（保留 WiFi 凭据）；当前 level=%d",
              (int)BOARD_KEY_GPIO, BOARD_KEY_SAMPLE_MS, BOARD_KEY_LONG_PRESS_MS,
              gpio_get_level(BOARD_KEY_GPIO));
     if (xTaskCreate(board_key_task, "board_key", 3072, NULL, 3, &s_task) != pdPASS) {
@@ -225,12 +225,10 @@ static void board_key_task(void *arg)
                              BOARD_KEY_LONG_PRESS_MS);
                 }
                 if ((now_us - press_start_us) / 1000 >= BOARD_KEY_LONG_PRESS_MS) {
-                    ESP_LOGW(TAG, "★ 长按 ≥ %d ms ⇒ 忘记 WiFi 并重启（重新进入配网广播）",
+                    ESP_LOGW(TAG, "★ 长按 ≥ %d ms ⇒ 重启进入 BLE 配网广播（保留 WiFi 凭据）",
                              BOARD_KEY_LONG_PRESS_MS);
-                    esp_err_t rc = wifi_prov_forget_wifi("board-key-long-press");
-                    ESP_LOGW(TAG, "wifi_prov_forget_wifi rc=%d(%s) ⇒ 1 s 后重启",
-                             (int)rc, esp_err_to_name(rc));
-                    vTaskDelay(pdMS_TO_TICKS(1000));
+                    prov_boot_request_set();
+                    vTaskDelay(pdMS_TO_TICKS(500));
                     esp_restart();
                 }
             }

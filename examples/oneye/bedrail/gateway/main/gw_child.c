@@ -37,6 +37,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -154,6 +155,10 @@ typedef struct {
     uint8_t battery_tlv[GW_EXTRA_TLV_CAP];
     uint8_t battery_tlv_len;
     int64_t battery_tlv_ms;
+    /* 2026-11-04〔子设备云端在线〕最近一次 BLE 在线状态（不落 NVS：重启后由 link 事件/首帧重建）。
+     * 为什么需要它：`sub.online` 是一次性边沿事件；若它恰好落在云断/事件队列清理窗口里，
+     * 云端就永久认为子设备离线（现场：网关与子设备都连得好，子设备 last_online 一直不动）。 */
+    bool    online;
 } gw_child_bind_t;
 
 /* 队列里的一条子设备事件（回调内定长拷贝，⛔ 不含任何外部指针） */
@@ -246,6 +251,9 @@ static uint32_t s_sub_q_dropped;     /* 事件队列满而丢弃的帧（2026-10
  *               ② 在**普通任务上下文**里清空 SDK 事件队列（不在 SDK 回调里调 SDK，避免重入）。 */
 static volatile bool s_cloud_up = true;
 static volatile bool s_purge_req;
+/* 2026-11-04：云恢复后**重报一次**所有仍在线子设备的 `sub.online`。
+ * 只在任务上下文执行（emit_event 调 SDK，⛔ 不在 SDK 回调里调）。 */
+static volatile bool s_online_reassert_req;
 static uint32_t s_cloud_dropped;
 
 /* ---------------------------------------------------------------- 小工具 */
@@ -649,6 +657,9 @@ void gw_child_on_cloud_state(bool up)
     s_cloud_up = up;
     if (up) {
         s_last_tele_ms = 0;   /* 恢复后立刻补报一帧，不用等满节流窗口 */
+        /* 2026-11-04：`sub.online` 是一次性边沿事件；云断/清队列窗口里丢掉就再也不会重发。
+         * 云恢复时申请一次“在线子设备重报”，由 gw_child_task 在普通上下文里执行。 */
+        s_online_reassert_req = true;
         /* 2026-10-26〔子设备发现〕云恢复 ⇒ 尽快开一个发现窗口并补报一次，
          * 否则链路闪断期间的窗口被丢弃，candidates 会在 App 里"过期"。 */
         s_disc_last_report_ms = 0;
@@ -751,6 +762,20 @@ static bool emit_event(const char *type, const char *data_json)
     }
     /* 失败即真的没发出去（未在线且缓存关/队列满/参数非法）—— ⛔ 不假装已上报、⛔ 不重试
      * （条目已在任务里出队；重试会形成"失败→回队→再失败"死循环）。 */
+    if (rc == ONEYE_DEV_SDK_ERR_STATE) {
+        /* 🔴 2026-11-04：event 库 `s_ev.inited` 被清掉时，SDK 对每帧都返回 STATE。
+         *   真机表现 = 网关 C 亮、子设备永久离线（sub.* 全部丢弃）。
+         *   连续 30 帧（约 60 s）仍 STATE ⇒ 重启恢复；这是止血，根因仍待查内存覆盖。 */
+        static uint32_t s_ev_state_fail;
+
+        s_ev_state_fail++;
+        if (s_ev_state_fail >= 30u) {
+            ESP_LOGE(TAG, "★ event 库连续 %u 帧 STATE（s_ev.inited 失效）⇒ 重启恢复"
+                          "（子设备事件无法上行）", (unsigned)s_ev_state_fail);
+            vTaskDelay(pdMS_TO_TICKS(500));
+            esp_restart();
+        }
+    }
     if (used_ms > 300) {
         ESP_LOGW(TAG, "event/up %s 失败：%s（rc=%d，耗时 %lld ms ⇒ 上报路径慢，检查 base/MQTT）",
                  type, oneye_dev_sdk_strerror(rc), (int)rc, (long long)used_ms);
@@ -1241,12 +1266,16 @@ static void handle_sub(const gw_sub_evt_t *e)
 
     switch (e->kind) {
     case GW_SUB_KIND_ONLINE:
-        (void)snprintf(data, sizeof(data), "{\"node\":\"%s\",\"model\":\"%s\",\"rssi\":%d}",
-                       s_binds[idx].node, s_binds[idx].model, (int)e->rssi);
-        (void)emit_event(GW_EVT_SUB_ONLINE, data);
+        if (!s_binds[idx].online) {
+            s_binds[idx].online = true;
+            (void)snprintf(data, sizeof(data), "{\"node\":\"%s\",\"model\":\"%s\",\"rssi\":%d}",
+                           s_binds[idx].node, s_binds[idx].model, (int)e->rssi);
+            (void)emit_event(GW_EVT_SUB_ONLINE, data);
+        }
         break;
 
     case GW_SUB_KIND_OFFLINE:
+        s_binds[idx].online = false;
         (void)snprintf(data, sizeof(data), "{\"node\":\"%s\",\"model\":\"%s\"}",
                        s_binds[idx].node, s_binds[idx].model);
         (void)emit_event(GW_EVT_SUB_OFFLINE, data);
@@ -1260,6 +1289,15 @@ static void handle_sub(const gw_sub_evt_t *e)
 
     case GW_SUB_KIND_TELEMETRY: {
         const int64_t now = now_ms();
+
+        /* 2026-11-04：收到子设备帧本身就是"在线"的最硬证据。
+         * 若 online 边沿事件在云断窗口里丢了，这里补一次 `sub.online`（只补一次）。 */
+        if (!s_binds[idx].online) {
+            s_binds[idx].online = true;
+            (void)snprintf(data, sizeof(data), "{\"node\":\"%s\",\"model\":\"%s\",\"rssi\":%d}",
+                           s_binds[idx].node, s_binds[idx].model, (int)e->rssi);
+            (void)emit_event(GW_EVT_SUB_ONLINE, data);
+        }
 
         /* 2026-11-02〔降载〕温度帧 0x01 本身会并入本周期 0x03 的通用 TLV（hall/gnss）；
          *   ⇒ 同一周期内**不再单独发 0x03**，否则 2 帧/2 s 会把 event 面/发送槽打满。
@@ -1835,6 +1873,11 @@ static void do_pair(const gw_cmd_t *c)
     oneye_link_err_t prc;
     const char *missing = NULL;
     bool use_builtin = false;
+    /* 🔴 2026-11-04：T31 固定用本工程内置 SIM 档。云端 linkProfile 注册后马上会被
+     *   `register_builtin_t31()` 覆盖，既多一次 6448 B 连续块分配（真机 largest=6400
+     *   时直接 NO_MEM），又会 free 掉刚注册的云端档，留下 `档案 <garbage> 未匹配` 的
+     *   悬垂档（随后 sub 帧全丢、网关掉线）。⇒ T31 只走内置档，不再注册云端档。 */
+    const bool t31_builtin_only = (strcmp(c->model, "T31") == 0);
 
     if (c->node[0] == '\0') {
         ack_command(c->id, "missing node");
@@ -1851,8 +1894,9 @@ static void do_pair(const gw_cmd_t *c)
         return;
     }
 
-    /* 档案先**校验**（不注册）：JSON 不合法就别动 NVS，避免留下"重启后注册失败"的坏档 */
-    if (c->has_profile) {
+    /* 档案先**校验**（不注册）：JSON 不合法就别动 NVS，避免留下"重启后注册失败"的坏档。
+     * T31 固定内置档，云端档只做“有/无”记录，不参与校验/注册（省 6448 B 连续块）。 */
+    if (c->has_profile && !t31_builtin_only) {
         errbuf[0] = '\0';
         prc = oneye_link_profile_validate(c->profile, c->profile_len, errbuf, sizeof(errbuf));
         if (prc != ONEYE_LINK_OK) {
@@ -1914,7 +1958,7 @@ static void do_pair(const gw_cmd_t *c)
 
     /* NVS 里的档案：只存**通过完整性校验**的那一份；回退时存内置 T31（自愈 —— 重启后
      * restore 读到的就是合法档，不再每次开机都撞一次坏档）。 */
-    if (c->has_profile && !use_builtin) {
+    if (c->has_profile && !use_builtin && !t31_builtin_only) {
         if (nvs_store_profile((size_t)idx, c->profile) != ESP_OK) {
             ESP_LOGE(TAG, "linkProfile 写 NVS 失败 ⇒ 撤销本次配对（node=%s）", c->node);
             (void)nvs_erase_bind((size_t)idx);
@@ -1923,7 +1967,7 @@ static void do_pair(const gw_cmd_t *c)
             ack_command(c->id, "nvs write failed");
             return;
         }
-    } else if (use_builtin) {
+    } else if (use_builtin || t31_builtin_only) {
         const char *bi = oneye_link_profile_builtin_t31();
         if (bi == NULL || nvs_store_profile((size_t)idx, bi) != ESP_OK) {
             ESP_LOGW(TAG, "内置 T31 档案写 NVS 失败 ⇒ 重启后靠启动期注册的内置档运行（node=%s）",
@@ -1935,7 +1979,7 @@ static void do_pair(const gw_cmd_t *c)
     }
 
     /* ② 再注册档案（link-sdk 的**运行时**档案表；重启后由 gw_child_restore_profiles 恢复） */
-    if (c->has_profile && !use_builtin) {
+    if (c->has_profile && !use_builtin && !t31_builtin_only) {
         prc = oneye_link_profile_register_json(c->profile, c->profile_len);
         if (prc != ONEYE_LINK_OK) {
             ESP_LOGE(TAG, "档案注册失败（%d）⇒ 撤销本次配对（node=%s）", (int)prc, c->node);
@@ -1959,6 +2003,8 @@ static void do_pair(const gw_cmd_t *c)
             ESP_LOGI(TAG, "T31 解码档复位：已重新注册内置完整档（%u B，来源=内置）",
                      (unsigned)rn);
         }
+    } else if (t31_builtin_only) {
+        ESP_LOGI(TAG, "T31 固定内置档 ⇒ 保留启动期已注册档，跳过云端档注册");
     } else {
         size_t bn = register_builtin_t31();
         if (bn == 0) {
@@ -2058,6 +2104,29 @@ static void gw_child_task(void *arg)
             uint32_t purged = oneye_dev_sdk_purge_event_queue();
             ESP_LOGW(TAG, "云断 ⇒ 已清空 SDK 事件队列 %u 帧（把内存让给 TLS 重连）",
                      (unsigned)purged);
+        }
+
+        /* 2026-11-04：云恢复 ⇒ 重报仍在线子设备的 `sub.online`。
+         * 这条是"一次性边沿事件丢失"的兜底：云断/清队列把首报吞掉后，云端不会自己转回在线。 */
+        if (s_online_reassert_req) {
+            s_online_reassert_req = false;
+            size_t i;
+            unsigned n = 0u;
+            for (i = 0; i < GW_CHILD_MAX; i++) {
+                char data[192];
+                if (!s_binds[i].used || !s_binds[i].online) {
+                    continue;
+                }
+                (void)snprintf(data, sizeof(data),
+                               "{\"node\":\"%s\",\"model\":\"%s\",\"rssi\":%d}",
+                               s_binds[i].node, s_binds[i].model, 0);
+                if (emit_event(GW_EVT_SUB_ONLINE, data)) {
+                    n++;
+                }
+            }
+            if (n > 0u) {
+                ESP_LOGI(TAG, "云恢复 ⇒ 已重报 %u 台在线子设备的 sub.online", (unsigned)n);
+            }
         }
 
         /* 2026-10-26〔子设备发现〕发现窗口状态机：开窗（8 s 低占空比扫描）→ 关窗 → 汇总上报。

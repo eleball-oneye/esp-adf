@@ -179,16 +179,15 @@ void esp_hidd_send_mouse_value_ex(uint16_t conn_id, uint8_t mouse_button, int8_t
 
 int esp_hidd_send_mouse_rel(uint16_t conn_id, uint8_t buttons, int16_t dx, int16_t dy, int8_t wheel)
 {
-    uint8_t buf[7] = {
-        HID_RPT_ID_MOUSE_REL,
-        buttons,
-        (uint8_t)(dx & 0xFF), (uint8_t)((dx >> 8) & 0xFF),
-        (uint8_t)(dy & 0xFF), (uint8_t)((dy >> 8) & 0xFF),
-        (uint8_t)wheel,
-    };
+    if (dx > 127) dx = 127;
+    if (dx < -127) dx = -127;
+    if (dy > 127) dy = 127;
+    if (dy < -127) dy = -127;
+    uint8_t buf[4] = { buttons, (uint8_t)(int8_t)dx, (uint8_t)(int8_t)dy, (uint8_t)wheel };
     hid_dev_send_report(hidd_le_env.gatt_if, conn_id,
                         HID_RPT_ID_MOUSE_REL, HID_REPORT_TYPE_INPUT, sizeof(buf), buf);
     return 0;
 }
+
 
 

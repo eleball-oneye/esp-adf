@@ -95,22 +95,18 @@ static int s_report_count;
 static float s_gain = CURSOR_GAIN_DEFAULT;
 static bool s_recenter_on = true;           /* pull cursor to screen center on engage */
 static bool s_recenter_pending = false;
-static bool s_hid_rel = false;
+static bool s_hid_rel = true;
 static int s_last_x = 16383;
 static int s_last_y = 16383;
 
 static void hid_send(uint8_t buttons, uint16_t x, uint16_t y, int8_t wheel)
 {
-    if (s_hid_rel) {
-        int dx = (int)x - s_last_x;
-        int dy = (int)y - s_last_y;
-        s_last_x = x;
-        s_last_y = y;
-        if (dx || dy || wheel || buttons) {
-            esp_hidd_send_mouse_rel(s_hid_conn_id, buttons, (int16_t)dx, (int16_t)dy, wheel);
-        }
-    } else {
-        esp_hidd_send_mouse_abs(s_hid_conn_id, buttons, x, y, wheel);
+    int dx = (int)x - s_last_x;
+    int dy = (int)y - s_last_y;
+    s_last_x = x;
+    s_last_y = y;
+    if (dx || dy || wheel || buttons) {
+        esp_hidd_send_mouse_rel(s_hid_conn_id, buttons, (int16_t)dx, (int16_t)dy, wheel);
     }
 }
 static int s_screen_w = 1920;

@@ -36,8 +36,8 @@
 #define HID_NUM_REPORTS          9
 
 // HID Report IDs for the service
-#define HID_RPT_ID_MOUSE_IN      3   // absolute pointer report id
-#define HID_RPT_ID_MOUSE_REL     4   // relative pointer report id
+#define HID_RPT_ID_MOUSE_IN      0   // boot mouse has no report id
+#define HID_RPT_ID_MOUSE_REL     0   // boot mouse has no report id
 #define HID_RPT_ID_KEY_IN        2   // Keyboard input report ID
 #define HID_RPT_ID_CC_IN         3   //Consumer Control input report ID
 #define HID_RPT_ID_VENDOR_OUT    4   // Vendor output report ID

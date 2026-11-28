@@ -476,6 +476,8 @@ static void clawbot_task(void *arg)
     };
     gpio_config(&boot_cfg);
     bool boot_prev = false;
+    int64_t boot_last_release = 0;
+    bool boot_double = false;
     int64_t boot_since = 0;
 
     printf("clawbot: hall GPIO %d/%d/%d, IMU %s\n",
@@ -534,18 +536,31 @@ static void clawbot_task(void *arg)
             enter_sleep("timeout");
         }
 
-        /* BOOT button: short press toggles the LCD, long press sleeps. */
+        /* BOOT button = momentary left button; double-click toggles the LCD.
+           Single click and long press behave like the index hall (press/hold). */
         bool boot_now = (gpio_get_level(GPIO_NUM_0) == 0);
         if (boot_now && !boot_prev) {
             boot_since = now;
+            s_buttons |= 0x01;
+            if (boot_last_release && (now - boot_last_release) < 350000) {
+                boot_double = true;
+            }
         } else if (!boot_now && boot_prev) {
+            s_buttons &= ~0x01;
             int64_t held_ms = (now - boot_since) / 1000;
-            if (held_ms >= 1500) {
-                enter_sleep("button");
-            } else if (held_ms >= 40) {
+            if (boot_double && held_ms < 600) {
                 lcd_set_power(!lcd_is_on());
                 printf("EVT,lcd,%d\n", lcd_is_on() ? 1 : 0);
+                boot_double = false;
+                boot_last_release = 0;
+            } else {
+                boot_last_release = now;
+                boot_double = false;
             }
+        } else if (boot_double && boot_last_release && (now - boot_last_release) > 400000) {
+            /* second click never came */
+            boot_double = false;
+            boot_last_release = 0;
         }
         boot_prev = boot_now;
 

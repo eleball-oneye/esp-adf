@@ -23,15 +23,11 @@
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
-#include "esp_bt.h"
-#include "esp_bt_main.h"
-#include "esp_gap_ble_api.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "nvs_flash.h"
 
-#include "esp_hidd_prf_api.h"
-#include "hid_dev.h"
+#include "ble_mouse.h"
 #include "lcd.h"
 #include "motion.h"
 #include "qmi8658.h"
@@ -106,7 +102,7 @@ static void hid_send(uint8_t buttons, uint16_t x, uint16_t y, int8_t wheel)
     s_last_x = x;
     s_last_y = y;
     if (dx || dy || wheel || buttons) {
-        esp_hidd_send_mouse_rel(s_hid_conn_id, buttons, (int16_t)dx, (int16_t)dy, wheel);
+        ble_mouse_send(buttons, (int16_t)dx, (int16_t)dy, wheel);
         static unsigned dbg;
         if ((dbg++ % 25) == 0) {
             printf("EVT,hid,tx,%d,%d\n", dx, dy);
@@ -124,9 +120,19 @@ static bool s_auto_sleep = false;  /* dev default: no auto sleep; enable with 's
 /* Runtime switches (serial commands). */
 static bool s_ble_enabled = true;
 static bool s_csv_enabled = true;
+static int s_wheel_pending;
+static void enter_sleep(const char *why)
+{
+    printf("EVT,sleep,%s\n", why);
+    lcd_sleep();
+    ble_mouse_stop_advertising();
+    esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);
+    esp_deep_sleep_start();
+}
+
+#if 0  /* Bluedroid adv data */
 static esp_bd_addr_t s_peer_bda;
 static bool s_peer_valid;
-static int s_wheel_pending;
 
 /* ---------------- BLE HID plumbing ---------------- */
 #define HIDD_DEVICE_NAME "clawbot-mouse"
@@ -161,6 +167,8 @@ static esp_ble_adv_params_t hidd_adv_params = {
     .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
 };
 
+#endif
+
 static void hid_center_cursor(void)
 {
     if (!(s_ble_enabled && s_hid_connected && s_hid_secure)) {
@@ -177,6 +185,7 @@ static void hid_center_cursor(void)
     printf("EVT,recenter,center\n");
 }
 
+#if 0  /* Bluedroid HID implementation replaced by ble_mouse.c (NimBLE) */
 static void ble_start_adv(void)
 {
     if (!s_ble_enabled) {
@@ -192,14 +201,6 @@ static void ble_start_adv(void)
     }
 }
 
-static void enter_sleep(const char *why)
-{
-    printf("EVT,sleep,%s\n", why);
-    lcd_sleep();
-    esp_ble_gap_stop_advertising();
-    esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);
-    esp_deep_sleep_start();
-}
 
 static void hidd_event_callback(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param)
 {
@@ -284,6 +285,39 @@ static void ble_hid_init(void)
     esp_ble_gap_set_security_param(ESP_BLE_SM_MAX_KEY_SIZE, &key_size, sizeof(uint8_t));
     esp_ble_gap_set_security_param(ESP_BLE_SM_SET_INIT_KEY, &init_key, sizeof(uint8_t));
     esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY, &rsp_key, sizeof(uint8_t));
+}
+
+#endif
+
+static void enter_sleep(const char *reason);
+
+static void on_ble_conn(bool connected)
+{
+    s_hid_connected = connected;
+    s_hid_secure = connected;
+    if (connected) {
+        s_adv_since = 0;
+        ESP_LOGI(TAG, "BLE connected");
+        printf("EVT,hid,connect\n");
+    } else {
+        ESP_LOGI(TAG, "BLE disconnected, re-advertising");
+        printf("EVT,hid,disconnect\n");
+    }
+}
+
+static void ble_start_adv(void)
+{
+    ble_mouse_start_advertising();
+}
+
+static void ble_stop_adv(void)
+{
+    ble_mouse_stop_advertising();
+}
+
+static void ble_hid_init(void)
+{
+    ble_mouse_init((ble_mouse_callbacks_t){ .on_connect = on_ble_conn });
 }
 
 /* ---------------- hall ---------------- */
@@ -550,7 +584,7 @@ static void clawbot_task(void *arg)
             }
 
             if (s_ble_enabled && s_hid_connected && s_hid_secure && s_buttons && !s_cursor_x && !s_cursor_y) {
-                esp_hidd_send_mouse_value_ex(s_hid_conn_id, s_buttons, 0, 0, 0);
+                ble_mouse_send(s_buttons, 0, 0, 0);
             }
 
             /* LCD debug page at 10 Hz. */
@@ -610,10 +644,7 @@ static void handle_command(const char *cmd)
         printf("EVT,ble,1\n");
     } else if (!strcmp(cmd, "ble off")) {
         s_ble_enabled = false;
-        esp_ble_gap_stop_advertising();
-        if (s_peer_valid) {
-            esp_ble_gap_disconnect(s_peer_bda);
-        }
+        ble_mouse_stop_advertising();
         printf("EVT,ble,0\n");
     } else if (!strcmp(cmd, "ble status")) {
         printf("EVT,ble,%d,%d\n", s_ble_enabled ? 1 : 0, s_hid_connected ? 1 : 0);
@@ -667,7 +698,7 @@ static void handle_command(const char *cmd)
         if (s_ble_enabled && s_hid_connected && s_hid_secure) {
             s_abs_x += 1500.0f;
             if (s_abs_x > 32767) s_abs_x = 32767;
-            esp_hidd_send_mouse_abs(s_hid_conn_id, 0, (uint16_t)s_abs_x, (uint16_t)s_abs_y, 0);
+            ble_mouse_send(0, 20, 0, 0);
             printf("EVT,hid,test\n");
         } else {
             printf("EVT,hid,not-connected\n");
@@ -741,7 +772,7 @@ static void battery_monitor_task(void *arg)
         int pct = (bat_mv - 3300) * 100 / (4200 - 3300);
         if (pct < 0) pct = 0;
         if (pct > 100) pct = 100;
-        esp_hidd_set_battery_level((uint8_t)pct);
+        ble_mouse_set_battery((uint8_t)pct);
     }
 }
 

@@ -3,9 +3,7 @@ idf_component_register(
          "qmi8658.c"
          "motion.c"
          "lcd.c"
-         "esp_hidd_prf_api.c"
-         "hid_dev.c"
-         "hid_device_le_prf.c"
+         "ble_mouse.c"
     INCLUDE_DIRS "."
     REQUIRES bt nvs_flash esp_timer esp_driver_gpio esp_driver_i2c esp_driver_spi esp_lcd lvgl esp_lvgl_port esp_adc
 )

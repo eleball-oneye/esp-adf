@@ -49,12 +49,12 @@ static const struct ble_gatt_svc_def s_svcs[] = {
         .type = BLE_GATT_SVC_TYPE_PRIMARY,
         .uuid = BLE_UUID16_DECLARE(0x1812),
         .characteristics = (struct ble_gatt_chr_def[]) {
-            { .uuid = BLE_UUID16_DECLARE(0x2A4A), .access_cb = hid_access, .flags = BLE_GATT_CHR_F_READ },
-            { .uuid = BLE_UUID16_DECLARE(0x2A4B), .access_cb = hid_access, .flags = BLE_GATT_CHR_F_READ },
-            { .uuid = BLE_UUID16_DECLARE(0x2A4C), .access_cb = hid_access, .flags = BLE_GATT_CHR_F_WRITE_NO_RSP },
-            { .uuid = BLE_UUID16_DECLARE(0x2A4E), .access_cb = hid_access, .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE },
-            { .uuid = BLE_UUID16_DECLARE(0x2A4D), .access_cb = hid_access, .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY },
-            { .uuid = BLE_UUID16_DECLARE(0x2A33), .access_cb = hid_access, .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY },
+            { .uuid = BLE_UUID16_DECLARE(0x2A4A), .access_cb = hid_access, .arg = (void *)0x2A4A, .flags = BLE_GATT_CHR_F_READ },
+            { .uuid = BLE_UUID16_DECLARE(0x2A4B), .access_cb = hid_access, .arg = (void *)0x2A4B, .flags = BLE_GATT_CHR_F_READ },
+            { .uuid = BLE_UUID16_DECLARE(0x2A4C), .access_cb = hid_access, .arg = (void *)0x2A4C, .flags = BLE_GATT_CHR_F_WRITE_NO_RSP },
+            { .uuid = BLE_UUID16_DECLARE(0x2A4E), .access_cb = hid_access, .arg = (void *)0x2A4E, .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE },
+            { .uuid = BLE_UUID16_DECLARE(0x2A4D), .access_cb = hid_access, .arg = (void *)0x2A4D, .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY },
+            { .uuid = BLE_UUID16_DECLARE(0x2A33), .access_cb = hid_access, .arg = (void *)0x2A33, .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY },
             { 0 }
         }
     },
@@ -81,7 +81,7 @@ static const struct ble_gatt_svc_def s_svcs[] = {
 
 static int hid_access(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
-    switch (ctxt->chr->uuid->u.type == BLE_UUID_TYPE_16 ? ctxt->chr->uuid->u16 : 0) {
+    switch ((uintptr_t)arg) {
     case 0x2A4A:
         return os_mbuf_append(ctxt->om, s_hid_info, sizeof(s_hid_info)) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
     case 0x2A4B:
@@ -107,7 +107,7 @@ static int hid_access(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt 
 
 static int dis_access(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
-    switch (ctxt->chr->uuid->u.type == BLE_UUID_TYPE_16 ? ctxt->chr->uuid->u16 : 0) {
+    switch ((uintptr_t)arg) {
     case 0x2A29: return os_mbuf_append(ctxt->om, s_manufacturer, sizeof(s_manufacturer) - 1) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
     case 0x2A24: return os_mbuf_append(ctxt->om, s_model, sizeof(s_model) - 1) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
     case 0x2A50: return os_mbuf_append(ctxt->om, s_pnp, sizeof(s_pnp)) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
@@ -165,8 +165,7 @@ static void advertise(void)
     fields.name_is_complete = 1;
 
     ble_uuid16_t hid_uuid = BLE_UUID16_INIT(0x1812);
-    ble_uuid16_t *uuids[] = { &hid_uuid };
-    fields.uuids16 = uuids;
+    fields.uuids16 = &hid_uuid;
     fields.num_uuids16 = 1;
     fields.uuids16_is_complete = 1;
 

@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "host/ble_hs.h"
 #include "host/util/util.h"
 #include "nimble/nimble_port.h"
@@ -18,6 +19,7 @@ static uint16_t s_report_handle;
 static uint16_t s_boot_handle;
 static bool s_report_sub;
 static bool s_boot_sub;
+static int64_t s_conn_us;
 static ble_mouse_callbacks_t s_cb;
 
 /* Report ID 1: buttons, dx, dy, wheel (relative). */
@@ -164,6 +166,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status == 0) {
             s_conn = event->connect.conn_handle;
+            s_conn_us = esp_timer_get_time();
             if (s_cb.on_connect) s_cb.on_connect(true);
         } else {
             advertise();
@@ -171,6 +174,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         return 0;
     case BLE_GAP_EVENT_DISCONNECT:
         s_conn = BLE_HS_CONN_HANDLE_NONE;
+        s_conn_us = 0;
         s_report_sub = s_boot_sub = false;
         if (s_cb.on_connect) s_cb.on_connect(false);
         advertise();
@@ -289,6 +293,14 @@ bool ble_mouse_connected(void)
 void ble_mouse_send(uint8_t buttons, int16_t dx, int16_t dy, int8_t wheel)
 {
     if (s_conn == BLE_HS_CONN_HANDLE_NONE) {
+        return;
+    }
+    /* Stale-link watchdog: phone forgot the device while the link stayed up. */
+    if (s_conn_us && !s_report_sub && !s_boot_sub &&
+        (esp_timer_get_time() - s_conn_us) > 10000000LL) {
+        ESP_LOGW(TAG, "no HID subscription, dropping stale link");
+        ble_gap_terminate(s_conn, BLE_ERR_REM_USER_CONN_TERM);
+        s_conn_us = 0;
         return;
     }
     if (dx > 127) dx = 127;

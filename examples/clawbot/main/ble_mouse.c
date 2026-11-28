@@ -261,7 +261,7 @@ void ble_mouse_init(ble_mouse_callbacks_t cb)
     ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_NO_IO;
     ble_hs_cfg.sm_bonding = 1;
     ble_hs_cfg.sm_mitm = 0;
-    ble_hs_cfg.sm_sc = 1;
+    ble_hs_cfg.sm_sc = 0;
 
     ble_svc_gap_init();
     ble_svc_gatt_init();

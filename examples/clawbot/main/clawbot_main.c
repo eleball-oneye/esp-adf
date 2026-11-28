@@ -803,6 +803,20 @@ static void battery_monitor_task(void *arg)
 
 void app_main(void)
 {
+    /* Battery power latch (schematic: Key2 -> SS8050 -> SYS_EN).
+       Drive the hold GPIO high immediately so the board stays powered
+       after the PWR button is released. */
+    gpio_config_t pwr = {
+        .pin_bit_mask = 1ULL << 40,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&pwr);
+    gpio_set_level(40, 1);
+    printf("EVT,pwr,latch\n");
+
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());

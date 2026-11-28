@@ -657,6 +657,9 @@ static void handle_command(const char *cmd)
         } else {
             printf("EVT,screen,invalid\n");
         }
+    } else if (!strncmp(cmd, "hid mode", 8)) {
+        s_hid_rel = strstr(cmd, "rel") != NULL;
+        printf("EVT,hid,mode,%s\n", s_hid_rel ? "rel" : "abs");
     } else if (!strcmp(cmd, "hid test")) {
         if (s_ble_enabled && s_hid_connected && s_hid_secure) {
             s_abs_x += 1500.0f;

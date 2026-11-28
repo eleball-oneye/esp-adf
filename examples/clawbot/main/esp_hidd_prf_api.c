@@ -180,7 +180,7 @@ void esp_hidd_send_mouse_value_ex(uint16_t conn_id, uint8_t mouse_button, int8_t
 int esp_hidd_send_mouse_rel(uint16_t conn_id, uint8_t buttons, int16_t dx, int16_t dy, int8_t wheel)
 {
     uint8_t buf[7] = {
-        2,
+        HID_RPT_ID_MOUSE_REL,
         buttons,
         (uint8_t)(dx & 0xFF), (uint8_t)((dx >> 8) & 0xFF),
         (uint8_t)(dy & 0xFF), (uint8_t)((dy >> 8) & 0xFF),

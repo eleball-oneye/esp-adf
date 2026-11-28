@@ -9,6 +9,8 @@ extern "C" {
 
 typedef struct {
     void (*on_connect)(bool connected);
+    /* gain: IMU gain x10 (e.g. 200 = 20.0), action: 0=back 1=longpress 2=none */
+    void (*on_config)(uint16_t gain_x10, uint8_t action);
 } ble_mouse_callbacks_t;
 
 void ble_mouse_init(ble_mouse_callbacks_t cb);

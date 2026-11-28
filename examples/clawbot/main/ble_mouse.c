@@ -43,6 +43,7 @@ static uint8_t s_boot[3] = { 0, 0, 0 };
 
 static int hid_access(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt *ctxt, void *arg);
 static int dis_access(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt *ctxt, void *arg);
+static int cfg_access(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt *ctxt, void *arg);
 
 static const struct ble_gatt_svc_def s_svcs[] = {
     {
@@ -55,6 +56,16 @@ static const struct ble_gatt_svc_def s_svcs[] = {
             { .uuid = BLE_UUID16_DECLARE(0x2A4E), .access_cb = hid_access, .arg = (void *)0x2A4E, .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE },
             { .uuid = BLE_UUID16_DECLARE(0x2A4D), .access_cb = hid_access, .arg = (void *)0x2A4D, .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY },
             { .uuid = BLE_UUID16_DECLARE(0x2A33), .access_cb = hid_access, .arg = (void *)0x2A33, .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY },
+            { 0 }
+        }
+    },
+    {
+        /* vendor config: write [0x01, gain_lo, gain_hi] or [0x02, action] */
+        .type = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid = BLE_UUID16_DECLARE(0xFFF0),
+        .characteristics = (struct ble_gatt_chr_def[]) {
+            { .uuid = BLE_UUID16_DECLARE(0xFFF1), .access_cb = cfg_access, .arg = (void *)0xFFF1,
+              .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP },
             { 0 }
         }
     },
@@ -123,6 +134,26 @@ static void on_gatt_register(struct ble_gatt_register_ctxt *ctxt, void *arg)
         if (u == 0x2A4D) s_report_handle = ctxt->chr.val_handle;
         if (u == 0x2A33) s_boot_handle = ctxt->chr.val_handle;
     }
+}
+
+static int cfg_access(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR || OS_MBUF_PKTLEN(ctxt->om) < 2) {
+        return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+    }
+    uint8_t buf[4] = {0};
+    uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
+    if (len > sizeof(buf)) len = sizeof(buf);
+    os_mbuf_copydata(ctxt->om, 0, len, buf);
+    if (buf[0] == 0x01 && len >= 3) {
+        uint16_t gain = (uint16_t)(buf[1] | (buf[2] << 8));
+        ESP_LOGI(TAG, "cfg gain=%u", gain);
+        if (s_cb.on_config) s_cb.on_config(gain, 0xFF);
+    } else if (buf[0] == 0x02 && len >= 2) {
+        ESP_LOGI(TAG, "cfg action=%u", buf[1]);
+        if (s_cb.on_config) s_cb.on_config(0, buf[1]);
+    }
+    return 0;
 }
 
 static void advertise(void);

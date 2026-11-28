@@ -291,6 +291,16 @@ static void ble_hid_init(void)
 
 static void enter_sleep(const char *reason);
 
+static void on_ble_config(uint16_t gain_x10, uint8_t action)
+{
+    if (action == 0xFF) {
+        s_gain = gain_x10 / 10.0f;
+        printf("EVT,gain,%.1f\n", (double)s_gain);
+    } else {
+        printf("EVT,cfg,action,%u\n", action);
+    }
+}
+
 static void on_ble_conn(bool connected)
 {
     s_hid_connected = connected;
@@ -317,7 +327,7 @@ static void ble_stop_adv(void)
 
 static void ble_hid_init(void)
 {
-    ble_mouse_init((ble_mouse_callbacks_t){ .on_connect = on_ble_conn });
+    ble_mouse_init((ble_mouse_callbacks_t){ .on_connect = on_ble_conn, .on_config = on_ble_config });
 }
 
 /* ---------------- hall ---------------- */

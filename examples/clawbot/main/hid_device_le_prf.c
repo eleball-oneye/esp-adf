@@ -31,7 +31,7 @@ static hid_report_map_t hid_rpt_map[HID_NUM_REPORTS];
 static const uint8_t hidReportMap[] = {
     // Standard boot-protocol mouse (no report ID): buttons, dx, dy, wheel
     0x05, 0x01, 0x09, 0x02, 0xA1, 0x01,
-    0x09, 0x01, 0xA1, 0x00,
+    0x85, 0x01, 0x09, 0x01, 0xA1, 0x00,
     0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, 0x95, 0x03, 0x75, 0x01, 0x81, 0x02,
     0x95, 0x01, 0x75, 0x05, 0x81, 0x01,
     0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x03, 0x81, 0x06,
@@ -351,6 +351,8 @@ void esp_hidd_prf_cb_hdl(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
         case ESP_GATTS_CLOSE_EVT:
             break;
         case ESP_GATTS_WRITE_EVT: {
+            ESP_LOGI(HID_LE_PRF_TAG, "write handle=%d len=%d", param->write.handle, param->write.len);
+
             if (hidd_le_env.hidd_inst.att_tbl[HIDD_LE_IDX_REPORT_MOUSE_IN_CCC] == param->write.handle) {
                 ESP_LOGI(HID_LE_PRF_TAG, "mouse CCCD write len=%d val=%02x%02x",
                          param->write.len, param->write.value[1], param->write.value[0]);

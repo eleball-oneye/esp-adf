@@ -95,6 +95,20 @@ static int s_report_count;
 static float s_gain = CURSOR_GAIN_DEFAULT;
 static bool s_recenter_on = true;           /* pull cursor to screen center on engage */
 static bool s_recenter_pending = false;
+static bool s_hid_rel = false;
+static int s_last_x = 16383;
+static int s_last_y = 16383;
+
+static void hid_send(uint8_t buttons, uint16_t x, uint16_t y, int8_t wheel)
+{
+    int dx = (int)x - s_last_x;
+    int dy = (int)y - s_last_y;
+    s_last_x = x;
+    s_last_y = y;
+    if (dx || dy || wheel || buttons) {
+        esp_hidd_send_mouse_rel(s_hid_conn_id, buttons, (int16_t)dx, (int16_t)dy, wheel);
+    }
+}
 static int s_screen_w = 1920;
 static int s_screen_h = 1080;
 static float s_abs_x = 16383.5f;   /* HID absolute position, 0..32767 */
@@ -151,7 +165,11 @@ static void hid_center_cursor(void)
     }
     s_abs_x = 16383.5f;
     s_abs_y = 16383.5f;
-    esp_hidd_send_mouse_abs(s_hid_conn_id, s_buttons, 16383, 16383, 0);
+    s_last_x = 16383;
+    s_last_y = 16383;
+    if (!s_hid_rel) {
+        hid_send(s_buttons, 16383, 16383, 0);
+    }
     printf("EVT,recenter,center\n");
 }
 
@@ -452,7 +470,7 @@ static void clawbot_task(void *arg)
 
                 if (s_ble_enabled && s_hid_connected && s_hid_secure) {
                     if (moved || wheel || s_buttons) {
-                        esp_hidd_send_mouse_abs(s_hid_conn_id, s_buttons,
+                        hid_send(s_buttons,
                                                 (uint16_t)s_abs_x, (uint16_t)s_abs_y, wheel);
                     }
                 }

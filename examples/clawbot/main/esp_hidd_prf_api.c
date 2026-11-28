@@ -183,7 +183,7 @@ int esp_hidd_send_mouse_rel(uint16_t conn_id, uint8_t buttons, int16_t dx, int16
     if (dx < -127) dx = -127;
     if (dy > 127) dy = 127;
     if (dy < -127) dy = -127;
-    uint8_t buf[5] = {
+    uint8_t report[5] = {
         HID_RPT_ID_MOUSE_REL,
         buttons,
         (uint8_t)(int8_t)dx,
@@ -191,9 +191,15 @@ int esp_hidd_send_mouse_rel(uint16_t conn_id, uint8_t buttons, int16_t dx, int16
         (uint8_t)wheel,
     };
     hid_dev_send_report(hidd_le_env.gatt_if, conn_id,
-                        HID_RPT_ID_MOUSE_REL, HID_REPORT_TYPE_INPUT, sizeof(buf), buf);
+                        HID_RPT_ID_MOUSE_REL, HID_REPORT_TYPE_INPUT, sizeof(report), report);
+
+    /* Boot-protocol mouse: Android often uses this path for pointers. */
+    uint8_t boot[3] = { buttons, (uint8_t)(int8_t)dx, (uint8_t)(int8_t)dy };
+    hid_dev_send_report(hidd_le_env.gatt_if, conn_id,
+                        0, HID_REPORT_TYPE_INPUT, sizeof(boot), boot);
     return 0;
 }
+
 
 
 

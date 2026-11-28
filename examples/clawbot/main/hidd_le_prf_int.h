@@ -33,7 +33,7 @@
 #define HID_MAX_APPS                 1
 
 // Number of HID reports defined in the service
-#define HID_NUM_REPORTS          9
+#define HID_NUM_REPORTS          10
 
 // HID Report IDs for the service
 #define HID_RPT_ID_MOUSE_IN      1   // standard BLE mouse report id
@@ -126,6 +126,9 @@ enum {
     HIDD_LE_IDX_REPORT_MOUSE_IN_VAL,
     HIDD_LE_IDX_REPORT_MOUSE_IN_CCC,
     HIDD_LE_IDX_REPORT_MOUSE_REP_REF,
+    HIDD_LE_IDX_BOOT_MOUSE_IN_CHAR,
+    HIDD_LE_IDX_BOOT_MOUSE_IN_VAL,
+    HIDD_LE_IDX_BOOT_MOUSE_IN_CCC,
 
     HIDD_LE_IDX_NB,
 };

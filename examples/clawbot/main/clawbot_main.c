@@ -107,6 +107,10 @@ static void hid_send(uint8_t buttons, uint16_t x, uint16_t y, int8_t wheel)
     s_last_y = y;
     if (dx || dy || wheel || buttons) {
         esp_hidd_send_mouse_rel(s_hid_conn_id, buttons, (int16_t)dx, (int16_t)dy, wheel);
+        static unsigned dbg;
+        if ((dbg++ % 25) == 0) {
+            printf("EVT,hid,tx,%d,%d\n", dx, dy);
+        }
     }
 }
 static int s_screen_w = 1920;
@@ -212,6 +216,9 @@ static void hidd_event_callback(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *
         memcpy(s_peer_bda, param->connect.remote_bda, sizeof(esp_bd_addr_t));
         s_peer_valid = true;
         s_hid_connected = true;
+        /* The minimal HOGP service exposes no encrypted characteristics, so the
+           host never starts pairing. Treat a live HID link as usable. */
+        s_hid_secure = true;
         ESP_LOGI(TAG, "BLE connected (conn_id=%u)", s_hid_conn_id);
         printf("EVT,hid,connect\n");
         s_adv_since = 0;

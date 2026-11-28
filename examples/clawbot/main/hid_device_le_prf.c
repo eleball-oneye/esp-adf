@@ -351,6 +351,11 @@ void esp_hidd_prf_cb_hdl(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
         case ESP_GATTS_CLOSE_EVT:
             break;
         case ESP_GATTS_WRITE_EVT: {
+            if (hidd_le_env.hidd_inst.att_tbl[HIDD_LE_IDX_REPORT_MOUSE_IN_CCC] == param->write.handle) {
+                ESP_LOGI(HID_LE_PRF_TAG, "mouse CCCD write len=%d val=%02x%02x",
+                         param->write.len, param->write.value[1], param->write.value[0]);
+            }
+
             esp_hidd_cb_param_t cb_param = {0};
             #if (SUPPORT_REPORT_VENDOR == true)
             #endif

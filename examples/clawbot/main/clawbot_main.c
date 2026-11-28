@@ -101,12 +101,16 @@ static int s_last_y = 16383;
 
 static void hid_send(uint8_t buttons, uint16_t x, uint16_t y, int8_t wheel)
 {
-    int dx = (int)x - s_last_x;
-    int dy = (int)y - s_last_y;
-    s_last_x = x;
-    s_last_y = y;
-    if (dx || dy || wheel || buttons) {
-        esp_hidd_send_mouse_rel(s_hid_conn_id, buttons, (int16_t)dx, (int16_t)dy, wheel);
+    if (s_hid_rel) {
+        int dx = (int)x - s_last_x;
+        int dy = (int)y - s_last_y;
+        s_last_x = x;
+        s_last_y = y;
+        if (dx || dy || wheel || buttons) {
+            esp_hidd_send_mouse_rel(s_hid_conn_id, buttons, (int16_t)dx, (int16_t)dy, wheel);
+        }
+    } else {
+        esp_hidd_send_mouse_abs(s_hid_conn_id, buttons, x, y, wheel);
     }
 }
 static int s_screen_w = 1920;

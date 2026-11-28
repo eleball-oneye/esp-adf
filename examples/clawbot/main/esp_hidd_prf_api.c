@@ -151,13 +151,14 @@ void esp_hidd_send_mouse_value(uint16_t conn_id, uint8_t mouse_button, int8_t mi
 
 void esp_hidd_send_mouse_abs(uint16_t conn_id, uint8_t mouse_button, uint16_t x, uint16_t y, int8_t wheel)
 {
-    uint8_t buffer[6];
-    buffer[0] = mouse_button;
-    buffer[1] = (uint8_t)(x & 0xFF);
-    buffer[2] = (uint8_t)(x >> 8);
-    buffer[3] = (uint8_t)(y & 0xFF);
-    buffer[4] = (uint8_t)(y >> 8);
-    buffer[5] = (uint8_t)wheel;
+    uint8_t buffer[7];
+    buffer[0] = HID_RPT_ID_MOUSE_IN;
+    buffer[1] = mouse_button;
+    buffer[2] = (uint8_t)(x & 0xFF);
+    buffer[3] = (uint8_t)(x >> 8);
+    buffer[4] = (uint8_t)(y & 0xFF);
+    buffer[5] = (uint8_t)(y >> 8);
+    buffer[6] = (uint8_t)wheel;
     hid_dev_send_report(hidd_le_env.gatt_if, conn_id,
                         HID_RPT_ID_MOUSE_IN, HID_REPORT_TYPE_INPUT, sizeof(buffer), buffer);
 }
@@ -178,13 +179,16 @@ void esp_hidd_send_mouse_value_ex(uint16_t conn_id, uint8_t mouse_button, int8_t
 
 int esp_hidd_send_mouse_rel(uint16_t conn_id, uint8_t buttons, int16_t dx, int16_t dy, int8_t wheel)
 {
-    if (dx > 127) dx = 127;
-    if (dx < -127) dx = -127;
-    if (dy > 127) dy = 127;
-    if (dy < -127) dy = -127;
-    uint8_t buf[4] = { buttons, (uint8_t)(int8_t)dx, (uint8_t)(int8_t)dy, (uint8_t)wheel };
+    uint8_t buf[7] = {
+        2,
+        buttons,
+        (uint8_t)(dx & 0xFF), (uint8_t)((dx >> 8) & 0xFF),
+        (uint8_t)(dy & 0xFF), (uint8_t)((dy >> 8) & 0xFF),
+        (uint8_t)wheel,
+    };
     hid_dev_send_report(hidd_le_env.gatt_if, conn_id,
                         HID_RPT_ID_MOUSE_REL, HID_REPORT_TYPE_INPUT, sizeof(buf), buf);
     return 0;
 }
+
 

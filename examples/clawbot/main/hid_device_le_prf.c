@@ -80,6 +80,7 @@ hidd_le_env_t hidd_le_env;
 
 // HID report map length
 uint8_t hidReportMapLen = sizeof(hidReportMap);
+/* logged at init so the host descriptor length can be compared with the logcat dscp_len */
 uint8_t hidProtocolMode = HID_PROTOCOL_MODE_REPORT;
 
 // HID report mapping table
@@ -550,6 +551,7 @@ void esp_hidd_set_battery_level(uint8_t level)
 
 void hidd_le_init(void)
 {
+    ESP_LOGI(HID_LE_PRF_TAG, "report map = %u bytes", (unsigned)sizeof(hidReportMap));
 
     /* Reset the hid device target environment */
     memset(&hidd_le_env, 0, sizeof(hidd_le_env_t));

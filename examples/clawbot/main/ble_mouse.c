@@ -116,6 +116,15 @@ static int dis_access(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt 
     }
 }
 
+static void on_gatt_register(struct ble_gatt_register_ctxt *ctxt, void *arg)
+{
+    if (ctxt->op == BLE_GATT_REGISTER_OP_CHR && ctxt->chr.chr_def->uuid->type == BLE_UUID_TYPE_16) {
+        uint16_t u = ((ble_uuid16_t *)ctxt->chr.chr_def->uuid)->value;
+        if (u == 0x2A4D) s_report_handle = ctxt->chr.val_handle;
+        if (u == 0x2A33) s_boot_handle = ctxt->chr.val_handle;
+    }
+}
+
 static void advertise(void);
 
 static int gap_event(struct ble_gap_event *event, void *arg)
@@ -136,6 +145,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         advertise();
         return 0;
     case BLE_GAP_EVENT_SUBSCRIBE:
+        ESP_LOGI(TAG, "subscribe handle=%u notify=%d", event->subscribe.attr_handle, event->subscribe.cur_notify);
         if (event->subscribe.attr_handle == s_report_handle) {
             s_report_sub = event->subscribe.cur_notify;
         } else if (event->subscribe.attr_handle == s_boot_handle) {
@@ -176,6 +186,8 @@ static void advertise(void)
     }
     struct ble_gap_adv_params params;
     memset(&params, 0, sizeof(params));
+    params.itvl_min = BLE_GAP_ADV_ITVL_MS(30);
+    params.itvl_max = BLE_GAP_ADV_ITVL_MS(50);
     params.conn_mode = BLE_GAP_CONN_MODE_UND;
     params.disc_mode = BLE_GAP_DISC_MODE_GEN;
     rc = ble_gap_adv_start(s_own_addr_type, NULL, BLE_HS_FOREVER, &params, gap_event, NULL);
@@ -214,6 +226,7 @@ void ble_mouse_init(ble_mouse_callbacks_t cb)
         return;
     }
     ble_hs_cfg.sync_cb = on_sync;
+    ble_hs_cfg.gatts_register_cb = on_gatt_register;
     ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_NO_IO;
     ble_hs_cfg.sm_bonding = 1;
     ble_hs_cfg.sm_mitm = 0;
@@ -232,12 +245,6 @@ void ble_mouse_init(ble_mouse_callbacks_t cb)
         ESP_LOGE(TAG, "gatt add rc=%d", rc);
         return;
     }
-    /* Resolve report handles after registration. */
-    ble_uuid16_t hid = BLE_UUID16_INIT(0x1812);
-    ble_uuid16_t rep = BLE_UUID16_INIT(0x2A4D);
-    ble_uuid16_t boot = BLE_UUID16_INIT(0x2A33);
-    ble_gatts_find_chr(&hid.u, &rep.u, NULL, &s_report_handle);
-    ble_gatts_find_chr(&hid.u, &boot.u, NULL, &s_boot_handle);
     ESP_LOGI(TAG, "HID report handle=%u boot=%u", s_report_handle, s_boot_handle);
 
     nimble_port_freertos_init(host_task);
